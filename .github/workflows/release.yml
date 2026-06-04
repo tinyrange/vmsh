@@ -71,6 +71,9 @@ jobs:
       MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
       MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
       MACOS_DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID || secrets.DEVELOPER_ID }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+      TEAM_ID: ${{ secrets.TEAM_ID }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -85,8 +88,29 @@ jobs:
             go.sum
             cc/go.sum
 
+      - name: Check macOS signing and notarization secrets
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in MACOS_CERTIFICATE MACOS_CERTIFICATE_PWD MACOS_DEVELOPER_ID APPLE_ID_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [[ "$APPLE_ID_PASSWORD" != @keychain:* ]]; then
+            for name in APPLE_ID TEAM_ID; do
+              if [ -z "${!name}" ]; then
+                missing+=("$name")
+              fi
+            done
+          fi
+          if [ "${#missing[@]}" -ne 0 ]; then
+            printf 'Missing required macOS release secrets:\n' >&2
+            printf '  %s\n' "${missing[@]}" >&2
+            exit 1
+          fi
+
       - name: Import Developer ID certificate
-        if: env.MACOS_CERTIFICATE != ''
         run: |
           set -euo pipefail
           printf '%s' "$MACOS_CERTIFICATE" | base64 -D > certificate.p12
@@ -116,24 +140,41 @@ jobs:
         run: |
           set -euo pipefail
           name="vmsh_${GITHUB_REF_NAME}_darwin_arm64"
-          identity="-"
-          keychain_args=()
-          signing_args=()
-
-          if [ -n "$MACOS_DEVELOPER_ID" ] && [ -n "$MACOS_CERTIFICATE" ]; then
-            identity="$MACOS_DEVELOPER_ID"
-            keychain_args=(--keychain build.keychain)
-            signing_args=(--timestamp --options runtime)
-          fi
-
           codesign \
             --force \
-            --sign "$identity" \
+            --sign "$MACOS_DEVELOPER_ID" \
             --entitlements tools/entitlements.xml \
-            "${signing_args[@]}" \
-            "${keychain_args[@]}" \
+            --timestamp \
+            --options runtime \
+            --keychain build.keychain \
             "dist/${name}"
           codesign --verify --strict --verbose=2 "dist/${name}"
+          codesign -d --verbose=4 "dist/${name}" 2>&1 | grep runtime
+
+      - name: Notarize macOS binary
+        run: |
+          set -euo pipefail
+          name="vmsh_${GITHUB_REF_NAME}_darwin_arm64"
+          notary_zip="dist/${name}_notary.zip"
+          ditto -c -k --keepParent "dist/${name}" "$notary_zip"
+
+          if [[ "$APPLE_ID_PASSWORD" == @keychain:* ]]; then
+            notary_profile="${APPLE_ID_PASSWORD#@keychain:}"
+            xcrun notarytool submit "$notary_zip" \
+              --keychain-profile "$notary_profile" \
+              --wait \
+              --timeout 30m
+          else
+            xcrun notarytool submit "$notary_zip" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_ID_PASSWORD" \
+              --team-id "$TEAM_ID" \
+              --wait \
+              --timeout 30m
+          fi
+
+          rm -f "$notary_zip"
+          spctl --assess --type exec -v "dist/${name}" 2>&1
 
       - name: Upload binary
         uses: actions/upload-artifact@v4

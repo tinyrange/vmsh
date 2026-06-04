@@ -230,13 +230,17 @@ daemon, so release assets do not need a `ccvm` sidecar.
 
 The macOS binary is built on `macos-15` and codesigned with the Hypervisor
 entitlement from `tools/entitlements.xml`. Configure these repository secrets
-for Developer ID signing:
+for Developer ID signing and notarization:
 
 - `MACOS_CERTIFICATE`: base64-encoded `.p12` signing certificate.
 - `MACOS_CERTIFICATE_PWD`: password for the `.p12` certificate.
 - `MACOS_DEVELOPER_ID`: Developer ID Application identity. The workflow also
   accepts `DEVELOPER_ID` for compatibility with older `cc` release settings.
+- `APPLE_ID`: Apple ID used by `notarytool`.
+- `APPLE_ID_PASSWORD`: app-specific password for `notarytool`, or
+  `@keychain:<profile>` to use a preconfigured notary keychain profile.
+- `TEAM_ID`: Apple Developer Team ID.
 
-If the macOS signing secrets are absent, the workflow uses ad-hoc signing so
-packaging can still be exercised, but public releases should use Developer ID
-signing.
+The workflow signs the binary with hardened runtime, submits a temporary ZIP
+containing that binary to Apple's notary service, and publishes the single
+signed binary as the release asset.
