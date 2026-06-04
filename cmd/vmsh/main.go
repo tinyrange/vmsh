@@ -640,6 +640,7 @@ type vmshAPI interface {
 	Capabilities() (client.CapabilitiesResponse, error)
 	GetImage(string) (client.ImageState, error)
 	PullImageStream(string, client.PullImageRequest, func(client.ProgressEvent) error) error
+	SaveInstanceImage(string, client.SaveImageRequest) (client.ImageState, error)
 	StartInstanceStreamWithID(string, client.StartInstanceRequest, func(client.BootEvent) error) (client.InstanceState, error)
 	ShutdownInstanceWithID(string) error
 	InstanceStatusOf(string) (client.InstanceState, error)
@@ -1334,6 +1335,8 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		}
 		id := firstNonEmpty(at.Options.VMID, s.context.VMID)
 		return s.stopVM(id)
+	case "save":
+		return s.saveVM(at, stdout)
 	case "forward":
 		if at.Command == "" {
 			return fmt.Errorf("usage: @forward <host-port:guest-port>")
@@ -2611,6 +2614,45 @@ func (s *shellState) stopVM(id string) error {
 	return nil
 }
 
+func (s *shellState) saveVM(at atLine, stdout io.Writer) error {
+	fields, err := splitShellFields(at.Command)
+	if err != nil {
+		return err
+	}
+	if len(fields) != 1 || hasSaveOnlyUnsupportedOptions(at.Options) {
+		return fmt.Errorf("usage: @save [--vm id] tag")
+	}
+	name := strings.TrimSpace(fields[0])
+	if name == "" || strings.HasPrefix(name, "-") {
+		return fmt.Errorf("usage: @save [--vm id] tag")
+	}
+	id := firstNonEmpty(at.Options.VMID, s.context.VMID)
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("vm id is required")
+	}
+	state, err := s.api.SaveInstanceImage(id, client.SaveImageRequest{Name: name})
+	if err != nil {
+		return err
+	}
+	if s.imageCache == nil {
+		s.imageCache = map[string]bool{}
+	}
+	s.imageCache[state.Name] = true
+	if _, err := fmt.Fprintf(stdout, "Saved %s as %s\n", id, state.Name); err != nil {
+		return err
+	}
+	return nil
+}
+
+func hasSaveOnlyUnsupportedOptions(opts commandOptions) bool {
+	for _, field := range opts.OptionFields {
+		if strings.TrimSpace(field) != "--vm" {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *shellState) chdirContext(target string) error {
 	if s.context.Mode == modeVM {
 		return s.chdirGuest(target)
@@ -2911,6 +2953,7 @@ func (s *shellState) help(w io.Writer) error {
 @status                  show vmsh and selected VM state
 @start [--vm id]         start a blank VM
 @stop [--vm id]          stop a VM
+@save [--vm id] tag      save the selected VM root filesystem as a local image
 @forward H:G             forward host port H to guest port G
 opts: --vm id --cwd path --user user --sudo --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested
 cd <dir>                 change the current host or VM working directory

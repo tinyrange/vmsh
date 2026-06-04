@@ -1423,6 +1423,56 @@ func TestGuestCommandPullsMissingImageBeforeRun(t *testing.T) {
 	}
 }
 
+func TestSaveVMUsesSelectedVMAndCachesImage(t *testing.T) {
+	api := &fakeVMSHAPI{}
+	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work"}, hostCWD: t.TempDir(), imageCache: map[string]bool{}}
+	var stdout bytes.Buffer
+
+	if err := sh.evalAt("@save saved-tag", &stdout, io.Discard); err != nil {
+		t.Fatalf("evalAt(@save) error = %v", err)
+	}
+	if len(api.saves) != 1 {
+		t.Fatalf("saves = %d, want 1", len(api.saves))
+	}
+	if api.saves[0].id != "work" || api.saves[0].req.Name != "saved-tag" {
+		t.Fatalf("save request = %#v, want work saved-tag", api.saves[0])
+	}
+	if !sh.imageCache["saved-tag"] {
+		t.Fatalf("saved-tag was not cached")
+	}
+	if got := stdout.String(); !strings.Contains(got, "Saved work as saved-tag") {
+		t.Fatalf("stdout = %q, want save message", got)
+	}
+}
+
+func TestSaveVMAllowsVMOption(t *testing.T) {
+	api := &fakeVMSHAPI{}
+	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "selected"}, hostCWD: t.TempDir()}
+
+	if err := sh.evalAt("@save --vm other saved-tag", io.Discard, io.Discard); err != nil {
+		t.Fatalf("evalAt(@save --vm) error = %v", err)
+	}
+	if len(api.saves) != 1 {
+		t.Fatalf("saves = %d, want 1", len(api.saves))
+	}
+	if api.saves[0].id != "other" || api.saves[0].req.Name != "saved-tag" {
+		t.Fatalf("save request = %#v, want other saved-tag", api.saves[0])
+	}
+}
+
+func TestSaveVMRejectsUnsupportedOptions(t *testing.T) {
+	api := &fakeVMSHAPI{}
+	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work"}, hostCWD: t.TempDir()}
+
+	err := sh.evalAt("@save --memory 2048 saved-tag", io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "usage: @save") {
+		t.Fatalf("handleAtLine(save --memory) error = %v, want usage", err)
+	}
+	if len(api.saves) != 0 {
+		t.Fatalf("saves = %d, want 0", len(api.saves))
+	}
+}
+
 func TestGuestCommandCachesImageAndRunningVMState(t *testing.T) {
 	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
 	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Network: true}, hostCWD: t.TempDir()}
@@ -1628,11 +1678,14 @@ type fakeVMSHAPI struct {
 	statuses     []client.InstanceState
 	streams      []fakeRun
 	starts       []fakeStart
+	saves        []fakeSave
 	streamEvents []client.ExecEvent
 	bootEvents   []client.BootEvent
 	pullEvents   []client.ProgressEvent
 	pulls        []fakePull
 	missingImgs  map[string]bool
+	saveState    client.ImageState
+	saveErr      error
 	imageGets    int
 	statusGets   int
 }
@@ -1651,6 +1704,11 @@ type fakePull struct {
 	name   string
 	source string
 	arch   string
+}
+
+type fakeSave struct {
+	id  string
+	req client.SaveImageRequest
 }
 
 func (f *fakeVMSHAPI) HealthCheck() error { return nil }
@@ -1688,6 +1746,17 @@ func (f *fakeVMSHAPI) PullImageStream(name string, req client.PullImageRequest, 
 		}
 	}
 	return nil
+}
+
+func (f *fakeVMSHAPI) SaveInstanceImage(id string, req client.SaveImageRequest) (client.ImageState, error) {
+	f.saves = append(f.saves, fakeSave{id: id, req: req})
+	if f.saveErr != nil {
+		return client.ImageState{}, f.saveErr
+	}
+	if f.saveState.Name != "" {
+		return f.saveState, nil
+	}
+	return client.ImageState{Name: req.Name, Status: "downloaded"}, nil
 }
 
 func (f *fakeVMSHAPI) StartInstanceStreamWithID(id string, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
