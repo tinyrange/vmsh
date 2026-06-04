@@ -2630,7 +2630,10 @@ func (s *shellState) saveVM(at atLine, stdout io.Writer) error {
 	if strings.TrimSpace(id) == "" {
 		return fmt.Errorf("vm id is required")
 	}
-	state, err := s.api.SaveInstanceImage(id, client.SaveImageRequest{Name: name})
+	state, err := s.api.SaveInstanceImage(id, client.SaveImageRequest{
+		Name:  name,
+		Image: localImageName(s.context.Image, s.context.Arch),
+	})
 	if err != nil {
 		return err
 	}

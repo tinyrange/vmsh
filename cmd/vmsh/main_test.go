@@ -1425,7 +1425,7 @@ func TestGuestCommandPullsMissingImageBeforeRun(t *testing.T) {
 
 func TestSaveVMUsesSelectedVMAndCachesImage(t *testing.T) {
 	api := &fakeVMSHAPI{}
-	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work"}, hostCWD: t.TempDir(), imageCache: map[string]bool{}}
+	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine"}, hostCWD: t.TempDir(), imageCache: map[string]bool{}}
 	var stdout bytes.Buffer
 
 	if err := sh.evalAt("@save saved-tag", &stdout, io.Discard); err != nil {
@@ -1434,8 +1434,8 @@ func TestSaveVMUsesSelectedVMAndCachesImage(t *testing.T) {
 	if len(api.saves) != 1 {
 		t.Fatalf("saves = %d, want 1", len(api.saves))
 	}
-	if api.saves[0].id != "work" || api.saves[0].req.Name != "saved-tag" {
-		t.Fatalf("save request = %#v, want work saved-tag", api.saves[0])
+	if api.saves[0].id != "work" || api.saves[0].req.Name != "saved-tag" || api.saves[0].req.Image != "alpine" {
+		t.Fatalf("save request = %#v, want work saved-tag from alpine", api.saves[0])
 	}
 	if !sh.imageCache["saved-tag"] {
 		t.Fatalf("saved-tag was not cached")
