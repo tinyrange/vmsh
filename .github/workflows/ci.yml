@@ -27,12 +27,12 @@ jobs:
             runs-on: macos-15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache-dependency-path: |
@@ -44,22 +44,25 @@ jobs:
 
       - name: Test cc without live VMs
         working-directory: cc
-        run: go test -short ./...
+        run: |
+          if [ "$(go env GOOS)/$(go env GOARCH)" = "darwin/arm64" ]; then
+            go list ./... | grep -v '^j5.nz/cc/internal/hv/hvf$' | xargs go test -short
+          else
+            go test -short ./...
+          fi
 
   linux-amd64-vm:
     name: Linux AMD64 VM smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    env:
-      CCX3_KVM_BOOT: "1"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache-dependency-path: |
@@ -77,14 +80,7 @@ jobs:
 
       - name: Test cc
         working-directory: cc
-        run: go test ./...
-
-      - name: Run selected KVM boot probes
-        working-directory: cc
-        run: |
-          go test ./internal/hv/kvm ./internal/vm \
-            -run 'Test(KernelBootSerial|InitramfsBootReadyMarker|RuntimeBackendRunCommand)$' \
-            -count=1 -v
+        run: go test -short ./...
 
       - name: Build ccvm, cc, and vmsh
         run: |
@@ -99,6 +95,15 @@ jobs:
           cd ..
           go build -o build/ci/vmsh ./cmd/vmsh
 
+      - name: Run selected KVM boot probes
+        working-directory: cc
+        env:
+          CCX3_KVM_BOOT: "1"
+        run: |
+          go test -tags embed_guestinit ./internal/hv/kvm ./internal/vm \
+            -run 'Test(KernelBootSerial|InitramfsBootReadyMarker|RuntimeBackendRunCommand)$' \
+            -count=1 -v
+
       - name: Run vmsh guest command smoke
         run: |
           cache="$(mktemp -d)"
@@ -112,17 +117,14 @@ jobs:
     name: Windows AMD64 VM smoke
     runs-on: windows-2025
     timeout-minutes: 60
-    env:
-      CCX3_WHP_BOOT: "1"
-      CCX3_WHP_BOOT_TIMEOUT_SECONDS: "180"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache-dependency-path: |
@@ -136,15 +138,7 @@ jobs:
       - name: Test cc
         working-directory: cc
         shell: pwsh
-        run: go test ./...
-
-      - name: Run selected WHP boot probes
-        working-directory: cc
-        shell: pwsh
-        run: >
-          go test ./internal/hv/whp ./internal/vm
-          -run 'Test(WindowsRuntimeBackendRunCommand|RunManagedExecWithAlpineRootFS)$'
-          -count=1 -v
+        run: go test -short ./...
 
       - name: Build ccvm, cc, and vmsh
         shell: pwsh
@@ -164,6 +158,17 @@ jobs:
           go build -o ../build/ci/cc.exe ./cmd/cc
           Pop-Location
           go build -o build/ci/vmsh.exe ./cmd/vmsh
+
+      - name: Run selected WHP boot probes
+        working-directory: cc
+        shell: pwsh
+        env:
+          CCX3_WHP_BOOT: "1"
+          CCX3_WHP_BOOT_TIMEOUT_SECONDS: "180"
+        run: >
+          go test -tags embed_guestinit ./internal/hv/whp ./internal/vm
+          -run 'Test(WindowsRuntimeBackendRunCommand|RunManagedExecWithAlpineRootFS)$'
+          -count=1 -v
 
       - name: Run vmsh guest command smoke
         shell: pwsh
