@@ -86,9 +86,9 @@ jobs:
         run: |
           mkdir -p build/ci
           cd cc
-          GOOS=linux GOARCH=arm64 go build -o ../build/ci/init-linux-arm64 ./internal/cmd/init
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o ../build/ci/init-linux-arm64 ./internal/cmd/init
           install -m 644 ../build/ci/init-linux-arm64 internal/guestinit/guest-init-linux-arm64
-          GOOS=linux GOARCH=amd64 go build -o ../build/ci/init-linux-amd64 ./internal/cmd/init
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ../build/ci/init-linux-amd64 ./internal/cmd/init
           install -m 644 ../build/ci/init-linux-amd64 internal/guestinit/guest-init-linux-amd64
           go build -tags embed_guestinit -o ../build/ci/ccvm ./cmd/ccvm
           go build -o ../build/ci/cc ./cmd/cc
@@ -100,7 +100,7 @@ jobs:
         env:
           CCX3_KVM_BOOT: "1"
         run: |
-          go test -tags embed_guestinit ./internal/hv/kvm ./internal/vm \
+          go test -p 1 -tags embed_guestinit ./internal/hv/kvm ./internal/vm \
             -run 'Test(KernelBootSerial|InitramfsBootReadyMarker|RuntimeBackendRunCommand)$' \
             -count=1 -v
 
@@ -145,6 +145,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force build/ci | Out-Null
           Push-Location cc
+          $env:CGO_ENABLED = "0"
           $env:GOOS = "linux"
           $env:GOARCH = "arm64"
           go build -o ../build/ci/init-linux-arm64 ./internal/cmd/init
@@ -152,6 +153,7 @@ jobs:
           $env:GOARCH = "amd64"
           go build -o ../build/ci/init-linux-amd64 ./internal/cmd/init
           Copy-Item ../build/ci/init-linux-amd64 internal/guestinit/guest-init-linux-amd64 -Force
+          Remove-Item Env:\CGO_ENABLED
           Remove-Item Env:\GOOS
           Remove-Item Env:\GOARCH
           go build -tags embed_guestinit -o ../build/ci/ccvm.exe ./cmd/ccvm
@@ -166,7 +168,7 @@ jobs:
           CCX3_WHP_BOOT: "1"
           CCX3_WHP_BOOT_TIMEOUT_SECONDS: "180"
         run: >
-          go test -tags embed_guestinit ./internal/hv/whp ./internal/vm
+          go test -p 1 -tags embed_guestinit ./internal/hv/whp ./internal/vm
           -run 'Test(WindowsRuntimeBackendRunCommand|RunManagedExecWithAlpineRootFS)$'
           -count=1 -v
 
