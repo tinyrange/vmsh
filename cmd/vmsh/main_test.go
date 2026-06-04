@@ -1,0 +1,1732 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"path"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/creack/pty"
+	"j5.nz/cc/client"
+)
+
+func TestSplitShellFields(t *testing.T) {
+	tests := []struct {
+		input string
+		want  []string
+	}{
+		{input: `@image alpine`, want: []string{"@image", "alpine"}},
+		{input: `cd "two words"`, want: []string{"cd", "two words"}},
+		{input: `@vm use 'work vm'`, want: []string{"@vm", "use", "work vm"}},
+		{input: `cd a\ b`, want: []string{"cd", "a b"}},
+	}
+	for _, tt := range tests {
+		got, err := splitShellFields(tt.input)
+		if err != nil {
+			t.Fatalf("splitShellFields(%q) error = %v", tt.input, err)
+		}
+		if strings.Join(got, "\x00") != strings.Join(tt.want, "\x00") {
+			t.Fatalf("splitShellFields(%q) = %#v, want %#v", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestSplitShellFieldsErrors(t *testing.T) {
+	for _, input := range []string{`"unterminated`, `abc\`} {
+		if _, err := splitShellFields(input); err == nil {
+			t.Fatalf("splitShellFields(%q) error = nil, want error", input)
+		}
+	}
+}
+
+func TestParseCD(t *testing.T) {
+	target, ok, err := parseCD(`cd "hello world"`)
+	if err != nil {
+		t.Fatalf("parseCD() error = %v", err)
+	}
+	if !ok || target != "hello world" {
+		t.Fatalf("parseCD() = %q, %v; want hello world, true", target, ok)
+	}
+
+	if _, ok, err := parseCD(`echo cd`); err != nil || ok {
+		t.Fatalf("parseCD(non-cd) = _, %v, %v; want false, nil", ok, err)
+	}
+
+	if _, ok, err := parseCD(`cd one two`); !ok || err == nil {
+		t.Fatalf("parseCD(extra args) = _, %v, %v; want true and error", ok, err)
+	}
+}
+
+func TestPersistentHostShellPreservesState(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host pty smoke test is unix-only")
+	}
+	dir := t.TempDir()
+	session, err := startPersistentHostShell(dir, os.Environ(), 80, 24, "")
+	if err != nil {
+		t.Fatalf("startPersistentHostShell() error = %v", err)
+	}
+	defer session.close()
+
+	var stdout, stderr bytes.Buffer
+	if err := session.run("printf 'first-host\\n'", &stdout, &stderr); err != nil {
+		t.Fatalf("run(first) error = %v; stderr=%q", err, stderr.String())
+	}
+	if got := normalizeTerminalOutput(stdout.String()); got != "first-host\n" {
+		t.Fatalf("first output = %q, want first-host", got)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := session.run("alias hp='echo host-persist'", &stdout, &stderr); err != nil {
+		t.Fatalf("run(alias) error = %v; stderr=%q", err, stderr.String())
+	}
+	if err := session.run("hp", &stdout, &stderr); err != nil {
+		t.Fatalf("run(alias use) error = %v; stderr=%q", err, stderr.String())
+	}
+	if got := normalizeTerminalOutput(stdout.String()); !strings.Contains(got, "host-persist\n") {
+		t.Fatalf("alias output = %q, want host-persist", got)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := session.run("cd /tmp", &stdout, &stderr); err != nil {
+		t.Fatalf("run(cd) error = %v; stderr=%q", err, stderr.String())
+	}
+	if got := session.cwd(); got != "/tmp" {
+		t.Fatalf("cwd after cd = %q, want /tmp", got)
+	}
+}
+
+func TestChdirHostKeepsWarmShellInSync(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host pty smoke test is unix-only")
+	}
+	dir := t.TempDir()
+	next := filepath.Join(dir, "next")
+	if err := os.Mkdir(next, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	session, err := startPersistentHostShell(dir, os.Environ(), 80, 24, "")
+	if err != nil {
+		t.Fatalf("startPersistentHostShell() error = %v", err)
+	}
+	defer session.close()
+
+	sh := &shellState{hostCWD: dir, hostShell: session}
+	if err := sh.chdirHost(next); err != nil {
+		t.Fatalf("chdirHost() error = %v", err)
+	}
+
+	var stdout bytes.Buffer
+	if err := session.run("pwd", &stdout, &bytes.Buffer{}); err != nil {
+		t.Fatalf("pwd error = %v", err)
+	}
+	if got := strings.TrimSpace(normalizeTerminalOutput(stdout.String())); got != next {
+		t.Fatalf("warm shell pwd = %q, want %q", got, next)
+	}
+}
+
+func normalizeTerminalOutput(value string) string {
+	return strings.ReplaceAll(value, "\r\n", "\n")
+}
+
+func TestParseAtLineTargetOptionsAndCommand(t *testing.T) {
+	got, err := parseAtLine(`@ubuntu:24.04 --vm work --memory 2g --cpus=4 pytest -q --maxfail=1`)
+	if err != nil {
+		t.Fatalf("parseAtLine() error = %v", err)
+	}
+	if got.Target != "ubuntu:24.04" || got.Options.VMID != "work" || got.Options.MemoryMB != 2048 || got.Options.CPUs != 4 {
+		t.Fatalf("parseAtLine() = %#v", got)
+	}
+	if got.Command != "pytest -q --maxfail=1" {
+		t.Fatalf("command = %q", got.Command)
+	}
+}
+
+func TestParseAtLineCurrentContextOptions(t *testing.T) {
+	got, err := parseAtLine(`@ --vm work --cwd /src`)
+	if err != nil {
+		t.Fatalf("parseAtLine() error = %v", err)
+	}
+	if got.Target != "" || got.Options.VMID != "work" || got.Options.CWD != "/src" || got.Command != "" {
+		t.Fatalf("parseAtLine() = %#v", got)
+	}
+}
+
+func TestParseAtLineSudoOption(t *testing.T) {
+	got, err := parseAtLine(`@ --sudo apt update`)
+	if err != nil {
+		t.Fatalf("parseAtLine() error = %v", err)
+	}
+	if !got.Options.Sudo || got.Command != "apt update" {
+		t.Fatalf("parseAtLine() = %#v", got)
+	}
+}
+
+func TestParseAtLineArchOption(t *testing.T) {
+	got, err := parseAtLine(`@ubuntu --arch x86_64 uname -m`)
+	if err != nil {
+		t.Fatalf("parseAtLine() error = %v", err)
+	}
+	if got.Options.Arch != "amd64" || got.Command != "uname -m" {
+		t.Fatalf("parseAtLine() = %#v, want arch amd64 command", got)
+	}
+}
+
+func TestBareOCISelectsCurrentContextAndPreparesImage(t *testing.T) {
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "default", Status: "stopped"}}
+	sh := &shellState{api: api, context: defaultContext("default", "", false), hostCWD: t.TempDir()}
+	if err := sh.eval(`@alpine`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("eval(@alpine) error = %v", err)
+	}
+	if sh.context.Mode != modeVM || sh.context.Image != "alpine" {
+		t.Fatalf("context = %#v, want vm/alpine", sh.context)
+	}
+	if len(api.starts) != 0 {
+		t.Fatalf("starts = %d, want 0", len(api.starts))
+	}
+}
+
+func TestBareOCIPullsMissingImageWithoutBooting(t *testing.T) {
+	api := &fakeVMSHAPI{
+		status:      client.InstanceState{ID: "default", Status: "stopped"},
+		missingImgs: map[string]bool{"alpine": true},
+		pullEvents: []client.ProgressEvent{{
+			Status:             "downloading",
+			Artifact:           "alpine",
+			Blob:               "rootfs",
+			BytesDownloaded:    1024,
+			BytesTotal:         2048,
+			FilesDownloaded:    1,
+			FilesTotal:         2,
+			RateBytesPerSecond: 512,
+			ETASeconds:         2,
+		}},
+	}
+	var prompts []string
+	sh := &shellState{
+		api:     api,
+		context: defaultContext("default", "", false),
+		hostCWD: t.TempDir(),
+		confirmPull: func(source string, stderr io.Writer) (bool, error) {
+			prompts = append(prompts, source)
+			return true, nil
+		},
+	}
+	var stderr bytes.Buffer
+	if err := sh.eval(`@alpine`, &bytes.Buffer{}, &stderr); err != nil {
+		t.Fatalf("eval(@alpine) error = %v", err)
+	}
+	if len(prompts) != 1 || prompts[0] != "docker.io/library/alpine:latest" {
+		t.Fatalf("prompts = %#v, want normalized alpine source", prompts)
+	}
+	if len(api.pulls) != 1 || api.pulls[0].name != "alpine" {
+		t.Fatalf("pulls = %#v, want alpine", api.pulls)
+	}
+	if len(api.starts) != 0 {
+		t.Fatalf("starts = %d, want 0", len(api.starts))
+	}
+	if sh.context.Mode != modeVM || sh.context.Image != "alpine" {
+		t.Fatalf("context = %#v, want vm/alpine", sh.context)
+	}
+	gotStatus := stderr.String()
+	if !strings.Contains(gotStatus, "Pull alpine") || !strings.Contains(gotStatus, "downloading") || strings.Contains(gotStatus, "{") {
+		t.Fatalf("pull status = %q, want human-readable pull progress", gotStatus)
+	}
+}
+
+func TestBareOCIPullCanBeCancelled(t *testing.T) {
+	api := &fakeVMSHAPI{
+		status:      client.InstanceState{ID: "default", Status: "stopped"},
+		missingImgs: map[string]bool{"ubuntu": true},
+	}
+	sh := &shellState{
+		api:     api,
+		context: defaultContext("default", "", false),
+		hostCWD: t.TempDir(),
+		confirmPull: func(source string, stderr io.Writer) (bool, error) {
+			if source != "docker.io/library/ubuntu:latest" {
+				t.Fatalf("source = %q, want normalized ubuntu source", source)
+			}
+			return false, nil
+		},
+	}
+	err := sh.eval(`@ubuntu`, &bytes.Buffer{}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "image pull cancelled") {
+		t.Fatalf("eval(@ubuntu) error = %v, want cancelled pull", err)
+	}
+	if len(api.pulls) != 0 {
+		t.Fatalf("pulls = %#v, want none after cancellation", api.pulls)
+	}
+}
+
+func TestDisplayPullSourceNormalizesCommonOCIRefs(t *testing.T) {
+	tests := []struct {
+		source string
+		want   string
+	}{
+		{source: "ubuntu", want: "docker.io/library/ubuntu:latest"},
+		{source: "ubuntu:24.04", want: "docker.io/library/ubuntu:24.04"},
+		{source: "j5.nz/tool", want: "j5.nz/tool:latest"},
+		{source: "ghcr.io/acme/tool:v1", want: "ghcr.io/acme/tool:v1"},
+	}
+	for _, tt := range tests {
+		if got := displayPullSource(tt.source); got != tt.want {
+			t.Fatalf("displayPullSource(%q) = %q, want %q", tt.source, got, tt.want)
+		}
+	}
+}
+
+func TestAliasExpandsBeforeCommandDispatch(t *testing.T) {
+	sh := &shellState{hostCWD: t.TempDir()}
+	if err := sh.eval(`@alias say=@host printf alias-ok`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("set alias error = %v", err)
+	}
+	var stdout bytes.Buffer
+	if err := sh.eval(`say`, &stdout, &bytes.Buffer{}); err != nil {
+		t.Fatalf("eval(alias) error = %v", err)
+	}
+	if stdout.String() != "alias-ok" {
+		t.Fatalf("stdout = %q, want alias-ok", stdout.String())
+	}
+}
+
+func TestAliasCanPointToHostClearCommand(t *testing.T) {
+	sh := &shellState{}
+	if err := sh.eval(`@alias clear=@host clear`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("set alias error = %v", err)
+	}
+	got, err := sh.expandAliasLine("clear")
+	if err != nil {
+		t.Fatalf("expandAliasLine() error = %v", err)
+	}
+	if got != "@host clear" {
+		t.Fatalf("expanded clear = %q, want @host clear", got)
+	}
+}
+
+func TestAliasPreservesCommandArguments(t *testing.T) {
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	sh := &shellState{api: api, context: commandContext{Mode: modeHost, VMID: "work", Network: true}, hostCWD: t.TempDir()}
+	if err := sh.eval(`@alias u=@ubuntu echo`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("set alias error = %v", err)
+	}
+	if err := sh.eval(`u hello --flag`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("eval(alias) error = %v", err)
+	}
+	if len(api.streams) != 1 || api.streams[0].req.Image != "ubuntu" {
+		t.Fatalf("streams = %#v, want ubuntu run", api.streams)
+	}
+	if got := strings.Join(api.streams[0].req.Command, " "); !strings.Contains(got, "echo hello --flag") {
+		t.Fatalf("command = %#v, want appended alias arguments", api.streams[0].req.Command)
+	}
+}
+
+func TestGuestCommandUsesArchitectureSpecificImage(t *testing.T) {
+	api := &fakeVMSHAPI{
+		status:      client.InstanceState{ID: "work", Status: "stopped"},
+		missingImgs: map[string]bool{"ubuntu@amd64": true},
+	}
+	sh := &shellState{
+		api:     api,
+		context: commandContext{Mode: modeHost, VMID: "work", Network: true},
+		hostCWD: t.TempDir(),
+		confirmPull: func(source string, stderr io.Writer) (bool, error) {
+			if source != "docker.io/library/ubuntu:latest (amd64)" {
+				t.Fatalf("pull prompt source = %q", source)
+			}
+			return true, nil
+		},
+	}
+	if err := sh.eval(`@ubuntu --arch amd64 uname -m`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("eval() error = %v", err)
+	}
+	if len(api.pulls) != 1 || api.pulls[0].name != "ubuntu@amd64" || api.pulls[0].source != "ubuntu" || api.pulls[0].arch != "amd64" {
+		t.Fatalf("pulls = %#v, want ubuntu@amd64 from ubuntu arch amd64", api.pulls)
+	}
+	if len(api.starts) != 1 || api.starts[0].req.Image != "ubuntu@amd64" {
+		t.Fatalf("starts = %#v, want boot image ubuntu@amd64", api.starts)
+	}
+	if len(api.streams) != 1 || api.streams[0].req.Image != "ubuntu@amd64" {
+		t.Fatalf("streams = %#v, want run image ubuntu@amd64", api.streams)
+	}
+}
+
+func TestAliasListsAndDeletesAliases(t *testing.T) {
+	sh := &shellState{}
+	if err := sh.eval(`@alias b=@host echo b`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("set b error = %v", err)
+	}
+	if err := sh.eval(`@alias a=@host echo a`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("set a error = %v", err)
+	}
+	var out bytes.Buffer
+	if err := sh.eval(`@alias`, &out, &bytes.Buffer{}); err != nil {
+		t.Fatalf("list aliases error = %v", err)
+	}
+	if out.String() != "a=@host echo a\nb=@host echo b\n" {
+		t.Fatalf("aliases = %q", out.String())
+	}
+	if err := sh.eval(`@alias -d a`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("delete alias error = %v", err)
+	}
+	out.Reset()
+	if err := sh.eval(`@alias`, &out, &bytes.Buffer{}); err != nil {
+		t.Fatalf("list aliases error = %v", err)
+	}
+	if out.String() != "b=@host echo b\n" {
+		t.Fatalf("aliases after delete = %q", out.String())
+	}
+}
+
+func TestAliasExpansionRejectsRecursiveAliases(t *testing.T) {
+	sh := &shellState{}
+	if err := sh.eval(`@alias a=b`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("set a error = %v", err)
+	}
+	if err := sh.eval(`@alias b=a`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("set b error = %v", err)
+	}
+	err := sh.eval(`a`, &bytes.Buffer{}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "alias expansion exceeded") {
+		t.Fatalf("recursive alias error = %v, want expansion limit", err)
+	}
+}
+
+func TestVMSHRCAcceptsCommentsAndAliases(t *testing.T) {
+	sh := &shellState{}
+	rc := strings.NewReader(`
+# personal vmsh aliases
+sudo=@sudo
+@alias clear=@host clear
+`)
+	if err := sh.evalVMSHRCLines(".vmshrc", rc); err != nil {
+		t.Fatalf("evalVMSHRCLines() error = %v", err)
+	}
+	if got := sh.aliases["sudo"]; got != "@sudo" {
+		t.Fatalf("sudo alias = %q, want @sudo", got)
+	}
+	if got := sh.aliases["clear"]; got != "@host clear" {
+		t.Fatalf("clear alias = %q, want @host clear", got)
+	}
+}
+
+func TestVMSHRCRejectsCommands(t *testing.T) {
+	sh := &shellState{}
+	err := sh.evalVMSHRCLines(".vmshrc", strings.NewReader("echo nope\n"))
+	if err == nil || !strings.Contains(err.Error(), ".vmshrc:1") || !strings.Contains(err.Error(), "only supports aliases") {
+		t.Fatalf("evalVMSHRCLines() error = %v, want rc subset error", err)
+	}
+}
+
+func TestLoadVMSHRCIgnoresMissingFile(t *testing.T) {
+	sh := &shellState{}
+	if err := sh.loadVMSHRC(filepath.Join(t.TempDir(), ".vmshrc")); err != nil {
+		t.Fatalf("loadVMSHRC(missing) error = %v", err)
+	}
+}
+
+func TestStartVMReportsBootProgressToStderr(t *testing.T) {
+	api := &fakeVMSHAPI{
+		status: client.InstanceState{ID: "work", Status: "stopped"},
+		bootEvents: []client.BootEvent{
+			{Kind: "status", Message: "preparing kernel"},
+			{Kind: "status", Message: "starting VM"},
+			{Kind: "ready", State: client.InstanceState{ID: "work", Status: "running", Image: "alpine"}},
+		},
+	}
+	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true}, hostCWD: t.TempDir()}
+	var stderr bytes.Buffer
+	if err := sh.eval(`@start --vm work`, &bytes.Buffer{}, &stderr); err != nil {
+		t.Fatalf("eval(@start) error = %v", err)
+	}
+	got := stderr.String()
+	if !strings.Contains(got, "Boot: preparing kernel") || !strings.Contains(got, "Boot: starting VM") || !strings.Contains(got, "Boot: ready alpine") {
+		t.Fatalf("boot status = %q, want detailed boot progress", got)
+	}
+}
+
+func TestScriptSendsLinesThroughCurrentContext(t *testing.T) {
+	dir := t.TempDir()
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	sh := &shellState{api: api, context: defaultContext("default", "", false), hostCWD: dir}
+	script := strings.NewReader(`
+# ignored
+@alpine --vm work --memory 512
+echo hello --flag
+@host
+`)
+	if err := sh.runScript(script, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("runScript() error = %v", err)
+	}
+	if len(api.streams) != 1 {
+		t.Fatalf("streams = %d, want 1", len(api.streams))
+	}
+	run := api.streams[0]
+	if run.id != "work" || run.req.Image != "alpine" || run.req.MemoryMB != 512 {
+		t.Fatalf("run = %#v", run)
+	}
+	if run.req.NestedVirt {
+		t.Fatalf("nested virtualization = true, want default false without capability")
+	}
+	if run.req.Network == nil || !run.req.Network.Enabled || !run.req.Network.AllowInternet {
+		t.Fatalf("network = %#v, want enabled internet", run.req.Network)
+	}
+	if run.req.User != defaultGuestUser {
+		t.Fatalf("user = %q, want %q", run.req.User, defaultGuestUser)
+	}
+	if len(run.req.Command) != 3 || run.req.Command[0] != "sh" || run.req.Command[1] != "-lc" || !strings.HasSuffix(run.req.Command[2], "echo hello --flag") {
+		t.Fatalf("command = %#v", run.req.Command)
+	}
+	for _, want := range []string{"HOME=/home/cc", "USER=cc", "LOGNAME=cc"} {
+		if !envContains(run.req.Env, want) {
+			t.Fatalf("env = %#v, missing %q", run.req.Env, want)
+		}
+	}
+	if len(run.req.Shares) != 1 {
+		t.Fatalf("shares = %#v", run.req.Shares)
+	}
+	wantHostRoot, wantWorkDir, err := guestHostPaths(dir)
+	if err != nil {
+		t.Fatalf("guestHostPaths() error = %v", err)
+	}
+	if run.req.Shares[0].Source != wantHostRoot || run.req.Shares[0].Mount != guestHostMount {
+		t.Fatalf("host share = %#v, want root at /host", run.req.Shares[0])
+	}
+	if !run.req.Shares[0].MapOwner || run.req.Shares[0].OwnerUID != defaultGuestUID || run.req.Shares[0].OwnerGID != defaultGuestGID {
+		t.Fatalf("host share owner = %#v, want mapped default guest user", run.req.Shares[0])
+	}
+	if run.req.WorkDir != wantWorkDir {
+		t.Fatalf("workdir = %q, want %q", run.req.WorkDir, wantWorkDir)
+	}
+	if sh.context.Mode != modeHost {
+		t.Fatalf("mode = %q, want host", sh.context.Mode)
+	}
+}
+
+func TestGuestRunsAsRootWithSudoOption(t *testing.T) {
+	dir := t.TempDir()
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true}, hostCWD: dir}
+	if err := sh.runScript(strings.NewReader("@ --sudo id -u\n@sudo id -u\n"), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("runScript() error = %v", err)
+	}
+	if len(api.streams) != 2 {
+		t.Fatalf("streams = %d, want 2", len(api.streams))
+	}
+	for _, run := range api.streams {
+		if run.req.User != "root" {
+			t.Fatalf("user = %q, want root", run.req.User)
+		}
+		for _, want := range []string{"HOME=/root", "USER=root", "LOGNAME=root"} {
+			if !envContains(run.req.Env, want) {
+				t.Fatalf("env = %#v, missing %q", run.req.Env, want)
+			}
+		}
+	}
+}
+
+func TestAtSudoUsesHostSudoWhenHostSelected(t *testing.T) {
+	ctx, command := sudoCommandContext(commandContext{Mode: modeHost, VMID: "work", Network: true}, "whoami")
+	if ctx.Mode != modeHost || command != "sudo whoami" {
+		t.Fatalf("sudoCommandContext(host) = %#v, %q; want host sudo command", ctx, command)
+	}
+}
+
+func TestAtSudoUsesGuestRootWhenVMSelected(t *testing.T) {
+	ctx, command := sudoCommandContext(commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true}, "whoami")
+	if ctx.Mode != modeVM || ctx.User != "root" || command != "whoami" {
+		t.Fatalf("sudoCommandContext(vm) = %#v, %q; want guest root command", ctx, command)
+	}
+}
+
+func TestGuestRunRequestsUseStreamingPath(t *testing.T) {
+	dir := t.TempDir()
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine"}, hostCWD: dir}
+	if err := sh.runScript(strings.NewReader("ls\nuname -a\n"), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("runScript() error = %v", err)
+	}
+	if len(api.streams) != 2 {
+		t.Fatalf("streams = %d, want 2", len(api.streams))
+	}
+	for _, run := range api.streams {
+		if run.id != "work" || run.req.Image != "alpine" {
+			t.Fatalf("stream = %#v", run)
+		}
+	}
+}
+
+func TestGuestTTYLSAliasUsesBusyBoxWidthFlag(t *testing.T) {
+	command := strings.Join(guestCommand("ls", true), " ")
+	if strings.Contains(command, "--width=") {
+		t.Fatalf("guest tty command contains GNU-only --width flag: %s", command)
+	}
+	if !strings.Contains(command, "-w ${COLUMNS:-80}") {
+		t.Fatalf("guest tty command = %s, want BusyBox-compatible -w width flag", command)
+	}
+}
+
+func TestNoNetworkOptionDisablesGuestNetwork(t *testing.T) {
+	dir := t.TempDir()
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	sh := &shellState{api: api, context: commandContext{Mode: modeHost, VMID: "work", Network: true}, hostCWD: dir}
+	if err := sh.runScript(strings.NewReader("@alpine --no-network echo hi\n"), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("runScript() error = %v", err)
+	}
+	if len(api.streams) != 1 {
+		t.Fatalf("streams = %d, want 1", len(api.streams))
+	}
+	if api.streams[0].req.Network != nil {
+		t.Fatalf("network = %#v, want nil", api.streams[0].req.Network)
+	}
+}
+
+func TestGuestBootUsesContextNetwork(t *testing.T) {
+	dir := t.TempDir()
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "stopped"}}
+	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true}, hostCWD: dir}
+	if err := sh.runScript(strings.NewReader("echo hi\n"), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("runScript() error = %v", err)
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	if api.starts[0].req.Network == nil || !api.starts[0].req.Network.Enabled || !api.starts[0].req.Network.AllowInternet {
+		t.Fatalf("start network = %#v, want enabled internet", api.starts[0].req.Network)
+	}
+	if api.starts[0].req.Image != "alpine" {
+		t.Fatalf("start image = %q, want alpine", api.starts[0].req.Image)
+	}
+	if api.starts[0].req.TimeoutSeconds != vmshBootTimeoutSeconds {
+		t.Fatalf("start timeout = %.1f, want %.1f", api.starts[0].req.TimeoutSeconds, float64(vmshBootTimeoutSeconds))
+	}
+}
+
+func TestGuestBootAndRunUseNestedVirtualizationContext(t *testing.T) {
+	dir := t.TempDir()
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "stopped"}}
+	sh := &shellState{
+		api:     api,
+		context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true, NestedVirt: true},
+		hostCWD: dir,
+	}
+	if err := sh.runScript(strings.NewReader("echo hi\n"), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("runScript() error = %v", err)
+	}
+	if len(api.starts) != 1 || !api.starts[0].req.NestedVirt {
+		t.Fatalf("starts = %#v, want nested virtualization enabled", api.starts)
+	}
+	if len(api.streams) != 1 || !api.streams[0].req.NestedVirt {
+		t.Fatalf("streams = %#v, want nested virtualization enabled", api.streams)
+	}
+}
+
+func TestStreamGuestRunWritesEventsAndExit(t *testing.T) {
+	api := &fakeVMSHAPI{
+		streamEvents: []client.ExecEvent{
+			{Kind: "stdout", Data: []byte("Linux\n")},
+			{Kind: "stderr", Output: "warn\n"},
+			{Kind: "exit", ExitCode: 0},
+		},
+	}
+	sh := &shellState{api: api}
+	var stdout, stderr bytes.Buffer
+	err := sh.streamGuestRun("work", client.RunRequest{Image: "ubuntu", Command: []string{"uname", "-a"}}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("streamGuestRun() error = %v", err)
+	}
+	if stdout.String() != "Linux\n" || stderr.String() != "warn\n" || sh.lastCode != 0 {
+		t.Fatalf("stdout=%q stderr=%q code=%d", stdout.String(), stderr.String(), sh.lastCode)
+	}
+}
+
+func TestStreamGuestRunRecordsNonzeroExitWithoutLog(t *testing.T) {
+	api := &fakeVMSHAPI{
+		streamEvents: []client.ExecEvent{
+			{Kind: "exit", ExitCode: 42},
+		},
+	}
+	sh := &shellState{api: api}
+	var stdout, stderr bytes.Buffer
+	err := sh.streamGuestRun("work", client.RunRequest{Image: "ubuntu", Command: []string{"false"}}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("streamGuestRun() error = %v", err)
+	}
+	if stdout.String() != "" || stderr.String() != "" || sh.lastCode != 42 {
+		t.Fatalf("stdout=%q stderr=%q code=%d", stdout.String(), stderr.String(), sh.lastCode)
+	}
+}
+
+func TestScriptStopsOnErrors(t *testing.T) {
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "default", Status: "running"}}
+	sh := &shellState{api: api, context: defaultContext("default", "", false), hostCWD: t.TempDir()}
+	err := sh.runScript(strings.NewReader("@ --bogus\n@alpine echo nope\n"), &bytes.Buffer{}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "unknown vmsh option") {
+		t.Fatalf("runScript() error = %v, want unknown option", err)
+	}
+	if len(api.streams) != 0 {
+		t.Fatalf("streams = %d, want 0", len(api.streams))
+	}
+}
+
+func TestLoopRequiresInteractiveTerminal(t *testing.T) {
+	sh := &shellState{context: defaultContext("default", "", false), hostCWD: t.TempDir()}
+	err := sh.loop(strings.NewReader("echo nope\n"), &bytes.Buffer{}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "requires an interactive terminal") {
+		t.Fatalf("loop() error = %v, want interactive terminal error", err)
+	}
+}
+
+func TestShouldSaveHistory(t *testing.T) {
+	for _, line := range []string{"ls", "  @ubuntu echo hi  "} {
+		if !shouldSaveHistory(line) {
+			t.Fatalf("shouldSaveHistory(%q) = false, want true", line)
+		}
+	}
+	for _, line := range []string{"", "   ", "# comment", "  # comment"} {
+		if shouldSaveHistory(line) {
+			t.Fatalf("shouldSaveHistory(%q) = true, want false", line)
+		}
+	}
+}
+
+func TestTerminalEnvForwardsColorAndSize(t *testing.T) {
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("COLORTERM", "truecolor")
+	t.Setenv("LS_COLORS", "di=34")
+	got := terminalEnv(120, 40)
+	joined := strings.Join(got, "\n")
+	for _, want := range []string{
+		"TERM=xterm-256color",
+		"COLORTERM=truecolor",
+		"LS_COLORS=di=34",
+		"CLICOLOR=1",
+		"COLUMNS=120",
+		"LINES=40",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("terminalEnv() = %#v, missing %q", got, want)
+		}
+	}
+}
+
+func TestTerminalEnvDefaultsTERM(t *testing.T) {
+	t.Setenv("TERM", "")
+	got := terminalEnv(0, 0)
+	joined := strings.Join(got, "\n")
+	if !strings.Contains(joined, "TERM=") {
+		t.Fatalf("terminalEnv() = %#v, missing TERM", got)
+	}
+}
+
+func TestExportPersistsIntoGuestCommands(t *testing.T) {
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true}, hostCWD: t.TempDir()}
+	if err := sh.runScript(strings.NewReader("export FOO=bar\nprintenv FOO\n"), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("runScript() error = %v", err)
+	}
+	if len(api.streams) != 1 || !envContains(api.streams[0].req.Env, "FOO=bar") {
+		t.Fatalf("stream env = %#v, want FOO=bar", api.streams)
+	}
+}
+
+func TestVMCDUsesGuestCWD(t *testing.T) {
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true}, hostCWD: t.TempDir()}
+	if err := sh.runScript(strings.NewReader("cd /\npwd\n"), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("runScript() error = %v", err)
+	}
+	if len(api.streams) != 1 || api.streams[0].req.WorkDir != "/" {
+		t.Fatalf("workdir = %#v, want /", api.streams)
+	}
+}
+
+func TestVMCDUsesGuestHome(t *testing.T) {
+	tests := []struct {
+		name  string
+		ctx   commandContext
+		input string
+		want  string
+	}{
+		{
+			name:  "ubuntu default user",
+			ctx:   commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Network: true},
+			input: "cd\npwd\n",
+			want:  "/home/ubuntu",
+		},
+		{
+			name:  "ubuntu tilde child",
+			ctx:   commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Network: true},
+			input: "cd ~/src\npwd\n",
+			want:  "/home/ubuntu/src",
+		},
+		{
+			name:  "created default user",
+			ctx:   commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true},
+			input: "cd ~\npwd\n",
+			want:  "/home/cc",
+		},
+		{
+			name:  "root user",
+			ctx:   commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", User: "root", Network: true},
+			input: "cd\npwd\n",
+			want:  "/root",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+			sh := &shellState{api: api, context: tt.ctx, hostCWD: t.TempDir()}
+			if err := sh.runScript(strings.NewReader(tt.input), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+				t.Fatalf("runScript() error = %v", err)
+			}
+			if len(api.streams) != 1 || api.streams[0].req.WorkDir != tt.want {
+				t.Fatalf("workdir = %#v, want %s", api.streams, tt.want)
+			}
+		})
+	}
+}
+
+func TestPrintVMsIsHumanReadableWhenEmpty(t *testing.T) {
+	sh := &shellState{api: &fakeVMSHAPI{}}
+	var out bytes.Buffer
+	if err := sh.printVMs(&out); err != nil {
+		t.Fatalf("printVMs() error = %v", err)
+	}
+	if strings.TrimSpace(out.String()) != "No VMs" {
+		t.Fatalf("printVMs() = %q, want No VMs", out.String())
+	}
+}
+
+func TestBackgroundJobIsTracked(t *testing.T) {
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true}, hostCWD: t.TempDir()}
+	var out bytes.Buffer
+	if err := sh.eval("echo hi &", &out, &bytes.Buffer{}); err != nil {
+		t.Fatalf("eval() error = %v", err)
+	}
+	if !strings.Contains(out.String(), "[1] running echo hi") {
+		t.Fatalf("background output = %q", out.String())
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		sh.jobsMu.Lock()
+		done := len(sh.jobs) == 1 && sh.jobs[0].Done
+		sh.jobsMu.Unlock()
+		if done {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("job did not complete: %#v", sh.jobs)
+}
+
+func TestCompleterSuggestsAtCommandsAndPaths(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "alpha dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cache := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cache, "images", "ubuntu"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sh := &shellState{hostCWD: dir, rootCache: cache}
+	completer := newVMSHCompleter(sh)
+	got, _ := completer.Do([]rune("@st"), 3)
+	if !completionContains(got, "atus") || !completionContains(got, "art") || !completionContains(got, "op") {
+		t.Fatalf("@ completions = %#v", got)
+	}
+	got, _ = completer.Do([]rune("@ub"), 3)
+	if !completionContains(got, "untu") {
+		t.Fatalf("image completions = %#v", got)
+	}
+	got, _ = completer.Do([]rune("@ubuntu --s"), 11)
+	if !completionContains(got, "udo") {
+		t.Fatalf("option completions = %#v", got)
+	}
+	got, _ = completer.Do([]rune("ec"), 2)
+	if !completionContains(got, "ho") {
+		t.Fatalf("command completions = %#v", got)
+	}
+	got, _ = completer.Do([]rune("@ubuntu ec"), 10)
+	if !completionContains(got, "ho") {
+		t.Fatalf("@ command completions = %#v", got)
+	}
+	got, _ = completer.Do([]rune("cd al"), 5)
+	if !completionContains(got, `pha\ dir/`) {
+		t.Fatalf("path completions = %#v", got)
+	}
+}
+
+func TestCompleterDoesNotSuggestCommandsWithoutPrefix(t *testing.T) {
+	sh := &shellState{hostCWD: t.TempDir()}
+	completer := newVMSHCompleter(sh)
+	if got, _ := completer.Complete([]rune(""), 0); len(got) != 0 {
+		t.Fatalf("empty command completions = %#v, want none", got)
+	}
+	if got, _ := completer.Complete([]rune("@ubuntu "), 8); len(got) != 0 {
+		t.Fatalf("empty @ command completions = %#v, want none", got)
+	}
+}
+
+func TestCompleterMapsGuestHostPaths(t *testing.T) {
+	root := t.TempDir()
+	hostDir := filepath.Join(root, "tmp", "vmsh host")
+	if err := os.MkdirAll(filepath.Join(hostDir, "project one"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, guestCWD, err := guestHostPaths(hostDir)
+	if err != nil {
+		t.Fatalf("guestHostPaths() error = %v", err)
+	}
+	sh := &shellState{
+		hostCWD: root,
+		context: commandContext{
+			Mode: modeVM,
+			CWD:  guestCWD,
+		},
+	}
+	completer := newVMSHCompleter(sh)
+	got, _ := completer.Do([]rune("cd pro"), 6)
+	if !completionContains(got, `ject\ one/`) {
+		t.Fatalf("guest /host path completions = %#v", got)
+	}
+}
+
+func TestCompleterCompletesGuestAbsolutePathsWithoutFind(t *testing.T) {
+	api := &fakeVMSHAPI{
+		status:       client.InstanceState{ID: "work", Status: "running"},
+		streamEvents: []client.ExecEvent{{Kind: "stdout", Data: []byte("-release\n")}, {Kind: "exit", ExitCode: 0}},
+	}
+	sh := &shellState{
+		api:     api,
+		hostCWD: t.TempDir(),
+		context: commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Network: true},
+	}
+	completer := newVMSHCompleter(sh)
+	got, _ := completer.Do([]rune("cat /etc/os"), 11)
+	if !completionContains(got, "-release") {
+		t.Fatalf("guest path completions = %#v, want -release", got)
+	}
+	if len(api.streams) != 1 {
+		t.Fatalf("guest completion streams = %d, want 1", len(api.streams))
+	}
+	run := api.streams[0]
+	if run.id != "work" || run.req.Image != "ubuntu" || run.req.Command[0] != "sh" || strings.Contains(strings.Join(run.req.Command, " "), "find ") {
+		t.Fatalf("guest completion run = %#v, want sh glob completion without find", run)
+	}
+	if run.req.WorkDir != "/etc" {
+		t.Fatalf("guest completion workdir = %q, want /etc", run.req.WorkDir)
+	}
+}
+
+func TestCompleterUsesArchitectureSpecificGuestImage(t *testing.T) {
+	api := &fakeVMSHAPI{
+		status:       client.InstanceState{ID: "work", Status: "running"},
+		streamEvents: []client.ExecEvent{{Kind: "stdout", Data: []byte("-release\n")}, {Kind: "exit", ExitCode: 0}},
+	}
+	sh := &shellState{
+		api:     api,
+		hostCWD: t.TempDir(),
+		context: commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Arch: "amd64", Network: true},
+	}
+	completer := newVMSHCompleter(sh)
+	got, _ := completer.Do([]rune("cat /etc/os"), 11)
+	if !completionContains(got, "-release") {
+		t.Fatalf("guest path completions = %#v, want -release", got)
+	}
+	if len(api.streams) != 1 || api.streams[0].req.Image != "ubuntu@amd64" {
+		t.Fatalf("guest completion streams = %#v, want ubuntu@amd64 completion", api.streams)
+	}
+}
+
+func TestCompleterExpandsAliasesBeforePathCompletion(t *testing.T) {
+	api := &fakeVMSHAPI{
+		status:       client.InstanceState{ID: "work", Status: "running"},
+		streamEvents: []client.ExecEvent{{Kind: "stdout", Data: []byte("-release\n")}, {Kind: "exit", ExitCode: 0}},
+	}
+	sh := &shellState{
+		api:     api,
+		aliases: map[string]string{"c": "@ubuntu cat"},
+		hostCWD: t.TempDir(),
+		context: commandContext{Mode: modeHost, VMID: "work", Network: true},
+	}
+	completer := newVMSHCompleter(sh)
+	got, replacementLen := completer.Do([]rune("c /etc/os"), 9)
+	if !completionContains(got, "-release") {
+		t.Fatalf("alias guest path completions = %#v, want -release", got)
+	}
+	if replacementLen != len("os") {
+		t.Fatalf("replacement length = %d, want %d", replacementLen, len("os"))
+	}
+	if len(api.streams) != 1 || api.streams[0].req.Image != "ubuntu" {
+		t.Fatalf("guest completion streams = %#v, want ubuntu completion", api.streams)
+	}
+}
+
+func TestCompleterReturnsLargeCandidateSets(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 20; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("item-%02d", i)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sh := &shellState{hostCWD: dir}
+	completer := newVMSHCompleter(sh)
+
+	got, _ := completer.Do([]rune("cat i"), 5)
+	if len(got) != 20 {
+		t.Fatalf("completion count = %d, want all 20: %#v", len(got), got)
+	}
+}
+
+func TestCompleterPrioritizesDirectories(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"zz-file", "aa-file", "src", "bin"} {
+		path := filepath.Join(dir, name)
+		if name == "src" || name == "bin" {
+			if err := os.Mkdir(path, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sh := &shellState{hostCWD: dir}
+	completer := newVMSHCompleter(sh)
+
+	got, _ := completer.Do([]rune("cat "), 4)
+	if len(got) < 2 || string(got[0]) != "bin/" || string(got[1]) != "src/" {
+		t.Fatalf("path ordering = %#v, want directories first", got)
+	}
+}
+
+func TestLineEditorReadsBasicLine(t *testing.T) {
+	master, tty, err := pty.Open()
+	if err != nil {
+		t.Skipf("open pty: %v", err)
+	}
+	defer master.Close()
+	defer tty.Close()
+
+	editor := newLineEditor(tty, io.Discard, "", nil)
+	done := make(chan struct {
+		line string
+		err  error
+	}, 1)
+	go func() {
+		line, err := editor.ReadLine("vmsh> ")
+		done <- struct {
+			line string
+			err  error
+		}{line: line, err: err}
+	}()
+	time.Sleep(25 * time.Millisecond)
+	if _, err := master.Write([]byte("echo hi\r")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("ReadLine() error = %v", got.err)
+		}
+		if got.line != "echo hi" {
+			t.Fatalf("ReadLine() = %q, want echo hi", got.line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadLine() timed out")
+	}
+}
+
+func TestLineEditorInsertsTabOnEmptyInput(t *testing.T) {
+	master, tty, err := pty.Open()
+	if err != nil {
+		t.Skipf("open pty: %v", err)
+	}
+	defer master.Close()
+	defer tty.Close()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "alpha"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sh := &shellState{hostCWD: dir}
+	editor := newLineEditor(tty, io.Discard, "", newVMSHCompleter(sh))
+	done := make(chan struct {
+		line string
+		err  error
+	}, 1)
+	go func() {
+		line, err := editor.ReadLine("vmsh> ")
+		done <- struct {
+			line string
+			err  error
+		}{line: line, err: err}
+	}()
+	time.Sleep(25 * time.Millisecond)
+	if _, err := master.Write([]byte("\t\r")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("ReadLine() error = %v", got.err)
+		}
+		if got.line != "\t" {
+			t.Fatalf("ReadLine() = %q, want literal tab", got.line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadLine() timed out")
+	}
+}
+
+func TestLineEditorInsertsTabAfterOnlyTabs(t *testing.T) {
+	master, tty, err := pty.Open()
+	if err != nil {
+		t.Skipf("open pty: %v", err)
+	}
+	defer master.Close()
+	defer tty.Close()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "alpha"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sh := &shellState{hostCWD: dir}
+	editor := newLineEditor(tty, io.Discard, "", newVMSHCompleter(sh))
+	done := make(chan struct {
+		line string
+		err  error
+	}, 1)
+	go func() {
+		line, err := editor.ReadLine("vmsh> ")
+		done <- struct {
+			line string
+			err  error
+		}{line: line, err: err}
+	}()
+	time.Sleep(25 * time.Millisecond)
+	if _, err := master.Write([]byte("\t\t\r")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("ReadLine() error = %v", got.err)
+		}
+		if got.line != "\t\t" {
+			t.Fatalf("ReadLine() = %q, want two literal tabs", got.line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadLine() timed out")
+	}
+}
+
+func TestLineEditorAcceptsCompletionSelection(t *testing.T) {
+	master, tty, err := pty.Open()
+	if err != nil {
+		t.Skipf("open pty: %v", err)
+	}
+	defer master.Close()
+	defer tty.Close()
+
+	dir := t.TempDir()
+	for _, name := range []string{"aa", "beta"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sh := &shellState{hostCWD: dir}
+	editor := newLineEditor(tty, io.Discard, "", newVMSHCompleter(sh))
+	done := make(chan struct {
+		line string
+		err  error
+	}, 1)
+	go func() {
+		line, err := editor.ReadLine("vmsh> ")
+		done <- struct {
+			line string
+			err  error
+		}{line: line, err: err}
+	}()
+	time.Sleep(25 * time.Millisecond)
+	if _, err := master.Write([]byte("cat \t\r\r")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("ReadLine() error = %v", got.err)
+		}
+		if got.line != "cat aa" {
+			t.Fatalf("ReadLine() = %q, want cat aa", got.line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadLine() timed out")
+	}
+}
+
+func TestLineEditorInsertsCompletionSuffix(t *testing.T) {
+	master, tty, err := pty.Open()
+	if err != nil {
+		t.Skipf("open pty: %v", err)
+	}
+	defer master.Close()
+	defer tty.Close()
+
+	sh := &shellState{hostCWD: t.TempDir()}
+	editor := newLineEditor(tty, io.Discard, "", newVMSHCompleter(sh))
+	done := make(chan struct {
+		line string
+		err  error
+	}, 1)
+	go func() {
+		line, err := editor.ReadLine("vmsh> ")
+		done <- struct {
+			line string
+			err  error
+		}{line: line, err: err}
+	}()
+	time.Sleep(25 * time.Millisecond)
+	if _, err := master.Write([]byte("ec\t\r\r")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("ReadLine() error = %v", got.err)
+		}
+		if got.line != "echo" {
+			t.Fatalf("ReadLine() = %q, want echo", got.line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadLine() timed out")
+	}
+}
+
+func TestLineEditorAsksBeforeHugeCommandCompletion(t *testing.T) {
+	editor := &lineEditor{width: 183}
+	items := make([]string, commandCompletionAskLimit+1)
+	for i := range items {
+		items[i] = fmt.Sprintf("p%d", i)
+	}
+	editor.buf = []rune("p")
+	editor.cursor = 1
+	editor.confirm = completionConfirm{
+		active:     true,
+		items:      items,
+		replaceLen: 1,
+		token:      "p",
+	}
+	var out bytes.Buffer
+	editor.out = &out
+	editor.renderCompletionConfirm()
+	if got := out.String(); !strings.Contains(got, "do you wish to see all 101 possibilities") {
+		t.Fatalf("confirmation output = %q", got)
+	}
+	editor.handleCompletionConfirm(keyEvent{key: keyRune, r: 'y'})
+	if editor.confirm.active || !editor.menu.active || len(editor.menu.items) != len(items) {
+		t.Fatalf("confirm yes = confirm %v menu %v items %d", editor.confirm.active, editor.menu.active, len(editor.menu.items))
+	}
+}
+
+func TestLineEditorLeftRightNavigateCompletionMenu(t *testing.T) {
+	master, tty, err := pty.Open()
+	if err != nil {
+		t.Skipf("open pty: %v", err)
+	}
+	defer master.Close()
+	defer tty.Close()
+
+	dir := t.TempDir()
+	for _, name := range []string{"aa", "bb", "cc"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sh := &shellState{hostCWD: dir}
+	editor := newLineEditor(tty, io.Discard, "", newVMSHCompleter(sh))
+	done := make(chan struct {
+		line string
+		err  error
+	}, 1)
+	go func() {
+		line, err := editor.ReadLine("vmsh> ")
+		done <- struct {
+			line string
+			err  error
+		}{line: line, err: err}
+	}()
+	time.Sleep(25 * time.Millisecond)
+	if _, err := master.Write([]byte("cat \t\x1b[C\r\r")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("ReadLine() error = %v", got.err)
+		}
+		if got.line != "cat bb" {
+			t.Fatalf("ReadLine() = %q, want cat bb", got.line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadLine() timed out")
+	}
+}
+
+func TestMergedEnvOverridesValues(t *testing.T) {
+	got := mergedEnv([]string{"TERM=dumb", "PATH=/bin"}, []string{"TERM=xterm-256color", "COLUMNS=120"})
+	joined := strings.Join(got, "\n")
+	for _, want := range []string{"TERM=xterm-256color", "PATH=/bin", "COLUMNS=120"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("mergedEnv() = %#v, missing %q", got, want)
+		}
+	}
+	if strings.Contains(joined, "TERM=dumb") {
+		t.Fatalf("mergedEnv() = %#v, kept old TERM", got)
+	}
+}
+
+func TestGuestCommandEnvPrefersExplicitExportsOverTerminalEnv(t *testing.T) {
+	ctx := commandContext{Image: "ubuntu"}
+	got := guestCommandEnv(ctx, map[string]string{"TERM": "xterm"}, []string{"TERM=xterm-ghostty", "COLUMNS=183", "LINES=50"})
+	joined := strings.Join(got, "\n")
+	for _, want := range []string{"TERM=xterm", "COLUMNS=183", "LINES=50", "HOME=/home/ubuntu"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("guestCommandEnv() = %#v, missing %q", got, want)
+		}
+	}
+	if strings.Contains(joined, "TERM=xterm-ghostty") {
+		t.Fatalf("guestCommandEnv() = %#v, terminal TERM overrode export", got)
+	}
+}
+
+func envContains(env []string, want string) bool {
+	for _, entry := range env {
+		if entry == want {
+			return true
+		}
+	}
+	return false
+}
+
+func completionContains(items [][]rune, want string) bool {
+	for _, item := range items {
+		if string(item) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestStreamGuestStdinForwardsTTYControlBytes(t *testing.T) {
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Close()
+
+	done := make(chan struct{})
+	out := make(chan client.ExecInput, 4)
+
+	go streamGuestStdin(read, out, done)
+	if _, err := write.Write([]byte("ab\x03cd")); err != nil {
+		t.Fatal(err)
+	}
+	if err := write.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-out:
+		if got.Kind != "stdin" || string(got.Data) != "ab\x03cd" {
+			t.Fatalf("input = %#v, want raw stdin with control byte", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for stdin")
+	}
+
+	select {
+	case got := <-out:
+		if got.Kind != "stdin_close" {
+			t.Fatalf("close input = %#v, want stdin_close", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for stdin close")
+	}
+}
+
+func TestGuestCommandPullsMissingImageBeforeRun(t *testing.T) {
+	api := &fakeVMSHAPI{
+		status:      client.InstanceState{ID: "default", Status: "running"},
+		missingImgs: map[string]bool{"ubuntu": true},
+	}
+	sh := &shellState{
+		api:     api,
+		context: defaultContext("default", "", false),
+		hostCWD: t.TempDir(),
+		confirmPull: func(source string, stderr io.Writer) (bool, error) {
+			return true, nil
+		},
+	}
+	if err := sh.eval("@ubuntu echo hi", &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("eval() error = %v", err)
+	}
+	if len(api.pulls) != 1 || api.pulls[0].name != "ubuntu" || api.pulls[0].source != "ubuntu" {
+		t.Fatalf("pulls = %#v, want ubuntu from ubuntu", api.pulls)
+	}
+	if len(api.streams) != 1 || api.streams[0].req.Image != "ubuntu" {
+		t.Fatalf("streams = %#v, want ubuntu run", api.streams)
+	}
+}
+
+func TestGuestCommandCachesImageAndRunningVMState(t *testing.T) {
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Network: true}, hostCWD: t.TempDir()}
+	if err := sh.runScript(strings.NewReader("true\ntrue\n"), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("runScript() error = %v", err)
+	}
+	if api.imageGets != 1 {
+		t.Fatalf("image gets = %d, want 1", api.imageGets)
+	}
+	if api.statusGets != 1 {
+		t.Fatalf("status gets = %d, want 1", api.statusGets)
+	}
+	if len(api.streams) != 2 {
+		t.Fatalf("streams = %d, want 2", len(api.streams))
+	}
+}
+
+func TestPersistentGuestShellPreservesState(t *testing.T) {
+	inputs := make(chan client.ExecInput, 8)
+	events := make(chan client.ExecEvent, 8)
+	done := make(chan error, 1)
+	session := &persistentGuestShell{
+		inputs:  inputs,
+		events:  events,
+		done:    done,
+		lastCWD: "/work",
+	}
+	go func() {
+		cwd := "/work"
+		alias := false
+		for input := range inputs {
+			if input.Kind == "stdin_close" {
+				break
+			}
+			line := strings.TrimSpace(string(input.Data))
+			switch {
+			case strings.HasPrefix(line, "alias gp="):
+				alias = true
+			case line == "gp" && alias:
+				events <- client.ExecEvent{Kind: "stdout", Data: []byte("guest-persist\n")}
+			case line == "cd /tmp":
+				cwd = "/tmp"
+			case line == "pwd":
+				events <- client.ExecEvent{Kind: "stdout", Data: []byte(cwd + "\n")}
+			}
+			events <- client.ExecEvent{Kind: "stdout", Data: []byte("__VMSH_DONE__:0:" + cwd + "\n")}
+		}
+		close(events)
+		done <- nil
+	}()
+	var out bytes.Buffer
+	if err := session.run("alias gp='echo guest-persist'", &out, &bytes.Buffer{}); err != nil {
+		t.Fatalf("alias run error = %v", err)
+	}
+	if err := session.run("gp", &out, &bytes.Buffer{}); err != nil {
+		t.Fatalf("gp run error = %v", err)
+	}
+	if err := session.run("cd /tmp", &out, &bytes.Buffer{}); err != nil {
+		t.Fatalf("cd run error = %v", err)
+	}
+	if err := session.run("pwd", &out, &bytes.Buffer{}); err != nil {
+		t.Fatalf("pwd run error = %v", err)
+	}
+	session.close()
+	if got := out.String(); got != "guest-persist\n/tmp\n" {
+		t.Fatalf("output = %q, want guest-persist and /tmp", got)
+	}
+	if got := session.cwd(); got != "/tmp" {
+		t.Fatalf("cwd = %q, want /tmp", got)
+	}
+}
+
+func TestPersistentGuestShellKeyIncludesArchitecture(t *testing.T) {
+	api := &fakeVMSHAPI{
+		streamEvents: []client.ExecEvent{{Kind: "stdout", Data: []byte("__VMSH_READY__:/work\n")}},
+	}
+	sh := &shellState{api: api}
+	req := client.RunRequest{Image: "ubuntu", User: defaultGuestUser, WorkDir: "/work"}
+	ctx := commandContext{VMID: "work", Image: "ubuntu"}
+	if _, err := sh.guestPersistentShell(ctx, req); err != nil {
+		t.Fatalf("guestPersistentShell(native) error = %v", err)
+	}
+	req.Image = "ubuntu@amd64"
+	ctx.Arch = "amd64"
+	if _, err := sh.guestPersistentShell(ctx, req); err != nil {
+		t.Fatalf("guestPersistentShell(amd64) error = %v", err)
+	}
+	sh.closeSessions()
+	if len(api.streams) != 2 {
+		t.Fatalf("streams = %d, want separate native and amd64 shells", len(api.streams))
+	}
+	if api.streams[0].req.Image != "ubuntu" || api.streams[1].req.Image != "ubuntu@amd64" {
+		t.Fatalf("stream images = %q, %q; want ubuntu and ubuntu@amd64", api.streams[0].req.Image, api.streams[1].req.Image)
+	}
+}
+
+func TestPersistentGuestShellConsumesSplitMarker(t *testing.T) {
+	session := &persistentGuestShell{}
+	before, _, _, ok := session.consumeOutput("hello\n__VMSH_DONE__:")
+	if ok {
+		t.Fatalf("consumeOutput partial marker ok=true")
+	}
+	if before != "hello\n" {
+		t.Fatalf("before = %q, want hello output", before)
+	}
+	before, code, cwd, ok := session.consumeOutput("7:/tmp\n")
+	if !ok || before != "" || code != 7 || cwd != "/tmp" {
+		t.Fatalf("consumeOutput marker = before %q code %d cwd %q ok %t", before, code, cwd, ok)
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	if got := shellQuote(`a'b`); got != `'a'"'"'b'` {
+		t.Fatalf("shellQuote() = %q", got)
+	}
+}
+
+func TestGuestHostPaths(t *testing.T) {
+	hostCWD := filepath.Join(string(filepath.Separator), "Users", "me", "src")
+	abs, err := filepath.Abs(hostCWD)
+	if err != nil {
+		t.Fatalf("Abs() error = %v", err)
+	}
+	hostRoot, guestCWD, err := guestHostPaths(hostCWD)
+	if err != nil {
+		t.Fatalf("guestHostPaths() error = %v", err)
+	}
+	wantRoot := string(filepath.Separator)
+	if volume := filepath.VolumeName(abs); volume != "" {
+		wantRoot = volume + string(filepath.Separator)
+	}
+	rel, err := filepath.Rel(wantRoot, abs)
+	if err != nil {
+		t.Fatalf("Rel() error = %v", err)
+	}
+	if hostRoot != wantRoot {
+		t.Fatalf("hostRoot = %q", hostRoot)
+	}
+	if want := path.Join(guestHostMount, filepath.ToSlash(rel)); guestCWD != want {
+		t.Fatalf("guestCWD = %q", guestCWD)
+	}
+}
+
+func TestGuestHostPathToHostPreservesMountedRoot(t *testing.T) {
+	hostCWD := filepath.Join(string(filepath.Separator), "Users", "me", "src")
+	_, guestCWD, err := guestHostPaths(hostCWD)
+	if err != nil {
+		t.Fatalf("guestHostPaths() error = %v", err)
+	}
+	got, ok := guestHostPathToHost(hostCWD, guestCWD)
+	if !ok {
+		t.Fatalf("guestHostPathToHost() ok=false")
+	}
+	want, err := filepath.Abs(hostCWD)
+	if err != nil {
+		t.Fatalf("Abs() error = %v", err)
+	}
+	if got != want {
+		t.Fatalf("guestHostPathToHost() = %q, want %q", got, want)
+	}
+}
+
+func TestParsePortForwardSpec(t *testing.T) {
+	forward, err := parsePortForwardSpec("8080:80")
+	if err != nil {
+		t.Fatalf("parsePortForwardSpec() error = %v", err)
+	}
+	if forward.Protocol != "tcp" || forward.HostAddr != "127.0.0.1" || forward.HostPort != 8080 || forward.GuestPort != 80 {
+		t.Fatalf("forward = %#v, want tcp 127.0.0.1:8080 -> 80", forward)
+	}
+}
+
+func TestResolveCCVMPathHonorsExplicitPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "custom-ccvm")
+	got, err := resolveCCVMPath(path)
+	if err != nil {
+		t.Fatalf("resolveCCVMPath(explicit) error = %v", err)
+	}
+	if got.Path != path || len(got.Args) != 0 {
+		t.Fatalf("resolveCCVMPath(explicit) = %#v; want path %q with no args", got, path)
+	}
+}
+
+func TestWriteReadDaemonState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ccvm.json")
+	if err := writeDaemonState(path, daemonState{Addr: "127.0.0.1:1234"}); err != nil {
+		t.Fatalf("writeDaemonState() error = %v", err)
+	}
+	state, err := readDaemonState(path)
+	if err != nil {
+		t.Fatalf("readDaemonState() error = %v", err)
+	}
+	if state.Addr != "127.0.0.1:1234" {
+		t.Fatalf("daemon addr = %q", state.Addr)
+	}
+	if _, err := readDaemonState(filepath.Join(t.TempDir(), "missing")); !os.IsNotExist(err) {
+		t.Fatalf("readDaemonState(missing) error = %v, want not exist", err)
+	}
+}
+
+type fakeVMSHAPI struct {
+	status       client.InstanceState
+	statuses     []client.InstanceState
+	streams      []fakeRun
+	starts       []fakeStart
+	streamEvents []client.ExecEvent
+	bootEvents   []client.BootEvent
+	pullEvents   []client.ProgressEvent
+	pulls        []fakePull
+	missingImgs  map[string]bool
+	imageGets    int
+	statusGets   int
+}
+
+type fakeRun struct {
+	id  string
+	req client.RunRequest
+}
+
+type fakeStart struct {
+	id  string
+	req client.StartInstanceRequest
+}
+
+type fakePull struct {
+	name   string
+	source string
+	arch   string
+}
+
+func (f *fakeVMSHAPI) HealthCheck() error { return nil }
+
+func (f *fakeVMSHAPI) Capabilities() (client.CapabilitiesResponse, error) {
+	return client.CapabilitiesResponse{}, nil
+}
+
+func (f *fakeVMSHAPI) GetImage(name string) (client.ImageState, error) {
+	f.imageGets++
+	if f.missingImgs != nil && f.missingImgs[name] {
+		return client.ImageState{}, fmt.Errorf("missing image")
+	}
+	return client.ImageState{Name: name, Status: "available"}, nil
+}
+
+func (f *fakeVMSHAPI) PullImageStream(name string, req client.PullImageRequest, onEvent func(client.ProgressEvent) error) error {
+	source, err := req.SourceString()
+	if err != nil {
+		return err
+	}
+	f.pulls = append(f.pulls, fakePull{name: name, source: source, arch: req.Architecture})
+	if f.missingImgs != nil {
+		f.missingImgs[name] = false
+	}
+	if onEvent != nil {
+		events := f.pullEvents
+		if len(events) == 0 {
+			events = []client.ProgressEvent{{Status: "downloaded", Artifact: name}}
+		}
+		for _, event := range events {
+			if err := onEvent(event); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (f *fakeVMSHAPI) StartInstanceStreamWithID(id string, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
+	f.starts = append(f.starts, fakeStart{id: id, req: req})
+	f.status = client.InstanceState{ID: id, Status: "running"}
+	if onEvent != nil {
+		for _, event := range f.bootEvents {
+			if err := onEvent(event); err != nil {
+				return client.InstanceState{}, err
+			}
+		}
+	}
+	return f.status, nil
+}
+
+func (f *fakeVMSHAPI) ShutdownInstanceWithID(id string) error {
+	f.status = client.InstanceState{ID: id, Status: "stopped"}
+	return nil
+}
+
+func (f *fakeVMSHAPI) InstanceStatusOf(id string) (client.InstanceState, error) {
+	f.statusGets++
+	if f.status.ID == "" {
+		return client.InstanceState{ID: id, Status: "stopped"}, nil
+	}
+	return f.status, nil
+}
+
+func (f *fakeVMSHAPI) InstanceStatuses() ([]client.InstanceState, error) {
+	return f.statuses, nil
+}
+
+func (f *fakeVMSHAPI) AddPortForwardTo(string, client.PortForward) error {
+	return nil
+}
+
+func (f *fakeVMSHAPI) CreateWatchdogLease(client.WatchdogLeaseRequest) (client.WatchdogLeaseResponse, error) {
+	return client.WatchdogLeaseResponse{LeaseID: "test-lease", TimeoutSeconds: 10}, nil
+}
+
+func (f *fakeVMSHAPI) FeedWatchdogLease(string) error {
+	return nil
+}
+
+func (f *fakeVMSHAPI) ReleaseWatchdogLease(string) error {
+	return nil
+}
+
+func (f *fakeVMSHAPI) RunStreamIn(id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
+	return f.RunStreamInContext(context.Background(), id, req, onEvent)
+}
+
+func (f *fakeVMSHAPI) RunStreamInContext(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return f.RunInteractiveStreamIn(id, req, nil, onEvent)
+}
+
+func (f *fakeVMSHAPI) RunInteractiveStreamIn(id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	f.streams = append(f.streams, fakeRun{id: id, req: req})
+	events := f.streamEvents
+	if len(events) == 0 {
+		events = []client.ExecEvent{{Kind: "exit", ExitCode: 0}}
+	}
+	for _, event := range events {
+		if onEvent != nil {
+			if err := onEvent(event); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}

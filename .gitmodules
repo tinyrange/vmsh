@@ -1,0 +1,3 @@
+[submodule "cc"]
+	path = cc
+	url = https://github.com/tinyrange/cc.git

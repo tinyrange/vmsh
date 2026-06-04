@@ -1,0 +1,177 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  portable:
+    name: Portable tests (${{ matrix.name }})
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-arm64
+            runs-on: ubuntu-24.04-arm
+          - name: macos-arm64
+            runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            cc/go.sum
+
+      - name: Test vmsh without live VMs
+        run: go test -short ./...
+
+      - name: Test cc without live VMs
+        working-directory: cc
+        run: go test -short ./...
+
+  linux-amd64-vm:
+    name: Linux AMD64 VM smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CCX3_KVM_BOOT: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            cc/go.sum
+
+      - name: Check KVM access
+        run: |
+          sudo chmod 666 /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+
+      - name: Test vmsh
+        run: go test ./...
+
+      - name: Test cc
+        working-directory: cc
+        run: go test ./...
+
+      - name: Run selected KVM boot probes
+        working-directory: cc
+        run: |
+          go test ./internal/hv/kvm ./internal/vm \
+            -run 'Test(KernelBootSerial|InitramfsBootReadyMarker|RuntimeBackendRunCommand)$' \
+            -count=1 -v
+
+      - name: Build ccvm, cc, and vmsh
+        run: |
+          mkdir -p build/ci
+          cd cc
+          GOOS=linux GOARCH=arm64 go build -o ../build/ci/init-linux-arm64 ./internal/cmd/init
+          install -m 644 ../build/ci/init-linux-arm64 internal/guestinit/guest-init-linux-arm64
+          GOOS=linux GOARCH=amd64 go build -o ../build/ci/init-linux-amd64 ./internal/cmd/init
+          install -m 644 ../build/ci/init-linux-amd64 internal/guestinit/guest-init-linux-amd64
+          go build -tags embed_guestinit -o ../build/ci/ccvm ./cmd/ccvm
+          go build -o ../build/ci/cc ./cmd/cc
+          cd ..
+          go build -o build/ci/vmsh ./cmd/vmsh
+
+      - name: Run vmsh guest command smoke
+        run: |
+          cache="$(mktemp -d)"
+          script="$(mktemp)"
+          ./build/ci/cc -ccvm ./build/ci/ccvm -cache-dir "$cache" pull alpine ./cc/fixtures/alpine.simg
+          printf "%s\n" "@alpine --vm ci-linux --memory 256 --no-network --no-nested sh -lc 'whoami; uname -m; printf vmsh-linux-ok'" > "$script"
+          ./build/ci/vmsh -ccvm ./build/ci/ccvm -cache-dir "$cache" -script "$script" | tee "$RUNNER_TEMP/vmsh-linux.out"
+          grep -q 'vmsh-linux-ok' "$RUNNER_TEMP/vmsh-linux.out"
+
+  windows-amd64-vm:
+    name: Windows AMD64 VM smoke
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      CCX3_WHP_BOOT: "1"
+      CCX3_WHP_BOOT_TIMEOUT_SECONDS: "180"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            cc/go.sum
+
+      - name: Test vmsh
+        shell: pwsh
+        run: go test ./...
+
+      - name: Test cc
+        working-directory: cc
+        shell: pwsh
+        run: go test ./...
+
+      - name: Run selected WHP boot probes
+        working-directory: cc
+        shell: pwsh
+        run: >
+          go test ./internal/hv/whp ./internal/vm
+          -run 'Test(WindowsRuntimeBackendRunCommand|RunManagedExecWithAlpineRootFS)$'
+          -count=1 -v
+
+      - name: Build ccvm, cc, and vmsh
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build/ci | Out-Null
+          Push-Location cc
+          $env:GOOS = "linux"
+          $env:GOARCH = "arm64"
+          go build -o ../build/ci/init-linux-arm64 ./internal/cmd/init
+          Copy-Item ../build/ci/init-linux-arm64 internal/guestinit/guest-init-linux-arm64 -Force
+          $env:GOARCH = "amd64"
+          go build -o ../build/ci/init-linux-amd64 ./internal/cmd/init
+          Copy-Item ../build/ci/init-linux-amd64 internal/guestinit/guest-init-linux-amd64 -Force
+          Remove-Item Env:\GOOS
+          Remove-Item Env:\GOARCH
+          go build -tags embed_guestinit -o ../build/ci/ccvm.exe ./cmd/ccvm
+          go build -o ../build/ci/cc.exe ./cmd/cc
+          Pop-Location
+          go build -o build/ci/vmsh.exe ./cmd/vmsh
+
+      - name: Run vmsh guest command smoke
+        shell: pwsh
+        run: |
+          $cache = Join-Path $env:RUNNER_TEMP "vmsh-cache"
+          $script = Join-Path $env:RUNNER_TEMP "vmsh-smoke.txt"
+          New-Item -ItemType Directory -Force $cache | Out-Null
+          ./build/ci/cc.exe -ccvm ./build/ci/ccvm.exe -cache-dir $cache pull alpine ./cc/fixtures/alpine.simg
+          "@alpine --vm ci-windows --memory 256 --no-network --no-nested sh -lc 'whoami; uname -m; printf vmsh-windows-ok'" | Set-Content -Encoding utf8 $script
+          ./build/ci/vmsh.exe -ccvm ./build/ci/ccvm.exe -cache-dir $cache -script $script | Tee-Object -FilePath "$env:RUNNER_TEMP/vmsh-windows.out"
+          Select-String -Path "$env:RUNNER_TEMP/vmsh-windows.out" -Pattern "vmsh-windows-ok"
