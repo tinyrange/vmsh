@@ -194,8 +194,10 @@ The workflow is split by capability:
   accessible to the runner user, enables `CCX3_KVM_BOOT=1` for selected live
   boot probes, and executes a `vmsh` script against the tracked Alpine SIMG
   fixture.
-- A hosted `windows-2025` job enables `CCX3_WHP_BOOT=1` for selected WHP probes
-  and runs the same `vmsh` script path on Windows.
+- A hosted `windows-2025` job checks WHP availability and boots an Alpine
+  kernel far enough to observe serial output. The current `cc` submodule notes
+  that managed guest command progress on GitHub Windows runners is not yet
+  reliable, so the full guest command smoke currently runs on Linux AMD64.
 
 The live jobs use the checked-in `cc/fixtures/alpine.simg` fixture so they can
 boot and run simple guest commands without depending on an external image pull.
