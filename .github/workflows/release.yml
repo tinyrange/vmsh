@@ -174,7 +174,7 @@ jobs:
           fi
 
           rm -f "$notary_zip"
-          spctl --assess --type exec -v "dist/${name}" 2>&1
+          codesign --verify --strict --verbose=2 "dist/${name}"
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
