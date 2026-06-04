@@ -30,6 +30,7 @@ import (
 const guestHostMount = "/host"
 const defaultGuestUser = "1000:1000"
 const vmshBootTimeoutSeconds = 60
+const internalCCVMEnv = "VMSH_INTERNAL_CCVM"
 
 const (
 	colorReset   = "\x1b[0m"
@@ -47,6 +48,7 @@ type daemonState struct {
 type ccvmLaunch struct {
 	Path string
 	Args []string
+	Env  []string
 }
 
 type shellMode string
@@ -690,6 +692,9 @@ type shellToken struct {
 }
 
 func main() {
+	if runInternalCCVMFromEnv() {
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "vmsh:", err)
 		os.Exit(1)
@@ -3393,10 +3398,13 @@ func resolveCCVMPath(path string) (ccvmLaunch, error) {
 			return ccvmLaunch{Path: candidate}, nil
 		}
 	}
+	if bundledCCVMAvailable() {
+		return ccvmLaunch{Path: exePath, Env: []string{internalCCVMEnv + "=1"}}, nil
+	}
 	if found, err := exec.LookPath("ccvm"); err == nil {
 		return ccvmLaunch{Path: found}, nil
 	}
-	return ccvmLaunch{}, fmt.Errorf("ccvm binary not found next to %s or on PATH; pass -ccvm", exePath)
+	return ccvmLaunch{}, fmt.Errorf("ccvm binary not found next to %s, bundled in vmsh, or on PATH; pass -ccvm", exePath)
 }
 
 func ccvmLaunchName(launch ccvmLaunch) string {
@@ -3418,6 +3426,9 @@ func connectBackend(launch ccvmLaunch, cacheDir, statePath string) (*client.Clie
 	args := append([]string{}, launch.Args...)
 	args = append(args, "-cache-dir", cacheDir)
 	proc := exec.Command(launch.Path, args...)
+	if len(launch.Env) != 0 {
+		proc.Env = append(os.Environ(), launch.Env...)
+	}
 	proc.Stderr = os.Stderr
 	detachDaemonCommand(proc)
 	stdout, err := proc.StdoutPipe()

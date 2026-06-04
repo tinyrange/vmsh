@@ -8,6 +8,9 @@ require (
 	j5.nz/cc v0.0.0
 )
 
-require golang.org/x/net v0.53.0 // indirect
+require (
+	github.com/ebitengine/purego v0.10.0 // indirect
+	golang.org/x/net v0.53.0 // indirect
+)
 
 replace j5.nz/cc => ./cc

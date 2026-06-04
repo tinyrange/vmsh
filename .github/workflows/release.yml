@@ -22,17 +22,13 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
-            archive: tar.gz
           - goos: linux
             goarch: arm64
-            archive: tar.gz
           - goos: windows
             goarch: amd64
-            archive: zip
             ext: .exe
           - goos: windows
             goarch: arm64
-            archive: zip
             ext: .exe
     steps:
       - name: Checkout
@@ -56,37 +52,22 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME}"
-          name="vmsh_${version}_${GOOS}_${GOARCH}"
-          out="dist/${name}"
-          mkdir -p "$out" build/release
+          name="vmsh_${version}_${GOOS}_${GOARCH}${EXE}"
+          mkdir -p dist build/release
 
           cd cc
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o ../build/release/init-linux-arm64 ./internal/cmd/init
           install -m 644 ../build/release/init-linux-arm64 internal/guestinit/guest-init-linux-arm64
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o ../build/release/init-linux-amd64 ./internal/cmd/init
           install -m 644 ../build/release/init-linux-amd64 internal/guestinit/guest-init-linux-amd64
-
-          GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -tags embed_guestinit -o "../${out}/ccvm${EXE}" ./cmd/ccvm
-          GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -o "../${out}/cc${EXE}" ./cmd/cc
           cd ..
-          GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -o "${out}/vmsh${EXE}" ./cmd/vmsh
+          GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -tags "embed_ccvm embed_guestinit" -o "dist/${name}" ./cmd/vmsh
 
-          cp README.md "${out}/README.md"
-          if [ -f cc/LICENSE ]; then
-            cp cc/LICENSE "${out}/CC-LICENSE"
-          fi
-
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            (cd dist && zip -9 -r "${name}.zip" "$name")
-          else
-            tar -C dist -czf "dist/${name}.tar.gz" "$name"
-          fi
-
-      - name: Upload archive
+      - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: vmsh-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/vmsh_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.${{ matrix.archive }}
+          path: dist/vmsh_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext }}
           if-no-files-found: error
 
   build-macos:
@@ -127,24 +108,15 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME}"
           name="vmsh_${version}_darwin_arm64"
-          out="dist/${name}"
-          mkdir -p "$out" build/release
+          mkdir -p dist build/release
 
           cd cc
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o ../build/release/init-linux-arm64 ./internal/cmd/init
           install -m 644 ../build/release/init-linux-arm64 internal/guestinit/guest-init-linux-arm64
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o ../build/release/init-linux-amd64 ./internal/cmd/init
           install -m 644 ../build/release/init-linux-amd64 internal/guestinit/guest-init-linux-amd64
-
-          GOOS=darwin GOARCH=arm64 go build -trimpath -tags embed_guestinit -o "../${out}/ccvm" ./cmd/ccvm
-          GOOS=darwin GOARCH=arm64 go build -trimpath -o "../${out}/cc" ./cmd/cc
           cd ..
-          GOOS=darwin GOARCH=arm64 go build -trimpath -o "${out}/vmsh" ./cmd/vmsh
-
-          cp README.md "${out}/README.md"
-          if [ -f cc/LICENSE ]; then
-            cp cc/LICENSE "${out}/CC-LICENSE"
-          fi
+          GOOS=darwin GOARCH=arm64 go build -trimpath -tags "embed_ccvm embed_guestinit" -o "dist/${name}" ./cmd/vmsh
 
       - name: Sign macOS binaries
         run: |
@@ -160,28 +132,20 @@ jobs:
             signing_args=(--timestamp --options runtime)
           fi
 
-          for bin in "dist/${name}/vmsh" "dist/${name}/cc" "dist/${name}/ccvm"; do
-            codesign \
-              --force \
-              --sign "$identity" \
-              --entitlements tools/entitlements.xml \
-              "${signing_args[@]}" \
-              "${keychain_args[@]}" \
-              "$bin"
-            codesign --verify --strict --verbose=2 "$bin"
-          done
+          codesign \
+            --force \
+            --sign "$identity" \
+            --entitlements tools/entitlements.xml \
+            "${signing_args[@]}" \
+            "${keychain_args[@]}" \
+            "dist/${name}"
+          codesign --verify --strict --verbose=2 "dist/${name}"
 
-      - name: Create archive
-        run: |
-          set -euo pipefail
-          name="vmsh_${GITHUB_REF_NAME}_darwin_arm64"
-          ditto -c -k --keepParent "dist/${name}" "dist/${name}.zip"
-
-      - name: Upload archive
+      - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: vmsh-darwin-arm64
-          path: dist/vmsh_${{ github.ref_name }}_darwin_arm64.zip
+          path: dist/vmsh_${{ github.ref_name }}_darwin_arm64
           if-no-files-found: error
 
   publish:
@@ -189,7 +153,7 @@ jobs:
     needs: [build-unix-windows, build-macos]
     runs-on: ubuntu-24.04
     steps:
-      - name: Download archives
+      - name: Download binaries
         uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -197,7 +161,7 @@ jobs:
       - name: Generate checksums
         run: |
           set -euo pipefail
-          find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print0 |
+          find artifacts -type f -name 'vmsh_*' -print0 |
             sort -z |
             xargs -0 sha256sum |
             sed 's#artifacts/[^/]*/##' > checksums.txt
@@ -208,6 +172,5 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            artifacts/**/*.zip
-            artifacts/**/*.tar.gz
+            artifacts/**/vmsh_*
             checksums.txt

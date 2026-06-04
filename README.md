@@ -56,8 +56,8 @@ Fast parser, shell-state, and client tests do not need VM support.
   launches `vmsh -ccvm build/vmsh/ccvm`.
 - `.github/workflows/ci.yml`: portable Go tests plus opt-in live VM smoke tests
   for KVM and WHP runners.
-- `.github/workflows/release.yml`: tag-triggered release packaging for Linux,
-  Windows, and signed macOS ARM64 archives.
+- `.github/workflows/release.yml`: tag-triggered single-binary releases for
+  Linux, Windows, and signed macOS ARM64.
 
 ## Getting Started
 
@@ -213,7 +213,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The workflow builds archives for:
+The workflow builds one standalone `vmsh` binary per target:
 
 - `linux/amd64`
 - `linux/arm64`
@@ -221,11 +221,13 @@ The workflow builds archives for:
 - `windows/arm64`
 - `darwin/arm64`
 
-Each archive contains `vmsh`, `ccvm`, and `cc`. The `ccvm` sidecar contains the
-embedded Linux guest init payloads for amd64 and arm64 guests, so released
-archives do not need a separate guest init build step.
+Release binaries are built with `embed_ccvm` and `embed_guestinit`. That compiles
+the `ccvm` daemon entrypoint into the same Go executable as `vmsh` and embeds
+the static Linux guest init payloads for amd64 and arm64 guests. At runtime,
+`vmsh` re-execs itself with `VMSH_INTERNAL_CCVM=1` when it needs to start the
+daemon, so release assets do not need a `ccvm` sidecar.
 
-The macOS archive is built on `macos-15` and codesigned with the Hypervisor
+The macOS binary is built on `macos-15` and codesigned with the Hypervisor
 entitlement from `tools/entitlements.xml`. Configure these repository secrets
 for Developer ID signing:
 
