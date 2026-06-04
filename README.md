@@ -56,6 +56,8 @@ Fast parser, shell-state, and client tests do not need VM support.
   launches `vmsh -ccvm build/vmsh/ccvm`.
 - `.github/workflows/ci.yml`: portable Go tests plus opt-in live VM smoke tests
   for KVM and WHP runners.
+- `.github/workflows/release.yml`: tag-triggered release packaging for Linux,
+  Windows, and signed macOS ARM64 archives.
 
 ## Getting Started
 
@@ -201,3 +203,37 @@ The workflow is split by capability:
 
 The live jobs use the checked-in `cc/fixtures/alpine.simg` fixture so they can
 boot and run simple guest commands without depending on an external image pull.
+
+## Releases
+
+Pushing a version tag matching `v*` runs the release workflow:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow builds archives for:
+
+- `linux/amd64`
+- `linux/arm64`
+- `windows/amd64`
+- `windows/arm64`
+- `darwin/arm64`
+
+Each archive contains `vmsh`, `ccvm`, and `cc`. The `ccvm` sidecar contains the
+embedded Linux guest init payloads for amd64 and arm64 guests, so released
+archives do not need a separate guest init build step.
+
+The macOS archive is built on `macos-15` and codesigned with the Hypervisor
+entitlement from `tools/entitlements.xml`. Configure these repository secrets
+for Developer ID signing:
+
+- `MACOS_CERTIFICATE`: base64-encoded `.p12` signing certificate.
+- `MACOS_CERTIFICATE_PWD`: password for the `.p12` certificate.
+- `MACOS_DEVELOPER_ID`: Developer ID Application identity. The workflow also
+  accepts `DEVELOPER_ID` for compatibility with older `cc` release settings.
+
+If the macOS signing secrets are absent, the workflow uses ad-hoc signing so
+packaging can still be exercised, but public releases should use Developer ID
+signing.

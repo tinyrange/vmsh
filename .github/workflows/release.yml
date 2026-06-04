@@ -1,0 +1,213 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-unix-windows:
+    name: Build ${{ matrix.goos }} ${{ matrix.goarch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            archive: zip
+            ext: .exe
+          - goos: windows
+            goarch: arm64
+            archive: zip
+            ext: .exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            cc/go.sum
+
+      - name: Build release payload
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          EXE: ${{ matrix.ext }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          name="vmsh_${version}_${GOOS}_${GOARCH}"
+          out="dist/${name}"
+          mkdir -p "$out" build/release
+
+          cd cc
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o ../build/release/init-linux-arm64 ./internal/cmd/init
+          install -m 644 ../build/release/init-linux-arm64 internal/guestinit/guest-init-linux-arm64
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o ../build/release/init-linux-amd64 ./internal/cmd/init
+          install -m 644 ../build/release/init-linux-amd64 internal/guestinit/guest-init-linux-amd64
+
+          GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -tags embed_guestinit -o "../${out}/ccvm${EXE}" ./cmd/ccvm
+          GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -o "../${out}/cc${EXE}" ./cmd/cc
+          cd ..
+          GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -o "${out}/vmsh${EXE}" ./cmd/vmsh
+
+          cp README.md "${out}/README.md"
+          if [ -f cc/LICENSE ]; then
+            cp cc/LICENSE "${out}/CC-LICENSE"
+          fi
+
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (cd dist && zip -9 -r "${name}.zip" "$name")
+          else
+            tar -C dist -czf "dist/${name}.tar.gz" "$name"
+          fi
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmsh-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/vmsh_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  build-macos:
+    name: Build signed macOS ARM64
+    runs-on: macos-15
+    env:
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+      MACOS_DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID || secrets.DEVELOPER_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            cc/go.sum
+
+      - name: Import Developer ID certificate
+        if: env.MACOS_CERTIFICATE != ''
+        run: |
+          set -euo pipefail
+          printf '%s' "$MACOS_CERTIFICATE" | base64 -D > certificate.p12
+          trap "rm -f certificate.p12" EXIT
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
+
+      - name: Build macOS payload
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          name="vmsh_${version}_darwin_arm64"
+          out="dist/${name}"
+          mkdir -p "$out" build/release
+
+          cd cc
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o ../build/release/init-linux-arm64 ./internal/cmd/init
+          install -m 644 ../build/release/init-linux-arm64 internal/guestinit/guest-init-linux-arm64
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o ../build/release/init-linux-amd64 ./internal/cmd/init
+          install -m 644 ../build/release/init-linux-amd64 internal/guestinit/guest-init-linux-amd64
+
+          GOOS=darwin GOARCH=arm64 go build -trimpath -tags embed_guestinit -o "../${out}/ccvm" ./cmd/ccvm
+          GOOS=darwin GOARCH=arm64 go build -trimpath -o "../${out}/cc" ./cmd/cc
+          cd ..
+          GOOS=darwin GOARCH=arm64 go build -trimpath -o "${out}/vmsh" ./cmd/vmsh
+
+          cp README.md "${out}/README.md"
+          if [ -f cc/LICENSE ]; then
+            cp cc/LICENSE "${out}/CC-LICENSE"
+          fi
+
+      - name: Sign macOS binaries
+        run: |
+          set -euo pipefail
+          name="vmsh_${GITHUB_REF_NAME}_darwin_arm64"
+          identity="-"
+          keychain_args=()
+          signing_args=()
+
+          if [ -n "$MACOS_DEVELOPER_ID" ] && [ -n "$MACOS_CERTIFICATE" ]; then
+            identity="$MACOS_DEVELOPER_ID"
+            keychain_args=(--keychain build.keychain)
+            signing_args=(--timestamp --options runtime)
+          fi
+
+          for bin in "dist/${name}/vmsh" "dist/${name}/cc" "dist/${name}/ccvm"; do
+            codesign \
+              --force \
+              --sign "$identity" \
+              --entitlements tools/entitlements.xml \
+              "${signing_args[@]}" \
+              "${keychain_args[@]}" \
+              "$bin"
+            codesign --verify --strict --verbose=2 "$bin"
+          done
+
+      - name: Create archive
+        run: |
+          set -euo pipefail
+          name="vmsh_${GITHUB_REF_NAME}_darwin_arm64"
+          ditto -c -k --keepParent "dist/${name}" "dist/${name}.zip"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmsh-darwin-arm64
+          path: dist/vmsh_${{ github.ref_name }}_darwin_arm64.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build-unix-windows, build-macos]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print0 |
+            sort -z |
+            xargs -0 sha256sum |
+            sed 's#artifacts/[^/]*/##' > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.tar.gz
+            checksums.txt
