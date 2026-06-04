@@ -217,9 +217,10 @@ The workflow builds one standalone `vmsh` binary per target:
 
 - `linux/amd64`
 - `linux/arm64`
-- `windows/amd64`
-- `windows/arm64`
 - `darwin/arm64`
+
+Windows release binaries are temporarily disabled while Windows-specific
+single-binary validation is handled on a Windows system.
 
 Release binaries are built with `embed_ccvm` and `embed_guestinit`. That compiles
 the `ccvm` daemon entrypoint into the same Go executable as `vmsh` and embeds
