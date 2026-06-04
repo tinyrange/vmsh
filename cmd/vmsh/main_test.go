@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -572,6 +573,37 @@ func TestGuestTTYLSAliasUsesBusyBoxWidthFlag(t *testing.T) {
 	}
 	if !strings.Contains(command, "-w ${COLUMNS:-80}") {
 		t.Fatalf("guest tty command = %s, want BusyBox-compatible -w width flag", command)
+	}
+}
+
+func TestPersistentHostShellPreludeAllowsBashExtglobFunctions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("persistent host shell uses Windows command shell")
+	}
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available")
+	}
+	t.Setenv("SHELL", bash)
+	prelude := bashHostShellOptionsPrelude() + "\n" + strings.Join([]string{
+		"__vmsh_extglob_probe() {",
+		"  case \"$1\" in",
+		"    --!(no-*)dir*) return 0 ;;",
+		"    *) return 1 ;;",
+		"  esac",
+		"}",
+	}, "\n") + "\n"
+	session, err := startPersistentHostShell(t.TempDir(), os.Environ(), 80, 24, prelude)
+	if err != nil {
+		t.Fatalf("startPersistentHostShell() error = %v", err)
+	}
+	defer session.close()
+	var stdout bytes.Buffer
+	if err := session.run("__vmsh_extglob_probe --color-dir && echo extglob-ok", &stdout, io.Discard); err != nil {
+		t.Fatalf("run extglob probe error = %v; stdout=%q", err, stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "extglob-ok") {
+		t.Fatalf("stdout = %q, want extglob-ok", stdout.String())
 	}
 }
 

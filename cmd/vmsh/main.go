@@ -1493,10 +1493,14 @@ func startPersistentHostShell(cwd string, env []string, cols, rows int, prelude 
 }
 
 func persistentHostShellScript() string {
-	return strings.Join([]string{
+	lines := []string{
 		"set +m 2>/dev/null || true",
 		"stty -echo 2>/dev/null || true",
-		"shopt -s expand_aliases 2>/dev/null || true",
+	}
+	if filepath.Base(hostShell()) == "bash" {
+		lines = append(lines, bashHostShellOptionsPrelude())
+	}
+	lines = append(lines, []string{
 		"printf '__VMSH_READY__:%s\\n' \"$PWD\"",
 		"while IFS= read -r __vmsh_line; do",
 		"  stty echo 2>/dev/null || true",
@@ -1505,7 +1509,8 @@ func persistentHostShellScript() string {
 		"  stty -echo 2>/dev/null || true",
 		"  printf '__VMSH_DONE__:%s:%s\\n' \"$__vmsh_status\" \"$PWD\"",
 		"done",
-	}, "\n")
+	}...)
+	return strings.Join(lines, "\n")
 }
 
 func (p *persistentHostShell) waitReady() error {
@@ -1665,13 +1670,16 @@ func captureHostShellPrelude() (string, error) {
 	if body == "" {
 		return "", nil
 	}
+	if filepath.Base(hostShell()) == "bash" {
+		return bashHostShellOptionsPrelude() + "\n" + body + "\n", nil
+	}
 	return body + "\n", nil
 }
 
 func hostShellHookPrelude() string {
 	switch filepath.Base(hostShell()) {
 	case "bash":
-		return "if [ -r \"$HOME/.bashrc\" ]; then . \"$HOME/.bashrc\"; fi\n"
+		return bashHostShellOptionsPrelude() + "\nif [ -r \"$HOME/.bashrc\" ]; then . \"$HOME/.bashrc\"; fi\n"
 	case "zsh":
 		return "if [ -r \"${ZDOTDIR:-$HOME}/.zshrc\" ]; then . \"${ZDOTDIR:-$HOME}/.zshrc\"; fi\n"
 	default:
@@ -1693,7 +1701,8 @@ func hostShellPrelude() string {
 func colorPrelude(primaryLS, fallbackLS string, bash bool) string {
 	var b strings.Builder
 	if bash {
-		b.WriteString("shopt -s expand_aliases 2>/dev/null || true\n")
+		b.WriteString(bashHostShellOptionsPrelude())
+		b.WriteByte('\n')
 	}
 	b.WriteString("alias ls >/dev/null 2>&1 || { ")
 	b.WriteString(shellQuoteCommandProbe(primaryLS))
@@ -1705,6 +1714,10 @@ func colorPrelude(primaryLS, fallbackLS string, bash bool) string {
 	b.WriteString(shellQuote(fallbackLS))
 	b.WriteString("; } || true\n")
 	return b.String()
+}
+
+func bashHostShellOptionsPrelude() string {
+	return "shopt -s expand_aliases extglob 2>/dev/null || true"
 }
 
 func shellQuoteCommandProbe(command string) string {
