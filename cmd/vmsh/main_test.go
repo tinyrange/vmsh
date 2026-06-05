@@ -288,14 +288,14 @@ func TestDisplayPullSourceNormalizesCommonOCIRefs(t *testing.T) {
 
 func TestAliasExpandsBeforeCommandDispatch(t *testing.T) {
 	sh := &shellState{hostCWD: t.TempDir()}
-	if err := sh.eval(`@alias say=@host printf alias-ok`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+	if err := sh.eval(`@alias say=@host echo alias-ok`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("set alias error = %v", err)
 	}
 	var stdout bytes.Buffer
 	if err := sh.eval(`say`, &stdout, &bytes.Buffer{}); err != nil {
 		t.Fatalf("eval(alias) error = %v", err)
 	}
-	if stdout.String() != "alias-ok" {
+	if strings.TrimSpace(stdout.String()) != "alias-ok" {
 		t.Fatalf("stdout = %q, want alias-ok", stdout.String())
 	}
 }
@@ -638,8 +638,24 @@ func TestGuestBootUsesContextNetwork(t *testing.T) {
 	if api.starts[0].req.Image != "alpine" {
 		t.Fatalf("start image = %q, want alpine", api.starts[0].req.Image)
 	}
-	if api.starts[0].req.TimeoutSeconds != vmshBootTimeoutSeconds {
-		t.Fatalf("start timeout = %.1f, want %.1f", api.starts[0].req.TimeoutSeconds, float64(vmshBootTimeoutSeconds))
+	if api.starts[0].req.TimeoutSeconds != vmshBootTimeoutSeconds() {
+		t.Fatalf("start timeout = %.1f, want %.1f", api.starts[0].req.TimeoutSeconds, vmshBootTimeoutSeconds())
+	}
+}
+
+func TestVMSHBootTimeoutReadsEnvironment(t *testing.T) {
+	t.Setenv("VMSH_VM_BOOT_TIMEOUT", "123.5")
+	if got := vmshBootTimeoutSeconds(); got != 123.5 {
+		t.Fatalf("vmshBootTimeoutSeconds() = %.1f, want 123.5", got)
+	}
+	t.Setenv("VMSH_VM_BOOT_TIMEOUT", "")
+	t.Setenv("CCX3_VM_BOOT_TIMEOUT", "98")
+	if got := vmshBootTimeoutSeconds(); got != 98 {
+		t.Fatalf("vmshBootTimeoutSeconds() fallback = %.1f, want 98", got)
+	}
+	t.Setenv("CCX3_VM_BOOT_TIMEOUT", "bad")
+	if got := vmshBootTimeoutSeconds(); got != defaultVMSHBootTimeoutSeconds {
+		t.Fatalf("vmshBootTimeoutSeconds() invalid = %.1f, want %.1f", got, float64(defaultVMSHBootTimeoutSeconds))
 	}
 }
 
@@ -863,6 +879,8 @@ func TestBackgroundJobIsTracked(t *testing.T) {
 }
 
 func TestCompleterSuggestsAtCommandsAndPaths(t *testing.T) {
+	t.Setenv("PATH", "")
+
 	dir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(dir, "alpha dir"), 0o755); err != nil {
 		t.Fatal(err)
@@ -1210,6 +1228,8 @@ func TestLineEditorAcceptsCompletionSelection(t *testing.T) {
 }
 
 func TestLineEditorInsertsCompletionSuffix(t *testing.T) {
+	t.Setenv("PATH", "")
+
 	master, tty, err := pty.Open()
 	if err != nil {
 		t.Skipf("open pty: %v", err)

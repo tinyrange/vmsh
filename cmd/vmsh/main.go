@@ -29,7 +29,7 @@ import (
 
 const guestHostMount = "/host"
 const defaultGuestUser = "1000:1000"
-const vmshBootTimeoutSeconds = 60
+const defaultVMSHBootTimeoutSeconds = 60
 const internalCCVMEnv = "VMSH_INTERNAL_CCVM"
 
 const (
@@ -2447,7 +2447,7 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 		MemoryMB:       ctx.MemoryMB,
 		CPUs:           ctx.CPUs,
 		NestedVirt:     ctx.NestedVirt,
-		TimeoutSeconds: vmshBootTimeoutSeconds,
+		TimeoutSeconds: vmshBootTimeoutSeconds(),
 	}
 	if ctx.Network {
 		req.Network = defaultNetworkConfig()
@@ -2467,6 +2467,21 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 	}
 	s.vmRunning[s.context.VMID] = true
 	return nil
+}
+
+func vmshBootTimeoutSeconds() float64 {
+	raw := strings.TrimSpace(os.Getenv("VMSH_VM_BOOT_TIMEOUT"))
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("CCX3_VM_BOOT_TIMEOUT"))
+	}
+	if raw == "" {
+		return defaultVMSHBootTimeoutSeconds
+	}
+	seconds, err := strconv.ParseFloat(raw, 64)
+	if err != nil || seconds <= 0 {
+		return defaultVMSHBootTimeoutSeconds
+	}
+	return seconds
 }
 
 type bootStatus struct {
