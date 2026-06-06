@@ -113,6 +113,35 @@ jobs:
           ./build/ci/vmsh -ccvm ./build/ci/ccvm -cache-dir "$cache" -script "$script" | tee "$RUNNER_TEMP/vmsh-linux.out"
           grep -q 'vmsh-linux-ok' "$RUNNER_TEMP/vmsh-linux.out"
 
+  macos-arm64-sidecar-vm:
+    name: macOS ARM64 sidecar VM smoke
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            cc/go.sum
+
+      - name: Run sidecar L2 and save smoke
+        working-directory: cc
+        env:
+          CCX3_DARWIN_SIDECAR_LIVE: "1"
+        run: |
+          go test ./internal/vm \
+            -run TestDarwinSidecarLiveL2AndSave \
+            -count=1 \
+            -timeout=5m \
+            -v
+
   windows-amd64-vm:
     name: Windows AMD64 VM smoke
     runs-on: windows-2025
