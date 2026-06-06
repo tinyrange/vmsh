@@ -455,6 +455,98 @@ func TestStartVMReportsBootProgressToStderr(t *testing.T) {
 	}
 }
 
+func TestRestartVMRequiresConfirmation(t *testing.T) {
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	sh := &shellState{
+		api:     api,
+		context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true, MemoryMB: 512},
+		hostCWD: t.TempDir(),
+		confirmVMRestart: func(id string, stderr io.Writer) (bool, error) {
+			if id != "work" {
+				t.Fatalf("confirm id = %q, want work", id)
+			}
+			return true, nil
+		},
+	}
+
+	if err := sh.evalAt("@restart", io.Discard, io.Discard); err != nil {
+		t.Fatalf("evalAt(@restart) error = %v", err)
+	}
+	if len(api.shutdowns) != 1 || api.shutdowns[0] != "work" {
+		t.Fatalf("shutdowns = %#v, want work", api.shutdowns)
+	}
+	if len(api.starts) != 1 || api.starts[0].id != "work" || api.starts[0].req.Image != "alpine" || api.starts[0].req.MemoryMB != 512 {
+		t.Fatalf("starts = %#v, want work alpine memory 512", api.starts)
+	}
+	if !sh.vmRunning["work"] {
+		t.Fatalf("vmRunning[work] = false, want true")
+	}
+}
+
+func TestRestartVMCancelled(t *testing.T) {
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	sh := &shellState{
+		api:     api,
+		context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine"},
+		hostCWD: t.TempDir(),
+		confirmVMRestart: func(string, io.Writer) (bool, error) {
+			return false, nil
+		},
+	}
+
+	err := sh.evalAt("@restart", io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "restart cancelled") {
+		t.Fatalf("evalAt(@restart cancelled) error = %v, want cancellation", err)
+	}
+	if len(api.shutdowns) != 0 || len(api.starts) != 0 {
+		t.Fatalf("shutdowns=%#v starts=%#v, want none", api.shutdowns, api.starts)
+	}
+}
+
+func TestRestartVMPreservesRunningStateWhenHostSelected(t *testing.T) {
+	api := &fakeVMSHAPI{
+		status: client.InstanceState{
+			ID:          "two",
+			Status:      "running",
+			Image:       "alpine",
+			MemoryMB:    768,
+			CPUs:        3,
+			NestedVirt:  true,
+			NetworkIPv4: "10.42.0.3",
+		},
+	}
+	sh := &shellState{
+		api:     api,
+		context: commandContext{Mode: modeHost, VMID: "default"},
+		hostCWD: t.TempDir(),
+		confirmVMRestart: func(id string, stderr io.Writer) (bool, error) {
+			return id == "two", nil
+		},
+	}
+
+	if err := sh.evalAt("@restart --vm two", io.Discard, io.Discard); err != nil {
+		t.Fatalf("evalAt(@restart --vm two) error = %v", err)
+	}
+	if len(api.shutdowns) != 1 || api.shutdowns[0] != "two" {
+		t.Fatalf("shutdowns = %#v, want two", api.shutdowns)
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	req := api.starts[0].req
+	if api.starts[0].id != "two" || req.Image != "alpine" || req.MemoryMB != 768 || req.CPUs != 3 || !req.NestedVirt || req.Network == nil || !req.Network.Enabled {
+		t.Fatalf("restart start = %#v, want preserved running state", api.starts[0])
+	}
+}
+
+func TestRestartVMRejectsCommand(t *testing.T) {
+	sh := &shellState{api: &fakeVMSHAPI{}, context: commandContext{VMID: "work"}, hostCWD: t.TempDir()}
+	err := sh.evalAt("@restart echo nope", io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "usage: @restart") {
+		t.Fatalf("evalAt(@restart command) error = %v, want usage", err)
+	}
+}
+
 func TestScriptSendsLinesThroughCurrentContext(t *testing.T) {
 	dir := t.TempDir()
 	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
@@ -1843,6 +1935,7 @@ type fakeVMSHAPI struct {
 	statuses     []client.InstanceState
 	streams      []fakeRun
 	starts       []fakeStart
+	shutdowns    []string
 	saves        []fakeSave
 	deletes      []string
 	streamEvents []client.ExecEvent
@@ -1948,6 +2041,7 @@ func (f *fakeVMSHAPI) StartInstanceStreamWithID(id string, req client.StartInsta
 }
 
 func (f *fakeVMSHAPI) ShutdownInstanceWithID(id string) error {
+	f.shutdowns = append(f.shutdowns, id)
 	f.status = client.InstanceState{ID: id, Status: "stopped"}
 	return nil
 }
