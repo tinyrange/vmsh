@@ -16,6 +16,7 @@ func runInternalCCVMFromEnv() bool {
 	if os.Getenv(internalCCVMEnv) != "1" {
 		return false
 	}
+	_ = os.Setenv(internalCCVMSidecarModeEnv, internalCCVMSidecarMode)
 	ccvmd.Main(os.Args[1:])
 	return true
 }

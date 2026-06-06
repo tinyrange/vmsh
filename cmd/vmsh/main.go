@@ -32,6 +32,8 @@ const defaultGuestUser = "1000:1000"
 const defaultVMSHBootTimeoutSeconds = 60
 const defaultGuestShellReadyTimeout = 5 * time.Second
 const internalCCVMEnv = "VMSH_INTERNAL_CCVM"
+const internalCCVMSidecarModeEnv = "CCX3_CCVM_SIDECAR_MODE"
+const internalCCVMSidecarMode = "vmsh-internal"
 
 const (
 	colorReset   = "\x1b[0m"
@@ -984,6 +986,12 @@ func (s *shellState) eval(line string, stdout, stderr io.Writer) error {
 	if strings.HasPrefix(line, "@") {
 		return s.evalAt(line, stdout, stderr)
 	}
+	if segments, ok, err := splitPipelineLine(line); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return s.runPipeline(s.context, segments, stdout, stderr)
+	}
 	if isExitCommand(line) {
 		return io.EOF
 	}
@@ -1108,7 +1116,212 @@ func (s *shellState) runMaybeBackground(ctx commandContext, line string, stdout,
 		}
 		return s.startBackgroundJob(ctx, command, stdout, stderr)
 	}
+	if segments, ok, err := splitPipelineLine(line); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return s.runPipeline(ctx, segments, stdout, stderr)
+	}
 	return s.runInContext(ctx, line, stdout, stderr)
+}
+
+type pipelineStage struct {
+	ctx  commandContext
+	line string
+	req  client.RunRequest
+}
+
+func splitPipelineLine(line string) ([]string, bool, error) {
+	var segments []string
+	start := 0
+	inSingle := false
+	inDouble := false
+	escaped := false
+	for i, r := range line {
+		switch {
+		case escaped:
+			escaped = false
+		case r == '\\' && !inSingle:
+			escaped = true
+		case r == '\'' && !inDouble:
+			inSingle = !inSingle
+		case r == '"' && !inSingle:
+			inDouble = !inDouble
+		case r == '|' && !inSingle && !inDouble:
+			prevPipe := i > 0 && line[i-1] == '|'
+			nextPipe := i+1 < len(line) && line[i+1] == '|'
+			if prevPipe || nextPipe {
+				continue
+			}
+			segment := strings.TrimSpace(line[start:i])
+			if segment == "" {
+				return nil, true, fmt.Errorf("pipeline segment is empty")
+			}
+			segments = append(segments, segment)
+			start = i + 1
+		}
+	}
+	if escaped {
+		if len(segments) == 0 {
+			return nil, false, nil
+		}
+		return nil, true, fmt.Errorf("unfinished escape")
+	}
+	if inSingle || inDouble {
+		if len(segments) == 0 {
+			return nil, false, nil
+		}
+		return nil, true, fmt.Errorf("unterminated quote")
+	}
+	if len(segments) == 0 {
+		return nil, false, nil
+	}
+	last := strings.TrimSpace(line[start:])
+	if last == "" {
+		return nil, true, fmt.Errorf("pipeline segment is empty")
+	}
+	segments = append(segments, last)
+	return segments, true, nil
+}
+
+func (s *shellState) runPipeline(base commandContext, segments []string, stdout, stderr io.Writer) error {
+	if len(segments) < 2 {
+		return fmt.Errorf("pipeline requires at least two commands")
+	}
+	stages := make([]pipelineStage, 0, len(segments))
+	for _, segment := range segments {
+		stage, err := s.preparePipelineStage(base, segment, stderr)
+		if err != nil {
+			return err
+		}
+		stages = append(stages, stage)
+	}
+
+	readers := make([]*io.PipeReader, len(stages)-1)
+	writers := make([]*io.PipeWriter, len(stages)-1)
+	for i := range readers {
+		readers[i], writers[i] = io.Pipe()
+	}
+
+	errs := make([]error, len(stages))
+	var wg sync.WaitGroup
+	for i := range stages {
+		i := i
+		var stdin io.Reader
+		if i > 0 {
+			stdin = readers[i-1]
+		}
+		stageStdout := stdout
+		if i < len(stages)-1 {
+			stageStdout = writers[i]
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := s.runPipelineStage(stages[i], stdin, stageStdout, stderr)
+			errs[i] = err
+			if reader, ok := stdin.(*io.PipeReader); ok {
+				_ = reader.Close()
+			}
+			if writer, ok := stageStdout.(*io.PipeWriter); ok {
+				if err != nil && sessionLastCode(err) < 0 {
+					_ = writer.CloseWithError(err)
+				} else {
+					_ = writer.Close()
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	for _, reader := range readers {
+		_ = reader.Close()
+	}
+
+	lastErr := errs[len(errs)-1]
+	s.lastCode = sessionLastCode(lastErr)
+	if lastErr != nil {
+		if s.lastCode >= 0 {
+			return nil
+		}
+		return lastErr
+	}
+	for _, err := range errs[:len(errs)-1] {
+		if err != nil && sessionLastCode(err) < 0 {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *shellState) preparePipelineStage(base commandContext, segment string, stderr io.Writer) (pipelineStage, error) {
+	ctx := base
+	line := segment
+	if strings.HasPrefix(segment, "@") {
+		at, err := parseAtLine(segment)
+		if err != nil {
+			return pipelineStage{}, err
+		}
+		ctx = base.withOptions(at.Options)
+		line = at.Command
+		switch at.Target {
+		case "":
+			if at.Options.Sudo {
+				ctx.Mode = modeVM
+				ctx.User = "root"
+			}
+		case "host":
+			if at.Options.Sudo {
+				return pipelineStage{}, fmt.Errorf("usage: @host [cmd]")
+			}
+			ctx.Mode = modeHost
+		case "sudo":
+			if line == "" {
+				return pipelineStage{}, fmt.Errorf("usage: @sudo <cmd>")
+			}
+			ctx, line = sudoCommandContext(ctx, line)
+		default:
+			if isControlAtTarget(at.Target) {
+				return pipelineStage{}, fmt.Errorf("@%s cannot be used in a pipeline", at.Target)
+			}
+			ctx.Mode = modeVM
+			ctx.Image = at.Target
+			if at.Options.Sudo {
+				ctx.User = "root"
+			}
+		}
+		if line == "" {
+			return pipelineStage{}, fmt.Errorf("pipeline segment %q has no command", segment)
+		}
+	}
+	stage := pipelineStage{ctx: ctx, line: line}
+	if ctx.Mode == modeVM {
+		req, err := s.prepareGuestRunRequest(ctx, line, false, 0, 0, stderr)
+		if err != nil {
+			return pipelineStage{}, err
+		}
+		stage.req = req
+	}
+	return stage, nil
+}
+
+func isControlAtTarget(target string) bool {
+	switch target {
+	case "help", "?", "ps", "jobs", "alias", "status", "where", "start", "stop", "restart", "save", "rmi", "tmux", "forward":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *shellState) runPipelineStage(stage pipelineStage, stdin io.Reader, stdout, stderr io.Writer) error {
+	switch stage.ctx.Mode {
+	case modeHost:
+		return s.runHostWithInput(stage.line, stdin, stdout, stderr)
+	case modeVM:
+		return s.streamGuestRunWithInput(stage.ctx.VMID, stage.req, stdin, stdout, stderr)
+	default:
+		return fmt.Errorf("unknown shell mode %q", stage.ctx.Mode)
+	}
 }
 
 func (s *shellState) evalExport(line string) (bool, error) {
@@ -1457,6 +1670,31 @@ func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 	s.lastCode = exitCode(err)
 	if err != nil && s.lastCode < 0 {
 		return err
+	}
+	return nil
+}
+
+func (s *shellState) runHostWithInput(line string, stdin io.Reader, stdout, stderr io.Writer) error {
+	args := hostShellCommand(line, false, s.hostCommandPrelude(false))
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Dir = s.hostCWD
+	if stdin == nil {
+		cmd.Stdin = nil
+	} else {
+		cmd.Stdin = stdin
+	}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if len(s.env) > 0 {
+		cmd.Env = mergedEnv(os.Environ(), shellEnv(s.env))
+	}
+	err := cmd.Run()
+	code := exitCode(err)
+	if err != nil && code < 0 {
+		return err
+	}
+	if code != 0 {
+		return persistentShellExit{code: code}
 	}
 	return nil
 }
@@ -1862,21 +2100,56 @@ func defaultGuestUserName(ctx commandContext) string {
 }
 
 func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io.Writer) error {
-	if ctx.Image == "" {
-		return fmt.Errorf("no guest image selected; run @<oci-tag> or set one with @<oci-tag>")
-	}
-	if err := s.ensureImageAvailable(ctx, stderr); err != nil {
-		return err
-	}
-	if err := s.ensureVMRunning(ctx, stderr); err != nil {
-		return err
-	}
-	hostRoot, hostGuestCWD, err := guestHostPaths(s.hostCWD)
+	tty, cols, rows := terminalRequestSize(stdout)
+	req, err := s.prepareGuestRunRequest(ctx, line, tty, cols, rows, stderr)
 	if err != nil {
 		return err
 	}
+	if tty && persistentGuestCommandAllowed(line) {
+		session, err := s.guestPersistentShell(ctx, req)
+		if err != nil {
+			s.lastCode = 1
+			return err
+		}
+		var interrupted atomic.Bool
+		err = session.run(line, stdout, stderr, func() (func(), error) {
+			return s.startGuestInputForwarding(req.TTY, session.inputs, stdout, stderr, func(name string) {
+				if name == "INT" {
+					interrupted.Store(true)
+				}
+			})
+		})
+		if interrupted.Load() && persistentGuestShellEnded(err) {
+			s.guestShell = nil
+			err = persistentShellExit{code: 130}
+		}
+		s.lastCode = sessionLastCode(err)
+		if session.cwd() != "" {
+			s.context.CWD = session.cwd()
+		}
+		if err == nil || s.lastCode >= 0 {
+			return nil
+		}
+		return err
+	}
+	return s.streamGuestRun(ctx.VMID, req, stdout, stderr)
+}
+
+func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty bool, cols, rows int, stderr io.Writer) (client.RunRequest, error) {
+	if ctx.Image == "" {
+		return client.RunRequest{}, fmt.Errorf("no guest image selected; run @<oci-tag> or set one with @<oci-tag>")
+	}
+	if err := s.ensureImageAvailable(ctx, stderr); err != nil {
+		return client.RunRequest{}, err
+	}
+	if err := s.ensureVMRunning(ctx, stderr); err != nil {
+		return client.RunRequest{}, err
+	}
+	hostRoot, hostGuestCWD, err := guestHostPaths(s.hostCWD)
+	if err != nil {
+		return client.RunRequest{}, err
+	}
 	workDir := firstNonEmpty(ctx.CWD, hostGuestCWD)
-	tty, cols, rows := terminalRequestSize(stdout)
 	req := client.RunRequest{
 		Image:   localImageName(ctx.Image, ctx.Arch),
 		Command: guestCommand(line, tty),
@@ -1908,34 +2181,7 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 	if ctx.Network {
 		req.Network = defaultNetworkConfig()
 	}
-	if tty && persistentGuestCommandAllowed(line) {
-		session, err := s.guestPersistentShell(ctx, req)
-		if err != nil {
-			s.lastCode = 1
-			return err
-		}
-		var interrupted atomic.Bool
-		err = session.run(line, stdout, stderr, func() (func(), error) {
-			return s.startGuestInputForwarding(req.TTY, session.inputs, stdout, stderr, func(name string) {
-				if name == "INT" {
-					interrupted.Store(true)
-				}
-			})
-		})
-		if interrupted.Load() && persistentGuestShellEnded(err) {
-			s.guestShell = nil
-			err = persistentShellExit{code: 130}
-		}
-		s.lastCode = sessionLastCode(err)
-		if session.cwd() != "" {
-			s.context.CWD = session.cwd()
-		}
-		if err == nil || s.lastCode >= 0 {
-			return nil
-		}
-		return err
-	}
-	return s.streamGuestRun(ctx.VMID, req, stdout, stderr)
+	return req, nil
 }
 
 func persistentGuestCommandAllowed(line string) bool {
@@ -2220,6 +2466,101 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 	}
 	s.lastCode = exitCode
 	return nil
+}
+
+func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, stdin io.Reader, stdout, stderr io.Writer) error {
+	req.TTY = false
+	req.Cols = 0
+	req.Rows = 0
+	if stdin == nil {
+		exitCode := 0
+		if err := s.api.RunStreamInContext(context.Background(), id, req, func(event client.ExecEvent) error {
+			switch event.Kind {
+			case "stdout", "output":
+				writeExecEventOutput(stdout, event)
+			case "stderr":
+				writeExecEventOutput(stderr, event)
+			case "exit":
+				exitCode = event.ExitCode
+			case "error":
+				if event.Error != "" {
+					return fmt.Errorf("%s", event.Error)
+				}
+				return fmt.Errorf("guest command failed")
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if exitCode != 0 {
+			return persistentShellExit{code: exitCode}
+		}
+		return nil
+	}
+
+	inputs := make(chan client.ExecInput, 8)
+	inputErr := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		inputErr <- streamReaderToGuestInput(stdin, inputs, done)
+		close(inputs)
+	}()
+	exitCode := 0
+	err := s.api.RunInteractiveStreamIn(id, req, inputs, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "stdout", "output":
+			writeExecEventOutput(stdout, event)
+		case "stderr":
+			writeExecEventOutput(stderr, event)
+		case "exit":
+			exitCode = event.ExitCode
+		case "error":
+			if event.Error != "" {
+				return fmt.Errorf("%s", event.Error)
+			}
+			return fmt.Errorf("guest command failed")
+		}
+		return nil
+	})
+	close(done)
+	if inErr := <-inputErr; err == nil && inErr != nil {
+		err = inErr
+	}
+	if err != nil {
+		return err
+	}
+	if exitCode != 0 {
+		return persistentShellExit{code: exitCode}
+	}
+	return nil
+}
+
+func streamReaderToGuestInput(r io.Reader, out chan<- client.ExecInput, done <-chan struct{}) error {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			if !sendGuestInputBlocking(out, done, client.ExecInput{Kind: "stdin", Data: append([]byte(nil), buf[:n]...)}) {
+				return nil
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				_ = sendGuestInputBlocking(out, done, client.ExecInput{Kind: "stdin_close"})
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func sendGuestInputBlocking(out chan<- client.ExecInput, done <-chan struct{}, input client.ExecInput) bool {
+	select {
+	case <-done:
+		return false
+	case out <- input:
+		return true
+	}
 }
 
 func (s *shellState) startGuestInputForwarding(tty bool, inputs chan<- client.ExecInput, stdout, stderr io.Writer, onSignal ...func(string)) (func(), error) {

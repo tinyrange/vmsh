@@ -9,8 +9,10 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -544,6 +546,76 @@ func TestRestartVMRejectsCommand(t *testing.T) {
 	err := sh.evalAt("@restart echo nope", io.Discard, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "usage: @restart") {
 		t.Fatalf("evalAt(@restart command) error = %v, want usage", err)
+	}
+}
+
+func TestSplitPipelineLine(t *testing.T) {
+	got, ok, err := splitPipelineLine(`printf 'a|b' | @alpine grep a || true`)
+	if err != nil {
+		t.Fatalf("splitPipelineLine() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("splitPipelineLine() ok=false, want true")
+	}
+	want := []string{`printf 'a|b'`, `@alpine grep a || true`}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("segments = %#v, want %#v", got, want)
+	}
+
+	if _, ok, err := splitPipelineLine("false || true"); err != nil || ok {
+		t.Fatalf("splitPipelineLine(||) = ok %v err %v, want no pipeline", ok, err)
+	}
+}
+
+func TestHostPipelineStreamsData(t *testing.T) {
+	sh := &shellState{
+		api:     &fakeVMSHAPI{},
+		context: commandContext{Mode: modeHost, VMID: "default"},
+		hostCWD: t.TempDir(),
+		env:     map[string]string{},
+		aliases: map[string]string{},
+	}
+	var stdout bytes.Buffer
+	if err := sh.eval("printf 'hello\\nworld\\n' | grep hello", &stdout, io.Discard); err != nil {
+		t.Fatalf("eval(host pipeline) error = %v", err)
+	}
+	if got := stdout.String(); got != "hello\n" {
+		t.Fatalf("stdout = %q, want hello", got)
+	}
+}
+
+func TestGuestPipelineStreamsBetweenStages(t *testing.T) {
+	api := &fakeVMSHAPI{
+		status: client.InstanceState{ID: "work", Status: "running"},
+		streamEventsByCommand: map[string][]client.ExecEvent{
+			"printf hello": {{Kind: "stdout", Data: []byte("hello")}, {Kind: "exit", ExitCode: 0}},
+			"cat":          {{Kind: "exit", ExitCode: 0}},
+		},
+	}
+	sh := &shellState{
+		api:        api,
+		context:    commandContext{Mode: modeVM, VMID: "work", Image: "alpine"},
+		hostCWD:    t.TempDir(),
+		imageCache: map[string]bool{"alpine": true},
+		vmRunning:  map[string]bool{"work": true},
+		env:        map[string]string{},
+		aliases:    map[string]string{},
+	}
+
+	if err := sh.eval("printf hello | cat", io.Discard, io.Discard); err != nil {
+		t.Fatalf("eval(guest pipeline) error = %v", err)
+	}
+	input := api.inputForCommand("cat")
+	if input != "hello" {
+		t.Fatalf("cat stdin = %q, want hello", input)
+	}
+	if len(api.streams) != 2 {
+		t.Fatalf("streams = %d, want 2", len(api.streams))
+	}
+	for _, run := range api.streams {
+		if run.req.TTY {
+			t.Fatalf("pipeline stage %#v used TTY", run.req.Command)
+		}
 	}
 }
 
@@ -1913,6 +1985,15 @@ func TestResolveCCVMPathHonorsExplicitPath(t *testing.T) {
 	}
 }
 
+func TestInternalCCVMSidecarModeConstants(t *testing.T) {
+	if internalCCVMSidecarModeEnv != "CCX3_CCVM_SIDECAR_MODE" {
+		t.Fatalf("sidecar mode env = %q, want CCX3_CCVM_SIDECAR_MODE", internalCCVMSidecarModeEnv)
+	}
+	if internalCCVMSidecarMode != "vmsh-internal" {
+		t.Fatalf("sidecar mode = %q, want vmsh-internal", internalCCVMSidecarMode)
+	}
+}
+
 func TestWriteReadDaemonState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ccvm.json")
 	if err := writeDaemonState(path, daemonState{Addr: "127.0.0.1:1234"}); err != nil {
@@ -1931,28 +2012,37 @@ func TestWriteReadDaemonState(t *testing.T) {
 }
 
 type fakeVMSHAPI struct {
-	status       client.InstanceState
-	statuses     []client.InstanceState
-	streams      []fakeRun
-	starts       []fakeStart
-	shutdowns    []string
-	saves        []fakeSave
-	deletes      []string
-	streamEvents []client.ExecEvent
-	bootEvents   []client.BootEvent
-	pullEvents   []client.ProgressEvent
-	pulls        []fakePull
-	missingImgs  map[string]bool
-	saveState    client.ImageState
-	saveErr      error
-	deleteErr    error
-	imageGets    int
-	statusGets   int
+	mu                    sync.Mutex
+	status                client.InstanceState
+	statuses              []client.InstanceState
+	streams               []fakeRun
+	streamInputs          []fakeRunInput
+	starts                []fakeStart
+	shutdowns             []string
+	saves                 []fakeSave
+	deletes               []string
+	streamEvents          []client.ExecEvent
+	streamEventsByCommand map[string][]client.ExecEvent
+	bootEvents            []client.BootEvent
+	pullEvents            []client.ProgressEvent
+	pulls                 []fakePull
+	missingImgs           map[string]bool
+	saveState             client.ImageState
+	saveErr               error
+	deleteErr             error
+	imageGets             int
+	statusGets            int
 }
 
 type fakeRun struct {
 	id  string
 	req client.RunRequest
+}
+
+type fakeRunInput struct {
+	id      string
+	command string
+	inputs  []client.ExecInput
 }
 
 type fakeStart struct {
@@ -2086,8 +2176,28 @@ func (f *fakeVMSHAPI) RunStreamInContext(ctx context.Context, id string, req cli
 }
 
 func (f *fakeVMSHAPI) RunInteractiveStreamIn(id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	var captured []client.ExecInput
+	if inputs != nil && !req.TTY {
+		for input := range inputs {
+			captured = append(captured, input)
+		}
+	}
+	command := runRequestCommandString(req)
+	f.mu.Lock()
 	f.streams = append(f.streams, fakeRun{id: id, req: req})
+	if inputs != nil {
+		f.streamInputs = append(f.streamInputs, fakeRunInput{id: id, command: command, inputs: captured})
+	}
 	events := f.streamEvents
+	if f.streamEventsByCommand != nil {
+		for suffix, commandEvents := range f.streamEventsByCommand {
+			if strings.HasSuffix(command, suffix) {
+				events = commandEvents
+				break
+			}
+		}
+	}
+	f.mu.Unlock()
 	if len(events) == 0 {
 		events = []client.ExecEvent{{Kind: "exit", ExitCode: 0}}
 	}
@@ -2099,4 +2209,29 @@ func (f *fakeVMSHAPI) RunInteractiveStreamIn(id string, req client.RunRequest, i
 		}
 	}
 	return nil
+}
+
+func runRequestCommandString(req client.RunRequest) string {
+	if len(req.Command) == 0 {
+		return ""
+	}
+	return req.Command[len(req.Command)-1]
+}
+
+func (f *fakeVMSHAPI) inputForCommand(command string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, runInput := range f.streamInputs {
+		if !strings.HasSuffix(runInput.command, command) {
+			continue
+		}
+		var b strings.Builder
+		for _, input := range runInput.inputs {
+			if input.Kind == "stdin" {
+				b.Write(input.Data)
+			}
+		}
+		return b.String()
+	}
+	return ""
 }
