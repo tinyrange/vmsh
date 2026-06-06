@@ -63,6 +63,8 @@ type shellState struct {
 	context     commandContext
 	hostCWD     string
 	rootCache   string
+	vmshPath    string
+	ccvmPath    string
 	imageCache  map[string]bool
 	vmRunning   map[string]bool
 	hostInit    hostShellInit
@@ -79,6 +81,7 @@ type shellState struct {
 	jobsMu      sync.Mutex
 	statusSeq   atomic.Uint64
 	completion  *vmshCompleter
+	tmuxExec    func([]string) error
 }
 
 type shellJob struct {
@@ -222,7 +225,7 @@ func (c *vmshCompleter) completionContext(prefix string) commandContext {
 	case "host":
 		ctx = ctx.withOptions(at.Options)
 		ctx.Mode = modeHost
-	case "help", "ps", "jobs", "alias", "status", "where", "start", "stop", "forward":
+	case "help", "ps", "jobs", "alias", "status", "where", "start", "stop", "forward", "tmux":
 	default:
 		ctx = ctx.withOptions(at.Options)
 		ctx.Mode = modeVM
@@ -239,7 +242,7 @@ func pathCompletionReplaceLen(token string) int {
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@alias", "@help", "@host", "@jobs", "@ps", "@status", "@start", "@stop", "@forward", "@rmi", "@sudo"}
+	words := []string{"@alias", "@help", "@host", "@jobs", "@ps", "@status", "@start", "@stop", "@forward", "@rmi", "@sudo", "@tmux"}
 	for _, image := range c.cachedImageNames() {
 		words = append(words, "@"+image)
 	}
@@ -742,6 +745,17 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	vmshPath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	childCCVMPath := ""
+	if strings.TrimSpace(*ccvmPath) != "" {
+		childCCVMPath = ccvmLaunch.Path
+		if abs, err := filepath.Abs(childCCVMPath); err == nil {
+			childCCVMPath = abs
+		}
+	}
 	api, err := connectBackend(ccvmLaunch, rootCache, statePath)
 	if err != nil {
 		return err
@@ -761,6 +775,8 @@ func run() error {
 		context:    defaultContext(strings.TrimSpace(*vmID), strings.TrimSpace(*image), caps.SupportsNestedVirt),
 		hostCWD:    cwd,
 		rootCache:  rootCache,
+		vmshPath:   vmshPath,
+		ccvmPath:   childCCVMPath,
 		imageCache: map[string]bool{},
 		vmRunning:  map[string]bool{},
 		promptOut:  os.Stdout,
@@ -1355,6 +1371,8 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		return s.saveVM(at, stdout)
 	case "rmi":
 		return s.removeImage(at, stdout)
+	case "tmux":
+		return s.startTmux(at)
 	case "forward":
 		if at.Command == "" {
 			return fmt.Errorf("usage: @forward <host-port:guest-port>")
@@ -1875,12 +1893,9 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 	if tty && persistentGuestCommandAllowed(line) {
 		session, err := s.guestPersistentShell(ctx, req)
 		if err == nil {
-			stopForwarding, err := s.startGuestInputForwarding(req.TTY, session.inputs, stdout, stderr)
-			if err != nil {
-				return err
-			}
-			defer stopForwarding()
-			err = session.run(line, stdout, stderr)
+			err = session.run(line, stdout, stderr, func() (func(), error) {
+				return s.startGuestInputForwarding(req.TTY, session.inputs, stdout, stderr)
+			})
 			s.lastCode = sessionLastCode(err)
 			if session.cwd() != "" {
 				s.context.CWD = session.cwd()
@@ -1988,10 +2003,21 @@ func parsePersistentReady(text string) (string, bool) {
 	return rest, true
 }
 
-func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer) error {
+func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer, startForwarding func() (func(), error)) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.inputs <- client.ExecInput{Kind: "stdin", Data: []byte(line + "\n")}
+	stopForwarding := func() {}
+	if startForwarding != nil {
+		stop, err := startForwarding()
+		if err != nil {
+			return err
+		}
+		if stop != nil {
+			stopForwarding = stop
+		}
+	}
+	defer stopForwarding()
 	for event := range p.events {
 		switch event.Kind {
 		case "stdout", "output":
@@ -2173,11 +2199,21 @@ func (s *shellState) startGuestInputForwarding(tty bool, inputs chan<- client.Ex
 		defer producers.Done()
 		forwardGuestSignals(inputs, done, tty, stdout, stderr)
 	}()
-	return func() {
-		restore()
+	return stopGuestInputForwarding(restore, func() {
 		close(done)
 		producers.Wait()
-	}, nil
+	}), nil
+}
+
+func stopGuestInputForwarding(restore func(), stopProducers func()) func() {
+	return func() {
+		if stopProducers != nil {
+			stopProducers()
+		}
+		if restore != nil {
+			restore()
+		}
+	}
 }
 
 func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan struct{}) {
@@ -2717,6 +2753,78 @@ func hasRMIUnsupportedOptions(opts commandOptions) bool {
 	return len(opts.OptionFields) != 0
 }
 
+func (s *shellState) startTmux(at atLine) error {
+	fields, err := splitShellFields(at.Command)
+	if err != nil {
+		return err
+	}
+	if len(fields) > 1 || len(at.Options.OptionFields) != 0 {
+		return fmt.Errorf("usage: @tmux [session]")
+	}
+	session := "vmsh"
+	if len(fields) == 1 {
+		session = strings.TrimSpace(fields[0])
+	}
+	if session == "" || strings.HasPrefix(session, "-") {
+		return fmt.Errorf("usage: @tmux [session]")
+	}
+	tmux := "tmux"
+	if s.tmuxExec == nil {
+		resolved, err := exec.LookPath("tmux")
+		if err != nil {
+			return fmt.Errorf("tmux not found on PATH")
+		}
+		tmux = resolved
+	}
+	command, err := s.tmuxDefaultCommand()
+	if err != nil {
+		return err
+	}
+	args := tmuxLaunchArgs(session, command, os.Getenv("TMUX") != "")
+	if s.tmuxExec != nil {
+		return s.tmuxExec(append([]string{tmux}, args...))
+	}
+	cmd := exec.Command(tmux, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func (s *shellState) tmuxDefaultCommand() (string, error) {
+	vmshPath := strings.TrimSpace(s.vmshPath)
+	if vmshPath == "" {
+		exe, err := os.Executable()
+		if err != nil {
+			return "", err
+		}
+		vmshPath = exe
+	}
+	if abs, err := filepath.Abs(vmshPath); err == nil {
+		vmshPath = abs
+	}
+	args := []string{"exec", shellQuote(vmshPath), "-cache-dir", shellQuote(s.rootCache)}
+	if strings.TrimSpace(s.ccvmPath) != "" {
+		args = append(args, "-ccvm", shellQuote(s.ccvmPath))
+	}
+	args = append(args, "-vm", shellQuote(firstNonEmpty(strings.TrimSpace(s.context.VMID), "default")))
+	if strings.TrimSpace(s.context.Image) != "" {
+		args = append(args, "-image", shellQuote(s.context.Image))
+	}
+	return strings.Join(args, " "), nil
+}
+
+func tmuxLaunchArgs(session, command string, insideTmux bool) []string {
+	setup := []string{
+		"new-session", "-d", "-A", "-s", session, "-n", "vmsh", command,
+		";", "set-option", "-t", session, "default-command", command,
+	}
+	if insideTmux {
+		return append(setup, ";", "switch-client", "-t", session)
+	}
+	return append(setup, ";", "attach-session", "-t", session)
+}
+
 func (s *shellState) chdirContext(target string) error {
 	if s.context.Mode == modeVM {
 		return s.chdirGuest(target)
@@ -3019,6 +3127,7 @@ func (s *shellState) help(w io.Writer) error {
 @stop [--vm id]          stop a VM
 @save [--vm id] tag      save the selected VM root filesystem as a local image
 @rmi image               remove a locally cached image
+@tmux [session]          open tmux with vmsh as the default pane command
 @forward H:G             forward host port H to guest port G
 opts: --vm id --cwd path --user user --sudo --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested
 cd <dir>                 change the current host or VM working directory

@@ -899,6 +899,10 @@ func TestCompleterSuggestsAtCommandsAndPaths(t *testing.T) {
 	if !completionContains(got, "i") {
 		t.Fatalf("@rmi completion = %#v", got)
 	}
+	got, _ = completer.Do([]rune("@tm"), 3)
+	if !completionContains(got, "ux") {
+		t.Fatalf("@tmux completion = %#v", got)
+	}
 	got, _ = completer.Do([]rune("@ub"), 3)
 	if !completionContains(got, "untu") {
 		t.Fatalf("image completions = %#v", got)
@@ -1537,6 +1541,60 @@ func TestRemoveImageRejectsUnsupportedOptions(t *testing.T) {
 	}
 }
 
+func TestTmuxLaunchUsesSharedVMShCommand(t *testing.T) {
+	var got []string
+	sh := &shellState{
+		api:       &fakeVMSHAPI{},
+		hostCWD:   t.TempDir(),
+		rootCache: "/tmp/vmsh cache",
+		vmshPath:  "/tmp/bin/vmsh",
+		ccvmPath:  "/tmp/bin/ccvm",
+		context:   commandContext{VMID: "work", Image: "alpine"},
+		tmuxExec: func(args []string) error {
+			got = append([]string(nil), args...)
+			return nil
+		},
+	}
+
+	if err := sh.evalAt("@tmux work", io.Discard, io.Discard); err != nil {
+		t.Fatalf("evalAt(@tmux) error = %v", err)
+	}
+	if len(got) == 0 || got[0] != "tmux" {
+		t.Fatalf("tmux args = %#v, want tmux command", got)
+	}
+	command := "exec '/tmp/bin/vmsh' -cache-dir '/tmp/vmsh cache' -ccvm '/tmp/bin/ccvm' -vm 'work' -image 'alpine'"
+	want := []string{
+		"tmux", "new-session", "-d", "-A", "-s", "work", "-n", "vmsh", command,
+		";", "set-option", "-t", "work", "default-command", command,
+		";", "attach-session", "-t", "work",
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("tmux args = %#v, want %#v", got, want)
+	}
+}
+
+func TestTmuxLaunchSwitchesClientInsideTmux(t *testing.T) {
+	t.Setenv("TMUX", "/tmp/tmux,1,0")
+	var got []string
+	sh := &shellState{
+		api:       &fakeVMSHAPI{},
+		hostCWD:   t.TempDir(),
+		rootCache: "/tmp/cache",
+		vmshPath:  "/tmp/bin/vmsh",
+		tmuxExec: func(args []string) error {
+			got = append([]string(nil), args...)
+			return nil
+		},
+	}
+
+	if err := sh.evalAt("@tmux", io.Discard, io.Discard); err != nil {
+		t.Fatalf("evalAt(@tmux) error = %v", err)
+	}
+	if len(got) < 3 || got[len(got)-3] != "switch-client" || got[len(got)-1] != "vmsh" {
+		t.Fatalf("tmux args = %#v, want switch-client to vmsh", got)
+	}
+}
+
 func TestGuestCommandCachesImageAndRunningVMState(t *testing.T) {
 	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
 	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Network: true}, hostCWD: t.TempDir()}
@@ -1588,16 +1646,16 @@ func TestPersistentGuestShellPreservesState(t *testing.T) {
 		done <- nil
 	}()
 	var out bytes.Buffer
-	if err := session.run("alias gp='echo guest-persist'", &out, &bytes.Buffer{}); err != nil {
+	if err := session.run("alias gp='echo guest-persist'", &out, &bytes.Buffer{}, nil); err != nil {
 		t.Fatalf("alias run error = %v", err)
 	}
-	if err := session.run("gp", &out, &bytes.Buffer{}); err != nil {
+	if err := session.run("gp", &out, &bytes.Buffer{}, nil); err != nil {
 		t.Fatalf("gp run error = %v", err)
 	}
-	if err := session.run("cd /tmp", &out, &bytes.Buffer{}); err != nil {
+	if err := session.run("cd /tmp", &out, &bytes.Buffer{}, nil); err != nil {
 		t.Fatalf("cd run error = %v", err)
 	}
-	if err := session.run("pwd", &out, &bytes.Buffer{}); err != nil {
+	if err := session.run("pwd", &out, &bytes.Buffer{}, nil); err != nil {
 		t.Fatalf("pwd run error = %v", err)
 	}
 	session.close()
@@ -1606,6 +1664,49 @@ func TestPersistentGuestShellPreservesState(t *testing.T) {
 	}
 	if got := session.cwd(); got != "/tmp" {
 		t.Fatalf("cwd = %q, want /tmp", got)
+	}
+}
+
+func TestPersistentGuestShellStartsForwardingAfterCommandInjection(t *testing.T) {
+	inputs := make(chan client.ExecInput, 8)
+	events := make(chan client.ExecEvent, 8)
+	session := &persistentGuestShell{
+		inputs: inputs,
+		events: events,
+		done:   make(chan error, 1),
+	}
+	started := false
+	err := session.run("python3 -m http.server", io.Discard, io.Discard, func() (func(), error) {
+		started = true
+		select {
+		case input := <-inputs:
+			if input.Kind != "stdin" || string(input.Data) != "python3 -m http.server\n" {
+				t.Fatalf("first input before forwarding = %#v, want command line", input)
+			}
+		default:
+			t.Fatal("forwarding started before command line was injected")
+		}
+		events <- client.ExecEvent{Kind: "stdout", Data: []byte("__VMSH_DONE__:0:/work\n")}
+		return func() {}, nil
+	})
+	if err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+	if !started {
+		t.Fatal("forwarding hook was not called")
+	}
+}
+
+func TestGuestInputForwardingStopSignalsBeforeRestore(t *testing.T) {
+	var order []string
+	stop := stopGuestInputForwarding(func() {
+		order = append(order, "restore")
+	}, func() {
+		order = append(order, "stop")
+	})
+	stop()
+	if fmt.Sprint(order) != "[stop restore]" {
+		t.Fatalf("stop order = %v, want stop before restore", order)
 	}
 }
 
