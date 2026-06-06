@@ -895,9 +895,21 @@ func TestCompleterSuggestsAtCommandsAndPaths(t *testing.T) {
 	if !completionContains(got, "atus") || !completionContains(got, "art") || !completionContains(got, "op") {
 		t.Fatalf("@ completions = %#v", got)
 	}
+	got, _ = completer.Do([]rune("@rm"), 3)
+	if !completionContains(got, "i") {
+		t.Fatalf("@rmi completion = %#v", got)
+	}
 	got, _ = completer.Do([]rune("@ub"), 3)
 	if !completionContains(got, "untu") {
 		t.Fatalf("image completions = %#v", got)
+	}
+	got, _ = completer.Do([]rune("@rmi ub"), 7)
+	if !completionContains(got, "untu") {
+		t.Fatalf("@rmi image completions = %#v", got)
+	}
+	got, _ = completer.Do([]rune("@rmi "), 5)
+	if !completionContains(got, "ubuntu") {
+		t.Fatalf("@rmi empty image completions = %#v", got)
 	}
 	got, _ = completer.Do([]rune("@ubuntu --s"), 11)
 	if !completionContains(got, "udo") {
@@ -1493,6 +1505,38 @@ func TestSaveVMRejectsUnsupportedOptions(t *testing.T) {
 	}
 }
 
+func TestRemoveImageDeletesCachedImage(t *testing.T) {
+	api := &fakeVMSHAPI{}
+	sh := &shellState{api: api, hostCWD: t.TempDir(), imageCache: map[string]bool{"alpine-gcc": true}}
+	var stdout bytes.Buffer
+
+	if err := sh.evalAt("@rmi alpine-gcc", &stdout, io.Discard); err != nil {
+		t.Fatalf("evalAt(@rmi) error = %v", err)
+	}
+	if len(api.deletes) != 1 || api.deletes[0] != "alpine-gcc" {
+		t.Fatalf("deletes = %#v, want alpine-gcc", api.deletes)
+	}
+	if sh.imageCache["alpine-gcc"] {
+		t.Fatalf("alpine-gcc remained in image cache")
+	}
+	if got := stdout.String(); !strings.Contains(got, "Removed alpine-gcc") {
+		t.Fatalf("stdout = %q, want remove message", got)
+	}
+}
+
+func TestRemoveImageRejectsUnsupportedOptions(t *testing.T) {
+	api := &fakeVMSHAPI{}
+	sh := &shellState{api: api, hostCWD: t.TempDir()}
+
+	err := sh.evalAt("@rmi --vm work alpine-gcc", io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "usage: @rmi") {
+		t.Fatalf("evalAt(@rmi --vm) error = %v, want usage", err)
+	}
+	if len(api.deletes) != 0 {
+		t.Fatalf("deletes = %d, want 0", len(api.deletes))
+	}
+}
+
 func TestGuestCommandCachesImageAndRunningVMState(t *testing.T) {
 	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
 	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Network: true}, hostCWD: t.TempDir()}
@@ -1699,6 +1743,7 @@ type fakeVMSHAPI struct {
 	streams      []fakeRun
 	starts       []fakeStart
 	saves        []fakeSave
+	deletes      []string
 	streamEvents []client.ExecEvent
 	bootEvents   []client.BootEvent
 	pullEvents   []client.ProgressEvent
@@ -1706,6 +1751,7 @@ type fakeVMSHAPI struct {
 	missingImgs  map[string]bool
 	saveState    client.ImageState
 	saveErr      error
+	deleteErr    error
 	imageGets    int
 	statusGets   int
 }
@@ -1764,6 +1810,14 @@ func (f *fakeVMSHAPI) PullImageStream(name string, req client.PullImageRequest, 
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+func (f *fakeVMSHAPI) DeleteImage(name string) error {
+	f.deletes = append(f.deletes, name)
+	if f.deleteErr != nil {
+		return f.deleteErr
 	}
 	return nil
 }

@@ -168,6 +168,10 @@ func (c *vmshCompleter) CompleteWithKind(line []rune, pos int) ([]string, int, c
 		candidates = suffixCompletions(vmshOptionWords(), token)
 		return candidates, len([]rune(token)), completionOption
 	}
+	if c.shouldCompleteRMIImage(prefix, tokenStart) {
+		candidates = suffixCompletions(c.cachedImageNames(), token)
+		return candidates, len([]rune(typedToken)), completionAt
+	}
 	if c.shouldCompleteCommand(prefix, tokenStart, isFirstToken, token) {
 		candidates = c.commandCandidates(token)
 		return candidates, len([]rune(typedToken)), completionCommand
@@ -235,7 +239,7 @@ func pathCompletionReplaceLen(token string) int {
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@alias", "@help", "@host", "@jobs", "@ps", "@status", "@start", "@stop", "@forward", "@sudo"}
+	words := []string{"@alias", "@help", "@host", "@jobs", "@ps", "@status", "@start", "@stop", "@forward", "@rmi", "@sudo"}
 	for _, image := range c.cachedImageNames() {
 		words = append(words, "@"+image)
 	}
@@ -327,6 +331,17 @@ func (c *vmshCompleter) shouldCompleteCommand(prefix string, tokenStart int, isF
 		return false
 	}
 	return true
+}
+
+func (c *vmshCompleter) shouldCompleteRMIImage(prefix string, tokenStart int) bool {
+	if !strings.HasPrefix(prefix, "@") {
+		return false
+	}
+	words := completedShellWords(prefix[:tokenStart])
+	if len(words) != 1 {
+		return false
+	}
+	return words[0] == "@rmi"
 }
 
 func completedShellWords(line string) []string {
@@ -640,6 +655,7 @@ type vmshAPI interface {
 	Capabilities() (client.CapabilitiesResponse, error)
 	GetImage(string) (client.ImageState, error)
 	PullImageStream(string, client.PullImageRequest, func(client.ProgressEvent) error) error
+	DeleteImage(string) error
 	SaveInstanceImage(string, client.SaveImageRequest) (client.ImageState, error)
 	StartInstanceStreamWithID(string, client.StartInstanceRequest, func(client.BootEvent) error) (client.InstanceState, error)
 	ShutdownInstanceWithID(string) error
@@ -1337,6 +1353,8 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		return s.stopVM(id)
 	case "save":
 		return s.saveVM(at, stdout)
+	case "rmi":
+		return s.removeImage(at, stdout)
 	case "forward":
 		if at.Command == "" {
 			return fmt.Errorf("usage: @forward <host-port:guest-port>")
@@ -2671,6 +2689,34 @@ func hasSaveOnlyUnsupportedOptions(opts commandOptions) bool {
 	return false
 }
 
+func (s *shellState) removeImage(at atLine, stdout io.Writer) error {
+	fields, err := splitShellFields(at.Command)
+	if err != nil {
+		return err
+	}
+	if len(fields) != 1 || hasRMIUnsupportedOptions(at.Options) {
+		return fmt.Errorf("usage: @rmi image")
+	}
+	name := strings.TrimSpace(fields[0])
+	if name == "" || strings.HasPrefix(name, "-") {
+		return fmt.Errorf("usage: @rmi image")
+	}
+	if err := s.api.DeleteImage(name); err != nil {
+		return err
+	}
+	if s.imageCache != nil {
+		delete(s.imageCache, name)
+	}
+	if _, err := fmt.Fprintf(stdout, "Removed %s\n", name); err != nil {
+		return err
+	}
+	return nil
+}
+
+func hasRMIUnsupportedOptions(opts commandOptions) bool {
+	return len(opts.OptionFields) != 0
+}
+
 func (s *shellState) chdirContext(target string) error {
 	if s.context.Mode == modeVM {
 		return s.chdirGuest(target)
@@ -2972,6 +3018,7 @@ func (s *shellState) help(w io.Writer) error {
 @start [--vm id]         start a blank VM
 @stop [--vm id]          stop a VM
 @save [--vm id] tag      save the selected VM root filesystem as a local image
+@rmi image               remove a locally cached image
 @forward H:G             forward host port H to guest port G
 opts: --vm id --cwd path --user user --sudo --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested
 cd <dir>                 change the current host or VM working directory
