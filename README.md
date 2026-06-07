@@ -180,7 +180,7 @@ Run selected Windows Hypervisor Platform probes on a `windows/amd64` host:
 ```powershell
 cd cc
 $env:CCX3_WHP_BOOT = "1"
-go test ./internal/hv/whp ./internal/vm `
+go test -tags embed_guestinit ./internal/hv/whp ./internal/vm `
   -run 'Test(WindowsRuntimeBackendRunCommand|RunManagedExecWithAlpineRootFS)$' `
   -count=1 -v
 ```

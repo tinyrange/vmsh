@@ -576,10 +576,16 @@ func TestHostPipelineStreamsData(t *testing.T) {
 		aliases: map[string]string{},
 	}
 	var stdout bytes.Buffer
-	if err := sh.eval("printf 'hello\\nworld\\n' | grep hello", &stdout, io.Discard); err != nil {
+	line := "printf 'hello\\nworld\\n' | grep hello"
+	want := "hello\n"
+	if runtime.GOOS == "windows" {
+		line = "echo hello| findstr hello"
+		want = "hello\r\n"
+	}
+	if err := sh.eval(line, &stdout, io.Discard); err != nil {
 		t.Fatalf("eval(host pipeline) error = %v", err)
 	}
-	if got := stdout.String(); got != "hello\n" {
+	if got := stdout.String(); got != want {
 		t.Fatalf("stdout = %q, want hello", got)
 	}
 }
@@ -645,13 +651,19 @@ echo hello --flag
 	if run.req.Network == nil || !run.req.Network.Enabled || !run.req.Network.AllowInternet {
 		t.Fatalf("network = %#v, want enabled internet", run.req.Network)
 	}
-	if run.req.User != defaultGuestUser {
-		t.Fatalf("user = %q, want %q", run.req.User, defaultGuestUser)
+	wantUser := defaultGuestUser
+	wantEnv := []string{"HOME=/home/cc", "USER=cc", "LOGNAME=cc"}
+	if runtime.GOOS == "windows" {
+		wantUser = "root"
+		wantEnv = []string{"HOME=/root", "USER=root", "LOGNAME=root"}
+	}
+	if run.req.User != wantUser {
+		t.Fatalf("user = %q, want %q", run.req.User, wantUser)
 	}
 	if len(run.req.Command) != 3 || run.req.Command[0] != "sh" || run.req.Command[1] != "-lc" || !strings.HasSuffix(run.req.Command[2], "echo hello --flag") {
 		t.Fatalf("command = %#v", run.req.Command)
 	}
-	for _, want := range []string{"HOME=/home/cc", "USER=cc", "LOGNAME=cc"} {
+	for _, want := range wantEnv {
 		if !envContains(run.req.Env, want) {
 			t.Fatalf("env = %#v, missing %q", run.req.Env, want)
 		}
@@ -964,28 +976,32 @@ func TestVMCDUsesGuestCWD(t *testing.T) {
 
 func TestVMCDUsesGuestHome(t *testing.T) {
 	tests := []struct {
-		name  string
-		ctx   commandContext
-		input string
-		want  string
+		name        string
+		ctx         commandContext
+		input       string
+		want        string
+		wantWindows string
 	}{
 		{
-			name:  "ubuntu default user",
-			ctx:   commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Network: true},
-			input: "cd\npwd\n",
-			want:  "/home/ubuntu",
+			name:        "ubuntu default user",
+			ctx:         commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Network: true},
+			input:       "cd\npwd\n",
+			want:        "/home/ubuntu",
+			wantWindows: "/root",
 		},
 		{
-			name:  "ubuntu tilde child",
-			ctx:   commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Network: true},
-			input: "cd ~/src\npwd\n",
-			want:  "/home/ubuntu/src",
+			name:        "ubuntu tilde child",
+			ctx:         commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Network: true},
+			input:       "cd ~/src\npwd\n",
+			want:        "/home/ubuntu/src",
+			wantWindows: "/root/src",
 		},
 		{
-			name:  "created default user",
-			ctx:   commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true},
-			input: "cd ~\npwd\n",
-			want:  "/home/cc",
+			name:        "created default user",
+			ctx:         commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true},
+			input:       "cd ~\npwd\n",
+			want:        "/home/cc",
+			wantWindows: "/root",
 		},
 		{
 			name:  "root user",
@@ -1001,8 +1017,12 @@ func TestVMCDUsesGuestHome(t *testing.T) {
 			if err := sh.runScript(strings.NewReader(tt.input), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 				t.Fatalf("runScript() error = %v", err)
 			}
-			if len(api.streams) != 1 || api.streams[0].req.WorkDir != tt.want {
-				t.Fatalf("workdir = %#v, want %s", api.streams, tt.want)
+			want := tt.want
+			if runtime.GOOS == "windows" && tt.wantWindows != "" {
+				want = tt.wantWindows
+			}
+			if len(api.streams) != 1 || api.streams[0].req.WorkDir != want {
+				t.Fatalf("workdir = %#v, want %s", api.streams, want)
 			}
 		})
 	}
@@ -1534,7 +1554,11 @@ func TestGuestCommandEnvPrefersExplicitExportsOverTerminalEnv(t *testing.T) {
 	ctx := commandContext{Image: "ubuntu"}
 	got := guestCommandEnv(ctx, map[string]string{"TERM": "xterm"}, []string{"TERM=xterm-ghostty", "COLUMNS=183", "LINES=50"})
 	joined := strings.Join(got, "\n")
-	for _, want := range []string{"TERM=xterm", "COLUMNS=183", "LINES=50", "HOME=/home/ubuntu"} {
+	wantHome := "HOME=/home/ubuntu"
+	if runtime.GOOS == "windows" {
+		wantHome = "HOME=/root"
+	}
+	for _, want := range []string{"TERM=xterm", "COLUMNS=183", "LINES=50", wantHome} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("guestCommandEnv() = %#v, missing %q", got, want)
 		}
@@ -1726,7 +1750,11 @@ func TestTmuxLaunchUsesSharedVMShCommand(t *testing.T) {
 	if len(got) == 0 || got[0] != "tmux" {
 		t.Fatalf("tmux args = %#v, want tmux command", got)
 	}
-	command := "exec '/tmp/bin/vmsh' -cache-dir '/tmp/vmsh cache' -ccvm '/tmp/bin/ccvm' -vm 'work' -image 'alpine'"
+	vmshPath, err := filepath.Abs("/tmp/bin/vmsh")
+	if err != nil {
+		t.Fatalf("Abs(vmsh) error = %v", err)
+	}
+	command := "exec " + shellQuote(vmshPath) + " -cache-dir '/tmp/vmsh cache' -ccvm '/tmp/bin/ccvm' -vm 'work' -image 'alpine'"
 	want := []string{
 		"tmux", "new-session", "-d", "-A", "-s", "work", "-n", "vmsh", command,
 		";", "set-option", "-t", "work", "default-command", command,
@@ -1982,6 +2010,26 @@ func TestResolveCCVMPathHonorsExplicitPath(t *testing.T) {
 	}
 	if got.Path != path || len(got.Args) != 0 {
 		t.Fatalf("resolveCCVMPath(explicit) = %#v; want path %q with no args", got, path)
+	}
+}
+
+func TestCCVMPathCandidatesUseHostExecutableNames(t *testing.T) {
+	dir := t.TempDir()
+	exePath := filepath.Join(dir, hostExecutableName("vmsh"))
+	got := ccvmPathCandidates(exePath)
+	want := []string{
+		filepath.Join(dir, hostExecutableName("ccvm")),
+		companionExecutablePath(exePath, "vm"),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ccvmPathCandidates() = %#v, want %#v", got, want)
+	}
+	if runtime.GOOS == "windows" {
+		for _, candidate := range got {
+			if !strings.EqualFold(filepath.Ext(candidate), ".exe") {
+				t.Fatalf("candidate %q extension = %q, want .exe", candidate, filepath.Ext(candidate))
+			}
+		}
 	}
 }
 

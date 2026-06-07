@@ -3792,6 +3792,9 @@ func guestRunUser(ctx commandContext) string {
 	if strings.TrimSpace(ctx.User) != "" {
 		return ctx.User
 	}
+	if runtime.GOOS == "windows" {
+		return "root"
+	}
 	return defaultGuestUser
 }
 
@@ -4078,11 +4081,7 @@ func resolveCCVMPath(path string) (ccvmLaunch, error) {
 	if err != nil {
 		return ccvmLaunch{}, err
 	}
-	candidates := []string{
-		filepath.Join(filepath.Dir(exePath), "ccvm"),
-		exePath + "vm",
-	}
-	for _, candidate := range candidates {
+	for _, candidate := range ccvmPathCandidates(exePath) {
 		if _, err := os.Stat(candidate); err == nil {
 			return ccvmLaunch{Path: candidate}, nil
 		}
@@ -4094,6 +4093,31 @@ func resolveCCVMPath(path string) (ccvmLaunch, error) {
 		return ccvmLaunch{Path: found}, nil
 	}
 	return ccvmLaunch{}, fmt.Errorf("ccvm binary not found next to %s, bundled in vmsh, or on PATH; pass -ccvm", exePath)
+}
+
+func ccvmPathCandidates(exePath string) []string {
+	return []string{
+		filepath.Join(filepath.Dir(exePath), hostExecutableName("ccvm")),
+		companionExecutablePath(exePath, "vm"),
+	}
+}
+
+func hostExecutableName(name string) string {
+	if runtime.GOOS == "windows" && filepath.Ext(name) == "" {
+		return name + ".exe"
+	}
+	return name
+}
+
+func companionExecutablePath(exePath, suffix string) string {
+	if runtime.GOOS != "windows" {
+		return exePath + suffix
+	}
+	ext := filepath.Ext(exePath)
+	if ext == "" {
+		return exePath + suffix + ".exe"
+	}
+	return strings.TrimSuffix(exePath, ext) + suffix + ext
 }
 
 func ccvmLaunchName(launch ccvmLaunch) string {

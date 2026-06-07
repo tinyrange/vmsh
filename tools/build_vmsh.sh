@@ -27,7 +27,7 @@ mkdir -p "${BUILD_DIR}"
   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "${BUILD_DIR}/init-linux-amd64" ./internal/cmd/init
   install -m 644 "${BUILD_DIR}/init-linux-amd64" "${GUESTINIT_AMD64_EMBED_PATH}"
 
-  go build -tags embed_guestinit -o "${CCVM_OUTPUT}" ./cmd/ccvm
+  CGO_ENABLED=0 go build -tags embed_guestinit -o "${CCVM_OUTPUT}" ./cmd/ccvm
   go build -o "${CC_OUTPUT}" ./cmd/cc
 )
 
