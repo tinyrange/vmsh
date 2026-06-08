@@ -3006,6 +3006,12 @@ func newBootStatus(w io.Writer) *bootStatus {
 }
 
 func (b *bootStatus) Update(event client.BootEvent) {
+	if event.Kind == "serial" {
+		if !b.tty && event.Data != "" {
+			fmt.Fprint(b.w, event.Data)
+		}
+		return
+	}
 	msg := formatBootEvent(event)
 	if msg == "" {
 		return
@@ -4113,10 +4119,6 @@ func formatBootEvent(event client.BootEvent) string {
 			return "Boot error: " + event.Error
 		}
 		return "Boot error"
-	case "serial":
-		if event.Data != "" {
-			return event.Data
-		}
 	}
 	return ""
 }

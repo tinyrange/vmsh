@@ -457,6 +457,36 @@ func TestStartVMReportsBootProgressToStderr(t *testing.T) {
 	}
 }
 
+func TestBootStatusIgnoresSerialForTTYSpinner(t *testing.T) {
+	var stderr bytes.Buffer
+	status := &bootStatus{terminalHoldStatus: &terminalHoldStatus{w: &stderr, tty: true}}
+
+	status.Update(client.BootEvent{Kind: "status", Message: "starting VM"})
+	status.Update(client.BootEvent{Kind: "serial", Data: "["})
+
+	status.mu.Lock()
+	got := status.message
+	status.mu.Unlock()
+	if got != "Boot: starting VM" {
+		t.Fatalf("spinner message = %q, want Boot: starting VM", got)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("serial wrote to tty spinner output: %q", stderr.String())
+	}
+}
+
+func TestBootStatusWritesSerialRawForNonTTY(t *testing.T) {
+	var stderr bytes.Buffer
+	status := newBootStatus(&stderr)
+
+	status.Update(client.BootEvent{Kind: "serial", Data: "ab"})
+	status.Update(client.BootEvent{Kind: "serial", Data: "c\n"})
+
+	if got := stderr.String(); got != "abc\n" {
+		t.Fatalf("serial output = %q, want raw serial bytes", got)
+	}
+}
+
 func TestRestartVMRequiresConfirmation(t *testing.T) {
 	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
 	sh := &shellState{
