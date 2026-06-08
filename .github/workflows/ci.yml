@@ -131,6 +131,15 @@ jobs:
             go.sum
             cc/go.sum
 
+      - name: Build guest init payloads
+        run: |
+          mkdir -p build/ci
+          cd cc
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o ../build/ci/init-linux-arm64 ./internal/cmd/init
+          install -m 644 ../build/ci/init-linux-arm64 internal/guestinit/guest-init-linux-arm64
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ../build/ci/init-linux-amd64 ./internal/cmd/init
+          install -m 644 ../build/ci/init-linux-amd64 internal/guestinit/guest-init-linux-amd64
+
       - name: Run sidecar L2 and save smoke
         working-directory: cc
         env:
