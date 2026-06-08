@@ -2253,10 +2253,14 @@ func guestPersistentCommand() []string {
 func (p *persistentGuestShell) waitReady() error {
 	timer := time.NewTimer(defaultGuestShellReadyTimeout)
 	defer timer.Stop()
+	var startup strings.Builder
 	for {
 		select {
 		case event, ok := <-p.events:
 			if !ok {
+				if msg := persistentStartupMessage(startup.String()); msg != "" {
+					return fmt.Errorf("persistent guest shell closed before ready: %s", msg)
+				}
 				return fmt.Errorf("persistent guest shell closed before ready")
 			}
 			switch event.Kind {
@@ -2266,11 +2270,20 @@ func (p *persistentGuestShell) waitReady() error {
 					p.lastCWD = cwd
 					return nil
 				}
+				appendPersistentStartupOutput(&startup, text)
+			case "stderr":
+				appendPersistentStartupOutput(&startup, execEventText(event))
 			case "exit":
+				if msg := persistentStartupMessage(startup.String()); msg != "" {
+					return fmt.Errorf("persistent guest shell exited before ready: %s", msg)
+				}
 				return fmt.Errorf("persistent guest shell exited before ready")
 			case "error":
 				if event.Error != "" {
 					return fmt.Errorf("%s", event.Error)
+				}
+				if msg := persistentStartupMessage(startup.String()); msg != "" {
+					return fmt.Errorf("persistent guest shell failed before ready: %s", msg)
 				}
 				return fmt.Errorf("persistent guest shell failed before ready")
 			}
@@ -2278,11 +2291,40 @@ func (p *persistentGuestShell) waitReady() error {
 			if err != nil {
 				return err
 			}
+			if msg := persistentStartupMessage(startup.String()); msg != "" {
+				return fmt.Errorf("persistent guest shell exited before ready: %s", msg)
+			}
 			return fmt.Errorf("persistent guest shell exited before ready")
 		case <-timer.C:
+			if msg := persistentStartupMessage(startup.String()); msg != "" {
+				return fmt.Errorf("persistent guest shell did not become ready: %s", msg)
+			}
 			return fmt.Errorf("persistent guest shell did not become ready")
 		}
 	}
+}
+
+func appendPersistentStartupOutput(dst *strings.Builder, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	if dst.Len() > 0 {
+		dst.WriteByte('\n')
+	}
+	dst.WriteString(text)
+}
+
+func persistentStartupMessage(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	const max = 500
+	if len(text) <= max {
+		return text
+	}
+	return text[len(text)-max:]
 }
 
 func parsePersistentReady(text string) (string, bool) {

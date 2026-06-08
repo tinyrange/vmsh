@@ -1948,6 +1948,23 @@ func TestPersistentGuestShellConsumesSplitMarker(t *testing.T) {
 	}
 }
 
+func TestPersistentGuestShellWaitReadyIncludesStartupStderr(t *testing.T) {
+	session := &persistentGuestShell{
+		events: make(chan client.ExecEvent, 2),
+		done:   make(chan error, 1),
+	}
+	session.events <- client.ExecEvent{Kind: "stderr", Data: []byte("ccx3-init: exec error: chdir /work: no such file or directory\n")}
+	session.events <- client.ExecEvent{Kind: "exit", ExitCode: 126}
+
+	err := session.waitReady()
+	if err == nil {
+		t.Fatal("waitReady() error = nil, want startup error")
+	}
+	if !strings.Contains(err.Error(), "ccx3-init: exec error") {
+		t.Fatalf("waitReady() error = %q, want startup stderr", err)
+	}
+}
+
 func TestShellQuote(t *testing.T) {
 	if got := shellQuote(`a'b`); got != `'a'"'"'b'` {
 		t.Fatalf("shellQuote() = %q", got)
