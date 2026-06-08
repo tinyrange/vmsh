@@ -2320,11 +2320,13 @@ func persistentStartupMessage(text string) string {
 	if text == "" {
 		return ""
 	}
-	const max = 500
+	const max = 1000
 	if len(text) <= max {
 		return text
 	}
-	return text[len(text)-max:]
+	const head = 600
+	const tail = 400
+	return text[:head] + "\n...\n" + text[len(text)-tail:]
 }
 
 func parsePersistentReady(text string) (string, bool) {

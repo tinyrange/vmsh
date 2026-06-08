@@ -1965,6 +1965,23 @@ func TestPersistentGuestShellWaitReadyIncludesStartupStderr(t *testing.T) {
 	}
 }
 
+func TestPersistentStartupMessageKeepsErrorAndDiagnostics(t *testing.T) {
+	errorLine := "ccx3-init: exec error: fork/exec /bin/sh: no such file or directory"
+	diagnostics := strings.Repeat("diagnostic line\n", 120) + "/proc/sys/fs/binfmt_misc/status: no such file or directory"
+
+	msg := persistentStartupMessage(errorLine + "\n" + diagnostics)
+
+	if !strings.Contains(msg, errorLine) {
+		t.Fatalf("persistentStartupMessage() = %q, want initial error", msg)
+	}
+	if !strings.Contains(msg, "...\n") {
+		t.Fatalf("persistentStartupMessage() = %q, want truncation marker", msg)
+	}
+	if !strings.Contains(msg, "/proc/sys/fs/binfmt_misc/status") {
+		t.Fatalf("persistentStartupMessage() = %q, want trailing diagnostics", msg)
+	}
+}
+
 func TestShellQuote(t *testing.T) {
 	if got := shellQuote(`a'b`); got != `'a'"'"'b'` {
 		t.Fatalf("shellQuote() = %q", got)
