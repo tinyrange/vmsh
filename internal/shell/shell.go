@@ -1,7 +1,9 @@
 package shell
 
 import (
+	"archive/tar"
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -72,6 +74,7 @@ type shellState struct {
 	jobs             []shellJob
 	nextJobID        int
 	jobsMu           sync.Mutex
+	contextCWD       map[string]string
 	statusSeq        atomic.Uint64
 	completion       *vmshCompleter
 	tmuxExec         func([]string) error
@@ -235,7 +238,7 @@ func pathCompletionReplaceLen(token string) int {
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@alias", "@help", "@host", "@jobs", "@ps", "@restart", "@status", "@start", "@stop", "@forward", "@rmi", "@sudo", "@tmux"}
+	words := []string{"@alias", "@copy", "@help", "@host", "@jobs", "@ps", "@restart", "@status", "@start", "@stop", "@forward", "@rmi", "@sudo", "@tmux"}
 	for _, image := range c.cachedImageNames() {
 		words = append(words, "@"+image)
 	}
@@ -280,6 +283,8 @@ func vmshOptionWords() []string {
 		"--no-network",
 		"--nested",
 		"--no-nested",
+		"--isolated",
+		"--shared",
 	}
 }
 
@@ -657,6 +662,7 @@ type commandContext struct {
 	CPUs       int       `json:"cpus,omitempty"`
 	Network    bool      `json:"network,omitempty"`
 	NestedVirt bool      `json:"nested_virtualization,omitempty"`
+	Isolated   bool      `json:"isolated,omitempty"`
 }
 
 type atLine struct {
@@ -675,6 +681,7 @@ type commandOptions struct {
 	CPUs         int
 	Network      *bool
 	NestedVirt   *bool
+	Isolated     *bool
 	OptionFields []string
 }
 
@@ -742,6 +749,7 @@ func Run(args []string) error {
 		ccvmPath:   childCCVMPath,
 		imageCache: map[string]bool{},
 		vmRunning:  map[string]bool{},
+		contextCWD: map[string]string{},
 		promptOut:  os.Stdout,
 		history:    filepath.Join(rootCache, "vmsh_history"),
 		env:        map[string]string{},
@@ -1265,7 +1273,7 @@ func (s *shellState) preparePipelineStage(base commandContext, segment string, s
 
 func isControlAtTarget(target string) bool {
 	switch target {
-	case "help", "?", "ps", "jobs", "alias", "status", "where", "start", "stop", "restart", "save", "rmi", "tmux", "forward":
+	case "help", "?", "ps", "jobs", "alias", "status", "where", "start", "stop", "restart", "save", "rmi", "tmux", "forward", "copy", "cp":
 		return true
 	default:
 		return false
@@ -1430,6 +1438,7 @@ func (s *shellState) startBackgroundJob(ctx commandContext, line string, stdout,
 		aliases:          cloneEnv(s.aliases),
 		confirmPull:      s.confirmPull,
 		confirmVMRestart: s.confirmVMRestart,
+		contextCWD:       cloneEnv(s.contextCWD),
 	}
 	s.jobsMu.Lock()
 	s.nextJobID++
@@ -1482,7 +1491,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			if at.Options.Sudo {
 				return fmt.Errorf("usage: @ --sudo <cmd>")
 			}
-			s.context = ctx
+			s.activateContext(ctx)
 			return nil
 		}
 		return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
@@ -1501,7 +1510,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("usage: @host [cmd]")
 		}
 		if at.Command == "" {
-			s.context = ctx
+			s.activateContext(ctx)
 			return nil
 		}
 		return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
@@ -1575,6 +1584,11 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		}
 		id := firstNonEmpty(at.Options.VMID, s.context.VMID)
 		return s.api.AddPortForwardTo(id, forward)
+	case "copy", "cp":
+		if len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @copy SRC DST")
+		}
+		return s.copyPath(at.Command, stdout, stderr)
 	default:
 		ctx := s.context.withOptions(at.Options)
 		ctx.Mode = modeVM
@@ -1589,7 +1603,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			if err := s.ensureImageAvailable(ctx, stderr); err != nil {
 				return err
 			}
-			s.context = ctx
+			s.activateContext(ctx)
 			return nil
 		}
 		return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
@@ -1656,6 +1670,572 @@ func (s *shellState) runHostWithInput(line string, stdin io.Reader, stdout, stde
 		return persistentShellExit{code: code}
 	}
 	return nil
+}
+
+type copyEndpoint struct {
+	ctx       commandContext
+	path      string
+	directory bool
+}
+
+func (s *shellState) copyPath(command string, stdout, stderr io.Writer) error {
+	fields, err := splitShellFields(command)
+	if err != nil {
+		return err
+	}
+	if len(fields) != 2 {
+		return fmt.Errorf("usage: @copy SRC DST")
+	}
+	src, err := s.parseCopyEndpoint(fields[0])
+	if err != nil {
+		return err
+	}
+	dst, err := s.parseCopyEndpoint(fields[1])
+	if err != nil {
+		return err
+	}
+	switch {
+	case src.ctx.Mode == modeHost && dst.ctx.Mode == modeHost:
+		return copyHostPath(src.path, dst.path)
+	}
+	srcHost, srcOK := s.copyEndpointHostPath(src)
+	dstHost, dstOK := s.copyEndpointHostPath(dst)
+	if srcOK && dstOK {
+		return copyHostPath(srcHost, dstHost)
+	}
+	switch {
+	case src.ctx.Mode == modeHost && dst.ctx.Mode == modeVM:
+		return s.copyHostToGuest(src.path, dst, stderr)
+	case src.ctx.Mode == modeVM && dst.ctx.Mode == modeHost:
+		return s.copyGuestToHost(src, dst.path, stderr)
+	default:
+		return fmt.Errorf("@copy between two guest contexts is not supported yet")
+	}
+}
+
+func (s *shellState) copyEndpointHostPath(ep copyEndpoint) (string, bool) {
+	if ep.ctx.Mode == modeHost {
+		return ep.path, true
+	}
+	if ep.ctx.Mode == modeVM && !ep.ctx.Isolated {
+		return guestHostPathToHost(s.hostCWD, ep.path)
+	}
+	return "", false
+}
+
+func (s *shellState) parseCopyEndpoint(raw string) (copyEndpoint, error) {
+	ctx := s.context
+	value := raw
+	if strings.HasPrefix(raw, "@") {
+		target, rest, ok := strings.Cut(strings.TrimPrefix(raw, "@"), ":")
+		if !ok {
+			return copyEndpoint{}, fmt.Errorf("copy endpoint %q must use @target:path", raw)
+		}
+		value = rest
+		switch target {
+		case "host":
+			ctx = s.context.withOptions(commandOptions{})
+			ctx.Mode = modeHost
+		case "":
+			ctx = s.context
+		default:
+			ctx = s.context
+			ctx.Mode = modeVM
+			ctx.Image = target
+			if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
+				ctx.CWD = cwd
+			}
+		}
+	}
+	if ctx.Mode == modeHost {
+		return copyEndpoint{ctx: ctx, path: s.resolveHostCopyPath(value), directory: copyEndpointDirectoryHint(value)}, nil
+	}
+	return copyEndpoint{ctx: ctx, path: s.resolveGuestCopyPath(ctx, value), directory: copyEndpointDirectoryHint(value)}, nil
+}
+
+func copyEndpointDirectoryHint(value string) bool {
+	value = strings.TrimSpace(value)
+	return value == "" || value == "." || value == "~" || strings.HasSuffix(value, "/")
+}
+
+func (s *shellState) resolveHostCopyPath(value string) string {
+	if value == "" {
+		value = "."
+	}
+	if strings.HasPrefix(value, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			switch {
+			case value == "~":
+				value = home
+			case strings.HasPrefix(value, "~/"):
+				value = filepath.Join(home, value[2:])
+			}
+		}
+	}
+	value = os.ExpandEnv(value)
+	if !filepath.IsAbs(value) {
+		value = filepath.Join(s.hostCWD, value)
+	}
+	return filepath.Clean(value)
+}
+
+func (s *shellState) resolveGuestCopyPath(ctx commandContext, value string) string {
+	if value == "" {
+		value = "."
+	}
+	home := guestHomeDir(ctx)
+	if value == "~" {
+		return home
+	}
+	if strings.HasPrefix(value, "~/") {
+		return path.Clean(path.Join(home, value[2:]))
+	}
+	if strings.HasPrefix(value, "/") {
+		return path.Clean(value)
+	}
+	return path.Clean(path.Join(s.currentGuestCWD(ctx), filepath.ToSlash(value)))
+}
+
+func (s *shellState) currentGuestCWD(ctx commandContext) string {
+	if ctx.Mode != modeVM {
+		return ""
+	}
+	if ctx.CWD != "" {
+		return ctx.CWD
+	}
+	if s.contextCWD != nil {
+		if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
+			return cwd
+		}
+	}
+	if ctx.Isolated {
+		return guestHomeDir(ctx)
+	}
+	_, guestCWD, err := guestHostPaths(s.hostCWD)
+	if err != nil {
+		return guestHomeDir(ctx)
+	}
+	return guestCWD
+}
+
+func copyHostPath(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	target := hostCopyTarget(src, dst, info)
+	if info.IsDir() {
+		return copyHostDir(src, target, info.Mode())
+	}
+	return copyHostFile(src, target, info.Mode())
+}
+
+func (s *shellState) copyHostToGuest(src string, dst copyEndpoint, stderr io.Writer) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if err := s.ensureGuestCopyReady(dst.ctx, stderr); err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return s.copyHostDirToGuest(src, dst, stderr)
+	}
+	return s.copyHostFileToGuest(src, dst, stderr)
+}
+
+func (s *shellState) copyHostDirToGuest(src string, dst copyEndpoint, stderr io.Writer) error {
+	targetRoot := dst.path
+	if dst.directory {
+		targetRoot = path.Join(dst.path, filepath.ToSlash(filepath.Base(src)))
+	}
+	type dirCopyOp struct {
+		hostPath string
+		target   string
+		info     os.FileInfo
+		dir      bool
+	}
+	var ops []dirCopyOp
+	if err := filepath.WalkDir(src, func(filePath string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if filePath == src {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, filePath)
+		if err != nil {
+			return err
+		}
+		target := path.Join(targetRoot, filepath.ToSlash(rel))
+		if info.IsDir() {
+			ops = append(ops, dirCopyOp{target: target, dir: true})
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		ops = append(ops, dirCopyOp{hostPath: filePath, target: target, info: info})
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, op := range ops {
+		if op.dir {
+			if err := s.guestFSMkdir(dst.ctx, op.target, stderr); err != nil {
+				return err
+			}
+			continue
+		}
+		fileDst := dst
+		fileDst.path = op.target
+		fileDst.directory = false
+		if err := s.copyHostFileToGuest(op.hostPath, fileDst, stderr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *shellState) copyHostFileToGuest(src string, dst copyEndpoint, stderr io.Writer) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	target := dst.path
+	if dst.directory {
+		target = path.Join(target, filepath.ToSlash(filepath.Base(src)))
+	}
+	return s.guestFSWrite(dst.ctx, target, data, stderr)
+}
+
+func (s *shellState) guestFSMkdir(ctx commandContext, dir string, stderr io.Writer) error {
+	return s.runGuestFSRequest(ctx, client.ExecRequest{
+		Kind:  "fs_mkdir",
+		Image: localImageName(ctx.Image, ctx.Arch),
+		Path:  dir,
+		User:  guestRunUser(ctx),
+	}, stderr)
+}
+
+func (s *shellState) guestFSWrite(ctx commandContext, target string, data []byte, stderr io.Writer) error {
+	return s.runGuestFSRequest(ctx, client.ExecRequest{
+		Kind:  "fs_write",
+		Image: localImageName(ctx.Image, ctx.Arch),
+		Path:  target,
+		User:  guestRunUser(ctx),
+		Stdin: append([]byte(nil), data...),
+	}, stderr)
+}
+
+func (s *shellState) runGuestFSRequest(ctx commandContext, req client.ExecRequest, stderr io.Writer) error {
+	var exitSeen bool
+	var exitCode int
+	var eventErr error
+	if err := s.api.ExecStreamIn(ctx.VMID, req, nil, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "stderr":
+			writeExecEventOutput(stderr, event)
+		case "error":
+			eventErr = fmt.Errorf("%s", firstNonEmpty(event.Error, execEventText(event)))
+		case "exit":
+			exitSeen = true
+			exitCode = event.ExitCode
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if eventErr != nil {
+		return eventErr
+	}
+	if exitSeen && exitCode != 0 {
+		return persistentShellExit{code: exitCode}
+	}
+	if !exitSeen {
+		return fmt.Errorf("guest copy did not report completion")
+	}
+	return nil
+}
+
+func (s *shellState) copyGuestToHost(src copyEndpoint, dst string, stderr io.Writer) error {
+	if err := s.ensureGuestCopyReady(src.ctx, stderr); err != nil {
+		return err
+	}
+	var tarData bytes.Buffer
+	var exitSeen bool
+	var exitCode int
+	var eventErr error
+	if err := s.api.ExecStreamIn(src.ctx.VMID, client.ExecRequest{
+		Kind:  "fs_archive",
+		Image: localImageName(src.ctx.Image, src.ctx.Arch),
+		Path:  src.path,
+		User:  guestRunUser(src.ctx),
+	}, nil, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "stdout", "output":
+			_, _ = tarData.Write(execEventBytes(event))
+		case "stderr":
+			writeExecEventOutput(stderr, event)
+		case "error":
+			eventErr = fmt.Errorf("%s", firstNonEmpty(event.Error, execEventText(event)))
+		case "exit":
+			exitSeen = true
+			exitCode = event.ExitCode
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if eventErr != nil {
+		return eventErr
+	}
+	if exitSeen && exitCode != 0 {
+		return persistentShellExit{code: exitCode}
+	}
+	if !exitSeen {
+		return fmt.Errorf("guest copy did not report completion")
+	}
+	return extractTarToHost(bytes.NewReader(tarData.Bytes()), dst, false)
+}
+
+func (s *shellState) ensureGuestCopyReady(ctx commandContext, stderr io.Writer) error {
+	if ctx.Mode != modeVM {
+		return nil
+	}
+	if ctx.Image == "" {
+		return fmt.Errorf("no guest image selected; run @<oci-tag> or set one with @<oci-tag>")
+	}
+	if err := s.ensureImageAvailable(ctx, stderr); err != nil {
+		return err
+	}
+	return s.ensureVMRunning(ctx, stderr)
+}
+
+func writePathTar(w io.Writer, src, rootName string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	tw := tar.NewWriter(w)
+	defer tw.Close()
+	rootName = filepath.ToSlash(filepath.Base(rootName))
+	return filepath.WalkDir(src, func(filePath string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		fileInfo, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(filepath.Dir(src), filePath)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			rel = filepath.Base(src)
+			fileInfo = info
+		}
+		name := filepath.ToSlash(rel)
+		if rootName != "" {
+			parts := strings.SplitN(name, "/", 2)
+			if len(parts) == 1 {
+				name = rootName
+			} else {
+				name = rootName + "/" + parts[1]
+			}
+		}
+		header, err := tar.FileInfoHeader(fileInfo, "")
+		if err != nil {
+			return err
+		}
+		header.Name = name
+		if err := tw.WriteHeader(header); err != nil {
+			return err
+		}
+		if !fileInfo.Mode().IsRegular() {
+			return nil
+		}
+		file, err := os.Open(filePath)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(tw, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	})
+}
+
+func extractTarToHost(r io.Reader, dst string, sourceIsDir bool) error {
+	mode := hostCopyDestMode(dst, sourceIsDir)
+	tr := tar.NewReader(r)
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		target, err := hostTarTarget(dst, mode, header.Name)
+		if err != nil {
+			return err
+		}
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, os.FileMode(header.Mode).Perm()); err != nil {
+				return err
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			file, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(header.Mode).Perm())
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.Copy(file, tr)
+			closeErr := file.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+		default:
+			continue
+		}
+	}
+}
+
+type copyDestMode int
+
+const (
+	copyDestIntoDir copyDestMode = iota
+	copyDestExact
+)
+
+func hostCopyDestMode(dst string, sourceIsDir bool) copyDestMode {
+	if info, err := os.Stat(dst); err == nil && info.IsDir() {
+		return copyDestIntoDir
+	}
+	if sourceIsDir || strings.HasSuffix(dst, string(filepath.Separator)) {
+		return copyDestIntoDir
+	}
+	return copyDestExact
+}
+
+func hostTarTarget(dst string, mode copyDestMode, name string) (string, error) {
+	cleanName := path.Clean(strings.TrimPrefix(filepath.ToSlash(name), "/"))
+	if cleanName == "." || strings.HasPrefix(cleanName, "../") || cleanName == ".." {
+		return "", fmt.Errorf("unsafe tar path %q", name)
+	}
+	if mode == copyDestIntoDir {
+		return filepath.Join(dst, filepath.FromSlash(cleanName)), nil
+	}
+	parts := strings.SplitN(cleanName, "/", 2)
+	if len(parts) == 1 {
+		return dst, nil
+	}
+	return filepath.Join(dst, filepath.FromSlash(parts[1])), nil
+}
+
+func hostCopyTarget(src, dst string, info os.FileInfo) string {
+	if dstInfo, err := os.Stat(dst); err == nil && dstInfo.IsDir() {
+		return filepath.Join(dst, filepath.Base(src))
+	}
+	if strings.HasSuffix(dst, string(filepath.Separator)) {
+		return filepath.Join(dst, filepath.Base(src))
+	}
+	return dst
+}
+
+func copyHostDir(src, dst string, mode os.FileMode) error {
+	if err := os.MkdirAll(dst, mode.Perm()); err != nil {
+		return err
+	}
+	return filepath.WalkDir(src, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == src {
+			return nil
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return os.MkdirAll(target, info.Mode().Perm())
+		}
+		if info.Mode().IsRegular() {
+			return copyHostFile(path, target, info.Mode())
+		}
+		return nil
+	})
+}
+
+func copyHostFile(src, dst string, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode.Perm())
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+func (s *shellState) activateContext(ctx commandContext) {
+	s.rememberContextCWD(s.context)
+	if ctx.Mode == modeVM && ctx.CWD == "" {
+		if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
+			ctx.CWD = cwd
+		}
+	}
+	s.context = ctx
+}
+
+func (s *shellState) rememberContextCWD(ctx commandContext) {
+	if ctx.Mode != modeVM || ctx.CWD == "" {
+		return
+	}
+	if s.contextCWD == nil {
+		s.contextCWD = map[string]string{}
+	}
+	s.contextCWD[contextCWDKey(ctx)] = ctx.CWD
+}
+
+func contextCWDKey(ctx commandContext) string {
+	return strings.Join([]string{
+		string(ctx.Mode),
+		ctx.VMID,
+		localImageName(ctx.Image, ctx.Arch),
+		strconv.FormatBool(ctx.Isolated),
+		guestRunUser(ctx),
+	}, "\x00")
 }
 
 func sessionLastCode(err error) int {
@@ -2089,6 +2669,7 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 		s.lastCode = sessionLastCode(err)
 		if session.cwd() != "" {
 			s.context.CWD = session.cwd()
+			s.rememberContextCWD(s.context)
 		}
 		if err == nil || s.lastCode >= 0 {
 			return nil
@@ -2108,15 +2689,25 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 	if err := s.ensureVMRunning(ctx, stderr); err != nil {
 		return client.RunRequest{}, err
 	}
-	hostRoot, hostGuestCWD, err := guestHostPaths(s.hostCWD)
-	if err != nil {
-		return client.RunRequest{}, err
-	}
-	workDir := firstNonEmpty(ctx.CWD, hostGuestCWD)
+	workDir := ctx.CWD
 	req := client.RunRequest{
-		Image:   localImageName(ctx.Image, ctx.Arch),
-		Command: guestCommand(line, tty),
-		Shares: []client.ShareMount{{
+		Image:      localImageName(ctx.Image, ctx.Arch),
+		Command:    guestCommand(line, tty),
+		WorkDir:    workDir,
+		User:       guestRunUser(ctx),
+		MemoryMB:   ctx.MemoryMB,
+		CPUs:       ctx.CPUs,
+		NestedVirt: ctx.NestedVirt,
+	}
+	if ctx.Isolated {
+		req.WorkDir = firstNonEmpty(req.WorkDir, guestHomeDir(ctx))
+	} else {
+		hostRoot, hostGuestCWD, err := guestHostPaths(s.hostCWD)
+		if err != nil {
+			return client.RunRequest{}, err
+		}
+		req.WorkDir = firstNonEmpty(req.WorkDir, hostGuestCWD)
+		req.Shares = []client.ShareMount{{
 			Source:   hostRoot,
 			Mount:    guestHostMount,
 			Writable: true,
@@ -2124,12 +2715,7 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 			OwnerUID: defaultGuestUID,
 			OwnerGID: defaultGuestGID,
 			Cache:    "strict",
-		}},
-		WorkDir:    workDir,
-		User:       guestRunUser(ctx),
-		MemoryMB:   ctx.MemoryMB,
-		CPUs:       ctx.CPUs,
-		NestedVirt: ctx.NestedVirt,
+		}}
 	}
 	if tty {
 		req.TTY = true
@@ -2395,6 +2981,13 @@ func execEventText(event client.ExecEvent) string {
 		return string(event.Data)
 	}
 	return event.Output
+}
+
+func execEventBytes(event client.ExecEvent) []byte {
+	if len(event.Data) > 0 {
+		return event.Data
+	}
+	return []byte(event.Output)
 }
 
 func (p *persistentGuestShell) cwd() string {
@@ -3364,7 +3957,11 @@ func (s *shellState) chdirGuest(target string) error {
 	}
 	current := s.context.CWD
 	if current == "" {
-		_, current, _ = guestHostPaths(s.hostCWD)
+		if s.context.Isolated {
+			current = guestHomeDir(s.context)
+		} else {
+			_, current, _ = guestHostPaths(s.hostCWD)
+		}
 	}
 	home := guestHomeDir(s.context)
 	if target == "" || target == "~" {
@@ -3381,6 +3978,9 @@ func (s *shellState) chdirGuest(target string) error {
 	}
 	target = path.Clean(target)
 	if strings.HasPrefix(target, guestHostMount+"/") || target == guestHostMount {
+		if s.context.Isolated {
+			return fmt.Errorf("%s is not mounted in isolated context", guestHostMount)
+		}
 		hostPath, ok := guestHostPathToHost(s.hostCWD, target)
 		if !ok {
 			return fmt.Errorf("cannot map guest host path %q", target)
@@ -3392,6 +3992,7 @@ func (s *shellState) chdirGuest(target string) error {
 		return nil
 	}
 	s.context.CWD = target
+	s.rememberContextCWD(s.context)
 	return nil
 }
 
@@ -3412,13 +4013,10 @@ func guestHostPathToHost(hostCWD, guestPath string) (string, bool) {
 
 func (s *shellState) prompt() string {
 	promptCWD := s.hostCWD
-	if s.context.Mode == modeVM && s.context.CWD != "" {
-		promptCWD = s.context.CWD
+	if s.context.Mode == modeVM {
+		promptCWD = s.currentGuestCWD(s.context)
 	}
-	leaf := filepath.Base(promptCWD)
-	if leaf == "." || leaf == string(filepath.Separator) {
-		leaf = promptCWD
-	}
+	leaf := displayPathLeaf(promptCWD, s.context.Mode)
 	base := colorGreen + "➜" + colorReset + "  " + colorCyan + leaf + colorReset
 	if s.context.Mode == modeVM {
 		target := "(" + contextImageText(s.context)
@@ -3426,9 +4024,28 @@ func (s *shellState) prompt() string {
 			target += ":" + s.context.VMID
 		}
 		target += ")"
-		return base + " " + colorMagenta + "vm:" + colorReset + colorYellow + target + colorReset + " "
+		label := "vm:"
+		if s.context.Isolated {
+			label = "vm isolated:"
+		}
+		return base + " " + colorMagenta + label + colorReset + colorYellow + target + colorReset + " "
 	}
 	return base + " " + colorBlue + "host" + colorReset + " "
+}
+
+func displayPathLeaf(value string, mode shellMode) string {
+	if mode == modeVM {
+		leaf := path.Base(value)
+		if leaf == "." || leaf == "/" {
+			return value
+		}
+		return leaf
+	}
+	leaf := filepath.Base(value)
+	if leaf == "." || leaf == string(filepath.Separator) {
+		return value
+	}
+	return leaf
 }
 
 func contextImageText(ctx commandContext) string {
@@ -3521,11 +4138,13 @@ func (s *shellState) printStatus(w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(w, "context: %s\nimage: %s\nvm: %s\nhost cwd: %s\nvm status: %s\n",
+	_, err = fmt.Fprintf(w, "context: %s\nimage: %s\nvm: %s\nisolated: %t\nhost cwd: %s\nguest cwd: %s\nvm status: %s\n",
 		s.context.Mode,
 		emptyText(contextImageText(s.context), "-"),
 		emptyText(s.context.VMID, "-"),
+		s.context.Isolated,
 		s.hostCWD,
+		emptyText(s.currentGuestCWD(s.context), "-"),
 		emptyText(state.Status, "unknown"),
 	)
 	if state.NetworkIPv4 != "" {
@@ -3602,9 +4221,10 @@ func (s *shellState) help(w io.Writer) error {
 @restart [--vm id]       restart a VM after confirmation
 @save [--vm id] tag      save the selected VM root filesystem as a local image
 @rmi image               remove a locally cached image
+@copy SRC DST            copy files between @host: and VM contexts
 @tmux [session]          open tmux with vmsh as the default pane command
 @forward H:G             forward host port H to guest port G
-opts: --vm id --cwd path --user user --sudo --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested
+opts: --vm id --cwd path --user user --sudo --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared
 cd <dir>                 change the current host or VM working directory
 exit                     leave vmsh
 `))
@@ -3751,6 +4371,18 @@ func parseCommandOptions(tokens []shellToken, start int) (commandOptions, int, e
 			}
 			enabled := false
 			opts.NestedVirt = &enabled
+		case "--isolated":
+			if hasInlineValue {
+				return opts, i, fmt.Errorf("--isolated does not take a value")
+			}
+			enabled := true
+			opts.Isolated = &enabled
+		case "--shared":
+			if hasInlineValue {
+				return opts, i, fmt.Errorf("--shared does not take a value")
+			}
+			enabled := false
+			opts.Isolated = &enabled
 		default:
 			return opts, i, fmt.Errorf("unknown vmsh option %q", name)
 		}
@@ -3786,6 +4418,9 @@ func (c commandContext) withOptions(opts commandOptions) commandContext {
 	}
 	if opts.NestedVirt != nil {
 		c.NestedVirt = *opts.NestedVirt
+	}
+	if opts.Isolated != nil {
+		c.Isolated = *opts.Isolated
 	}
 	return c
 }

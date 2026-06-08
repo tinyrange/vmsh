@@ -183,6 +183,23 @@ func TestParseAtLineArchOption(t *testing.T) {
 	}
 }
 
+func TestParseAtLineIsolatedOption(t *testing.T) {
+	got, err := parseAtLine(`@alpine --isolated sh`)
+	if err != nil {
+		t.Fatalf("parseAtLine() error = %v", err)
+	}
+	if got.Options.Isolated == nil || !*got.Options.Isolated {
+		t.Fatalf("isolated option = %#v, want true", got.Options.Isolated)
+	}
+	got, err = parseAtLine(`@alpine --shared sh`)
+	if err != nil {
+		t.Fatalf("parseAtLine(shared) error = %v", err)
+	}
+	if got.Options.Isolated == nil || *got.Options.Isolated {
+		t.Fatalf("shared option = %#v, want false", got.Options.Isolated)
+	}
+}
+
 func TestBareOCISelectsCurrentContextAndPreparesImage(t *testing.T) {
 	api := &fakeVMSHAPI{status: client.InstanceState{ID: "default", Status: "stopped"}}
 	sh := &shellState{api: api, context: defaultContext("default", "", false), hostCWD: t.TempDir()}
@@ -242,6 +259,44 @@ func TestBareOCIPullsMissingImageWithoutBooting(t *testing.T) {
 	gotStatus := stderr.String()
 	if !strings.Contains(gotStatus, "Pull alpine") || !strings.Contains(gotStatus, "downloading") || strings.Contains(gotStatus, "{") {
 		t.Fatalf("pull status = %q, want human-readable pull progress", gotStatus)
+	}
+}
+
+func TestBareOCISelectsIsolatedContext(t *testing.T) {
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "default", Status: "stopped"}}
+	sh := &shellState{api: api, context: defaultContext("default", "", false), hostCWD: t.TempDir(), contextCWD: map[string]string{}}
+	if err := sh.eval(`@alpine --isolated`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("eval(@alpine --isolated) error = %v", err)
+	}
+	if sh.context.Mode != modeVM || sh.context.Image != "alpine" || !sh.context.Isolated {
+		t.Fatalf("context = %#v, want isolated vm/alpine", sh.context)
+	}
+	if len(api.starts) != 0 {
+		t.Fatalf("starts = %d, want 0", len(api.starts))
+	}
+	if !strings.Contains(sh.prompt(), "vm isolated:") {
+		t.Fatalf("prompt = %q, want isolated signal", sh.prompt())
+	}
+}
+
+func TestIsolatedPromptUsesGuestDefaultCWD(t *testing.T) {
+	hostRoot := t.TempDir()
+	hostCWD := filepath.Join(hostRoot, "host-work")
+	if err := os.Mkdir(hostCWD, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sh := &shellState{
+		context:    commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Isolated: true},
+		hostCWD:    hostCWD,
+		contextCWD: map[string]string{},
+	}
+
+	prompt := sh.prompt()
+	if strings.Contains(prompt, "host-work") {
+		t.Fatalf("prompt = %q, used host cwd in isolated context", prompt)
+	}
+	if !strings.Contains(prompt, "cc") {
+		t.Fatalf("prompt = %q, want guest home leaf", prompt)
 	}
 }
 
@@ -786,6 +841,67 @@ func TestGuestRunRequestsUseStreamingPath(t *testing.T) {
 		if run.id != "work" || run.req.Image != "alpine" {
 			t.Fatalf("stream = %#v", run)
 		}
+	}
+}
+
+func TestIsolatedGuestRunDoesNotMountHost(t *testing.T) {
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Isolated: true}, hostCWD: t.TempDir(), imageCache: map[string]bool{}}
+
+	if err := sh.runGuest(sh.context, "pwd", io.Discard, io.Discard); err != nil {
+		t.Fatalf("runGuest() error = %v", err)
+	}
+	if len(api.streams) != 1 {
+		t.Fatalf("streams = %d, want 1", len(api.streams))
+	}
+	req := api.streams[0].req
+	if len(req.Shares) != 0 {
+		t.Fatalf("shares = %#v, want none", req.Shares)
+	}
+	if req.WorkDir != "/home/cc" {
+		t.Fatalf("workdir = %q, want guest home", req.WorkDir)
+	}
+}
+
+func TestSharedGuestRunStillMountsHost(t *testing.T) {
+	dir := t.TempDir()
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine"}, hostCWD: dir, imageCache: map[string]bool{}}
+
+	if err := sh.runGuest(sh.context, "pwd", io.Discard, io.Discard); err != nil {
+		t.Fatalf("runGuest() error = %v", err)
+	}
+	req := api.streams[0].req
+	if len(req.Shares) != 1 || req.Shares[0].Mount != guestHostMount {
+		t.Fatalf("shares = %#v, want /host mount", req.Shares)
+	}
+	_, wantCWD, err := guestHostPaths(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.WorkDir != wantCWD {
+		t.Fatalf("workdir = %q, want %q", req.WorkDir, wantCWD)
+	}
+}
+
+func TestContextCWDIsRememberedPerIsolationMode(t *testing.T) {
+	sh := &shellState{
+		context:    commandContext{Mode: modeVM, VMID: "work", Image: "alpine", CWD: "/shared"},
+		hostCWD:    t.TempDir(),
+		contextCWD: map[string]string{},
+	}
+	sh.activateContext(commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Isolated: true})
+	if sh.context.CWD != "" {
+		t.Fatalf("isolated cwd = %q, want empty/new context", sh.context.CWD)
+	}
+	sh.context.CWD = "/iso"
+	sh.activateContext(commandContext{Mode: modeVM, VMID: "work", Image: "alpine"})
+	if sh.context.CWD != "/shared" {
+		t.Fatalf("shared cwd = %q, want /shared", sh.context.CWD)
+	}
+	sh.activateContext(commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Isolated: true})
+	if sh.context.CWD != "/iso" {
+		t.Fatalf("isolated restored cwd = %q, want /iso", sh.context.CWD)
 	}
 }
 
@@ -1787,6 +1903,151 @@ func TestGuestHostPathToHostPreservesMountedRoot(t *testing.T) {
 	}
 }
 
+func TestCopySharedGuestPathUsesHostMountMapping(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	if err := os.Mkdir(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "main.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "dst")
+	if err := os.Mkdir(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, guestDst, err := guestHostPaths(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh := &shellState{
+		context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine", CWD: guestDst},
+		hostCWD: dir,
+	}
+
+	if err := sh.evalAt("@copy @host:./src .", io.Discard, io.Discard); err != nil {
+		t.Fatalf("@copy shared host->guest error = %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "src", "main.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("copied file = %q, want hello", got)
+	}
+}
+
+func TestCopyHostToIsolatedGuestUsesAgentFSWrite(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	if err := os.Mkdir(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "main.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	sh := &shellState{
+		api:        api,
+		context:    commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Isolated: true, CWD: "/work"},
+		hostCWD:    dir,
+		imageCache: map[string]bool{},
+	}
+
+	if err := sh.evalAt("@copy @host:./src .", io.Discard, io.Discard); err != nil {
+		t.Fatalf("@copy isolated host->guest error = %v", err)
+	}
+	if len(api.streams) != 0 {
+		t.Fatalf("streams = %d, want 0", len(api.streams))
+	}
+	if len(api.execStreams) != 1 {
+		t.Fatalf("exec streams = %d, want fs_write", len(api.execStreams))
+	}
+	req := api.execStreams[0].req
+	if req.Kind != "fs_write" || req.Path != "/work/src/main.txt" {
+		t.Fatalf("exec request = %#v, want fs_write /work/src/main.txt", req)
+	}
+	if string(req.Stdin) != "hello" {
+		t.Fatalf("stdin = %q, want hello", string(req.Stdin))
+	}
+}
+
+func TestCopyHostFileToGuestCurrentDirectoryUsesAgentFSWrite(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	sh := &shellState{
+		api:        api,
+		context:    commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Isolated: true, CWD: "/home/cc"},
+		hostCWD:    dir,
+		imageCache: map[string]bool{},
+	}
+
+	if err := sh.evalAt("@copy @host:./go.mod .", io.Discard, io.Discard); err != nil {
+		t.Fatalf("@copy isolated file error = %v", err)
+	}
+	if len(api.streams) != 0 {
+		t.Fatalf("streams = %d, want 0", len(api.streams))
+	}
+	if len(api.execStreams) != 1 {
+		t.Fatalf("exec streams = %d, want fs_write", len(api.execStreams))
+	}
+	req := api.execStreams[0].req
+	if req.Kind != "fs_write" || req.Path != "/home/cc/go.mod" {
+		t.Fatalf("exec request = %#v, want fs_write /home/cc/go.mod", req)
+	}
+	if string(req.Stdin) != "module example.test\n" {
+		t.Fatalf("stdin = %q, want module payload", string(req.Stdin))
+	}
+}
+
+func TestCopyIsolatedGuestToHostUsesAgentFSArchive(t *testing.T) {
+	dir := t.TempDir()
+	srcRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(srcRoot, "out.txt"), []byte("guest"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var tarData bytes.Buffer
+	if err := writePathTar(&tarData, filepath.Join(srcRoot, "out.txt"), "out.txt"); err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeVMSHAPI{
+		status: client.InstanceState{ID: "work", Status: "running"},
+		streamEventsByCommand: map[string][]client.ExecEvent{
+			"fs_archive:/work/out.txt": {
+				{Kind: "stdout", Data: tarData.Bytes()},
+				{Kind: "exit", ExitCode: 0},
+			},
+		},
+	}
+	sh := &shellState{
+		api:        api,
+		context:    commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Isolated: true, CWD: "/work"},
+		hostCWD:    dir,
+		imageCache: map[string]bool{},
+	}
+
+	if err := sh.evalAt("@copy ./out.txt @host:./copied.txt", io.Discard, io.Discard); err != nil {
+		t.Fatalf("@copy isolated guest->host error = %v", err)
+	}
+	if len(api.execStreams) != 1 {
+		t.Fatalf("exec streams = %d, want 1", len(api.execStreams))
+	}
+	req := api.execStreams[0].req
+	if req.Kind != "fs_archive" || req.Path != "/work/out.txt" {
+		t.Fatalf("exec request = %#v, want fs_archive /work/out.txt", req)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "copied.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "guest" {
+		t.Fatalf("copied file = %q, want guest", got)
+	}
+}
+
 func TestParsePortForwardSpec(t *testing.T) {
 	forward, err := parsePortForwardSpec("8080:80")
 	if err != nil {
@@ -1802,6 +2063,7 @@ type fakeVMSHAPI struct {
 	status                client.InstanceState
 	statuses              []client.InstanceState
 	streams               []fakeRun
+	execStreams           []fakeExec
 	streamInputs          []fakeRunInput
 	starts                []fakeStart
 	shutdowns             []string
@@ -1823,6 +2085,11 @@ type fakeVMSHAPI struct {
 type fakeRun struct {
 	id  string
 	req client.RunRequest
+}
+
+type fakeExec struct {
+	id  string
+	req client.ExecRequest
 }
 
 type fakeRunInput struct {
@@ -1981,6 +2248,39 @@ func (f *fakeVMSHAPI) RunInteractiveStreamIn(id string, req client.RunRequest, i
 				events = commandEvents
 				break
 			}
+		}
+	}
+	f.mu.Unlock()
+	if len(events) == 0 {
+		events = []client.ExecEvent{{Kind: "exit", ExitCode: 0}}
+	}
+	for _, event := range events {
+		if onEvent != nil {
+			if err := onEvent(event); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (f *fakeVMSHAPI) ExecStreamIn(id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	var captured []client.ExecInput
+	if inputs != nil {
+		for input := range inputs {
+			captured = append(captured, input)
+		}
+	}
+	f.mu.Lock()
+	f.execStreams = append(f.execStreams, fakeExec{id: id, req: req})
+	if inputs != nil {
+		f.streamInputs = append(f.streamInputs, fakeRunInput{id: id, command: req.Kind + ":" + req.Path, inputs: captured})
+	}
+	events := f.streamEvents
+	if f.streamEventsByCommand != nil {
+		key := req.Kind + ":" + req.Path
+		if commandEvents, ok := f.streamEventsByCommand[key]; ok {
+			events = commandEvents
 		}
 	}
 	f.mu.Unlock()

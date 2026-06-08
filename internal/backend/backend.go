@@ -37,6 +37,7 @@ type API interface {
 	RunStreamIn(string, client.RunRequest, func(client.ExecEvent) error) error
 	RunStreamInContext(context.Context, string, client.RunRequest, func(client.ExecEvent) error) error
 	RunInteractiveStreamIn(string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+	ExecStreamIn(string, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 }
 
 type DaemonState struct {
