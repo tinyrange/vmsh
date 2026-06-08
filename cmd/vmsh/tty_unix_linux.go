@@ -53,6 +53,8 @@ func makeRawTerminal(file *os.File) (func(), error) {
 	}, nil
 }
 
+func interruptTerminalRead(*os.File) {}
+
 func prepareTerminalOutput(*os.File) func() {
 	return func() {}
 }

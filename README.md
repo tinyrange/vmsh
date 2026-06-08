@@ -50,10 +50,9 @@ Fast parser, shell-state, and client tests do not need VM support.
 - `cmd/vmsh`: the `vmsh` shell and tests.
 - `cc`: git submodule containing `ccvm`, VM backends, image import, and the
   lower-level `cc` CLI.
-- `tools/build_vmsh.sh`: local Unix build helper for `cc`, `ccvm`, and `vmsh`.
-- `tools/run_vmsh.sh`: local development runner that builds guest init payloads,
-  builds `ccvm` from the submodule, builds `vmsh`, signs `ccvm` on macOS, and
-  launches `vmsh -ccvm build/vmsh/ccvm`.
+- `tools/build.go`: local build and run helper for `cc`, `ccvm`, and `vmsh`.
+  It builds guest init payloads, builds `ccvm` from the submodule, builds
+  `vmsh`, signs `ccvm` on macOS, and can launch `vmsh -ccvm build/vmsh/ccvm`.
 - `.github/workflows/ci.yml`: portable Go tests plus opt-in live VM smoke tests
   for KVM and WHP runners.
 - `.github/workflows/release.yml`: tag-triggered single-binary releases for
@@ -77,7 +76,13 @@ git submodule update --init --recursive
 Run the shell locally:
 
 ```sh
-./tools/run_vmsh.sh
+./tools/build.go run
+```
+
+On Windows, the same helper can be run with:
+
+```powershell
+go run .\tools\build.go run
 ```
 
 Run an existing `ccvm` binary instead:
@@ -90,7 +95,7 @@ go build -o build/vmsh/vmsh ./cmd/vmsh
 Run a non-interactive script, which is useful for CI and smoke tests:
 
 ```sh
-./tools/build_vmsh.sh
+./tools/build.go
 ./build/vmsh/cc -ccvm ./build/vmsh/ccvm pull alpine ./cc/fixtures/alpine.simg
 
 cat > /tmp/vmsh-smoke <<'EOF'

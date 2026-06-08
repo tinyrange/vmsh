@@ -725,6 +725,15 @@ func TestAtSudoUsesGuestRootWhenVMSelected(t *testing.T) {
 	}
 }
 
+func TestPersistentGuestCommandAllowedDoesNotDependOnHostSupport(t *testing.T) {
+	if !persistentGuestCommandAllowed("ls") {
+		t.Fatal("persistentGuestCommandAllowed(ls) = false, want true")
+	}
+	if persistentGuestCommandAllowed("cat") {
+		t.Fatal("persistentGuestCommandAllowed(cat) = true, want false without arguments")
+	}
+}
+
 func TestGuestRunRequestsUseStreamingPath(t *testing.T) {
 	dir := t.TempDir()
 	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}

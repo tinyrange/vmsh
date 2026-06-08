@@ -46,6 +46,13 @@ func makeRawTerminal(file *os.File) (func(), error) {
 	}, nil
 }
 
+func interruptTerminalRead(file *os.File) {
+	if file == nil {
+		return
+	}
+	_ = windows.CancelIoEx(windows.Handle(file.Fd()), nil)
+}
+
 func prepareTerminalOutput(file *os.File) func() {
 	handle := windows.Handle(file.Fd())
 	var original uint32

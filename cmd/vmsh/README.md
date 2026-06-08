@@ -121,8 +121,8 @@ context or a one-shot command.
 
 ## Building
 
-For local development, `tools/run_vmsh.sh` builds `ccvm` and `vmsh` separately
-and runs `vmsh -ccvm build/vmsh/ccvm`.
+For local development, `tools/build.go run` builds `ccvm` and `vmsh`
+separately and runs `vmsh -ccvm build/vmsh/ccvm`.
 
 `vmsh` keeps `cc` as a submodule. After cloning, initialize it with:
 
@@ -133,7 +133,13 @@ git submodule update --init --recursive
 Then run:
 
 ```sh
-./tools/run_vmsh.sh
+./tools/build.go run
+```
+
+On Windows, run the same helper with:
+
+```powershell
+go run .\tools\build.go run
 ```
 
 The runner builds the Linux guest init payloads and `ccvm` inside the `cc`

@@ -1724,6 +1724,10 @@ func persistentHostCommandAllowed(line string) bool {
 	if runtime.GOOS == "windows" {
 		return false
 	}
+	return persistentShellCommandAllowed(line)
+}
+
+func persistentShellCommandAllowed(line string) bool {
 	fields, err := splitShellFields(line)
 	if err != nil || len(fields) == 0 {
 		return false
@@ -2113,7 +2117,7 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 		}
 		var interrupted atomic.Bool
 		err = session.run(line, stdout, stderr, func() (func(), error) {
-			return s.startGuestInputForwarding(req.TTY, session.inputs, stdout, stderr, func(name string) {
+			return s.startGuestInputForwarding(req.TTY, false, session.inputs, stdout, stderr, func(name string) {
 				if name == "INT" {
 					interrupted.Store(true)
 				}
@@ -2185,7 +2189,7 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 }
 
 func persistentGuestCommandAllowed(line string) bool {
-	return persistentHostCommandAllowed(line)
+	return persistentShellCommandAllowed(line)
 }
 
 func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequest) (*persistentGuestShell, error) {
@@ -2435,7 +2439,7 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 	}
 
 	inputs := make(chan client.ExecInput, 8)
-	stopForwarding, err := s.startGuestInputForwarding(req.TTY, inputs, stdout, stderr)
+	stopForwarding, err := s.startGuestInputForwarding(req.TTY, true, inputs, stdout, stderr)
 	if err != nil {
 		return err
 	}
@@ -2563,11 +2567,12 @@ func sendGuestInputBlocking(out chan<- client.ExecInput, done <-chan struct{}, i
 	}
 }
 
-func (s *shellState) startGuestInputForwarding(tty bool, inputs chan<- client.ExecInput, stdout, stderr io.Writer, onSignal ...func(string)) (func(), error) {
+func (s *shellState) startGuestInputForwarding(tty, forwardStdin bool, inputs chan<- client.ExecInput, stdout, stderr io.Writer, onSignal ...func(string)) (func(), error) {
 	restore := func() {}
 	done := make(chan struct{})
+	cancelRead := func() {}
 	var producers sync.WaitGroup
-	if tty {
+	if tty && forwardStdin {
 		file, ok := stdout.(*os.File)
 		if ok && isTerminalFD(int(file.Fd())) && isTerminalFD(int(os.Stdin.Fd())) {
 			terminalRestore, err := makeRawTerminal(os.Stdin)
@@ -2575,6 +2580,7 @@ func (s *shellState) startGuestInputForwarding(tty bool, inputs chan<- client.Ex
 				return nil, err
 			}
 			restore = terminalRestore
+			cancelRead = func() { interruptTerminalRead(os.Stdin) }
 			producers.Add(1)
 			go func() {
 				defer producers.Done()
@@ -2590,6 +2596,7 @@ func (s *shellState) startGuestInputForwarding(tty bool, inputs chan<- client.Ex
 	}()
 	return stopGuestInputForwarding(restore, func() {
 		close(done)
+		cancelRead()
 		producers.Wait()
 	}), nil
 }
