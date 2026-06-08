@@ -231,3 +231,18 @@ jobs:
           go test -p 1 -tags embed_guestinit ./internal/vm
           -run 'TestWindowsRuntimeBackend(RunCommand|StartThenExec|RunStreamForwardsStdin|StartWithWritableShare)$'
           -count=1 -v
+
+      - name: Run vmsh Windows guest command smoke
+        shell: pwsh
+        run: |
+          $cache = Join-Path $env:RUNNER_TEMP "vmsh-cache"
+          $script = Join-Path $env:RUNNER_TEMP "vmsh-windows-smoke.vmsh"
+          $out = Join-Path $env:RUNNER_TEMP "vmsh-windows.out"
+          New-Item -ItemType Directory -Force $cache | Out-Null
+          .\build\ci\cc.exe -ccvm .\build\ci\ccvm.exe -cache-dir $cache pull alpine .\cc\fixtures\alpine.simg
+          "@alpine --vm ci-windows --memory 256 --no-network --no-nested sh -lc 'whoami; uname -m; printf vmsh-windows-ok'" | Set-Content -Path $script
+          .\build\ci\vmsh.exe -ccvm .\build\ci\ccvm.exe -cache-dir $cache -script $script | Tee-Object -FilePath $out
+          if (-not (Select-String -Path $out -Pattern "vmsh-windows-ok" -Quiet)) {
+            Get-Content $out
+            throw "vmsh Windows smoke output did not contain vmsh-windows-ok"
+          }
