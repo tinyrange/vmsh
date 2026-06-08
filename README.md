@@ -202,9 +202,9 @@ The workflow is split by capability:
   boot probes, and executes a `vmsh` script against the tracked Alpine SIMG
   fixture.
 - A hosted `windows-2025` job checks WHP availability and boots an Alpine
-  kernel far enough to observe serial output. The current `cc` submodule notes
-  that managed guest command progress on GitHub Windows runners is not yet
-  reliable, so the full guest command smoke currently runs on Linux AMD64.
+  kernel, then runs live WHP guest runtime probes for vsock, virtio-fs, managed
+  exec, streamed stdin, writable host shares, and a full `vmsh.exe` script smoke
+  against the tracked Alpine SIMG fixture.
 
 The live jobs use the checked-in `cc/fixtures/alpine.simg` fixture so they can
 boot and run simple guest commands without depending on an external image pull.
@@ -222,16 +222,19 @@ The workflow builds one standalone `vmsh` binary per target:
 
 - `linux/amd64`
 - `linux/arm64`
+- `windows/amd64`
 - `darwin/arm64`
-
-Windows release binaries are temporarily disabled while Windows-specific
-single-binary validation is handled on a Windows system.
 
 Release binaries are built with `embed_ccvm` and `embed_guestinit`. That compiles
 the `ccvm` daemon entrypoint into the same Go executable as `vmsh` and embeds
 the static Linux guest init payloads for amd64 and arm64 guests. At runtime,
 `vmsh` re-execs itself with `VMSH_INTERNAL_CCVM=1` when it needs to start the
 daemon, so release assets do not need a `ccvm` sidecar.
+
+The release workflow also supports manual dry runs from GitHub Actions. Use
+`workflow_dispatch`, provide a version string for artifact names, and leave
+`publish` disabled to build, sign, notarize, upload artifacts, and generate
+checksums without creating a GitHub Release.
 
 The macOS binary is built on `macos-15` and codesigned with the Hypervisor
 entitlement from `tools/entitlements.xml`. Configure these repository secrets

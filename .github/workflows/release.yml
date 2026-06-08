@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version string to use in artifact names, for example v0.1.0-rc.1
+        required: true
+        default: v0.0.0-dryrun
+      publish:
+        description: Publish a GitHub Release after building artifacts
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: write
@@ -11,6 +22,9 @@ permissions:
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
+
+env:
+  RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
 
 jobs:
   build-unix-windows:
@@ -48,7 +62,7 @@ jobs:
           EXE: ${{ matrix.ext }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME}"
+          version="${RELEASE_VERSION}"
           name="vmsh_${version}_${GOOS}_${GOARCH}${EXE}"
           mkdir -p dist build/release
 
@@ -64,7 +78,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vmsh-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/vmsh_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext }}
+          path: dist/vmsh_${{ env.RELEASE_VERSION }}_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext }}
           if-no-files-found: error
 
   build-macos:
@@ -127,7 +141,7 @@ jobs:
       - name: Build macOS payload
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME}"
+          version="${RELEASE_VERSION}"
           name="vmsh_${version}_darwin_arm64"
           mkdir -p dist build/release
 
@@ -142,7 +156,7 @@ jobs:
       - name: Sign macOS binaries
         run: |
           set -euo pipefail
-          name="vmsh_${GITHUB_REF_NAME}_darwin_arm64"
+          name="vmsh_${RELEASE_VERSION}_darwin_arm64"
           codesign \
             --force \
             --sign "$MACOS_DEVELOPER_ID" \
@@ -157,7 +171,7 @@ jobs:
       - name: Notarize macOS binary
         run: |
           set -euo pipefail
-          name="vmsh_${GITHUB_REF_NAME}_darwin_arm64"
+          name="vmsh_${RELEASE_VERSION}_darwin_arm64"
           notary_zip="dist/${name}_notary.zip"
           ditto -c -k --keepParent "dist/${name}" "$notary_zip"
 
@@ -183,7 +197,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vmsh-darwin-arm64
-          path: dist/vmsh_${{ github.ref_name }}_darwin_arm64
+          path: dist/vmsh_${{ env.RELEASE_VERSION }}_darwin_arm64
           if-no-files-found: error
 
   publish:
@@ -205,9 +219,18 @@ jobs:
             sed 's#artifacts/[^/]*/##' > checksums.txt
           cat checksums.txt
 
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmsh-checksums
+          path: checksums.txt
+          if-no-files-found: error
+
       - name: Create GitHub Release
+        if: github.event_name == 'push' || inputs.publish
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_VERSION }}
           generate_release_notes: true
           files: |
             artifacts/**/vmsh_*
