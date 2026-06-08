@@ -994,32 +994,28 @@ func TestVMCDUsesGuestCWD(t *testing.T) {
 
 func TestVMCDUsesGuestHome(t *testing.T) {
 	tests := []struct {
-		name        string
-		ctx         commandContext
-		input       string
-		want        string
-		wantWindows string
+		name  string
+		ctx   commandContext
+		input string
+		want  string
 	}{
 		{
-			name:        "ubuntu default user",
-			ctx:         commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Network: true},
-			input:       "cd\npwd\n",
-			want:        "/home/ubuntu",
-			wantWindows: "/root",
+			name:  "ubuntu default user",
+			ctx:   commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Network: true},
+			input: "cd\npwd\n",
+			want:  "/home/ubuntu",
 		},
 		{
-			name:        "ubuntu tilde child",
-			ctx:         commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Network: true},
-			input:       "cd ~/src\npwd\n",
-			want:        "/home/ubuntu/src",
-			wantWindows: "/root/src",
+			name:  "ubuntu tilde child",
+			ctx:   commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Network: true},
+			input: "cd ~/src\npwd\n",
+			want:  "/home/ubuntu/src",
 		},
 		{
-			name:        "created default user",
-			ctx:         commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true},
-			input:       "cd ~\npwd\n",
-			want:        "/home/cc",
-			wantWindows: "/root",
+			name:  "created default user",
+			ctx:   commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true},
+			input: "cd ~\npwd\n",
+			want:  "/home/cc",
 		},
 		{
 			name:  "root user",
@@ -1035,12 +1031,8 @@ func TestVMCDUsesGuestHome(t *testing.T) {
 			if err := sh.runScript(strings.NewReader(tt.input), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 				t.Fatalf("runScript() error = %v", err)
 			}
-			want := tt.want
-			if runtime.GOOS == "windows" && tt.wantWindows != "" {
-				want = tt.wantWindows
-			}
-			if len(api.streams) != 1 || api.streams[0].req.WorkDir != want {
-				t.Fatalf("workdir = %#v, want %s", api.streams, want)
+			if len(api.streams) != 1 || api.streams[0].req.WorkDir != tt.want {
+				t.Fatalf("workdir = %#v, want %s", api.streams, tt.want)
 			}
 		})
 	}
@@ -1573,9 +1565,6 @@ func TestGuestCommandEnvPrefersExplicitExportsOverTerminalEnv(t *testing.T) {
 	got := guestCommandEnv(ctx, map[string]string{"TERM": "xterm"}, []string{"TERM=xterm-ghostty", "COLUMNS=183", "LINES=50"})
 	joined := strings.Join(got, "\n")
 	wantHome := "HOME=/home/ubuntu"
-	if runtime.GOOS == "windows" {
-		wantHome = "HOME=/root"
-	}
 	for _, want := range []string{"TERM=xterm", "COLUMNS=183", "LINES=50", wantHome} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("guestCommandEnv() = %#v, missing %q", got, want)
