@@ -5,6 +5,7 @@ package main
 import (
 	"os"
 
+	"github.com/tinyrange/vmsh/internal/backend"
 	"j5.nz/cc/ccvmd"
 )
 
@@ -13,10 +14,10 @@ func bundledCCVMAvailable() bool {
 }
 
 func runInternalCCVMFromEnv() bool {
-	if os.Getenv(internalCCVMEnv) != "1" {
+	if os.Getenv(backend.InternalCCVMEnv) != "1" {
 		return false
 	}
-	_ = os.Setenv(internalCCVMSidecarModeEnv, internalCCVMSidecarMode)
+	_ = os.Setenv(backend.InternalCCVMSidecarModeEnv, backend.InternalCCVMSidecarMode)
 	ccvmd.Main(os.Args[1:])
 	return true
 }

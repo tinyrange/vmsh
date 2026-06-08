@@ -1,4 +1,4 @@
-package main
+package editor
 
 import (
 	"errors"
@@ -10,22 +10,40 @@ import (
 	"syscall"
 	"time"
 	"unicode/utf8"
+
+	"github.com/tinyrange/vmsh/internal/terminal"
 )
 
-var errLineInterrupted = errors.New("line interrupted")
+var ErrLineInterrupted = errors.New("line interrupted")
+
+type CompletionKind string
+
+const (
+	CompletionNone    CompletionKind = ""
+	CompletionAt      CompletionKind = "at"
+	CompletionOption  CompletionKind = "option"
+	CompletionCommand CompletionKind = "command"
+	CompletionPath    CompletionKind = "path"
+)
+
+type Completer interface {
+	CompleteWithKind(line []rune, pos int) ([]string, int, CompletionKind)
+}
 
 const (
 	completionMenuMinItemWidth = 8
 	completionMenuMaxItemWidth = 24
 	completionMenuCellPadding  = 2
 	commandCompletionAskLimit  = 100
+	colorReset                 = "\x1b[0m"
+	colorYellow                = "\x1b[33m"
 )
 
-type lineEditor struct {
+type LineEditor struct {
 	in        *os.File
 	out       io.Writer
 	history   *lineHistory
-	completer *vmshCompleter
+	completer Completer
 	width     int
 	prompt    string
 	buf       []rune
@@ -85,14 +103,14 @@ type keyEvent struct {
 	r   rune
 }
 
-func newLineEditor(in *os.File, out io.Writer, historyPath string, completer *vmshCompleter) *lineEditor {
+func NewLineEditor(in *os.File, out io.Writer, historyPath string, completer Completer) *LineEditor {
 	width := 80
 	if file, ok := out.(*os.File); ok {
-		if cols, _, err := terminalSize(file); err == nil && cols > 0 {
+		if cols, _, err := terminal.Size(file); err == nil && cols > 0 {
 			width = cols
 		}
 	}
-	return &lineEditor{
+	return &LineEditor{
 		in:        in,
 		out:       out,
 		history:   loadLineHistory(historyPath, 1000),
@@ -116,6 +134,11 @@ func loadLineHistory(path string, limit int) *lineHistory {
 	return h
 }
 
+func shouldSaveHistory(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return trimmed != "" && !strings.HasPrefix(trimmed, "#")
+}
+
 func (h *lineHistory) add(line string) {
 	if h == nil || !shouldSaveHistory(line) {
 		return
@@ -136,8 +159,8 @@ func (h *lineHistory) trim() {
 	h.items = append([]string(nil), h.items[len(h.items)-h.limit:]...)
 }
 
-func (e *lineEditor) ReadLine(prompt string) (string, error) {
-	restore, err := makeRawTerminal(e.in)
+func (e *LineEditor) ReadLine(prompt string) (string, error) {
+	restore, err := terminal.MakeRaw(e.in)
 	if err != nil {
 		return "", err
 	}
@@ -189,7 +212,7 @@ func (e *lineEditor) ReadLine(prompt string) (string, error) {
 			e.refresh()
 			fmt.Fprint(e.out, "^C\r\n")
 			restore()
-			return "", errLineInterrupted
+			return "", ErrLineInterrupted
 		case keyCtrlD:
 			if len(e.buf) == 0 {
 				e.menu = completionMenu{}
@@ -268,14 +291,14 @@ func (e *lineEditor) ReadLine(prompt string) (string, error) {
 	}
 }
 
-func (e *lineEditor) historyItems() []string {
+func (e *LineEditor) historyItems() []string {
 	if e.history == nil {
 		return nil
 	}
 	return e.history.items
 }
 
-func (e *lineEditor) historyMove(pos int, draft string, delta int) (int, string) {
+func (e *LineEditor) historyMove(pos int, draft string, delta int) (int, string) {
 	items := e.historyItems()
 	if len(items) == 0 {
 		return pos, draft
@@ -300,7 +323,7 @@ func (e *lineEditor) historyMove(pos int, draft string, delta int) (int, string)
 	return pos, draft
 }
 
-func (e *lineEditor) insertRune(r rune) {
+func (e *LineEditor) insertRune(r rune) {
 	e.menu.active = false
 	e.buf = append(e.buf, 0)
 	copy(e.buf[e.cursor+1:], e.buf[e.cursor:])
@@ -317,7 +340,7 @@ func onlyTabs(buf []rune) bool {
 	return true
 }
 
-func (e *lineEditor) deleteLeft() {
+func (e *LineEditor) deleteLeft() {
 	e.menu.active = false
 	if e.cursor == 0 {
 		return
@@ -327,7 +350,7 @@ func (e *lineEditor) deleteLeft() {
 	e.cursor--
 }
 
-func (e *lineEditor) deleteRight() {
+func (e *LineEditor) deleteRight() {
 	e.menu.active = false
 	if e.cursor >= len(e.buf) {
 		return
@@ -336,7 +359,7 @@ func (e *lineEditor) deleteRight() {
 	e.buf = e.buf[:len(e.buf)-1]
 }
 
-func (e *lineEditor) startCompletion() {
+func (e *LineEditor) startCompletion() {
 	if e.completer == nil {
 		return
 	}
@@ -357,7 +380,7 @@ func (e *lineEditor) startCompletion() {
 	if tokenStart < 0 {
 		tokenStart = 0
 	}
-	if kind == completionCommand && len(items) > commandCompletionAskLimit {
+	if kind == CompletionCommand && len(items) > commandCompletionAskLimit {
 		e.confirm = completionConfirm{
 			active:     true,
 			items:      items,
@@ -369,7 +392,7 @@ func (e *lineEditor) startCompletion() {
 	e.openCompletionMenu(items, replaceLen, string(e.buf[tokenStart:e.cursor]))
 }
 
-func (e *lineEditor) openCompletionMenu(items []string, replaceLen int, token string) {
+func (e *LineEditor) openCompletionMenu(items []string, replaceLen int, token string) {
 	e.menu = completionMenu{
 		active:     true,
 		items:      items,
@@ -380,7 +403,7 @@ func (e *lineEditor) openCompletionMenu(items []string, replaceLen int, token st
 	e.confirm = completionConfirm{}
 }
 
-func (e *lineEditor) handleCompletionConfirm(ev keyEvent) {
+func (e *LineEditor) handleCompletionConfirm(ev keyEvent) {
 	switch ev.key {
 	case keyRune:
 		switch ev.r {
@@ -400,7 +423,7 @@ func (e *lineEditor) handleCompletionConfirm(ev keyEvent) {
 	}
 }
 
-func (e *lineEditor) acceptCompletion() {
+func (e *LineEditor) acceptCompletion() {
 	if !e.menu.active || len(e.menu.items) == 0 {
 		return
 	}
@@ -414,7 +437,7 @@ func (e *lineEditor) acceptCompletion() {
 	e.insertCompletion(item, replaceLen)
 }
 
-func (e *lineEditor) insertCompletion(value string, replaceLen int) {
+func (e *LineEditor) insertCompletion(value string, replaceLen int) {
 	_ = replaceLen
 	replacement := []rune(value)
 	next := make([]rune, 0, len(e.buf)+len(replacement))
@@ -425,7 +448,7 @@ func (e *lineEditor) insertCompletion(value string, replaceLen int) {
 	e.cursor += len(replacement)
 }
 
-func (e *lineEditor) moveCompletion(delta int) {
+func (e *LineEditor) moveCompletion(delta int) {
 	if !e.menu.active || len(e.menu.items) == 0 {
 		return
 	}
@@ -438,14 +461,14 @@ func (e *lineEditor) moveCompletion(delta int) {
 	}
 }
 
-func (e *lineEditor) menuColumns() int {
+func (e *LineEditor) menuColumns() int {
 	if !e.menu.active || len(e.menu.items) == 0 {
 		return 1
 	}
 	return e.completionColumns(e.menu.items, e.menu.token)
 }
 
-func (e *lineEditor) completionColumns(items []string, token string) int {
+func (e *LineEditor) completionColumns(items []string, token string) int {
 	if len(items) == 0 {
 		return 1
 	}
@@ -456,11 +479,11 @@ func (e *lineEditor) completionColumns(items []string, token string) int {
 	return cols
 }
 
-func (e *lineEditor) menuItemWidth(items []string) int {
+func (e *LineEditor) menuItemWidth(items []string) int {
 	return e.completionItemWidth(items, e.menu.token)
 }
 
-func (e *lineEditor) completionItemWidth(items []string, token string) int {
+func (e *LineEditor) completionItemWidth(items []string, token string) int {
 	width := maxCompletionDisplayWidth(items, token) + completionMenuCellPadding
 	if width < completionMenuMinItemWidth {
 		return completionMenuMinItemWidth
@@ -471,7 +494,7 @@ func (e *lineEditor) completionItemWidth(items []string, token string) int {
 	return width
 }
 
-func (e *lineEditor) refresh() {
+func (e *LineEditor) refresh() {
 	before := string(e.buf[:e.cursor])
 	after := string(e.buf[e.cursor:])
 	fmt.Fprint(e.out, "\r\x1b[J")
@@ -488,7 +511,7 @@ func (e *lineEditor) refresh() {
 	fmt.Fprint(e.out, "\x1b8")
 }
 
-func (e *lineEditor) renderMenu() {
+func (e *LineEditor) renderMenu() {
 	if !e.menu.active || len(e.menu.items) == 0 {
 		return
 	}
@@ -513,7 +536,7 @@ func (e *lineEditor) renderMenu() {
 	}
 }
 
-func (e *lineEditor) renderCompletionConfirm() {
+func (e *LineEditor) renderCompletionConfirm() {
 	lineCount := completionDisplayLines(len(e.confirm.items), e.completionColumns(e.confirm.items, e.confirm.token))
 	fmt.Fprintf(e.out, "\r\n%sdo you wish to see all %d possibilities (%d lines)?%s",
 		colorYellow,
@@ -523,18 +546,18 @@ func (e *lineEditor) renderCompletionConfirm() {
 	)
 }
 
-func (e *lineEditor) completionDisplayText(item string) string {
+func (e *LineEditor) completionDisplayText(item string) string {
 	if e.menu.token == "" {
 		return item
 	}
 	return e.menu.token + item
 }
 
-func (e *lineEditor) bell() {
+func (e *LineEditor) bell() {
 	fmt.Fprint(e.out, "\a")
 }
 
-func (e *lineEditor) readKey() (keyEvent, error) {
+func (e *LineEditor) readKey() (keyEvent, error) {
 	var buf [1]byte
 	for {
 		n, err := e.in.Read(buf[:])
@@ -551,7 +574,7 @@ func (e *lineEditor) readKey() (keyEvent, error) {
 	}
 }
 
-func (e *lineEditor) decodeKey(b byte) (keyEvent, error) {
+func (e *LineEditor) decodeKey(b byte) (keyEvent, error) {
 	switch b {
 	case '\r', '\n':
 		return keyEvent{key: keyEnter}, nil
@@ -575,7 +598,7 @@ func (e *lineEditor) decodeKey(b byte) (keyEvent, error) {
 	}
 }
 
-func (e *lineEditor) readRune(first byte) (keyEvent, error) {
+func (e *LineEditor) readRune(first byte) (keyEvent, error) {
 	if first < utf8.RuneSelf {
 		return keyEvent{key: keyRune, r: rune(first)}, nil
 	}
@@ -591,7 +614,7 @@ func (e *lineEditor) readRune(first byte) (keyEvent, error) {
 	return keyEvent{key: keyRune, r: r}, nil
 }
 
-func (e *lineEditor) readEscape() (keyEvent, error) {
+func (e *LineEditor) readEscape() (keyEvent, error) {
 	b, err := e.readByteWithTimeout(15 * time.Millisecond)
 	if err != nil {
 		if errors.Is(err, os.ErrDeadlineExceeded) {
@@ -645,7 +668,7 @@ func (e *lineEditor) readEscape() (keyEvent, error) {
 	return keyEvent{key: keyEscape}, nil
 }
 
-func (e *lineEditor) readByteBlocking() (byte, error) {
+func (e *LineEditor) readByteBlocking() (byte, error) {
 	for {
 		b, err := e.readByteWithTimeout(0)
 		if err == nil {
@@ -659,7 +682,7 @@ func (e *lineEditor) readByteBlocking() (byte, error) {
 	}
 }
 
-func (e *lineEditor) readByteWithTimeout(timeout time.Duration) (byte, error) {
+func (e *LineEditor) readByteWithTimeout(timeout time.Duration) (byte, error) {
 	deadline := time.Time{}
 	if timeout > 0 {
 		deadline = time.Now().Add(timeout)

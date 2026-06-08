@@ -1,6 +1,6 @@
 //go:build linux
 
-package main
+package terminal
 
 import (
 	"os"
@@ -9,12 +9,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func isTerminalFD(fd int) bool {
+func IsTerminalFD(fd int) bool {
 	_, err := unix.IoctlGetTermios(fd, unix.TCGETS)
 	return err == nil
 }
 
-func terminalSize(file *os.File) (int, int, error) {
+func Size(file *os.File) (int, int, error) {
 	ws, err := unix.IoctlGetWinsize(int(file.Fd()), unix.TIOCGWINSZ)
 	if err != nil {
 		return 0, 0, err
@@ -22,7 +22,7 @@ func terminalSize(file *os.File) (int, int, error) {
 	return int(ws.Col), int(ws.Row), nil
 }
 
-func makeRawTerminal(file *os.File) (func(), error) {
+func MakeRaw(file *os.File) (func(), error) {
 	fd := int(file.Fd())
 	termios, err := unix.IoctlGetTermios(fd, unix.TCGETS)
 	if err != nil {
@@ -53,13 +53,13 @@ func makeRawTerminal(file *os.File) (func(), error) {
 	}, nil
 }
 
-func interruptTerminalRead(*os.File) {}
+func InterruptRead(*os.File) {}
 
-func prepareTerminalOutput(*os.File) func() {
+func PrepareOutput(*os.File) func() {
 	return func() {}
 }
 
-func hostSignals(tty bool) []os.Signal {
+func HostSignals(tty bool) []os.Signal {
 	signals := []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP}
 	if tty {
 		signals = append(signals, syscall.SIGWINCH)
@@ -67,11 +67,11 @@ func hostSignals(tty bool) []os.Signal {
 	return signals
 }
 
-func isResizeSignal(sig os.Signal) bool {
+func IsResizeSignal(sig os.Signal) bool {
 	return sig == syscall.SIGWINCH
 }
 
-func signalName(sig os.Signal) (string, bool) {
+func SignalName(sig os.Signal) (string, bool) {
 	switch sig {
 	case os.Interrupt:
 		return "INT", true

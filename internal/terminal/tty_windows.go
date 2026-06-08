@@ -1,6 +1,6 @@
 //go:build windows
 
-package main
+package terminal
 
 import (
 	"os"
@@ -8,12 +8,12 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func isTerminalFD(fd int) bool {
+func IsTerminalFD(fd int) bool {
 	var mode uint32
 	return windows.GetConsoleMode(windows.Handle(fd), &mode) == nil
 }
 
-func terminalSize(file *os.File) (int, int, error) {
+func Size(file *os.File) (int, int, error) {
 	var info windows.ConsoleScreenBufferInfo
 	if err := windows.GetConsoleScreenBufferInfo(windows.Handle(file.Fd()), &info); err != nil {
 		return 0, 0, err
@@ -29,7 +29,7 @@ func terminalSize(file *os.File) (int, int, error) {
 	return cols, rows, nil
 }
 
-func makeRawTerminal(file *os.File) (func(), error) {
+func MakeRaw(file *os.File) (func(), error) {
 	handle := windows.Handle(file.Fd())
 	var original uint32
 	if err := windows.GetConsoleMode(handle, &original); err != nil {
@@ -46,14 +46,14 @@ func makeRawTerminal(file *os.File) (func(), error) {
 	}, nil
 }
 
-func interruptTerminalRead(file *os.File) {
+func InterruptRead(file *os.File) {
 	if file == nil {
 		return
 	}
 	_ = windows.CancelIoEx(windows.Handle(file.Fd()), nil)
 }
 
-func prepareTerminalOutput(file *os.File) func() {
+func PrepareOutput(file *os.File) func() {
 	handle := windows.Handle(file.Fd())
 	var original uint32
 	if err := windows.GetConsoleMode(handle, &original); err != nil {
@@ -68,15 +68,15 @@ func prepareTerminalOutput(file *os.File) func() {
 	}
 }
 
-func hostSignals(_ bool) []os.Signal {
+func HostSignals(_ bool) []os.Signal {
 	return []os.Signal{os.Interrupt}
 }
 
-func isResizeSignal(os.Signal) bool {
+func IsResizeSignal(os.Signal) bool {
 	return false
 }
 
-func signalName(sig os.Signal) (string, bool) {
+func SignalName(sig os.Signal) (string, bool) {
 	switch sig {
 	case os.Interrupt:
 		return "INT", true
