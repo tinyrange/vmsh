@@ -3799,9 +3799,6 @@ func guestRunUser(ctx commandContext) string {
 	if strings.TrimSpace(ctx.User) != "" {
 		return ctx.User
 	}
-	if runtime.GOOS == "windows" {
-		return "root"
-	}
 	return defaultGuestUser
 }
 

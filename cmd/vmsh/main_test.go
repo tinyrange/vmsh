@@ -651,14 +651,9 @@ echo hello --flag
 	if run.req.Network == nil || !run.req.Network.Enabled || !run.req.Network.AllowInternet {
 		t.Fatalf("network = %#v, want enabled internet", run.req.Network)
 	}
-	wantUser := defaultGuestUser
 	wantEnv := []string{"HOME=/home/cc", "USER=cc", "LOGNAME=cc"}
-	if runtime.GOOS == "windows" {
-		wantUser = "root"
-		wantEnv = []string{"HOME=/root", "USER=root", "LOGNAME=root"}
-	}
-	if run.req.User != wantUser {
-		t.Fatalf("user = %q, want %q", run.req.User, wantUser)
+	if run.req.User != defaultGuestUser {
+		t.Fatalf("user = %q, want %q", run.req.User, defaultGuestUser)
 	}
 	if len(run.req.Command) != 3 || run.req.Command[0] != "sh" || run.req.Command[1] != "-lc" || !strings.HasSuffix(run.req.Command[2], "echo hello --flag") {
 		t.Fatalf("command = %#v", run.req.Command)
@@ -708,6 +703,20 @@ func TestGuestRunsAsRootWithSudoOption(t *testing.T) {
 				t.Fatalf("env = %#v, missing %q", run.req.Env, want)
 			}
 		}
+	}
+}
+
+func TestAtImageCommandUsesDefaultGuestUser(t *testing.T) {
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "default", Status: "running"}}
+	sh := &shellState{api: api, context: defaultContext("default", "", false), hostCWD: t.TempDir()}
+	if err := sh.eval("@alpine whoami", &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("eval(@alpine whoami) error = %v", err)
+	}
+	if len(api.streams) != 1 {
+		t.Fatalf("streams = %d, want 1", len(api.streams))
+	}
+	if api.streams[0].req.User != defaultGuestUser {
+		t.Fatalf("user = %q, want %q", api.streams[0].req.User, defaultGuestUser)
 	}
 }
 
