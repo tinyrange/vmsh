@@ -199,7 +199,7 @@ jobs:
           Pop-Location
           go build -o build/ci/vmsh.exe ./cmd/vmsh
 
-      - name: Run selected WHP boot probes
+      - name: Run WHP smoke probes
         working-directory: cc
         shell: pwsh
         env:
@@ -208,4 +208,26 @@ jobs:
         run: >
           go test -p 1 -tags embed_guestinit ./internal/hv/whp
           -run 'Test(SingleInstructionHLT|KernelBootFirstSerialByte)$'
+          -count=1 -v
+
+      - name: Run WHP guest runtime probes
+        working-directory: cc
+        shell: pwsh
+        env:
+          CCX3_WHP_BOOT: "1"
+          CCX3_WHP_BOOT_TIMEOUT_SECONDS: "180"
+        run: >
+          go test -p 1 -tags embed_guestinit ./internal/hv/whp
+          -run 'Test(GuestInitReadyMarkerOverVsock|GuestInitRunsCommandFromAlpineRootFS|RunManagedExecWithAlpineRootFS|ManagedSessionExecWithAlpineRootFS|ManagedSessionExecStreamForwardsStdin)$'
+          -count=1 -v
+
+      - name: Run Windows runtime backend probes
+        working-directory: cc
+        shell: pwsh
+        env:
+          CCX3_WHP_BOOT: "1"
+          CCX3_WHP_BOOT_TIMEOUT_SECONDS: "180"
+        run: >
+          go test -p 1 -tags embed_guestinit ./internal/vm
+          -run 'TestWindowsRuntimeBackend(RunCommand|StartThenExec|RunStreamForwardsStdin|StartWithWritableShare)$'
           -count=1 -v
