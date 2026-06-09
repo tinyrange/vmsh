@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestResolveCCVMPathHonorsExplicitPath(t *testing.T) {
@@ -63,5 +64,30 @@ func TestWriteReadDaemonState(t *testing.T) {
 	}
 	if _, err := ReadDaemonState(filepath.Join(t.TempDir(), "missing")); !os.IsNotExist(err) {
 		t.Fatalf("ReadDaemonState(missing) error = %v, want not exist", err)
+	}
+}
+
+func TestDaemonWatchdogTimeoutDefaultAndEnvironment(t *testing.T) {
+	t.Setenv("VMSH_DAEMON_WATCHDOG_TIMEOUT", "")
+	t.Setenv("CCX3_DAEMON_WATCHDOG_TIMEOUT", "")
+	if got := daemonWatchdogTimeout(); got != 3*time.Second {
+		t.Fatalf("daemonWatchdogTimeout(default) = %s, want 3s", got)
+	}
+
+	t.Setenv("VMSH_DAEMON_WATCHDOG_TIMEOUT", "1.25")
+	if got := daemonWatchdogTimeout(); got != 1250*time.Millisecond {
+		t.Fatalf("daemonWatchdogTimeout(VMSH) = %s, want 1.25s", got)
+	}
+
+	t.Setenv("VMSH_DAEMON_WATCHDOG_TIMEOUT", "")
+	t.Setenv("CCX3_DAEMON_WATCHDOG_TIMEOUT", "2")
+	if got := daemonWatchdogTimeout(); got != 2*time.Second {
+		t.Fatalf("daemonWatchdogTimeout(CCX3) = %s, want 2s", got)
+	}
+
+	t.Setenv("VMSH_DAEMON_WATCHDOG_TIMEOUT", "bad")
+	t.Setenv("CCX3_DAEMON_WATCHDOG_TIMEOUT", "2")
+	if got := daemonWatchdogTimeout(); got != 3*time.Second {
+		t.Fatalf("daemonWatchdogTimeout(invalid) = %s, want fallback 3s", got)
 	}
 }

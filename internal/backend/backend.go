@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -172,7 +173,7 @@ func NewClient(addr string) *client.Client {
 }
 
 func StartDaemonLease(api API) (func(), error) {
-	const timeout = 10 * time.Second
+	timeout := daemonWatchdogTimeout()
 	lease, err := api.CreateWatchdogLease(client.WatchdogLeaseRequest{TimeoutSeconds: timeout.Seconds()})
 	if err != nil {
 		return nil, err
@@ -197,6 +198,22 @@ func StartDaemonLease(api API) (func(), error) {
 		<-stopped
 		_ = api.ReleaseWatchdogLease(lease.LeaseID)
 	}, nil
+}
+
+func daemonWatchdogTimeout() time.Duration {
+	const fallback = 3 * time.Second
+	for _, name := range []string{"VMSH_DAEMON_WATCHDOG_TIMEOUT", "CCX3_DAEMON_WATCHDOG_TIMEOUT"} {
+		raw := strings.TrimSpace(os.Getenv(name))
+		if raw == "" {
+			continue
+		}
+		seconds, err := strconv.ParseFloat(raw, 64)
+		if err != nil || seconds <= 0 {
+			return fallback
+		}
+		return time.Duration(seconds * float64(time.Second))
+	}
+	return fallback
 }
 
 func ReadDaemonState(path string) (DaemonState, error) {
