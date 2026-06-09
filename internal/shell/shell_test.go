@@ -1328,8 +1328,61 @@ func TestCompleterDoesNotSuggestCommandsWithoutPrefix(t *testing.T) {
 	if got, _ := completer.Complete([]rune(""), 0); len(got) != 0 {
 		t.Fatalf("empty command completions = %#v, want none", got)
 	}
-	if got, _ := completer.Complete([]rune("@ubuntu "), 8); len(got) != 0 {
-		t.Fatalf("empty @ command completions = %#v, want none", got)
+}
+
+func TestCompleterSuggestsCommandsAtVMCommandPosition(t *testing.T) {
+	t.Setenv("PATH", "")
+
+	sh := &shellState{context: commandContext{Mode: modeHost, VMID: "work"}, hostCWD: t.TempDir()}
+	completer := newVMSHCompleter(sh)
+	got, _ := completer.Do([]rune("@ubuntu "), 8)
+	if !completionContains(got, "echo") || !completionContains(got, "python3") {
+		t.Fatalf("empty @ command completions = %#v, want command names", got)
+	}
+	got, _ = completer.Do([]rune("@ubuntu cat && ec"), len("@ubuntu cat && ec"))
+	if !completionContains(got, "ho") {
+		t.Fatalf("@ shell separator command completions = %#v, want echo", got)
+	}
+	got, _ = completer.Do([]rune("pwd && ec"), 9)
+	if !completionContains(got, "ho") {
+		t.Fatalf("shell separator command completions = %#v, want echo", got)
+	}
+}
+
+func TestCompleterUsesGuestPathForVMCommands(t *testing.T) {
+	t.Setenv("PATH", "")
+
+	api := &fakeVMSHAPI{
+		status:       client.InstanceState{ID: "work", Status: "running"},
+		streamEvents: []client.ExecEvent{{Kind: "stdout", Data: []byte("stat\nstrace\n")}, {Kind: "exit", ExitCode: 0}},
+	}
+	sh := &shellState{
+		api:     api,
+		context: commandContext{Mode: modeHost, VMID: "work"},
+		hostCWD: t.TempDir(),
+	}
+	completer := newVMSHCompleter(sh)
+	got, _ := completer.Do([]rune("@ubuntu st"), len("@ubuntu st"))
+	if !completionContains(got, "at") || !completionContains(got, "race") {
+		t.Fatalf("guest command completions = %#v, want stat and strace", got)
+	}
+	if len(api.streams) != 1 || api.streams[0].req.Image != "ubuntu" {
+		t.Fatalf("guest command completion streams = %#v, want ubuntu command scan", api.streams)
+	}
+}
+
+func TestCompleterSuggestsPathsAtVMArgumentPosition(t *testing.T) {
+	t.Setenv("PATH", "")
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "input.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sh := &shellState{context: commandContext{Mode: modeHost, VMID: "work"}, hostCWD: dir}
+	completer := newVMSHCompleter(sh)
+	got, _ := completer.Do([]rune("@host cat "), 10)
+	if !completionContains(got, "input.txt") {
+		t.Fatalf("@host argument path completions = %#v, want input.txt", got)
 	}
 }
 
@@ -1357,6 +1410,25 @@ func TestCompleterMapsGuestHostPaths(t *testing.T) {
 	}
 }
 
+func TestCompleterHandlesEscapedSpacePathTokens(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "alpha dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "alpha dir", "note.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sh := &shellState{hostCWD: root}
+	completer := newVMSHCompleter(sh)
+	got, replacementLen := completer.Do([]rune(`cat alpha\ dir/no`), len(`cat alpha\ dir/no`))
+	if !completionContains(got, "te.txt") {
+		t.Fatalf("escaped-space path completions = %#v, want te.txt", got)
+	}
+	if replacementLen != len("no") {
+		t.Fatalf("replacement length = %d, want %d", replacementLen, len("no"))
+	}
+}
+
 func TestCompleterCompletesGuestAbsolutePathsWithoutFind(t *testing.T) {
 	api := &fakeVMSHAPI{
 		status:       client.InstanceState{ID: "work", Status: "running"},
@@ -1381,6 +1453,26 @@ func TestCompleterCompletesGuestAbsolutePathsWithoutFind(t *testing.T) {
 	}
 	if run.req.WorkDir != "/etc" {
 		t.Fatalf("guest completion workdir = %q, want /etc", run.req.WorkDir)
+	}
+}
+
+func TestCompleterCompletesSharedGuestLocalPaths(t *testing.T) {
+	api := &fakeVMSHAPI{
+		status:       client.InstanceState{ID: "work", Status: "running"},
+		streamEvents: []client.ExecEvent{{Kind: "stdout", Data: []byte(".txt\n")}, {Kind: "exit", ExitCode: 0}},
+	}
+	sh := &shellState{
+		api:     api,
+		hostCWD: t.TempDir(),
+		context: commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", CWD: "/home/cc"},
+	}
+	completer := newVMSHCompleter(sh)
+	got, _ := completer.Do([]rune("cat no"), 6)
+	if !completionContains(got, ".txt") {
+		t.Fatalf("shared guest-local path completions = %#v, want .txt", got)
+	}
+	if len(api.streams) != 1 || api.streams[0].req.WorkDir != "/home/cc" {
+		t.Fatalf("guest completion streams = %#v, want guest-local cwd", api.streams)
 	}
 }
 

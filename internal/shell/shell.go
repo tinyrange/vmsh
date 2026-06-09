@@ -144,42 +144,72 @@ func (c *vmshCompleter) Complete(line []rune, pos int) ([]string, int) {
 	return candidates, replacementLen
 }
 
+type completionTokenInfo struct {
+	Start   int
+	Raw     string
+	Value   string
+	IsFirst bool
+}
+
 func (c *vmshCompleter) CompleteWithKind(line []rune, pos int) ([]string, int, completionKind) {
 	prefix := string(line[:pos])
-	typedTokenStart := lastCompletionTokenStart(prefix)
-	typedToken := prefix[typedTokenStart:]
+	typed := completionToken(prefix)
 	effectivePrefix := c.effectiveCompletionPrefix(prefix)
 	completionCtx := c.completionContext(effectivePrefix)
 	prefix = effectivePrefix
-	tokenStart := lastCompletionTokenStart(prefix)
-	token := prefix[tokenStart:]
-	isFirstToken := strings.TrimSpace(prefix[:tokenStart]) == ""
+	token := completionToken(prefix)
 	var candidates []string
-	if strings.HasPrefix(prefix, "@") && isFirstToken {
+	if strings.HasPrefix(prefix, "@") && token.IsFirst {
 		for _, word := range c.atTargetWords() {
-			if strings.HasPrefix(word, token) {
-				candidates = append(candidates, word[len(token):])
+			if strings.HasPrefix(word, token.Value) {
+				candidates = append(candidates, word[len(token.Value):])
 			}
 		}
-		return candidates, len([]rune(token)), completionAt
+		return candidates, len([]rune(token.Raw)), completionAt
 	}
-	if strings.HasPrefix(prefix, "@") && strings.HasPrefix(token, "--") {
-		candidates = suffixCompletions(vmshOptionWords(), token)
-		return candidates, len([]rune(token)), completionOption
+	if strings.HasPrefix(prefix, "@") && strings.HasPrefix(token.Value, "--") {
+		candidates = suffixCompletions(vmshOptionWords(), token.Value)
+		return candidates, len([]rune(token.Raw)), completionOption
 	}
-	if c.shouldCompleteRMIImage(prefix, tokenStart) {
-		candidates = suffixCompletions(c.cachedImageNames(), token)
-		return candidates, len([]rune(typedToken)), completionAt
+	if c.shouldCompleteRMIImage(prefix, token.Start) {
+		candidates = suffixCompletions(c.cachedImageNames(), token.Value)
+		return candidates, len([]rune(typed.Raw)), completionAt
 	}
-	if c.shouldCompleteCommand(prefix, tokenStart, isFirstToken, token) {
-		candidates = c.commandCandidates(token)
-		return candidates, len([]rune(typedToken)), completionCommand
+	if c.shouldCompleteCommand(prefix, token.Start, token.IsFirst, token.Value) {
+		candidates = c.commandCandidates(token.Value, completionCtx)
+		return candidates, len([]rune(typed.Raw)), completionCommand
 	}
-	if !isFirstToken || token == "" || strings.Contains(token, "/") || token == "." || token == ".." || strings.HasPrefix(token, "~") {
-		candidates = c.pathCandidates(token, completionCtx)
-		return candidates, pathCompletionReplaceLen(typedToken), completionPath
+	if c.shouldCompletePath(token.IsFirst, token.Value) {
+		candidates = c.pathCandidates(token.Value, completionCtx)
+		return candidates, pathCompletionReplaceLen(typed.Raw, completionCtx.Mode), completionPath
 	}
 	return nil, 0, completionNone
+}
+
+func completionToken(prefix string) completionTokenInfo {
+	start := lastCompletionTokenStart(prefix)
+	raw := prefix[start:]
+	info := completionTokenInfo{Start: start, Raw: raw, Value: raw}
+	if tokens, err := lexShellTokens(prefix); err == nil {
+		if len(tokens) == 0 {
+			info.Start = len(prefix)
+			info.Raw = ""
+			info.Value = ""
+		} else {
+			last := tokens[len(tokens)-1]
+			if last.End == len(prefix) {
+				info.Start = last.Start
+				info.Raw = prefix[last.Start:last.End]
+				info.Value = last.Value
+			} else {
+				info.Start = len(prefix)
+				info.Raw = ""
+				info.Value = ""
+			}
+		}
+	}
+	info.IsFirst = strings.TrimSpace(prefix[:info.Start]) == ""
+	return info
 }
 
 func (c *vmshCompleter) effectiveCompletionPrefix(prefix string) string {
@@ -230,11 +260,38 @@ func (c *vmshCompleter) completionContext(prefix string) commandContext {
 	return ctx
 }
 
-func pathCompletionReplaceLen(token string) int {
+func pathCompletionReplaceLen(token string, mode shellMode) int {
 	if token == "" {
 		return 0
 	}
-	return len([]rune(filepath.Base(token)))
+	lastSeparator := lastPathSeparator(token, mode)
+	if lastSeparator < 0 {
+		return len([]rune(token))
+	}
+	return len([]rune(token[lastSeparator+1:]))
+}
+
+func lastPathSeparator(token string, mode shellMode) int {
+	separators := "/"
+	if mode != modeVM && os.PathSeparator != '/' {
+		separators += string(os.PathSeparator)
+	}
+	escaped := false
+	last := -1
+	for i, r := range token {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		if strings.ContainsRune(separators, r) {
+			last = i
+		}
+	}
+	return last
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
@@ -303,35 +360,56 @@ func (c *vmshCompleter) shouldCompleteCommand(prefix string, tokenStart int, isF
 	if strings.Contains(token, "/") || strings.HasPrefix(token, "~") || token == "." || token == ".." {
 		return false
 	}
-	if token == "" {
-		return false
-	}
 	if isFirstToken {
-		return !strings.HasPrefix(prefix, "@")
+		return token != "" && !strings.HasPrefix(prefix, "@")
 	}
 	if !strings.HasPrefix(prefix, "@") {
+		return token != "" && previousShellWordIsCommandSeparator(prefix[:tokenStart])
+	}
+	at, err := parseAtLine(prefix[:tokenStart])
+	if err != nil || !atTargetAcceptsCommand(at.Target) {
 		return false
 	}
-	words := completedShellWords(prefix[:tokenStart])
-	seenTarget := false
-	for i, word := range words {
-		if i == 0 {
-			if !strings.HasPrefix(word, "@") {
-				return false
-			}
-			seenTarget = strings.TrimPrefix(word, "@") != ""
-			continue
-		}
-		if strings.HasPrefix(word, "--") {
-			continue
-		}
-		if !seenTarget && word != "" {
-			seenTarget = true
-			continue
-		}
+	if at.Command == "" {
+		return true
+	}
+	return previousShellWordIsCommandSeparator(at.Command)
+}
+
+func (c *vmshCompleter) shouldCompletePath(isFirstToken bool, token string) bool {
+	if isFirstToken && token == "" {
+		return false
+	}
+	if isFirstToken && token != "" && !strings.Contains(token, "/") && !strings.HasPrefix(token, "~") && token != "." && token != ".." {
 		return false
 	}
 	return true
+}
+
+func atTargetAcceptsCommand(target string) bool {
+	switch target {
+	case "help", "ps", "jobs", "alias", "status", "where", "start", "stop", "restart", "save", "rmi", "tmux", "forward", "copy", "cp":
+		return false
+	default:
+		return true
+	}
+}
+
+func previousShellWordIsCommandSeparator(prefix string) bool {
+	words := completedShellWords(prefix)
+	if len(words) == 0 {
+		return false
+	}
+	return shellCommandSeparator(words[len(words)-1])
+}
+
+func shellCommandSeparator(word string) bool {
+	switch word {
+	case ";", "&&", "||", "|":
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *vmshCompleter) shouldCompleteRMIImage(prefix string, tokenStart int) bool {
@@ -357,7 +435,7 @@ func completedShellWords(line string) []string {
 	return words
 }
 
-func (c *vmshCompleter) commandCandidates(token string) []string {
+func (c *vmshCompleter) commandCandidates(token string, ctx commandContext) []string {
 	seen := map[string]bool{}
 	var out []string
 	add := func(name string) {
@@ -369,6 +447,13 @@ func (c *vmshCompleter) commandCandidates(token string) []string {
 	}
 	for _, name := range []string{"cd", "exit", "export", "pwd", "echo", "env", "ls", "cat", "grep", "find", "git", "make", "go", "python", "python3", "sh"} {
 		add(name)
+	}
+	if ctx.Mode == modeVM {
+		for _, name := range c.guestCommandNames(token, ctx) {
+			add(name)
+		}
+		sortCompletionItems(out)
+		return out
 	}
 	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
 		entries, err := os.ReadDir(dir)
@@ -388,6 +473,68 @@ func (c *vmshCompleter) commandCandidates(token string) []string {
 	}
 	sortCompletionItems(out)
 	return out
+}
+
+func (c *vmshCompleter) guestCommandNames(token string, ctx commandContext) []string {
+	if c.shell == nil || c.shell.api == nil || ctx.VMID == "" || ctx.Image == "" {
+		return nil
+	}
+	status, err := c.shell.api.InstanceStatusOf(ctx.VMID)
+	if err != nil || status.Status != "running" {
+		return nil
+	}
+	script := guestCommandCompletionScript(token)
+	req := client.RunRequest{
+		Image:   localImageName(ctx.Image, ctx.Arch),
+		Command: []string{"sh", "-lc", script},
+		WorkDir: firstNonEmpty(ctx.CWD, guestHomeDir(ctx)),
+		User:    guestRunUser(ctx),
+	}
+	var stdout strings.Builder
+	runCtx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	defer cancel()
+	err = c.shell.api.RunStreamInContext(runCtx, ctx.VMID, req, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "stdout", "output":
+			stdout.WriteString(execEventText(event))
+		case "error":
+			if event.Error != "" {
+				return fmt.Errorf("%s", event.Error)
+			}
+			return fmt.Errorf("guest command completion failed")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+func guestCommandCompletionScript(base string) string {
+	return strings.Join([]string{
+		"base=" + shellQuote(base),
+		`seen=":"`,
+		`IFS=:`,
+		`for dir in $PATH; do`,
+		`  [ -d "$dir" ] || continue`,
+		`  for p in "$dir"/"$base"*; do`,
+		`    [ -f "$p" ] || [ -L "$p" ] || continue`,
+		`    [ -x "$p" ] || continue`,
+		`    name=${p##*/}`,
+		`    case "$seen" in *:"$name":*) continue ;; esac`,
+		`    seen="$seen$name:"`,
+		`    printf '%s\n' "$name"`,
+		`  done`,
+		`done`,
+	}, "\n")
 }
 
 func lastCompletionTokenStart(line string) int {
@@ -476,10 +623,7 @@ func (c *vmshCompleter) guestPathCandidates(token string, ctx commandContext) ([
 		return nil, false
 	}
 	dirPart, base := path.Split(filepath.ToSlash(token))
-	current := ctx.CWD
-	if current == "" {
-		_, current, _ = guestHostPaths(c.shell.hostCWD)
-	}
+	current := c.shell.currentGuestCWD(ctx)
 	var guestDir string
 	switch {
 	case dirPart == "":
@@ -592,10 +736,7 @@ func (c *vmshCompleter) guestHostCompletionDir(dirPart string) (string, bool) {
 		return guestHostPathToHost(c.shell.hostCWD, dirPart)
 	}
 	if !strings.HasPrefix(dirPart, "/") {
-		current := c.shell.context.CWD
-		if current == "" {
-			_, current, _ = guestHostPaths(c.shell.hostCWD)
-		}
+		current := c.shell.currentGuestCWD(c.shell.context)
 		guestDir := path.Clean(path.Join(current, filepath.ToSlash(dirPart)))
 		if guestDir == guestHostMount || strings.HasPrefix(guestDir, guestHostMount+"/") {
 			return guestHostPathToHost(c.shell.hostCWD, guestDir)
