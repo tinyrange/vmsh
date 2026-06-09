@@ -1007,6 +1007,31 @@ func drainSignals(signals <-chan os.Signal) {
 	}
 }
 
+func (s *shellState) interruptibleCommandContext() (context.Context, func(), *atomic.Bool) {
+	ctx, cancel := context.WithCancel(context.Background())
+	interrupted := &atomic.Bool{}
+	if s.interruptSignals == nil {
+		return ctx, cancel, interrupted
+	}
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		select {
+		case <-done:
+		case <-ctx.Done():
+		case <-s.interruptSignals:
+			interrupted.Store(true)
+			cancel()
+		}
+	}()
+	return ctx, func() {
+		once.Do(func() {
+			cancel()
+			close(done)
+		})
+	}, interrupted
+}
+
 func (s *shellState) runScript(in io.Reader, stdout, stderr io.Writer) error {
 	return s.evalScriptLines(in, stdout, stderr)
 }
@@ -1317,6 +1342,8 @@ func (s *shellState) runPipeline(base commandContext, segments []string, stdout,
 	if len(segments) < 2 {
 		return fmt.Errorf("pipeline requires at least two commands")
 	}
+	ctx, stop, interrupted := s.interruptibleCommandContext()
+	defer stop()
 	stages := make([]pipelineStage, 0, len(segments))
 	for _, segment := range segments {
 		stage, err := s.preparePipelineStage(base, segment, stderr)
@@ -1331,6 +1358,17 @@ func (s *shellState) runPipeline(base commandContext, segments []string, stdout,
 	for i := range readers {
 		readers[i], writers[i] = io.Pipe()
 	}
+	doneClosingPipes := make(chan struct{})
+	go func() {
+		defer close(doneClosingPipes)
+		<-ctx.Done()
+		for _, reader := range readers {
+			_ = reader.CloseWithError(ctx.Err())
+		}
+		for _, writer := range writers {
+			_ = writer.CloseWithError(ctx.Err())
+		}
+	}()
 
 	errs := make([]error, len(stages))
 	var wg sync.WaitGroup
@@ -1347,7 +1385,7 @@ func (s *shellState) runPipeline(base commandContext, segments []string, stdout,
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err := s.runPipelineStage(stages[i], stdin, stageStdout, stderr)
+			err := s.runPipelineStage(ctx, stages[i], stdin, stageStdout, stderr)
 			errs[i] = err
 			if reader, ok := stdin.(*io.PipeReader); ok {
 				_ = reader.Close()
@@ -1362,11 +1400,17 @@ func (s *shellState) runPipeline(base commandContext, segments []string, stdout,
 		}()
 	}
 	wg.Wait()
+	stop()
+	<-doneClosingPipes
 	for _, reader := range readers {
 		_ = reader.Close()
 	}
 
 	lastErr := errs[len(errs)-1]
+	if interrupted.Load() {
+		s.lastCode = 130
+		return nil
+	}
 	s.lastCode = sessionLastCode(lastErr)
 	if lastErr != nil {
 		if s.lastCode >= 0 {
@@ -1442,12 +1486,12 @@ func isControlAtTarget(target string) bool {
 	}
 }
 
-func (s *shellState) runPipelineStage(stage pipelineStage, stdin io.Reader, stdout, stderr io.Writer) error {
+func (s *shellState) runPipelineStage(ctx context.Context, stage pipelineStage, stdin io.Reader, stdout, stderr io.Writer) error {
 	switch stage.ctx.Mode {
 	case modeHost:
-		return s.runHostWithInput(stage.line, stdin, stdout, stderr)
+		return s.runHostWithInputContext(ctx, stage.line, stdin, stdout, stderr)
 	case modeVM:
-		return s.streamGuestRunWithInput(stage.ctx.VMID, stage.req, stdin, stdout, stderr)
+		return s.streamGuestRunWithInputContext(ctx, stage.ctx.VMID, stage.req, stdin, stdout, stderr)
 	default:
 		return fmt.Errorf("unknown shell mode %q", stage.ctx.Mode)
 	}
@@ -1810,8 +1854,12 @@ func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 }
 
 func (s *shellState) runHostWithInput(line string, stdin io.Reader, stdout, stderr io.Writer) error {
+	return s.runHostWithInputContext(context.Background(), line, stdin, stdout, stderr)
+}
+
+func (s *shellState) runHostWithInputContext(ctx context.Context, line string, stdin io.Reader, stdout, stderr io.Writer) error {
 	args := hostShellCommand(line, false, s.hostCommandPrelude(false))
-	cmd := exec.Command(args[0], args[1:]...)
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Dir = s.hostCWD
 	if stdin == nil {
 		cmd.Stdin = nil
@@ -1824,6 +1872,9 @@ func (s *shellState) runHostWithInput(line string, stdin io.Reader, stdout, stde
 		cmd.Env = mergedEnv(os.Environ(), shellEnv(s.env))
 	}
 	err := cmd.Run()
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return persistentShellExit{code: 130}
+	}
 	code := exitCode(err)
 	if err != nil && code < 0 {
 		return err
@@ -3231,12 +3282,16 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 }
 
 func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, stdin io.Reader, stdout, stderr io.Writer) error {
+	return s.streamGuestRunWithInputContext(context.Background(), id, req, stdin, stdout, stderr)
+}
+
+func (s *shellState) streamGuestRunWithInputContext(ctx context.Context, id string, req client.RunRequest, stdin io.Reader, stdout, stderr io.Writer) error {
 	req.TTY = false
 	req.Cols = 0
 	req.Rows = 0
 	if stdin == nil {
 		exitCode := 0
-		if err := s.api.RunStreamInContext(context.Background(), id, req, func(event client.ExecEvent) error {
+		if err := s.api.RunStreamInContext(ctx, id, req, func(event client.ExecEvent) error {
 			switch event.Kind {
 			case "stdout", "output":
 				writeExecEventOutput(stdout, event)
@@ -3252,6 +3307,9 @@ func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, s
 			}
 			return nil
 		}); err != nil {
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return persistentShellExit{code: 130}
+			}
 			return err
 		}
 		if exitCode != 0 {
@@ -3263,10 +3321,20 @@ func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, s
 	inputs := make(chan client.ExecInput, 8)
 	inputErr := make(chan error, 1)
 	done := make(chan struct{})
+	cancelWatchDone := make(chan struct{})
 	go func() {
 		inputErr <- streamReaderToGuestInput(stdin, inputs, done)
 		close(inputs)
 	}()
+	if ctx.Done() != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				sendGuestInputBlockingSafe(inputs, done, client.ExecInput{Kind: "signal", Signal: "INT"})
+			case <-cancelWatchDone:
+			}
+		}()
+	}
 	exitCode := 0
 	err := s.api.RunInteractiveStreamIn(id, req, inputs, func(event client.ExecEvent) error {
 		switch event.Kind {
@@ -3284,9 +3352,13 @@ func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, s
 		}
 		return nil
 	})
+	close(cancelWatchDone)
 	close(done)
 	if inErr := <-inputErr; err == nil && inErr != nil {
 		err = inErr
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return persistentShellExit{code: 130}
 	}
 	if err != nil {
 		return err
@@ -3295,6 +3367,15 @@ func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, s
 		return persistentShellExit{code: exitCode}
 	}
 	return nil
+}
+
+func sendGuestInputBlockingSafe(out chan<- client.ExecInput, done <-chan struct{}, input client.ExecInput) (sent bool) {
+	defer func() {
+		if recover() != nil {
+			sent = false
+		}
+	}()
+	return sendGuestInputBlocking(out, done, input)
 }
 
 func streamReaderToGuestInput(r io.Reader, out chan<- client.ExecInput, done <-chan struct{}) error {

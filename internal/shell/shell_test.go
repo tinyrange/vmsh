@@ -760,6 +760,43 @@ func TestGuestPipelineStreamsBetweenStages(t *testing.T) {
 	}
 }
 
+func TestPipelineInterruptStopsHostToGuestPipeline(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses unix yes command")
+	}
+	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	interrupts := make(chan os.Signal, 1)
+	sh := &shellState{
+		api:              api,
+		context:          commandContext{Mode: modeHost, VMID: "work"},
+		hostCWD:          t.TempDir(),
+		imageCache:       map[string]bool{"alpine": true},
+		vmRunning:        map[string]bool{"work": true},
+		env:              map[string]string{},
+		aliases:          map[string]string{},
+		interruptSignals: interrupts,
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- sh.eval("yes | @alpine cat", io.Discard, io.Discard)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	interrupts <- os.Interrupt
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("pipeline error = %v, want nil interrupt handling", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pipeline did not stop after interrupt")
+	}
+	if sh.lastCode != 130 {
+		t.Fatalf("lastCode = %d, want 130", sh.lastCode)
+	}
+}
+
 func TestScriptSendsLinesThroughCurrentContext(t *testing.T) {
 	dir := t.TempDir()
 	api := &fakeVMSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
