@@ -1200,6 +1200,20 @@ func TestScriptStopsOnErrors(t *testing.T) {
 	}
 }
 
+func TestHostCommandInterruptedBySignalIsNotFatal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses unix signals")
+	}
+	sh := &shellState{context: defaultContext("default", "", false), hostCWD: t.TempDir()}
+	err := sh.eval(`sh -c 'kill -INT $$'`, &bytes.Buffer{}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("eval() error = %v, want nil", err)
+	}
+	if sh.lastCode != 130 {
+		t.Fatalf("lastCode = %d, want 130", sh.lastCode)
+	}
+}
+
 func TestLoopRequiresInteractiveTerminal(t *testing.T) {
 	sh := &shellState{context: defaultContext("default", "", false), hostCWD: t.TempDir()}
 	err := sh.loop(strings.NewReader("echo nope\n"), &bytes.Buffer{}, &bytes.Buffer{})

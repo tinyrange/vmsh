@@ -4823,9 +4823,20 @@ func exitCode(err error) int {
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		return exitErr.ExitCode()
+		return processExitCode(exitErr.ProcessState, exitErr.ExitCode())
 	}
 	return -1
+}
+
+func processExitCode(state *os.ProcessState, fallback int) int {
+	if state == nil {
+		return fallback
+	}
+	status, ok := state.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() {
+		return fallback
+	}
+	return 128 + int(status.Signal())
 }
 
 func parsePortForwardSpec(spec string) (client.PortForward, error) {
