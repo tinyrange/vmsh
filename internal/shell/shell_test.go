@@ -746,17 +746,58 @@ func TestGuestPipelineStreamsBetweenStages(t *testing.T) {
 	if err := sh.eval("printf hello | cat", io.Discard, io.Discard); err != nil {
 		t.Fatalf("eval(guest pipeline) error = %v", err)
 	}
-	input := api.inputForCommand("cat")
-	if input != "hello" {
-		t.Fatalf("cat stdin = %q, want hello", input)
-	}
 	if len(api.streams) != 2 {
 		t.Fatalf("streams = %d, want 2", len(api.streams))
+	}
+	if got := string(api.streams[1].req.Stdin); got != "hello" {
+		t.Fatalf("cat stdin = %q, want hello", got)
 	}
 	for _, run := range api.streams {
 		if run.req.TTY {
 			t.Fatalf("pipeline stage %#v used TTY", run.req.Command)
 		}
+	}
+}
+
+func TestMixedPipelinePassesGuestStdinAsRunRequestStdin(t *testing.T) {
+	api := &fakeVMSHAPI{
+		status: client.InstanceState{ID: "work", Status: "running"},
+		streamEventsByCommand: map[string][]client.ExecEvent{
+			"grep go.": {{Kind: "stdout", Data: []byte("go.mod\ngo.sum\n")}, {Kind: "exit", ExitCode: 0}},
+			"wc -l":    {{Kind: "stdout", Data: []byte("2\n")}, {Kind: "exit", ExitCode: 0}},
+		},
+	}
+	sh := &shellState{
+		api:        api,
+		context:    commandContext{Mode: modeHost, VMID: "work"},
+		hostCWD:    t.TempDir(),
+		imageCache: map[string]bool{"ubuntu": true, "alpine": true},
+		vmRunning:  map[string]bool{"work": true},
+		env:        map[string]string{},
+		aliases:    map[string]string{},
+	}
+	if err := os.WriteFile(filepath.Join(sh.hostCWD, "go.mod"), []byte("module test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sh.hostCWD, "go.sum"), []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+
+	if err := sh.eval("ls | @ubuntu grep go. | @alpine wc -l", &stdout, io.Discard); err != nil {
+		t.Fatalf("eval(mixed pipeline) error = %v", err)
+	}
+	if got := strings.TrimSpace(stdout.String()); got != "2" {
+		t.Fatalf("stdout = %q, want 2", stdout.String())
+	}
+	if len(api.streams) != 2 {
+		t.Fatalf("streams = %d, want 2 guest stages", len(api.streams))
+	}
+	if got := string(api.streams[0].req.Stdin); !strings.Contains(got, "go.mod") || !strings.Contains(got, "go.sum") {
+		t.Fatalf("grep stdin = %q, want host ls output", got)
+	}
+	if got := string(api.streams[1].req.Stdin); got != "go.mod\ngo.sum\n" {
+		t.Fatalf("wc stdin = %q, want grep output", got)
 	}
 }
 

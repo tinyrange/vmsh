@@ -35,6 +35,7 @@ const guestHostMount = "/host"
 const defaultGuestUser = "1000:1000"
 const defaultVMSHBootTimeoutSeconds = 60
 const defaultGuestShellReadyTimeout = 5 * time.Second
+const maxPipelineGuestStdinBytes = 64 * 1024 * 1024
 
 const (
 	colorReset   = "\x1b[0m"
@@ -3289,54 +3290,18 @@ func (s *shellState) streamGuestRunWithInputContext(ctx context.Context, id stri
 	req.TTY = false
 	req.Cols = 0
 	req.Rows = 0
-	if stdin == nil {
-		exitCode := 0
-		if err := s.api.RunStreamInContext(ctx, id, req, func(event client.ExecEvent) error {
-			switch event.Kind {
-			case "stdout", "output":
-				writeExecEventOutput(stdout, event)
-			case "stderr":
-				writeExecEventOutput(stderr, event)
-			case "exit":
-				exitCode = event.ExitCode
-			case "error":
-				if event.Error != "" {
-					return fmt.Errorf("%s", event.Error)
-				}
-				return fmt.Errorf("guest command failed")
-			}
-			return nil
-		}); err != nil {
+	if stdin != nil {
+		data, err := readAllLimit(stdin, maxPipelineGuestStdinBytes)
+		if err != nil {
 			if errors.Is(ctx.Err(), context.Canceled) {
 				return persistentShellExit{code: 130}
 			}
 			return err
 		}
-		if exitCode != 0 {
-			return persistentShellExit{code: exitCode}
-		}
-		return nil
-	}
-
-	inputs := make(chan client.ExecInput, 8)
-	inputErr := make(chan error, 1)
-	done := make(chan struct{})
-	cancelWatchDone := make(chan struct{})
-	go func() {
-		inputErr <- streamReaderToGuestInput(stdin, inputs, done)
-		close(inputs)
-	}()
-	if ctx.Done() != nil {
-		go func() {
-			select {
-			case <-ctx.Done():
-				sendGuestInputBlockingSafe(inputs, done, client.ExecInput{Kind: "signal", Signal: "INT"})
-			case <-cancelWatchDone:
-			}
-		}()
+		req.Stdin = data
 	}
 	exitCode := 0
-	err := s.api.RunInteractiveStreamIn(id, req, inputs, func(event client.ExecEvent) error {
+	if err := s.api.RunStreamInContext(ctx, id, req, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stdout", "output":
 			writeExecEventOutput(stdout, event)
@@ -3351,16 +3316,10 @@ func (s *shellState) streamGuestRunWithInputContext(ctx context.Context, id stri
 			return fmt.Errorf("guest command failed")
 		}
 		return nil
-	})
-	close(cancelWatchDone)
-	close(done)
-	if inErr := <-inputErr; err == nil && inErr != nil {
-		err = inErr
-	}
-	if errors.Is(ctx.Err(), context.Canceled) {
-		return persistentShellExit{code: 130}
-	}
-	if err != nil {
+	}); err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return persistentShellExit{code: 130}
+		}
 		return err
 	}
 	if exitCode != 0 {
@@ -3369,13 +3328,16 @@ func (s *shellState) streamGuestRunWithInputContext(ctx context.Context, id stri
 	return nil
 }
 
-func sendGuestInputBlockingSafe(out chan<- client.ExecInput, done <-chan struct{}, input client.ExecInput) (sent bool) {
-	defer func() {
-		if recover() != nil {
-			sent = false
-		}
-	}()
-	return sendGuestInputBlocking(out, done, input)
+func readAllLimit(r io.Reader, limit int64) ([]byte, error) {
+	limited := &io.LimitedReader{R: r, N: limit + 1}
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("pipeline guest stdin exceeds %d bytes", limit)
+	}
+	return data, nil
 }
 
 func streamReaderToGuestInput(r io.Reader, out chan<- client.ExecInput, done <-chan struct{}) error {
