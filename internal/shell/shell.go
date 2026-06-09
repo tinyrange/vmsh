@@ -4017,7 +4017,7 @@ func (s *shellState) prompt() string {
 		promptCWD = s.currentGuestCWD(s.context)
 	}
 	leaf := displayPathLeaf(promptCWD, s.context.Mode)
-	base := colorGreen + "➜" + colorReset + "  " + colorCyan + leaf + colorReset
+	base := colorGreen + "➜" + colorReset + "  " + promptCWDColor(s.context, promptCWD) + leaf + colorReset
 	if s.context.Mode == modeVM {
 		target := "(" + contextImageText(s.context)
 		if s.context.VMID != "" && s.context.VMID != "default" {
@@ -4031,6 +4031,19 @@ func (s *shellState) prompt() string {
 		return base + " " + colorMagenta + label + colorReset + colorYellow + target + colorReset + " "
 	}
 	return base + " " + colorBlue + "host" + colorReset + " "
+}
+
+func promptCWDColor(ctx commandContext, cwd string) string {
+	if ctx.Mode != modeVM {
+		return colorCyan
+	}
+	if ctx.Isolated {
+		return colorMagenta
+	}
+	if cwd == guestHostMount || strings.HasPrefix(cwd, guestHostMount+"/") {
+		return colorCyan
+	}
+	return colorYellow
 }
 
 func displayPathLeaf(value string, mode shellMode) string {

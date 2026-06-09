@@ -300,6 +300,56 @@ func TestIsolatedPromptUsesGuestDefaultCWD(t *testing.T) {
 	}
 }
 
+func TestPromptColorCodesWorkingDirectoryContext(t *testing.T) {
+	root := t.TempDir()
+	hostCWD := filepath.Join(root, "project")
+	if err := os.Mkdir(hostCWD, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name  string
+		ctx   commandContext
+		leaf  string
+		color string
+	}{
+		{
+			name:  "host",
+			ctx:   commandContext{Mode: modeHost},
+			leaf:  "project",
+			color: colorCyan,
+		},
+		{
+			name:  "shared host directory",
+			ctx:   commandContext{Mode: modeVM, Image: "alpine"},
+			leaf:  "project",
+			color: colorCyan,
+		},
+		{
+			name:  "shared guest directory",
+			ctx:   commandContext{Mode: modeVM, Image: "alpine", CWD: "/work"},
+			leaf:  "work",
+			color: colorYellow,
+		},
+		{
+			name:  "isolated guest",
+			ctx:   commandContext{Mode: modeVM, Image: "alpine", Isolated: true, CWD: "/work"},
+			leaf:  "work",
+			color: colorMagenta,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sh := &shellState{context: tt.ctx, hostCWD: hostCWD}
+			prompt := sh.prompt()
+			if !strings.Contains(prompt, tt.color+tt.leaf+colorReset) {
+				t.Fatalf("prompt = %q, want %s-colored cwd %q", prompt, tt.name, tt.leaf)
+			}
+		})
+	}
+}
+
 func TestBareOCIPullCanBeCancelled(t *testing.T) {
 	api := &fakeVMSHAPI{
 		status:      client.InstanceState{ID: "default", Status: "stopped"},
