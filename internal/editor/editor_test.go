@@ -149,6 +149,23 @@ func TestLineEditorLeftRightNavigateCompletionMenu(t *testing.T) {
 	assertLine(t, done, "cat bb")
 }
 
+func TestLineEditorRepeatedTabKeepsCompletionMenuStable(t *testing.T) {
+	master, tty, err := pty.Open()
+	if err != nil {
+		t.Skipf("open pty: %v", err)
+	}
+	defer master.Close()
+	defer tty.Close()
+
+	editor := NewLineEditor(tty, io.Discard, "", fakeCompleter{items: []string{"aa", "bb", "cc"}, kind: CompletionPath})
+	done := readLineAsync(editor)
+	time.Sleep(25 * time.Millisecond)
+	if _, err := master.Write([]byte("cat \t\t\r\r")); err != nil {
+		t.Fatal(err)
+	}
+	assertLine(t, done, "cat aa")
+}
+
 type lineResult struct {
 	line string
 	err  error

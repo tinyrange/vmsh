@@ -271,7 +271,7 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 			historyPos, draft = e.historyMove(historyPos, draft, 1)
 		case keyTab:
 			if e.menu.active {
-				e.moveCompletion(1)
+				break
 			} else if onlyTabs(e.buf) {
 				e.insertRune('\t')
 			} else {
