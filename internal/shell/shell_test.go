@@ -1769,21 +1769,39 @@ func TestSaveVMUsesSelectedVMAndCachesImage(t *testing.T) {
 	api := &fakeVMSHAPI{}
 	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine"}, hostCWD: t.TempDir(), imageCache: map[string]bool{}}
 	var stdout bytes.Buffer
+	var stderr bytes.Buffer
 
-	if err := sh.evalAt("@save saved-tag", &stdout, io.Discard); err != nil {
+	if err := sh.evalAt("@save saved-tag", &stdout, &stderr); err != nil {
 		t.Fatalf("evalAt(@save) error = %v", err)
 	}
 	if len(api.saves) != 1 {
 		t.Fatalf("saves = %d, want 1", len(api.saves))
 	}
-	if api.saves[0].id != "work" || api.saves[0].req.Name != "saved-tag" || api.saves[0].req.Image != "alpine" {
-		t.Fatalf("save request = %#v, want work saved-tag from alpine", api.saves[0])
+	if api.saves[0].id != "work" || api.saves[0].req.Name != "saved-tag" || api.saves[0].req.Image != "" {
+		t.Fatalf("save request = %#v, want work saved-tag from running VM rootfs", api.saves[0])
 	}
 	if !sh.imageCache["saved-tag"] {
 		t.Fatalf("saved-tag was not cached")
 	}
 	if got := stdout.String(); !strings.Contains(got, "Saved work as saved-tag") {
 		t.Fatalf("stdout = %q, want save message", got)
+	}
+	if got := stderr.String(); !strings.Contains(got, "Save saved-tag") || !strings.Contains(got, "status: saved") || !strings.Contains(got, "files: 1") {
+		t.Fatalf("stderr = %q, want save progress", got)
+	}
+}
+
+func TestFormatSaveProgressLabelsSnapshotVMAndSavedPath(t *testing.T) {
+	for _, status := range []string{"flushing", "snapshotting"} {
+		msg := formatSaveProgressEvent(client.ProgressEvent{Status: status, Artifact: "go", Blob: "default"}, "go")
+		if !strings.Contains(msg, "vm: default") || strings.Contains(msg, "blob: default") {
+			t.Fatalf("%s progress = %q, want vm label without blob label", status, msg)
+		}
+	}
+
+	saving := formatSaveProgressEvent(client.ProgressEvent{Status: "saving", Artifact: "go", Blob: "/usr/bin/go"}, "go")
+	if !strings.Contains(saving, "path: /usr/bin/go") || strings.Contains(saving, "blob: /usr/bin/go") {
+		t.Fatalf("saving progress = %q, want path label without blob label", saving)
 	}
 }
 
@@ -1852,6 +1870,48 @@ func TestSaveVMInterruptCancelsWithoutExitingShell(t *testing.T) {
 	}
 	if sh.lastCode != 130 {
 		t.Fatalf("lastCode = %d, want 130", sh.lastCode)
+	}
+	if len(api.saves) != 1 {
+		t.Fatalf("saves = %d, want 1", len(api.saves))
+	}
+}
+
+func TestSaveVMClosesPersistentGuestShellBeforeSave(t *testing.T) {
+	inputs := make(chan client.ExecInput, 8)
+	done := make(chan error, 1)
+	closed := make(chan struct{}, 1)
+	go func() {
+		input := <-inputs
+		if input.Kind == "stdin_close" {
+			closed <- struct{}{}
+		}
+		done <- nil
+	}()
+	api := &fakeVMSHAPI{
+		saveContextHook: func(context.Context) error {
+			select {
+			case <-closed:
+			default:
+				t.Fatal("save started before persistent guest shell was closed")
+			}
+			return nil
+		},
+	}
+	sh := &shellState{
+		api:     api,
+		context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine"},
+		hostCWD: t.TempDir(),
+		guestShell: &persistentGuestShell{
+			inputs: inputs,
+			done:   done,
+		},
+	}
+
+	if err := sh.evalAt("@save saved-tag", io.Discard, io.Discard); err != nil {
+		t.Fatalf("evalAt(@save) error = %v", err)
+	}
+	if sh.guestShell != nil {
+		t.Fatal("persistent guest shell remained after save")
 	}
 	if len(api.saves) != 1 {
 		t.Fatalf("saves = %d, want 1", len(api.saves))
@@ -2501,6 +2561,21 @@ func (f *fakeVMSHAPI) SaveInstanceImageContext(ctx context.Context, id string, r
 		return f.saveState, nil
 	}
 	return client.ImageState{Name: req.Name, Status: "downloaded"}, nil
+}
+
+func (f *fakeVMSHAPI) SaveInstanceImageStream(ctx context.Context, id string, req client.SaveImageRequest, onEvent func(client.ProgressEvent) error) error {
+	state, err := f.SaveInstanceImageContext(ctx, id, req)
+	if err != nil {
+		return err
+	}
+	if onEvent == nil {
+		return nil
+	}
+	return onEvent(client.ProgressEvent{
+		Status:          "saved",
+		Artifact:        firstNonEmpty(state.Name, req.Name),
+		FilesDownloaded: 1,
+	})
 }
 
 func (f *fakeVMSHAPI) StartInstanceStreamWithID(id string, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {

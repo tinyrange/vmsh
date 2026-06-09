@@ -869,7 +869,11 @@ func Run(args []string) error {
 			childCCVMPath = abs
 		}
 	}
-	api, err := backend.ConnectCCVM(ccvmLaunch, rootCache, statePath)
+	api, err := backend.ConnectCCVMWithOptions(ccvmLaunch, rootCache, statePath, backend.ConnectOptions{
+		OnStart: func(launch backend.CCVMLaunch, cacheDir string) {
+			fmt.Fprintf(os.Stderr, "vmsh: starting ccvm daemon: %s (cache: %s)\n", backend.CCVMLaunchName(launch), cacheDir)
+		},
+	})
 	if err != nil {
 		return err
 	}
@@ -1769,7 +1773,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		id := firstNonEmpty(ctx.VMID, s.context.VMID)
 		return s.restartVM(id, ctx, stderr)
 	case "save":
-		return s.saveVM(at, stdout)
+		return s.saveVM(at, stdout, stderr)
 	case "rmi":
 		return s.removeImage(at, stdout)
 	case "tmux":
@@ -3978,7 +3982,7 @@ func restartContextFromState(ctx commandContext, state client.InstanceState) com
 	return ctx
 }
 
-func (s *shellState) saveVM(at atLine, stdout io.Writer) error {
+func (s *shellState) saveVM(at atLine, stdout, stderr io.Writer) error {
 	fields, err := splitShellFields(at.Command)
 	if err != nil {
 		return err
@@ -3994,11 +3998,29 @@ func (s *shellState) saveVM(at atLine, stdout io.Writer) error {
 	if strings.TrimSpace(id) == "" {
 		return fmt.Errorf("vm id is required")
 	}
+	if s.guestShell != nil {
+		s.guestShell.close()
+		s.guestShell = nil
+	}
 	ctx, stop, interrupted := s.interruptibleCommandContext()
 	defer stop()
-	state, err := s.api.SaveInstanceImageContext(ctx, id, client.SaveImageRequest{
-		Name:  name,
-		Image: localImageName(s.context.Image, s.context.Arch),
+	progress := newTerminalHoldStatus(stderr, "Save "+name+": flushing")
+	defer progress.Close()
+	savedName := name
+	req := client.SaveImageRequest{
+		Name: name,
+	}
+	err = s.api.SaveInstanceImageStream(ctx, id, req, func(event client.ProgressEvent) error {
+		if event.Status == "saved" && event.Artifact != "" {
+			savedName = event.Artifact
+		}
+		message := formatSaveProgressEvent(event, name)
+		if event.Status == "saved" {
+			progress.finishWith(message)
+			return nil
+		}
+		progress.Update(message)
+		return nil
 	})
 	if err != nil {
 		if interrupted.Load() || errors.Is(ctx.Err(), context.Canceled) {
@@ -4010,8 +4032,8 @@ func (s *shellState) saveVM(at atLine, stdout io.Writer) error {
 	if s.imageCache == nil {
 		s.imageCache = map[string]bool{}
 	}
-	s.imageCache[state.Name] = true
-	if _, err := fmt.Fprintf(stdout, "Saved %s as %s\n", id, state.Name); err != nil {
+	s.imageCache[savedName] = true
+	if _, err := fmt.Fprintf(stdout, "Saved %s as %s\n", id, savedName); err != nil {
 		return err
 	}
 	return nil
@@ -4882,11 +4904,27 @@ func parseTCPPort(value, label string) (int, error) {
 }
 
 func formatDetailedProgressEvent(event client.ProgressEvent, fallbackArtifact string) string {
+	return formatDetailedProgressEventTitle("Pull", event, fallbackArtifact)
+}
+
+func formatSaveProgressEvent(event client.ProgressEvent, fallbackArtifact string) string {
+	blobLabel := "path"
+	if event.Status == "flushing" || event.Status == "snapshotting" {
+		blobLabel = "vm"
+	}
+	return formatDetailedProgressEventWithBlobLabel("Save", event, fallbackArtifact, blobLabel)
+}
+
+func formatDetailedProgressEventTitle(titlePrefix string, event client.ProgressEvent, fallbackArtifact string) string {
+	return formatDetailedProgressEventWithBlobLabel(titlePrefix, event, fallbackArtifact, "blob")
+}
+
+func formatDetailedProgressEventWithBlobLabel(titlePrefix string, event client.ProgressEvent, fallbackArtifact, blobLabel string) string {
 	artifact := firstNonEmpty(event.Artifact, fallbackArtifact)
 	if artifact == "" && event.Status == "" && event.Blob == "" && event.Error == "" {
 		return ""
 	}
-	title := "Pull"
+	title := titlePrefix
 	if artifact != "" {
 		title += " " + artifact
 	}
@@ -4896,7 +4934,7 @@ func formatDetailedProgressEvent(event client.ProgressEvent, fallbackArtifact st
 		lines = append(lines, "  artifact: "+event.Artifact)
 	}
 	if event.Blob != "" {
-		lines = append(lines, "  blob: "+event.Blob)
+		lines = append(lines, "  "+blobLabel+": "+event.Blob)
 	}
 	if event.Progress > 0 {
 		lines = append(lines, fmt.Sprintf("  progress: %.1f%%", event.Progress*100))

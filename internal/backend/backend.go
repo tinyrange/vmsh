@@ -28,6 +28,7 @@ type API interface {
 	DeleteImage(string) error
 	SaveInstanceImage(string, client.SaveImageRequest) (client.ImageState, error)
 	SaveInstanceImageContext(context.Context, string, client.SaveImageRequest) (client.ImageState, error)
+	SaveInstanceImageStream(context.Context, string, client.SaveImageRequest, func(client.ProgressEvent) error) error
 	StartInstanceStreamWithID(string, client.StartInstanceRequest, func(client.BootEvent) error) (client.InstanceState, error)
 	ShutdownInstanceWithID(string) error
 	InstanceStatusOf(string) (client.InstanceState, error)
@@ -50,6 +51,10 @@ type CCVMLaunch struct {
 	Path string
 	Args []string
 	Env  []string
+}
+
+type ConnectOptions struct {
+	OnStart func(CCVMLaunch, string)
 }
 
 func ResolveCCVMPath(path string, bundledAvailable bool) (CCVMLaunch, error) {
@@ -100,6 +105,10 @@ func CompanionExecutablePath(exePath, suffix string) string {
 }
 
 func ConnectCCVM(launch CCVMLaunch, cacheDir, statePath string) (*client.Client, error) {
+	return ConnectCCVMWithOptions(launch, cacheDir, statePath, ConnectOptions{})
+}
+
+func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts ConnectOptions) (*client.Client, error) {
 	if state, err := ReadDaemonState(statePath); err == nil {
 		api := NewClient(state.Addr)
 		if err := api.HealthCheck(); err == nil {
@@ -119,6 +128,9 @@ func ConnectCCVM(launch CCVMLaunch, cacheDir, statePath string) (*client.Client,
 	stdout, err := proc.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("prepare ccvm stdout pipe for %s: %w", CCVMLaunchName(launch), err)
+	}
+	if opts.OnStart != nil {
+		opts.OnStart(launch, cacheDir)
 	}
 	if err := proc.Start(); err != nil {
 		return nil, fmt.Errorf("start ccvm daemon %s with cache %s: %w", CCVMLaunchName(launch), cacheDir, err)
