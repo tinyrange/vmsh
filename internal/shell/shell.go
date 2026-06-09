@@ -76,6 +76,7 @@ type shellState struct {
 	jobsMu           sync.Mutex
 	contextCWD       map[string]string
 	statusSeq        atomic.Uint64
+	interruptSignals <-chan os.Signal
 	completion       *vmshCompleter
 	tmuxExec         func([]string) error
 }
@@ -964,9 +965,19 @@ func (s *shellState) warmHostShell(stdout, stderr io.Writer) {
 
 func (s *shellState) evalLineEditor(in *os.File, stdout, stderr io.Writer) error {
 	lineEditor := editor.NewLineEditor(in, stdout, s.history, s.completion)
+	interrupts := make(chan os.Signal, 8)
+	signal.Notify(interrupts, os.Interrupt)
+	previousInterrupts := s.interruptSignals
+	s.interruptSignals = interrupts
+	defer func() {
+		signal.Stop(interrupts)
+		s.interruptSignals = previousInterrupts
+	}()
 	for {
+		drainSignals(interrupts)
 		s.drawPromptStatus(stdout)
 		line, err := lineEditor.ReadLine(s.prompt())
+		drainSignals(interrupts)
 		s.statusSeq.Add(1)
 		switch {
 		case errors.Is(err, editor.ErrLineInterrupted):
@@ -982,6 +993,16 @@ func (s *shellState) evalLineEditor(in *os.File, stdout, stderr io.Writer) error
 			}
 			s.lastCode = 1
 			fmt.Fprintln(stderr, "vmsh:", err)
+		}
+	}
+}
+
+func drainSignals(signals <-chan os.Signal) {
+	for {
+		select {
+		case <-signals:
+		default:
+			return
 		}
 	}
 }
@@ -3329,7 +3350,7 @@ func (s *shellState) startGuestInputForwarding(tty, forwardStdin bool, inputs ch
 	producers.Add(1)
 	go func() {
 		defer producers.Done()
-		forwardGuestSignals(inputs, done, tty, stdout, stderr, onSignal...)
+		forwardGuestSignals(inputs, done, tty, stdout, stderr, s.interruptSignals, onSignal...)
 	}()
 	return stopGuestInputForwarding(restore, func() {
 		close(done)
@@ -3374,46 +3395,68 @@ func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan st
 	}
 }
 
-func forwardGuestSignals(out chan<- client.ExecInput, done <-chan struct{}, tty bool, stdout, stderr io.Writer, onSignal ...func(string)) {
+func forwardGuestSignals(out chan<- client.ExecInput, done <-chan struct{}, tty bool, stdout, stderr io.Writer, interrupts <-chan os.Signal, onSignal ...func(string)) {
 	signals := terminal.HostSignals(tty)
+	if interrupts != nil {
+		signals = withoutInterruptSignal(signals)
+	}
 	sigCh := make(chan os.Signal, 8)
-	signal.Notify(sigCh, signals...)
-	defer signal.Stop(sigCh)
+	if len(signals) > 0 {
+		signal.Notify(sigCh, signals...)
+		defer signal.Stop(sigCh)
+	}
 	for {
 		select {
 		case <-done:
 			return
 		case sig := <-sigCh:
-			if sig == nil {
-				continue
-			}
-			if terminal.IsResizeSignal(sig) {
-				file, ok := stdout.(*os.File)
-				if !ok {
-					continue
-				}
-				cols, rows, err := terminal.Size(file)
-				if err != nil {
-					continue
-				}
-				sendGuestInput(out, done, client.ExecInput{Kind: "resize", Cols: cols, Rows: rows})
-				continue
-			}
-			name, ok := terminal.SignalName(sig)
-			if !ok {
-				continue
-			}
-			for _, fn := range onSignal {
-				if fn != nil {
-					fn(name)
-				}
-			}
-			if name == "INT" {
-				fmt.Fprintln(stderr)
-			}
-			sendGuestInput(out, done, client.ExecInput{Kind: "signal", Signal: name})
+			forwardGuestSignal(sig, out, done, stdout, stderr, onSignal...)
+		case sig := <-interrupts:
+			forwardGuestSignal(sig, out, done, stdout, stderr, onSignal...)
 		}
 	}
+}
+
+func withoutInterruptSignal(signals []os.Signal) []os.Signal {
+	out := signals[:0]
+	for _, sig := range signals {
+		if sig == os.Interrupt {
+			continue
+		}
+		out = append(out, sig)
+	}
+	return out
+}
+
+func forwardGuestSignal(sig os.Signal, out chan<- client.ExecInput, done <-chan struct{}, stdout, stderr io.Writer, onSignal ...func(string)) {
+	if sig == nil {
+		return
+	}
+	if terminal.IsResizeSignal(sig) {
+		file, ok := stdout.(*os.File)
+		if !ok {
+			return
+		}
+		cols, rows, err := terminal.Size(file)
+		if err != nil {
+			return
+		}
+		sendGuestInput(out, done, client.ExecInput{Kind: "resize", Cols: cols, Rows: rows})
+		return
+	}
+	name, ok := terminal.SignalName(sig)
+	if !ok {
+		return
+	}
+	for _, fn := range onSignal {
+		if fn != nil {
+			fn(name)
+		}
+	}
+	if name == "INT" {
+		fmt.Fprintln(stderr)
+	}
+	sendGuestInput(out, done, client.ExecInput{Kind: "signal", Signal: name})
 }
 
 func sendGuestInput(out chan<- client.ExecInput, done <-chan struct{}, input client.ExecInput) {

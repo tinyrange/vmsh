@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1918,6 +1919,42 @@ func TestGuestInputForwardingStopSignalsBeforeRestore(t *testing.T) {
 	stop()
 	if fmt.Sprint(order) != "[stop restore]" {
 		t.Fatalf("stop order = %v, want stop before restore", order)
+	}
+}
+
+func TestForwardGuestSignalsUsesShellInterruptChannel(t *testing.T) {
+	inputs := make(chan client.ExecInput, 4)
+	done := make(chan struct{})
+	interrupts := make(chan os.Signal, 1)
+	var stderr bytes.Buffer
+	var forwarded []string
+
+	go forwardGuestSignals(inputs, done, false, io.Discard, &stderr, interrupts, func(name string) {
+		forwarded = append(forwarded, name)
+	})
+	interrupts <- os.Interrupt
+
+	select {
+	case got := <-inputs:
+		if got.Kind != "signal" || got.Signal != "INT" {
+			t.Fatalf("forwarded input = %#v, want INT signal", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for forwarded interrupt")
+	}
+	close(done)
+	if fmt.Sprint(forwarded) != "[INT]" {
+		t.Fatalf("forwarded callbacks = %#v, want INT", forwarded)
+	}
+	if stderr.String() != "\n" {
+		t.Fatalf("stderr = %q, want interrupt newline", stderr.String())
+	}
+}
+
+func TestWithoutInterruptSignal(t *testing.T) {
+	got := withoutInterruptSignal([]os.Signal{syscall.SIGHUP, os.Interrupt, syscall.SIGTERM})
+	if fmt.Sprint(got) != fmt.Sprint([]os.Signal{syscall.SIGHUP, syscall.SIGTERM}) {
+		t.Fatalf("withoutInterruptSignal() = %#v", got)
 	}
 }
 
