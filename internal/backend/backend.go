@@ -27,6 +27,7 @@ type API interface {
 	PullImageStream(string, client.PullImageRequest, func(client.ProgressEvent) error) error
 	DeleteImage(string) error
 	SaveInstanceImage(string, client.SaveImageRequest) (client.ImageState, error)
+	SaveInstanceImageContext(context.Context, string, client.SaveImageRequest) (client.ImageState, error)
 	StartInstanceStreamWithID(string, client.StartInstanceRequest, func(client.BootEvent) error) (client.InstanceState, error)
 	ShutdownInstanceWithID(string) error
 	InstanceStatusOf(string) (client.InstanceState, error)

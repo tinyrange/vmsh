@@ -1815,6 +1815,49 @@ func TestSaveVMRejectsUnsupportedOptions(t *testing.T) {
 	}
 }
 
+func TestSaveVMInterruptCancelsWithoutExitingShell(t *testing.T) {
+	interrupts := make(chan os.Signal, 1)
+	started := make(chan struct{})
+	api := &fakeVMSHAPI{
+		saveContextHook: func(ctx context.Context) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	sh := &shellState{
+		api:              api,
+		context:          commandContext{Mode: modeVM, VMID: "work", Image: "alpine"},
+		hostCWD:          t.TempDir(),
+		interruptSignals: interrupts,
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- sh.evalAt("@save saved-tag", io.Discard, io.Discard)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for save to start")
+	}
+	interrupts <- os.Interrupt
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("evalAt(@save) error = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for save to cancel")
+	}
+	if sh.lastCode != 130 {
+		t.Fatalf("lastCode = %d, want 130", sh.lastCode)
+	}
+	if len(api.saves) != 1 {
+		t.Fatalf("saves = %d, want 1", len(api.saves))
+	}
+}
+
 func TestRemoveImageDeletesCachedImage(t *testing.T) {
 	api := &fakeVMSHAPI{}
 	sh := &shellState{api: api, hostCWD: t.TempDir(), imageCache: map[string]bool{"alpine-gcc": true}}
@@ -2354,6 +2397,7 @@ type fakeVMSHAPI struct {
 	missingImgs           map[string]bool
 	saveState             client.ImageState
 	saveErr               error
+	saveContextHook       func(context.Context) error
 	deleteErr             error
 	imageGets             int
 	statusGets            int
@@ -2437,7 +2481,19 @@ func (f *fakeVMSHAPI) DeleteImage(name string) error {
 }
 
 func (f *fakeVMSHAPI) SaveInstanceImage(id string, req client.SaveImageRequest) (client.ImageState, error) {
+	return f.SaveInstanceImageContext(context.Background(), id, req)
+}
+
+func (f *fakeVMSHAPI) SaveInstanceImageContext(ctx context.Context, id string, req client.SaveImageRequest) (client.ImageState, error) {
+	if err := ctx.Err(); err != nil {
+		return client.ImageState{}, err
+	}
 	f.saves = append(f.saves, fakeSave{id: id, req: req})
+	if f.saveContextHook != nil {
+		if err := f.saveContextHook(ctx); err != nil {
+			return client.ImageState{}, err
+		}
+	}
 	if f.saveErr != nil {
 		return client.ImageState{}, f.saveErr
 	}

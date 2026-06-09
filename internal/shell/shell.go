@@ -3994,11 +3994,17 @@ func (s *shellState) saveVM(at atLine, stdout io.Writer) error {
 	if strings.TrimSpace(id) == "" {
 		return fmt.Errorf("vm id is required")
 	}
-	state, err := s.api.SaveInstanceImage(id, client.SaveImageRequest{
+	ctx, stop, interrupted := s.interruptibleCommandContext()
+	defer stop()
+	state, err := s.api.SaveInstanceImageContext(ctx, id, client.SaveImageRequest{
 		Name:  name,
 		Image: localImageName(s.context.Image, s.context.Arch),
 	})
 	if err != nil {
+		if interrupted.Load() || errors.Is(ctx.Err(), context.Canceled) {
+			s.lastCode = 130
+			return nil
+		}
 		return err
 	}
 	if s.imageCache == nil {
