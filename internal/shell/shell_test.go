@@ -796,8 +796,14 @@ func TestMixedPipelinePassesGuestStdinAsRunRequestStdin(t *testing.T) {
 	if got := string(api.streams[0].req.Stdin); !strings.Contains(got, "go.mod") || !strings.Contains(got, "go.sum") {
 		t.Fatalf("grep stdin = %q, want host ls output", got)
 	}
+	if !api.streams[0].req.StdinClosed {
+		t.Fatal("grep stdin was not marked closed")
+	}
 	if got := string(api.streams[1].req.Stdin); got != "go.mod\ngo.sum\n" {
 		t.Fatalf("wc stdin = %q, want grep output", got)
+	}
+	if !api.streams[1].req.StdinClosed {
+		t.Fatal("wc stdin was not marked closed")
 	}
 }
 

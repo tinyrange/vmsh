@@ -3299,6 +3299,7 @@ func (s *shellState) streamGuestRunWithInputContext(ctx context.Context, id stri
 			return err
 		}
 		req.Stdin = data
+		req.StdinClosed = true
 	}
 	exitCode := 0
 	if err := s.api.RunStreamInContext(ctx, id, req, func(event client.ExecEvent) error {
