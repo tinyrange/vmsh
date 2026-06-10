@@ -32,6 +32,7 @@ type API interface {
 	InstanceStatusOf(string) (client.InstanceState, error)
 	InstanceStatuses() ([]client.InstanceState, error)
 	AddPortForwardTo(string, client.PortForward) error
+	AllowServiceProxyPortTo(string, int) error
 	CreateWatchdogLease(client.WatchdogLeaseRequest) (client.WatchdogLeaseResponse, error)
 	FeedWatchdogLease(string) error
 	ReleaseWatchdogLease(string) error

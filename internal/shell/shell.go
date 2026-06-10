@@ -32,6 +32,7 @@ import (
 )
 
 const guestHostMount = "/host"
+const isolatedVMSuffix = "-isolated"
 const defaultGuestUser = "1000:1000"
 const defaultVMSHBootTimeoutSeconds = 60
 const defaultGuestShellReadyTimeout = 5 * time.Second
@@ -165,7 +166,7 @@ func (c *vmshCompleter) CompleteWithKind(line []rune, pos int) ([]string, int, c
 		return candidates, len([]rune(token)), completionAt
 	}
 	if strings.HasPrefix(prefix, "@") && strings.HasPrefix(token, "--") {
-		candidates = suffixCompletions(vmshOptionWords(), token)
+		candidates = suffixCompletions(vmshOptionWords(prefix[:tokenStart]), token)
 		return candidates, len([]rune(token)), completionOption
 	}
 	if c.shouldCompleteRMIImage(prefix, tokenStart) {
@@ -248,7 +249,7 @@ func (c *vmshCompleter) completionContext(prefix string) commandContext {
 	case "host":
 		ctx = ctx.withOptions(at.Options)
 		ctx.Mode = modeHost
-	case "help", "ps", "jobs", "alias", "status", "where", "start", "stop", "restart", "forward", "tmux":
+	case "help", "ps", "jobs", "alias", "status", "where", "start", "stop", "restart", "forward", "tmux", "agent":
 	default:
 		ctx = ctx.withOptions(at.Options)
 		ctx.Mode = modeVM
@@ -265,7 +266,7 @@ func pathCompletionReplaceLen(token string) int {
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@alias", "@copy", "@help", "@host", "@jobs", "@ps", "@restart", "@status", "@start", "@stop", "@forward", "@rmi", "@sudo", "@tmux"}
+	words := []string{"@agent", "@alias", "@copy", "@help", "@host", "@jobs", "@ps", "@restart", "@status", "@start", "@stop", "@forward", "@rmi", "@sudo", "@tmux"}
 	for _, image := range c.cachedImageNames() {
 		words = append(words, "@"+image)
 	}
@@ -296,8 +297,8 @@ func (c *vmshCompleter) cachedImageNames() []string {
 	return images
 }
 
-func vmshOptionWords() []string {
-	return []string{
+func vmshOptionWords(prefix string) []string {
+	words := []string{
 		"--vm",
 		"--cwd",
 		"--user",
@@ -313,6 +314,11 @@ func vmshOptionWords() []string {
 		"--isolated",
 		"--shared",
 	}
+	completed := completedShellWords(prefix)
+	if len(completed) > 0 && completed[0] == "@agent" {
+		words = append(words, "--proxy")
+	}
+	return words
 }
 
 func suffixCompletions(words []string, token string) []string {
@@ -428,7 +434,8 @@ func (c *vmshCompleter) guestCommandNames(ctx commandContext, token string) []st
 	if c.shell == nil || c.shell.api == nil || ctx.VMID == "" || ctx.Image == "" {
 		return nil
 	}
-	status, err := c.shell.api.InstanceStatusOf(ctx.VMID)
+	id := backendVMID(ctx)
+	status, err := c.shell.api.InstanceStatusOf(id)
 	if err != nil || status.Status != "running" {
 		return nil
 	}
@@ -441,7 +448,7 @@ func (c *vmshCompleter) guestCommandNames(ctx commandContext, token string) []st
 	var stdout strings.Builder
 	runCtx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
 	defer cancel()
-	err = c.shell.api.RunStreamInContext(runCtx, ctx.VMID, req, func(event client.ExecEvent) error {
+	err = c.shell.api.RunStreamInContext(runCtx, id, req, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stdout", "output":
 			stdout.WriteString(execEventText(event))
@@ -596,7 +603,8 @@ func (c *vmshCompleter) guestPathCandidates(token string, ctx commandContext) ([
 }
 
 func (c *vmshCompleter) guestPathCandidatesInDir(ctx commandContext, guestDir, base string) ([]string, error) {
-	status, err := c.shell.api.InstanceStatusOf(ctx.VMID)
+	id := backendVMID(ctx)
+	status, err := c.shell.api.InstanceStatusOf(id)
 	if err != nil || status.Status != "running" {
 		return nil, err
 	}
@@ -610,7 +618,7 @@ func (c *vmshCompleter) guestPathCandidatesInDir(ctx commandContext, guestDir, b
 	var stdout strings.Builder
 	runCtx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
 	defer cancel()
-	err = c.shell.api.RunStreamInContext(runCtx, ctx.VMID, req, func(event client.ExecEvent) error {
+	err = c.shell.api.RunStreamInContext(runCtx, id, req, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stdout", "output":
 			stdout.WriteString(execEventText(event))
@@ -771,6 +779,7 @@ type commandOptions struct {
 	User         string
 	Arch         string
 	Sudo         bool
+	AgentProxy   bool
 	MemoryMB     uint64
 	CPUs         int
 	Network      *bool
@@ -1588,7 +1597,7 @@ func (s *shellState) preparePipelineStage(base commandContext, segment string, s
 
 func isControlAtTarget(target string) bool {
 	switch target {
-	case "help", "?", "ps", "jobs", "alias", "status", "where", "start", "stop", "restart", "save", "rmi", "tmux", "forward", "copy", "cp":
+	case "help", "?", "ps", "jobs", "alias", "status", "where", "start", "stop", "restart", "save", "rmi", "tmux", "forward", "copy", "cp", "agent":
 		return true
 	default:
 		return false
@@ -1600,7 +1609,7 @@ func (s *shellState) runPipelineStage(stage pipelineStage, stdin io.Reader, stdo
 	case modeHost:
 		return s.runHostWithInput(stage.line, stdin, stdout, stderr)
 	case modeVM:
-		return s.streamGuestRunWithInput(stage.ctx.VMID, stage.req, stdin, stdout, stderr)
+		return s.streamGuestRunWithInput(backendVMID(stage.ctx), stage.req, stdin, stdout, stderr)
 	default:
 		return fmt.Errorf("unknown shell mode %q", stage.ctx.Mode)
 	}
@@ -1861,20 +1870,21 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("usage: @start [--vm id]")
 		}
 		ctx := s.context.withOptions(at.Options)
-		id := firstNonEmpty(ctx.VMID, s.context.VMID)
+		id := backendVMID(ctx)
 		return s.startVM(id, ctx, stderr)
 	case "stop":
 		if at.Command != "" {
 			return fmt.Errorf("usage: @stop [--vm id]")
 		}
-		id := firstNonEmpty(at.Options.VMID, s.context.VMID)
+		ctx := s.context.withOptions(at.Options)
+		id := backendVMID(ctx)
 		return s.stopVM(id)
 	case "restart":
 		if at.Command != "" {
 			return fmt.Errorf("usage: @restart [--vm id]")
 		}
 		ctx := s.context.withOptions(at.Options)
-		id := firstNonEmpty(ctx.VMID, s.context.VMID)
+		id := backendVMID(ctx)
 		return s.restartVM(id, ctx, stderr)
 	case "save":
 		return s.saveVM(at, stdout)
@@ -1897,13 +1907,16 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		id := firstNonEmpty(at.Options.VMID, s.context.VMID)
+		ctx := s.context.withOptions(at.Options)
+		id := backendVMID(ctx)
 		return s.api.AddPortForwardTo(id, forward)
 	case "copy", "cp":
 		if len(at.Options.OptionFields) != 0 {
 			return fmt.Errorf("usage: @copy SRC DST")
 		}
 		return s.copyPath(at.Command, stdout, stderr)
+	case "agent":
+		return s.runAgent(at, stdout, stderr)
 	default:
 		ctx := s.context.withOptions(at.Options)
 		ctx.Mode = modeVM
@@ -2283,7 +2296,7 @@ func (s *shellState) runGuestFSRequest(ctx commandContext, req client.ExecReques
 	var exitSeen bool
 	var exitCode int
 	var eventErr error
-	if err := s.api.ExecStreamIn(ctx.VMID, req, nil, func(event client.ExecEvent) error {
+	if err := s.api.ExecStreamIn(backendVMID(ctx), req, nil, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stderr":
 			writeExecEventOutput(stderr, event)
@@ -2317,7 +2330,7 @@ func (s *shellState) copyGuestToHost(src copyEndpoint, dst string, stderr io.Wri
 	var exitSeen bool
 	var exitCode int
 	var eventErr error
-	if err := s.api.ExecStreamIn(src.ctx.VMID, client.ExecRequest{
+	if err := s.api.ExecStreamIn(backendVMID(src.ctx), client.ExecRequest{
 		Kind:  "fs_archive",
 		Image: localImageName(src.ctx.Image, src.ctx.Arch),
 		Path:  src.path,
@@ -2583,6 +2596,21 @@ func contextCWDKey(ctx commandContext) string {
 		strconv.FormatBool(ctx.Isolated),
 		guestRunUser(ctx),
 	}, "\x00")
+}
+
+func backendVMID(ctx commandContext) string {
+	return backendVMIDFor(ctx.VMID, ctx.Isolated)
+}
+
+func backendVMIDFor(id string, isolated bool) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = "default"
+	}
+	if isolated {
+		return id + isolatedVMSuffix
+	}
+	return id
 }
 
 func sessionLastCode(err error) int {
@@ -3069,7 +3097,7 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 		}
 		return err
 	}
-	return s.streamGuestRun(ctx.VMID, req, stdout, stderr)
+	return s.streamGuestRun(backendVMID(ctx), req, stdout, stderr)
 }
 
 func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty bool, cols, rows int, stderr io.Writer) (client.RunRequest, error) {
@@ -3121,7 +3149,7 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 	}
 	req.Env = guestCommandEnv(ctx, s.env, terminal)
 	if ctx.Network {
-		req.Network = defaultNetworkConfig()
+		req.Network = networkConfigForContext(ctx)
 	}
 	return req, nil
 }
@@ -3131,7 +3159,7 @@ func persistentGuestCommandAllowed(line string) bool {
 }
 
 func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequest) (*persistentGuestShell, error) {
-	key := strings.Join([]string{ctx.VMID, localImageName(ctx.Image, ctx.Arch), req.User}, "\x00")
+	key := guestPersistentShellKey(ctx, req)
 	if s.guestShell != nil && s.guestShell.key == key {
 		return s.guestShell, nil
 	}
@@ -3158,7 +3186,7 @@ func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequ
 		lastCWD: req.WorkDir,
 	}
 	go func() {
-		err := s.api.RunInteractiveStreamIn(ctx.VMID, req, inputs, func(event client.ExecEvent) error {
+		err := s.api.RunInteractiveStreamIn(backendVMID(ctx), req, inputs, func(event client.ExecEvent) error {
 			events <- event
 			return nil
 		})
@@ -3171,6 +3199,34 @@ func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequ
 	}
 	s.guestShell = session
 	return session, nil
+}
+
+func guestPersistentShellKey(ctx commandContext, req client.RunRequest) string {
+	return strings.Join([]string{
+		backendVMID(ctx),
+		req.Image,
+		req.User,
+		shareMountKey(req.Shares),
+	}, "\x00")
+}
+
+func shareMountKey(shares []client.ShareMount) string {
+	if len(shares) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(shares))
+	for _, share := range shares {
+		parts = append(parts, strings.Join([]string{
+			share.Source,
+			share.Mount,
+			strconv.FormatBool(share.Writable),
+			strconv.FormatBool(share.MapOwner),
+			strconv.FormatUint(uint64(share.OwnerUID), 10),
+			strconv.FormatUint(uint64(share.OwnerGID), 10),
+			share.Cache,
+		}, "\x1f"))
+	}
+	return strings.Join(parts, "\x1e")
 }
 
 func guestPersistentCommand() []string {
@@ -4125,7 +4181,7 @@ func guestHostPaths(hostCWD string) (hostRoot, guestCWD string, err error) {
 }
 
 func (s *shellState) ensureVMRunning(ctx commandContext, stderr io.Writer) error {
-	id := ctx.VMID
+	id := backendVMID(ctx)
 	if s.vmRunning != nil && s.vmRunning[id] {
 		return nil
 	}
@@ -4156,7 +4212,7 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 		TimeoutSeconds: vmshBootTimeoutSeconds(),
 	}
 	if ctx.Network {
-		req.Network = defaultNetworkConfig()
+		req.Network = networkConfigForContext(ctx)
 	}
 	boot := newBootStatus(stderr)
 	defer boot.Close()
@@ -4167,11 +4223,11 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 	if err != nil {
 		return err
 	}
-	s.context.VMID = firstNonEmpty(state.ID, id)
+	startedID := firstNonEmpty(state.ID, id)
 	if s.vmRunning == nil {
 		s.vmRunning = map[string]bool{}
 	}
-	s.vmRunning[s.context.VMID] = true
+	s.vmRunning[startedID] = true
 	return nil
 }
 
@@ -4329,10 +4385,22 @@ func defaultNetworkConfig() *client.NetworkConfig {
 	return &client.NetworkConfig{Enabled: true, AllowInternet: true}
 }
 
+func networkConfigForContext(ctx commandContext) *client.NetworkConfig {
+	cfg := defaultNetworkConfig()
+	if ctx.Isolated {
+		cfg.BlockHostAccess = true
+	}
+	return cfg
+}
+
 func (s *shellState) stopVM(id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return fmt.Errorf("vm id is required")
+	}
+	if s.guestShell != nil {
+		s.guestShell.close()
+		s.guestShell = nil
 	}
 	if err := s.api.ShutdownInstanceWithID(id); err != nil {
 		return err
@@ -4368,7 +4436,6 @@ func (s *shellState) restartVM(id string, ctx commandContext, stderr io.Writer) 
 	if err := s.stopVM(id); err != nil {
 		return err
 	}
-	ctx.VMID = id
 	return s.startVM(id, ctx, stderr)
 }
 
@@ -4403,13 +4470,14 @@ func (s *shellState) saveVM(at atLine, stdout io.Writer) error {
 	if name == "" || strings.HasPrefix(name, "-") {
 		return fmt.Errorf("usage: @save [--vm id] tag")
 	}
-	id := firstNonEmpty(at.Options.VMID, s.context.VMID)
+	ctx := s.context.withOptions(at.Options)
+	id := backendVMID(ctx)
 	if strings.TrimSpace(id) == "" {
 		return fmt.Errorf("vm id is required")
 	}
 	state, err := s.api.SaveInstanceImage(id, client.SaveImageRequest{
 		Name:  name,
-		Image: localImageName(s.context.Image, s.context.Arch),
+		Image: localImageName(ctx.Image, ctx.Arch),
 	})
 	if err != nil {
 		return err
@@ -4788,14 +4856,16 @@ func (s *shellState) drawPromptStatus(stdout io.Writer) {
 }
 
 func (s *shellState) printStatus(w io.Writer) error {
-	state, err := s.api.InstanceStatusOf(s.context.VMID)
+	id := backendVMID(s.context)
+	state, err := s.api.InstanceStatusOf(id)
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(w, "context: %s\nimage: %s\nvm: %s\nisolated: %t\nhost cwd: %s\nguest cwd: %s\nvm status: %s\n",
+	_, err = fmt.Fprintf(w, "context: %s\nimage: %s\nvm: %s\nbackend vm: %s\nisolated: %t\nhost cwd: %s\nguest cwd: %s\nvm status: %s\n",
 		s.context.Mode,
 		emptyText(contextImageText(s.context), "-"),
 		emptyText(s.context.VMID, "-"),
+		emptyText(id, "-"),
 		s.context.Isolated,
 		s.hostCWD,
 		emptyText(s.currentGuestCWD(s.context), "-"),
@@ -4876,9 +4946,11 @@ func (s *shellState) help(w io.Writer) error {
 @save [--vm id] tag      save the selected VM root filesystem as a local image
 @rmi image               remove a locally cached image
 @copy SRC DST            copy files between @host: and VM contexts
+@agent codex [args]      run Codex inside the current VM with host ~/.codex mounted
+@agent --proxy codex     run Codex through a host auth proxy without mounting ~/.codex
 @tmux [session]          open tmux with vmsh as the default pane command
 @forward H:G             forward host port H to guest port G
-opts: --vm id --cwd path --user user --sudo --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared
+opts: --vm id --cwd path --user user --sudo --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
 cd <dir>                 change the current host or VM working directory
 exit                     leave vmsh
 `))
@@ -4903,7 +4975,7 @@ func parseAtLine(line string) (atLine, error) {
 		at.Target = tokens[0].Value
 		i = 1
 	}
-	opts, next, err := parseCommandOptions(tokens, i)
+	opts, next, err := parseCommandOptions(tokens, i, at.Target)
 	if err != nil {
 		return atLine{}, err
 	}
@@ -4914,7 +4986,7 @@ func parseAtLine(line string) (atLine, error) {
 	return at, nil
 }
 
-func parseCommandOptions(tokens []shellToken, start int) (commandOptions, int, error) {
+func parseCommandOptions(tokens []shellToken, start int, target string) (commandOptions, int, error) {
 	var opts commandOptions
 	i := start
 	for i < len(tokens) {
@@ -4971,6 +5043,14 @@ func parseCommandOptions(tokens []shellToken, start int) (commandOptions, int, e
 				return opts, i, fmt.Errorf("--sudo does not take a value")
 			}
 			opts.Sudo = true
+		case "--proxy":
+			if target != "agent" {
+				return opts, i, fmt.Errorf("unknown vmsh option %q", name)
+			}
+			if hasInlineValue {
+				return opts, i, fmt.Errorf("--proxy does not take a value")
+			}
+			opts.AgentProxy = true
 		case "--memory-mb":
 			v, err := readValue()
 			if err != nil {
@@ -5046,6 +5126,8 @@ func parseCommandOptions(tokens []shellToken, start int) (commandOptions, int, e
 }
 
 func (c commandContext) withOptions(opts commandOptions) commandContext {
+	wasIsolated := c.Isolated
+	explicitCWD := opts.CWD != ""
 	if opts.VMID != "" {
 		c.VMID = opts.VMID
 	}
@@ -5075,6 +5157,9 @@ func (c commandContext) withOptions(opts commandOptions) commandContext {
 	}
 	if opts.Isolated != nil {
 		c.Isolated = *opts.Isolated
+	}
+	if opts.Isolated != nil && c.Isolated != wasIsolated && !explicitCWD {
+		c.CWD = ""
 	}
 	return c
 }
