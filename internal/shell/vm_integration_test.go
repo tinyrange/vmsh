@@ -61,6 +61,10 @@ func TestVMIntegrationScriptCommandsStartVMAndUseShellFeatures(t *testing.T) {
 		"@" + env.image + " --vm script --no-network printf 'direct:%s\\n' \"$(cat /tmp/vmsh-script.txt)\"",
 		"printf 'alpha\\nbeta\\n' | grep beta",
 		"@sudo sh -lc 'echo sudo:$(id -u)'",
+		"@sudo",
+		"printf 'sudo-shell:%s\\n' \"$(id -u)\"",
+		"exit",
+		"printf 'after-sudo-shell:%s\\n' \"$(id -u)\"",
 		"@jobs",
 		"@stop --vm script",
 		"@ps",
@@ -83,6 +87,8 @@ func TestVMIntegrationScriptCommandsStartVMAndUseShellFeatures(t *testing.T) {
 	requireContains(t, stdout, "direct:guest-cwd-file")
 	requireContains(t, stdout, "beta")
 	requireContains(t, stdout, "sudo:0")
+	requireContains(t, stdout, "sudo-shell:0")
+	requireContains(t, stdout, "after-sudo-shell:1000")
 	requireContains(t, stdout, "No jobs")
 
 	copied, err := os.ReadFile(filepath.Join(sh.hostCWD, "guest-from-script.txt"))
@@ -177,6 +183,57 @@ func TestVMIntegrationPersistentTTYGuestShellState(t *testing.T) {
 
 	if err := sh.stopVM("tty"); err != nil {
 		t.Fatalf("stop tty VM: %v", err)
+	}
+}
+
+func TestVMIntegrationPersistentTTYSudoSubshell(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("persistent TTY shell test requires a Unix PTY")
+	}
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+
+	stdout, stderr, err := sh.runTestScript("@" + env.image + " --vm sudo-tty --memory 768 --cpus 1 --no-network\n")
+	if err != nil {
+		t.Fatalf("select VM context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+
+	out, err := sh.evalOnTestPTY("id -u")
+	if err != nil {
+		t.Fatalf("run id before sudo subshell: %v\noutput:\n%s", err, out)
+	}
+	requireContains(t, out, "1000")
+
+	out, err = sh.evalOnTestPTY("@sudo")
+	if err != nil {
+		t.Fatalf("enter sudo subshell: %v\noutput:\n%s", err, out)
+	}
+	if sh.context.User != "root" {
+		t.Fatalf("sudo context user = %q, want root", sh.context.User)
+	}
+
+	out, err = sh.evalOnTestPTY("id -u")
+	if err != nil {
+		t.Fatalf("run id in sudo subshell: %v\noutput:\n%s", err, out)
+	}
+	requireContains(t, out, "0")
+
+	out, err = sh.evalOnTestPTY("exit")
+	if err != nil {
+		t.Fatalf("exit sudo subshell: %v\noutput:\n%s", err, out)
+	}
+	if sh.context.User == "root" {
+		t.Fatalf("sudo context did not restore: %+v", sh.context)
+	}
+
+	out, err = sh.evalOnTestPTY("id -u")
+	if err != nil {
+		t.Fatalf("run id after sudo subshell: %v\noutput:\n%s", err, out)
+	}
+	requireContains(t, out, "1000")
+
+	if err := sh.stopVM("sudo-tty"); err != nil {
+		t.Fatalf("stop sudo-tty VM: %v", err)
 	}
 }
 

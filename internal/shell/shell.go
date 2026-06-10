@@ -75,6 +75,7 @@ type shellState struct {
 	nextJobID        int
 	jobsMu           sync.Mutex
 	contextCWD       map[string]string
+	contextStack     []commandContext
 	statusSeq        atomic.Uint64
 	completion       *vmshCompleter
 	tmuxExec         func([]string) error
@@ -1079,6 +1080,10 @@ func (s *shellState) eval(line string, stdout, stderr io.Writer) error {
 		}
 	}
 	if isExitCommand(line) {
+		if s.exitSubshell() {
+			s.lastCode = 0
+			return nil
+		}
 		return io.EOF
 	}
 	if ok, err := s.evalExport(line); ok || err != nil {
@@ -1861,7 +1866,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 	case "sudo":
 		ctx := s.context.withOptions(at.Options)
 		if at.Command == "" {
-			return fmt.Errorf("usage: @sudo <cmd>")
+			return s.enterSudoSubshell(ctx, stdout, stderr)
 		}
 		ctx, command := sudoCommandContext(ctx, at.Command)
 		return s.runMaybeBackground(ctx, command, stdout, stderr)
@@ -2576,6 +2581,49 @@ func (s *shellState) activateContext(ctx commandContext) {
 		}
 	}
 	s.context = ctx
+}
+
+func (s *shellState) enterSubshell(ctx commandContext) {
+	s.contextStack = append(s.contextStack, s.context)
+	s.activateContext(ctx)
+}
+
+func (s *shellState) enterSudoSubshell(ctx commandContext, stdout, stderr io.Writer) error {
+	ctx = sudoSubshellContext(ctx)
+	tty, cols, rows := terminalRequestSize(stdout)
+	if tty {
+		req, err := s.prepareGuestRunRequest(ctx, ":", true, cols, rows, stderr)
+		if err != nil {
+			return err
+		}
+		session, err := s.guestPersistentShell(ctx, req)
+		if err != nil {
+			return err
+		}
+		if cwd := session.cwd(); cwd != "" {
+			ctx.CWD = cwd
+		}
+	} else {
+		if ctx.Image == "" {
+			return fmt.Errorf("no guest image selected; run @<oci-tag> first")
+		}
+		if err := s.ensureImageAvailable(ctx, stderr); err != nil {
+			return err
+		}
+	}
+	s.enterSubshell(ctx)
+	return nil
+}
+
+func (s *shellState) exitSubshell() bool {
+	if len(s.contextStack) == 0 {
+		return false
+	}
+	last := len(s.contextStack) - 1
+	ctx := s.contextStack[last]
+	s.contextStack = s.contextStack[:last]
+	s.activateContext(ctx)
+	return true
 }
 
 func (s *shellState) rememberContextCWD(ctx commandContext) {
@@ -4737,6 +4785,9 @@ func (s *shellState) prompt() string {
 		if s.context.Isolated {
 			label = "vm isolated:"
 		}
+		if isRootGuestContext(s.context) {
+			label = "root " + label
+		}
 		return base + " " + colorMagenta + label + colorReset + colorYellow + target + colorReset + " "
 	}
 	return base + " " + colorBlue + "host" + colorReset + " "
@@ -4775,6 +4826,11 @@ func contextImageText(ctx commandContext) string {
 		return ctx.Image
 	}
 	return ctx.Image + "@" + ctx.Arch
+}
+
+func isRootGuestContext(ctx commandContext) bool {
+	user := strings.TrimSpace(guestRunUser(ctx))
+	return user == "root" || user == "0" || strings.HasPrefix(user, "0:")
 }
 
 func terminalRequestSize(stdout io.Writer) (bool, int, int) {
@@ -4934,7 +4990,7 @@ func (s *shellState) help(w io.Writer) error {
 @<oci-tag> [opts] [cmd]  run cmd in an OCI image, or make it current if cmd is omitted
 @host [cmd]              run cmd on the host, or make host current if cmd is omitted
 @ [opts] [cmd]           update or use the current context
-@sudo <cmd>              run cmd as root in the current VM
+@sudo [cmd]              open a root VM subshell, or run cmd as root in the current VM
 @alias [name=value]      list aliases, or set one (example: @alias clear=@host clear)
 @alias -d name           delete an alias
 @ps                      list VMs
@@ -4952,7 +5008,7 @@ func (s *shellState) help(w io.Writer) error {
 @forward H:G             forward host port H to guest port G
 opts: --vm id --cwd path --user user --sudo --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
 cd <dir>                 change the current host or VM working directory
-exit                     leave vmsh
+exit                     leave the current subshell, or vmsh at top level
 `))
 	return err
 }
@@ -5168,9 +5224,14 @@ func sudoCommandContext(ctx commandContext, command string) (commandContext, str
 	if ctx.Mode == modeHost {
 		return ctx, "sudo " + command
 	}
+	ctx = sudoSubshellContext(ctx)
+	return ctx, command
+}
+
+func sudoSubshellContext(ctx commandContext) commandContext {
 	ctx.Mode = modeVM
 	ctx.User = "root"
-	return ctx, command
+	return ctx
 }
 
 const (

@@ -89,6 +89,48 @@ func TestShellCommandPassingBuildsGuestRunRequests(t *testing.T) {
 	}
 }
 
+func TestSudoWithoutCommandOpensRootSubshell(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "alpine", CWD: "/work", User: "app", Network: true}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@sudo", &stdout, &stderr); err != nil {
+		t.Fatalf("enter sudo subshell: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if len(sh.contextStack) != 1 {
+		t.Fatalf("context stack len = %d, want 1", len(sh.contextStack))
+	}
+	if sh.context.Mode != modeVM || sh.context.User != "root" || sh.context.CWD != "/work" {
+		t.Fatalf("sudo context = %+v, want root VM context at /work", sh.context)
+	}
+
+	if err := sh.eval("whoami", &stdout, &stderr); err != nil {
+		t.Fatalf("run in sudo subshell: %v", err)
+	}
+	if len(api.runs) != 1 || api.runs[0].req.User != "root" {
+		t.Fatalf("sudo subshell run = %+v, want root user", api.runs)
+	}
+
+	if err := sh.eval("exit", &stdout, &stderr); err != nil {
+		t.Fatalf("exit sudo subshell: %v", err)
+	}
+	if len(sh.contextStack) != 0 {
+		t.Fatalf("context stack len after exit = %d, want 0", len(sh.contextStack))
+	}
+	if sh.context.Mode != modeVM || sh.context.User != "app" || sh.context.CWD != "/work" {
+		t.Fatalf("restored context = %+v, want app VM context at /work", sh.context)
+	}
+
+	if err := sh.eval("whoami", &stdout, &stderr); err != nil {
+		t.Fatalf("run after sudo subshell: %v", err)
+	}
+	if len(api.runs) != 2 || api.runs[1].req.User != "app" {
+		t.Fatalf("post-subshell run = %+v, want app user", api.runs)
+	}
+}
+
 func TestGuestPersistentShellRestartsWhenIsolationChanges(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu"}
