@@ -2,18 +2,23 @@ package shell
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"reflect"
@@ -26,6 +31,7 @@ import (
 	"testing"
 	"time"
 
+	cryptossh "golang.org/x/crypto/ssh"
 	"j5.nz/cc/client"
 )
 
@@ -268,6 +274,32 @@ func TestIsolatedContextDoesNotInheritHostMappedCWD(t *testing.T) {
 	}
 	if strings.HasPrefix(req.WorkDir, guestHostMount+"/") || req.WorkDir == guestHostMount {
 		t.Fatalf("isolated workdir = %q, want non-host path", req.WorkDir)
+	}
+}
+
+func TestVMContextDoesNotInheritSSHCWD(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{
+		Mode:    modeSSH,
+		SSHHost: "ws1",
+		CWD:     "/home/joshua/dev/tmp",
+		Network: true,
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@alpine", &stdout, &stderr); err != nil {
+		t.Fatalf("switch to vm context: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if sh.context.CWD == "/home/joshua/dev/tmp" {
+		t.Fatalf("vm context inherited ssh cwd %q", sh.context.CWD)
+	}
+	req, err := sh.prepareGuestRunRequest(sh.context, "pwd", false, 0, 0, io.Discard)
+	if err != nil {
+		t.Fatalf("prepare guest run: %v", err)
+	}
+	if strings.HasPrefix(req.WorkDir, "/home/joshua/dev/tmp") {
+		t.Fatalf("guest workdir = %q, want non-ssh path", req.WorkDir)
 	}
 }
 
@@ -998,6 +1030,10 @@ func TestCompletionsUseCachedImagesOptionsAndHostMappedPaths(t *testing.T) {
 	if kind != completionOption || replaceLen != len("--pr") || !hasString(candidates, "oxy") {
 		t.Fatalf("agent option completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
+	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@ss"), len("@ss"))
+	if kind != completionAt || replaceLen != len("@ss") || !hasString(candidates, "h") {
+		t.Fatalf("ssh target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
+	}
 	candidates, _, _ = c.CompleteWithKind([]rune("@alpine --pr"), len("@alpine --pr"))
 	if hasString(candidates, "oxy") {
 		t.Fatalf("non-agent option completion included proxy: %q", candidates)
@@ -1045,6 +1081,14 @@ func TestCompletionsUseCurrentCommandSegmentAndGuestCommands(t *testing.T) {
 		t.Fatalf("guest command completion runs = %+v", api.runs)
 	}
 
+	sh.context = commandContext{Mode: modeSSH, SSHHost: "ws1"}
+	line = []rune("cat ./")
+	candidates, _, kind = c.CompleteWithKind(line, len(line))
+	if kind != completionPath || len(candidates) != 0 {
+		t.Fatalf("ssh path completion candidates=%q kind=%q, want none", candidates, kind)
+	}
+
+	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "alpine"}
 	line = []rune("printf x | @host ec")
 	candidates, replaceLen, kind = c.CompleteWithKind(line, len(line))
 	if kind != completionCommand || replaceLen != len("ec") || !hasString(candidates, "ho") {
@@ -1514,6 +1558,423 @@ func TestGuestPipelineStreamsLargeInputInChunks(t *testing.T) {
 	}
 }
 
+func TestSSHAtCommandUsesHostSSHConfigAlias(t *testing.T) {
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		_, _ = io.WriteString(stdout, "ssh-ok\n")
+		return 0
+	})
+	server.installConfig(t, "ws1")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ssh ws1 printf ok", &stdout, &stderr); err != nil {
+		t.Fatalf("run ssh command: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if stdout.String() != "ssh-ok\n" {
+		t.Fatalf("ssh stdout = %q", stdout.String())
+	}
+	cfg, err := resolveSSHConfig(commandContext{Mode: modeSSH, SSHHost: "ws1"})
+	if err != nil {
+		t.Fatalf("resolve ssh config: %v", err)
+	}
+	if cfg.HostName != "127.0.0.1" || cfg.Port != server.port || cfg.User != "testuser" {
+		t.Fatalf("resolved ssh config = %+v", cfg)
+	}
+	if commands := server.commands(); len(commands) != 1 || !strings.Contains(commands[0], "printf ok") {
+		t.Fatalf("ssh commands = %q", commands)
+	}
+}
+
+func TestSSHContextTracksRemoteCWD(t *testing.T) {
+	remoteLines := make(chan string, 4)
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		if strings.Contains(command, "__VMSH_READY__") {
+			_, _ = io.WriteString(stdout, "__VMSH_READY__:/home/test\n")
+			scanner := bufio.NewScanner(stdin)
+			for scanner.Scan() {
+				line := scanner.Text()
+				remoteLines <- line
+				_, _ = io.WriteString(stdout, "/srv/ws1\n__VMSH_DONE__:0:/srv/ws1\n")
+			}
+			return 0
+		}
+		_, _ = io.WriteString(stdout, "/srv/ws1\n")
+		return 0
+	})
+	server.installConfig(t, "ws1")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ssh ws1", &stdout, &stderr); err != nil {
+		t.Fatalf("enter ssh context: %v", err)
+	}
+	if sh.context.Mode != modeSSH || sh.context.SSHHost != "ws1" {
+		t.Fatalf("ssh context = %+v", sh.context)
+	}
+	if err := sh.eval("cd project", &stdout, &stderr); err != nil {
+		t.Fatalf("ssh cd: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if sh.context.CWD != "/srv/ws1" {
+		t.Fatalf("ssh cwd = %q, want /srv/ws1", sh.context.CWD)
+	}
+	select {
+	case line := <-remoteLines:
+		if !strings.Contains(line, "cd ") || !strings.Contains(line, "project") {
+			t.Fatalf("remote persistent line = %q, want cd project", line)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("persistent ssh shell did not receive cd command")
+	}
+}
+
+func TestSSHPipelineStreamsHostInputToSSH(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("ssh pipeline test uses POSIX host commands")
+	}
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		if strings.Contains(command, "cat") {
+			_, _ = io.Copy(stdout, stdin)
+		}
+		return 0
+	})
+	server.installConfig(t, "ws1")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("printf ssh-data | @ssh ws1 cat", &stdout, &stderr); err != nil {
+		t.Fatalf("run ssh pipeline: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if stdout.String() != "ssh-data" {
+		t.Fatalf("ssh pipeline stdout = %q", stdout.String())
+	}
+	if commands := server.commands(); len(commands) != 1 || !strings.Contains(commands[0], "cat") {
+		t.Fatalf("ssh pipeline commands = %q", commands)
+	}
+}
+
+func TestStopCommandStopsNamedVM(t *testing.T) {
+	api := newRecordingShellAPI()
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running"}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@stop work", &stdout, &stderr); err != nil {
+		t.Fatalf("stop named VM: %v", err)
+	}
+	if got := api.instances["work"].Status; got != "stopped" {
+		t.Fatalf("VM status = %q, want stopped", got)
+	}
+}
+
+func TestSSHConnectionIsPersistentPerHost(t *testing.T) {
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		_, _ = io.WriteString(stdout, "ok\n")
+		return 0
+	})
+	server.installConfig(t, "ws1")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ssh ws1 first", &stdout, &stderr); err != nil {
+		t.Fatalf("first ssh command: %v", err)
+	}
+	if err := sh.eval("@ssh ws1 second", &stdout, &stderr); err != nil {
+		t.Fatalf("second ssh command: %v", err)
+	}
+	if got := server.connectionCount(); got != 1 {
+		t.Fatalf("ssh connections = %d, want one persistent client", got)
+	}
+	if commands := server.commands(); len(commands) != 2 {
+		t.Fatalf("ssh commands = %q, want two sessions", commands)
+	}
+}
+
+func TestSSHContextKeepsPersistentShellUntilStop(t *testing.T) {
+	closed := make(chan struct{})
+	remoteLines := make(chan string, 2)
+	var readyCount atomic.Int32
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		if strings.Contains(command, "__VMSH_READY__") {
+			readyCount.Add(1)
+			_, _ = io.WriteString(stdout, "__VMSH_READY__:/home/test\n")
+			scanner := bufio.NewScanner(stdin)
+			for scanner.Scan() {
+				remoteLines <- scanner.Text()
+				_, _ = io.WriteString(stdout, "__VMSH_DONE__:0:/home/test\n")
+			}
+			close(closed)
+		}
+		return 0
+	})
+	server.installConfig(t, "ws1")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ssh ws1", &stdout, &stderr); err != nil {
+		t.Fatalf("enter ssh context: %v", err)
+	}
+	if got := server.ptyCount(); got != 1 {
+		t.Fatalf("persistent ssh pty requests = %d, want one", got)
+	}
+	if err := sh.eval("@host", &stdout, &stderr); err != nil {
+		t.Fatalf("switch to host: %v", err)
+	}
+	if err := sh.eval("@ws1", &stdout, &stderr); err != nil {
+		t.Fatalf("return to ssh context by session name: %v", err)
+	}
+	if err := sh.eval("printf still-open", &stdout, &stderr); err != nil {
+		t.Fatalf("run persistent ssh command: %v", err)
+	}
+	if got := readyCount.Load(); got != 1 {
+		t.Fatalf("persistent ssh shell starts = %d, want one reused shell", got)
+	}
+	select {
+	case line := <-remoteLines:
+		if !strings.Contains(line, "printf still-open") {
+			t.Fatalf("remote persistent line = %q, want printf command", line)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("persistent ssh shell did not receive command after @host")
+	}
+	if err := sh.eval("@stop ws1", &stdout, &stderr); err != nil {
+		t.Fatalf("stop ssh session: %v", err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("persistent ssh shell did not close after @stop")
+	}
+}
+
+func TestSSHPersistentShellSurvivesDotFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("persistent ssh shell script uses POSIX sh")
+	}
+	cmd := exec.Command("sh", "-ic", sshPersistentShellScript(commandContext{}))
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("stdin pipe: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start shell: %v", err)
+	}
+	_, _ = io.WriteString(stdin, ". profile\n")
+	_, _ = io.WriteString(stdin, "echo after\n")
+	_ = stdin.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shell exited with %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatalf("persistent shell script hung\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+
+	var codes []int
+	normalized := strings.ReplaceAll(stdout.String(), "\r\n", "\n")
+	for _, line := range strings.Split(normalized, "\n") {
+		code, _, ok := parsePersistentMarker(line)
+		if ok {
+			codes = append(codes, code)
+		}
+	}
+	if !strings.Contains(normalized, "after") || !reflect.DeepEqual(codes, []int{1, 0}) {
+		t.Fatalf("persistent shell output did not survive dot failure; codes=%v\nstdout:\n%s\nstderr:\n%s", codes, stdout.String(), stderr.String())
+	}
+}
+
+func TestSSHCopyStreamsTarOverConnection(t *testing.T) {
+	received := make(chan string, 1)
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		switch {
+		case strings.Contains(command, "tar -xf -"):
+			tr := tar.NewReader(stdin)
+			header, err := tr.Next()
+			if err != nil {
+				_, _ = fmt.Fprintf(stderr, "read tar: %v", err)
+				return 1
+			}
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				_, _ = fmt.Fprintf(stderr, "read file: %v", err)
+				return 1
+			}
+			received <- header.Name + ":" + string(data)
+			return 0
+		case strings.Contains(command, "tar -cf -"):
+			tw := tar.NewWriter(stdout)
+			data := []byte("from-ssh")
+			_ = tw.WriteHeader(&tar.Header{Name: "remote.txt", Mode: 0o644, Size: int64(len(data))})
+			_, _ = tw.Write(data)
+			_ = tw.Close()
+			return 0
+		default:
+			return 0
+		}
+	})
+	server.installConfig(t, "ws1")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	src := filepath.Join(sh.hostCWD, "local.txt")
+	if err := os.WriteFile(src, []byte("to-ssh"), 0o644); err != nil {
+		t.Fatalf("write local source: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	if err := sh.copyPath("@host:local.txt @ssh:ws1:/tmp/remote.txt", &stdout, &stderr); err != nil {
+		t.Fatalf("copy local to ssh: %v\nstderr:\n%s", err, stderr.String())
+	}
+	select {
+	case got := <-received:
+		if got != "remote.txt:to-ssh" {
+			t.Fatalf("remote tar payload = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("remote tar was not received")
+	}
+
+	dst := filepath.Join(sh.hostCWD, "from-ssh.txt")
+	if err := sh.copyPath("@ssh:ws1:/tmp/remote.txt @host:from-ssh.txt", &stdout, &stderr); err != nil {
+		t.Fatalf("copy ssh to local: %v\nstderr:\n%s", err, stderr.String())
+	}
+	data, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read copied local file: %v", err)
+	}
+	if string(data) != "from-ssh" {
+		t.Fatalf("copied local data = %q", string(data))
+	}
+}
+
+func TestSSHCopyBetweenActiveSessions(t *testing.T) {
+	payload := "module github.com/tinyrange/vmsh\n"
+	srcServer := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		switch {
+		case strings.Contains(command, "__VMSH_READY__"):
+			_, _ = io.WriteString(stdout, "__VMSH_READY__:/home/test\n")
+			scanner := bufio.NewScanner(stdin)
+			for scanner.Scan() {
+				_, _ = io.WriteString(stdout, "__VMSH_DONE__:0:/home/test\n")
+			}
+			return 0
+		case strings.Contains(command, "tar -cf -"):
+			tw := tar.NewWriter(stdout)
+			_ = tw.WriteHeader(&tar.Header{Name: "go.mod", Mode: 0o644, Size: int64(len(payload))})
+			_, _ = tw.Write([]byte(payload))
+			_ = tw.Close()
+			return 0
+		default:
+			return 0
+		}
+	})
+	received := make(chan string, 1)
+	dstServer := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		switch {
+		case strings.Contains(command, "__VMSH_READY__"):
+			_, _ = io.WriteString(stdout, "__VMSH_READY__:/home/test\n")
+			scanner := bufio.NewScanner(stdin)
+			for scanner.Scan() {
+				_, _ = io.WriteString(stdout, "__VMSH_DONE__:0:/home/test\n")
+			}
+			return 0
+		case strings.Contains(command, "tar -xf -"):
+			tr := tar.NewReader(stdin)
+			header, err := tr.Next()
+			if err != nil {
+				_, _ = fmt.Fprintf(stderr, "read tar: %v", err)
+				return 1
+			}
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				_, _ = fmt.Fprintf(stderr, "read file: %v", err)
+				return 1
+			}
+			received <- header.Name + ":" + string(data)
+			return 0
+		default:
+			return 0
+		}
+	})
+	installTestSSHConfigs(t, map[string]*testSSHServer{
+		"ws1":       srcServer,
+		"astra-pi5": dstServer,
+	})
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	t.Cleanup(sh.closeSessions)
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ssh astra-pi5", &stdout, &stderr); err != nil {
+		t.Fatalf("enter destination ssh context: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if err := sh.eval("@ssh ws1", &stdout, &stderr); err != nil {
+		t.Fatalf("enter source ssh context: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if err := sh.copyPath("@ws1:./go.mod @astra-pi5:.", &stdout, &stderr); err != nil {
+		t.Fatalf("copy between active ssh sessions: %v\nstderr:\n%s", err, stderr.String())
+	}
+	select {
+	case got := <-received:
+		if got != "go.mod:"+payload {
+			t.Fatalf("remote-to-remote payload = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("destination ssh session did not receive copied tar")
+	}
+}
+
+func TestSSHCompletionUsesConfigAndRemotePath(t *testing.T) {
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		switch {
+		case strings.Contains(command, "__VMSH_READY__"):
+			_, _ = io.WriteString(stdout, "__VMSH_READY__:/home/test\n")
+			scanner := bufio.NewScanner(stdin)
+			for scanner.Scan() {
+				_, _ = io.WriteString(stdout, "__VMSH_DONE__:0:/home/test\n")
+			}
+			return 0
+		case strings.Contains(command, "for p in"):
+			_, _ = io.WriteString(stdout, "le\nfolder/\n")
+			return 0
+		default:
+			return 0
+		}
+	})
+	server.installConfig(t, "ws1")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	c := newVMSHCompleter(sh)
+	candidates, replaceLen, kind := c.CompleteWithKind([]rune("@ssh w"), len("@ssh w"))
+	if kind != completionAt || replaceLen != len("w") || !hasString(candidates, "s1") {
+		t.Fatalf("ssh host completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ssh ws1", &stdout, &stderr); err != nil {
+		t.Fatalf("enter ssh context: %v\nstderr:\n%s", err, stderr.String())
+	}
+	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@w"), len("@w"))
+	if kind != completionAt || replaceLen != len("@w") || !hasString(candidates, "s1") {
+		t.Fatalf("ssh session target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
+	}
+	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@stop w"), len("@stop w"))
+	if kind != completionAt || replaceLen != len("w") || !hasString(candidates, "s1") {
+		t.Fatalf("stop completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
+	}
+	candidates, replaceLen, kind = c.CompleteWithKind([]rune("cat /tmp/fi"), len("cat /tmp/fi"))
+	if kind != completionPath || replaceLen != len("fi") || !hasString(candidates, "le") || !hasString(candidates, "folder/") {
+		t.Fatalf("ssh path completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
+	}
+}
+
 func TestCopyEndpointResolutionAndGuestHostPathSafety(t *testing.T) {
 	api := newRecordingShellAPI("alpine", "ubuntu")
 	sh := newUnitShell(t, api)
@@ -1527,7 +1988,7 @@ func TestCopyEndpointResolutionAndGuestHostPathSafety(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse current guest endpoint: %v", err)
 	}
-	if guest.ctx.Mode != modeVM || guest.path != path.Join(guestCWD, "notes.txt") {
+	if guest.context().Mode != modeVM || guest.path != path.Join(guestCWD, "notes.txt") {
 		t.Fatalf("current guest endpoint = %+v", guest)
 	}
 
@@ -1535,7 +1996,7 @@ func TestCopyEndpointResolutionAndGuestHostPathSafety(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse host endpoint: %v", err)
 	}
-	if host.ctx.Mode != modeHost || host.path != filepath.Join(sh.hostCWD, "relative.txt") {
+	if host.context().Mode != modeHost || host.path != filepath.Join(sh.hostCWD, "relative.txt") {
 		t.Fatalf("host endpoint = %+v", host)
 	}
 
@@ -1543,8 +2004,16 @@ func TestCopyEndpointResolutionAndGuestHostPathSafety(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse named guest endpoint: %v", err)
 	}
-	if ubuntu.ctx.Image != "ubuntu" || ubuntu.path != "/home/ubuntu/result.txt" {
+	if ubuntu.context().Image != "ubuntu" || ubuntu.path != "/home/ubuntu/result.txt" {
 		t.Fatalf("named guest endpoint = %+v", ubuntu)
+	}
+
+	ssh, err := sh.parseCopyEndpoint("@ssh:ws1:relative.txt")
+	if err != nil {
+		t.Fatalf("parse ssh endpoint: %v", err)
+	}
+	if ssh.context().Mode != modeSSH || ssh.context().SSHHost != "ws1" || ssh.path != "~/relative.txt" {
+		t.Fatalf("ssh endpoint = %+v context=%+v", ssh, ssh.context())
 	}
 
 	if _, err := sh.parseCopyEndpoint("@ubuntu"); err == nil || !strings.Contains(err.Error(), "must use @target:path") {
@@ -1552,6 +2021,40 @@ func TestCopyEndpointResolutionAndGuestHostPathSafety(t *testing.T) {
 	}
 	if hostPath, ok := guestHostPathToHost(sh.hostCWD, "/tmp/file"); ok || hostPath != "" {
 		t.Fatalf("non-host guest path mapped to %q", hostPath)
+	}
+}
+
+func TestShellTargetsExposeLocalPathSemantics(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI("alpine"))
+	hostTarget, err := sh.targetFor(commandContext{Mode: modeHost})
+	if err != nil {
+		t.Fatalf("host target: %v", err)
+	}
+	hostPath := filepath.Join(sh.hostCWD, "data.txt")
+	if got, ok := hostTarget.LocalPath(hostPath); !ok || got != hostPath {
+		t.Fatalf("host local path = %q, %t; want %q, true", got, ok, hostPath)
+	}
+
+	_, guestCWD, err := guestHostPaths(sh.hostCWD)
+	if err != nil {
+		t.Fatalf("guest host paths: %v", err)
+	}
+	guestTarget, err := sh.targetFor(commandContext{Mode: modeVM, VMID: "vm", Image: "alpine"})
+	if err != nil {
+		t.Fatalf("guest target: %v", err)
+	}
+	guestPath := path.Join(guestCWD, "data.txt")
+	wantHostPath := filepath.Join(sh.hostCWD, "data.txt")
+	if got, ok := guestTarget.LocalPath(guestPath); !ok || got != wantHostPath {
+		t.Fatalf("guest shared local path = %q, %t; want %q, true", got, ok, wantHostPath)
+	}
+
+	isolatedTarget, err := sh.targetFor(commandContext{Mode: modeVM, VMID: "vm", Image: "alpine", Isolated: true})
+	if err != nil {
+		t.Fatalf("isolated guest target: %v", err)
+	}
+	if got, ok := isolatedTarget.LocalPath(path.Join(guestHostMount, "data.txt")); ok || got != "" {
+		t.Fatalf("isolated guest local path = %q, %t; want empty, false", got, ok)
 	}
 }
 
@@ -1581,6 +2084,162 @@ func TestExtractTarToHostRejectsTraversal(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(parent, "evil.txt")); !os.IsNotExist(err) {
 		t.Fatalf("traversal file exists or stat failed unexpectedly: %v", err)
 	}
+}
+
+type testSSHServer struct {
+	listener net.Listener
+	signer   cryptossh.Signer
+	port     string
+	handler  func(string, io.Reader, io.Writer, io.Writer) uint32
+	mu       sync.Mutex
+	conns    int
+	ptys     int
+	execs    []string
+}
+
+func startTestSSHServer(t *testing.T, handler func(string, io.Reader, io.Writer, io.Writer) uint32) *testSSHServer {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate ssh host key: %v", err)
+	}
+	signer, err := cryptossh.NewSignerFromKey(key)
+	if err != nil {
+		t.Fatalf("create ssh signer: %v", err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen ssh: %v", err)
+	}
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("split ssh addr: %v", err)
+	}
+	server := &testSSHServer{listener: listener, signer: signer, port: port, handler: handler}
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+	go server.serve(t)
+	return server
+}
+
+func (s *testSSHServer) installConfig(t *testing.T, alias string) {
+	t.Helper()
+	installTestSSHConfigs(t, map[string]*testSSHServer{alias: s})
+}
+
+func installTestSSHConfigs(t *testing.T, hosts map[string]*testSSHServer) {
+	t.Helper()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config")
+	knownHostsPath := filepath.Join(dir, "known_hosts")
+	aliases := make([]string, 0, len(hosts))
+	for alias := range hosts {
+		aliases = append(aliases, alias)
+	}
+	sort.Strings(aliases)
+	var config strings.Builder
+	var knownHosts strings.Builder
+	for _, alias := range aliases {
+		server := hosts[alias]
+		_, _ = fmt.Fprintf(&config, "Host %s\n  HostName 127.0.0.1\n  Port %s\n  User testuser\n  StrictHostKeyChecking yes\n", alias, server.port)
+		hostKey := strings.TrimSpace(string(cryptossh.MarshalAuthorizedKey(server.signer.PublicKey())))
+		_, _ = fmt.Fprintf(&knownHosts, "[127.0.0.1]:%s %s\n", server.port, hostKey)
+	}
+	if err := os.WriteFile(configPath, []byte(config.String()), 0o600); err != nil {
+		t.Fatalf("write ssh config: %v", err)
+	}
+	if err := os.WriteFile(knownHostsPath, []byte(knownHosts.String()), 0o600); err != nil {
+		t.Fatalf("write known_hosts: %v", err)
+	}
+	oldConfigPaths := sshConfigPaths
+	oldKnownHosts := sshKnownHosts
+	sshConfigPaths = []string{configPath}
+	sshKnownHosts = []string{knownHostsPath}
+	t.Cleanup(func() {
+		sshConfigPaths = oldConfigPaths
+		sshKnownHosts = oldKnownHosts
+	})
+}
+
+func (s *testSSHServer) serve(t *testing.T) {
+	config := &cryptossh.ServerConfig{NoClientAuth: true}
+	config.AddHostKey(s.signer)
+	for {
+		conn, err := s.listener.Accept()
+		if err != nil {
+			return
+		}
+		go s.handleConn(t, conn, config)
+	}
+}
+
+func (s *testSSHServer) handleConn(t *testing.T, conn net.Conn, config *cryptossh.ServerConfig) {
+	_, chans, reqs, err := cryptossh.NewServerConn(conn, config)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+	s.mu.Lock()
+	s.conns++
+	s.mu.Unlock()
+	go cryptossh.DiscardRequests(reqs)
+	for ch := range chans {
+		if ch.ChannelType() != "session" {
+			_ = ch.Reject(cryptossh.UnknownChannelType, "session required")
+			continue
+		}
+		channel, requests, err := ch.Accept()
+		if err != nil {
+			continue
+		}
+		go s.handleChannel(channel, requests)
+	}
+}
+
+func (s *testSSHServer) handleChannel(channel cryptossh.Channel, requests <-chan *cryptossh.Request) {
+	defer channel.Close()
+	for req := range requests {
+		switch req.Type {
+		case "pty-req":
+			s.mu.Lock()
+			s.ptys++
+			s.mu.Unlock()
+			_ = req.Reply(true, nil)
+		case "exec":
+			var payload struct {
+				Command string
+			}
+			cryptossh.Unmarshal(req.Payload, &payload)
+			_ = req.Reply(true, nil)
+			s.mu.Lock()
+			s.execs = append(s.execs, payload.Command)
+			s.mu.Unlock()
+			status := s.handler(payload.Command, channel, channel, channel.Stderr())
+			_, _ = channel.SendRequest("exit-status", false, cryptossh.Marshal(struct{ Status uint32 }{status}))
+			return
+		default:
+			_ = req.Reply(false, nil)
+		}
+	}
+}
+
+func (s *testSSHServer) connectionCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conns
+}
+
+func (s *testSSHServer) ptyCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ptys
+}
+
+func (s *testSSHServer) commands() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.execs...)
 }
 
 func newUnitShell(t *testing.T, api *recordingShellAPI) *shellState {

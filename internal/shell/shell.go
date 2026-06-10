@@ -50,6 +50,7 @@ type shellMode string
 const (
 	modeHost shellMode = "host"
 	modeVM   shellMode = "vm"
+	modeSSH  shellMode = "ssh"
 )
 
 type shellState struct {
@@ -64,6 +65,9 @@ type shellState struct {
 	hostInit         hostShellInit
 	hostShell        *persistentHostShell
 	guestShell       *persistentGuestShell
+	sshShells        map[string]*persistentSSHShell
+	sshMu            sync.Mutex
+	sshClients       map[string]*persistentSSHClient
 	lastCode         int
 	promptOut        io.Writer
 	history          string
@@ -170,8 +174,16 @@ func (c *vmshCompleter) CompleteWithKind(line []rune, pos int) ([]string, int, c
 		candidates = suffixCompletions(vmshOptionWords(prefix[:tokenStart]), token)
 		return candidates, len([]rune(token)), completionOption
 	}
+	if c.shouldCompleteSSHHost(prefix, tokenStart) {
+		candidates = suffixCompletions(sshHostAliases(), token)
+		return candidates, len([]rune(typedToken)), completionAt
+	}
 	if c.shouldCompleteRMIImage(prefix, tokenStart) {
 		candidates = suffixCompletions(c.cachedImageNames(), token)
+		return candidates, len([]rune(typedToken)), completionAt
+	}
+	if c.shouldCompleteStopTarget(prefix, tokenStart) {
+		candidates = suffixCompletions(c.stopTargetNames(), token)
 		return candidates, len([]rune(typedToken)), completionAt
 	}
 	if c.shouldCompleteCommand(prefix, tokenStart, isFirstToken, token) {
@@ -244,19 +256,32 @@ func (c *vmshCompleter) completionContext(prefix string) commandContext {
 	case "sudo":
 		ctx = ctx.withOptions(at.Options)
 		if ctx.Mode != modeHost {
-			ctx.Mode = modeVM
+			ctx = vmCommandContext(ctx, commandOptions{}, ctx.Image)
 			ctx.User = "root"
 		}
 	case "host":
-		ctx = ctx.withOptions(at.Options)
-		ctx.Mode = modeHost
+		ctx = hostCommandContext(ctx, at.Options)
+	case "ssh":
+		host, _, err := parseSSHAtCommand(at.Command)
+		if err == nil {
+			ctx = sshCommandContext(ctx, at.Options, host)
+		}
 	case "help", "ps", "jobs", "alias", "status", "where", "start", "stop", "restart", "forward", "tmux", "agent":
 	default:
-		ctx = ctx.withOptions(at.Options)
-		ctx.Mode = modeVM
-		ctx.Image = at.Target
+		if sshCtx, ok := c.shellSSHSessionContext(at.Target); ok {
+			ctx = sshCtx
+		} else {
+			ctx = vmCommandContext(ctx, at.Options, at.Target)
+		}
 	}
 	return ctx
+}
+
+func (c *vmshCompleter) shellSSHSessionContext(name string) (commandContext, bool) {
+	if c.shell == nil {
+		return commandContext{}, false
+	}
+	return c.shell.sshSessionContext(name)
 }
 
 func pathCompletionReplaceLen(token string) int {
@@ -267,7 +292,12 @@ func pathCompletionReplaceLen(token string) int {
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@agent", "@alias", "@copy", "@help", "@host", "@jobs", "@ps", "@restart", "@status", "@start", "@stop", "@forward", "@rmi", "@sudo", "@tmux"}
+	words := []string{"@agent", "@alias", "@copy", "@help", "@host", "@jobs", "@ps", "@restart", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux"}
+	if c.shell != nil {
+		for _, name := range c.shell.sshSessionNames() {
+			words = append(words, "@"+name)
+		}
+	}
 	for _, image := range c.cachedImageNames() {
 		words = append(words, "@"+image)
 	}
@@ -379,6 +409,50 @@ func (c *vmshCompleter) shouldCompleteRMIImage(prefix string, tokenStart int) bo
 	return words[0] == "@rmi"
 }
 
+func (c *vmshCompleter) shouldCompleteSSHHost(prefix string, tokenStart int) bool {
+	if !strings.HasPrefix(prefix, "@") {
+		return false
+	}
+	words := completedShellWords(prefix[:tokenStart])
+	return len(words) == 1 && words[0] == "@ssh"
+}
+
+func (c *vmshCompleter) shouldCompleteStopTarget(prefix string, tokenStart int) bool {
+	if !strings.HasPrefix(prefix, "@") {
+		return false
+	}
+	words := completedShellWords(prefix[:tokenStart])
+	return len(words) == 1 && words[0] == "@stop"
+}
+
+func (c *vmshCompleter) stopTargetNames() []string {
+	if c.shell == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var names []string
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	for _, name := range c.shell.sshSessionNames() {
+		add(name)
+	}
+	if c.shell.api != nil {
+		if states, err := c.shell.api.InstanceStatuses(); err == nil {
+			for _, state := range states {
+				add(state.ID)
+			}
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 func completedShellWords(line string) []string {
 	tokens, err := lexShellTokens(line)
 	if err != nil {
@@ -406,6 +480,13 @@ func (c *vmshCompleter) commandCandidates(token string, ctx commandContext) []st
 	}
 	if ctx.Mode == modeVM {
 		for _, name := range c.guestCommandNames(ctx, token) {
+			add(name)
+		}
+		sortCompletionItems(out)
+		return out
+	}
+	if ctx.Mode == modeSSH {
+		for _, name := range c.sshCommandNames(ctx, token) {
 			add(name)
 		}
 		sortCompletionItems(out)
@@ -475,6 +556,25 @@ func (c *vmshCompleter) guestCommandNames(ctx commandContext, token string) []st
 	return uniqueStrings(names)
 }
 
+func (c *vmshCompleter) sshCommandNames(ctx commandContext, token string) []string {
+	if c.shell == nil || !c.shell.hasSSHClient(ctx) {
+		return nil
+	}
+	var stdout strings.Builder
+	if err := c.shell.runSSHCommand(ctx, guestCommandCompletionScript(token), nil, &stdout, io.Discard, false, false); err != nil {
+		return nil
+	}
+	var names []string
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		name := strings.TrimSpace(line)
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return uniqueStrings(names)
+}
+
 func guestCommandCompletionScript(prefix string) string {
 	return strings.Join([]string{
 		"prefix=" + shellQuote(prefix),
@@ -528,7 +628,46 @@ func (c *vmshCompleter) pathCandidates(token string, ctx commandContext) []strin
 			return out
 		}
 	}
+	if ctx.Mode == modeSSH {
+		if out, ok := c.sshPathCandidates(token, ctx); ok {
+			return out
+		}
+		return nil
+	}
 	return c.hostPathCandidates(token, ctx)
+}
+
+func (c *vmshCompleter) sshPathCandidates(token string, ctx commandContext) ([]string, bool) {
+	if c.shell == nil || !c.shell.hasSSHClient(ctx) {
+		return nil, false
+	}
+	dirPart, base := path.Split(filepath.ToSlash(token))
+	current := c.shell.currentSSHCWD(ctx)
+	var remoteDir string
+	switch {
+	case dirPart == "":
+		remoteDir = current
+	case dirPart == "~" || strings.HasPrefix(dirPart, "~/"):
+		remoteDir = path.Join("~", strings.TrimPrefix(strings.TrimSuffix(dirPart, "/"), "~"))
+	case strings.HasPrefix(dirPart, "/"):
+		remoteDir = path.Clean(dirPart)
+	default:
+		remoteDir = path.Clean(path.Join(current, dirPart))
+	}
+	var stdout strings.Builder
+	if err := c.shell.runSSHCommand(ctx, guestCompletionScript(remoteDir, base), nil, &stdout, io.Discard, false, false); err != nil {
+		return nil, true
+	}
+	var out []string
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		out = append(out, shellEscapeCompletion(line))
+	}
+	sortCompletionItems(out)
+	return out, true
 }
 
 func (c *vmshCompleter) hostPathCandidates(token string, ctx commandContext) []string {
@@ -757,6 +896,7 @@ func uniqueStrings(items []string) []string {
 type commandContext struct {
 	Mode       shellMode `json:"mode"`
 	Image      string    `json:"image,omitempty"`
+	SSHHost    string    `json:"ssh_host,omitempty"`
 	Arch       string    `json:"arch,omitempty"`
 	VMID       string    `json:"vm,omitempty"`
 	CWD        string    `json:"cwd,omitempty"`
@@ -1203,14 +1343,11 @@ func (s *shellState) expandAliasCompletionPrefixOnce(line string) (string, bool,
 }
 
 func (s *shellState) runInContext(ctx commandContext, line string, stdout, stderr io.Writer) error {
-	switch ctx.Mode {
-	case modeHost:
-		return s.runHost(line, stdout, stderr)
-	case modeVM:
-		return s.runGuest(ctx, line, stdout, stderr)
-	default:
-		return fmt.Errorf("unknown shell mode %q", ctx.Mode)
+	target, err := s.targetFor(ctx)
+	if err != nil {
+		return err
 	}
+	return target.Run(line, stdout, stderr)
 }
 
 func (s *shellState) runMaybeBackground(ctx commandContext, line string, stdout, stderr io.Writer) error {
@@ -1409,9 +1546,7 @@ func (s *shellState) runCommandListPart(base commandContext, command string, std
 }
 
 type pipelineStage struct {
-	ctx  commandContext
-	line string
-	req  client.RunRequest
+	command preparedTargetCommand
 }
 
 func splitPipelineLine(line string) ([]string, bool, error) {
@@ -1569,7 +1704,14 @@ func (s *shellState) preparePipelineStage(base commandContext, segment string, s
 			if at.Options.Sudo {
 				return pipelineStage{}, fmt.Errorf("usage: @host [cmd]")
 			}
-			ctx.Mode = modeHost
+			ctx = hostCommandContext(base, at.Options)
+		case "ssh":
+			host, command, err := parseSSHAtCommand(at.Command)
+			if err != nil {
+				return pipelineStage{}, err
+			}
+			ctx = sshCommandContext(ctx, at.Options, host)
+			line = command
 		case "sudo":
 			if line == "" {
 				return pipelineStage{}, fmt.Errorf("usage: @sudo <cmd>")
@@ -1579,30 +1721,33 @@ func (s *shellState) preparePipelineStage(base commandContext, segment string, s
 			if isControlAtTarget(at.Target) {
 				return pipelineStage{}, fmt.Errorf("@%s cannot be used in a pipeline", at.Target)
 			}
-			ctx.Mode = modeVM
-			ctx.Image = at.Target
-			if at.Options.Sudo {
-				ctx.User = "root"
+			if sshCtx, ok := s.sshSessionContext(at.Target); ok {
+				if len(at.Options.OptionFields) != 0 {
+					return pipelineStage{}, fmt.Errorf("usage: @%s [cmd]", at.Target)
+				}
+				ctx = sshCtx
+			} else {
+				ctx = vmCommandContext(base, at.Options, at.Target)
 			}
 		}
 		if line == "" {
 			return pipelineStage{}, fmt.Errorf("pipeline segment %q has no command", segment)
 		}
 	}
-	stage := pipelineStage{ctx: ctx, line: line}
-	if ctx.Mode == modeVM {
-		req, err := s.prepareGuestRunRequest(ctx, line, false, 0, 0, stderr)
-		if err != nil {
-			return pipelineStage{}, err
-		}
-		stage.req = req
+	target, err := s.targetFor(ctx)
+	if err != nil {
+		return pipelineStage{}, err
 	}
-	return stage, nil
+	command, err := target.PrepareRunWithInput(line, stderr)
+	if err != nil {
+		return pipelineStage{}, err
+	}
+	return pipelineStage{command: command}, nil
 }
 
 func isControlAtTarget(target string) bool {
 	switch target {
-	case "help", "?", "ps", "jobs", "alias", "status", "where", "start", "stop", "restart", "save", "rmi", "tmux", "forward", "copy", "cp", "agent":
+	case "help", "?", "ps", "jobs", "alias", "status", "where", "start", "stop", "restart", "save", "rmi", "tmux", "forward", "copy", "cp", "agent", "ssh":
 		return true
 	default:
 		return false
@@ -1610,14 +1755,7 @@ func isControlAtTarget(target string) bool {
 }
 
 func (s *shellState) runPipelineStage(stage pipelineStage, stdin io.Reader, stdout, stderr io.Writer) error {
-	switch stage.ctx.Mode {
-	case modeHost:
-		return s.runHostWithInput(stage.line, stdin, stdout, stderr)
-	case modeVM:
-		return s.streamGuestRunWithInput(backendVMID(stage.ctx), stage.req, stdin, stdout, stderr)
-	default:
-		return fmt.Errorf("unknown shell mode %q", stage.ctx.Mode)
-	}
+	return stage.command.RunWithInput(stdin, stdout, stderr)
 }
 
 func (s *shellState) evalExport(line string) (bool, error) {
@@ -1833,8 +1971,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		}
 		return s.help(stdout)
 	case "host":
-		ctx := s.context.withOptions(at.Options)
-		ctx.Mode = modeHost
+		ctx := hostCommandContext(s.context, at.Options)
 		if at.Options.Sudo {
 			return fmt.Errorf("usage: @host [cmd]")
 		}
@@ -1843,6 +1980,24 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return nil
 		}
 		return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
+	case "ssh":
+		host, command, err := parseSSHAtCommand(at.Command)
+		if err != nil {
+			return err
+		}
+		ctx := sshCommandContext(s.context, at.Options, host)
+		if command == "" {
+			session, err := s.sshPersistentShell(ctx, stdout, stderr)
+			if err != nil {
+				return err
+			}
+			if cwd := session.cwd(); cwd != "" {
+				ctx.CWD = cwd
+			}
+			s.activateContext(ctx)
+			return nil
+		}
+		return s.runMaybeBackground(ctx, command, stdout, stderr)
 	case "ps":
 		if at.Command != "" || len(at.Options.OptionFields) != 0 {
 			return fmt.Errorf("usage: @ps")
@@ -1878,12 +2033,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		id := backendVMID(ctx)
 		return s.startVM(id, ctx, stderr)
 	case "stop":
-		if at.Command != "" {
-			return fmt.Errorf("usage: @stop [--vm id]")
-		}
-		ctx := s.context.withOptions(at.Options)
-		id := backendVMID(ctx)
-		return s.stopVM(id)
+		return s.stopSession(at)
 	case "restart":
 		if at.Command != "" {
 			return fmt.Errorf("usage: @restart [--vm id]")
@@ -1923,12 +2073,17 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 	case "agent":
 		return s.runAgent(at, stdout, stderr)
 	default:
-		ctx := s.context.withOptions(at.Options)
-		ctx.Mode = modeVM
-		ctx.Image = at.Target
-		if at.Options.Sudo {
-			ctx.User = "root"
+		if ctx, ok := s.sshSessionContext(at.Target); ok {
+			if len(at.Options.OptionFields) != 0 {
+				return fmt.Errorf("usage: @%s [cmd]", at.Target)
+			}
+			if at.Command == "" {
+				s.activateContext(ctx)
+				return nil
+			}
+			return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
 		}
+		ctx := vmCommandContext(s.context, at.Options, at.Target)
 		if at.Command == "" {
 			if at.Options.Sudo {
 				return fmt.Errorf("usage: @%s --sudo <cmd>", at.Target)
@@ -2037,10 +2192,33 @@ func (s *shellState) runHostWithInput(line string, stdin io.Reader, stdout, stde
 	return nil
 }
 
+func sshRemoteCommandScript(ctx commandContext, line string) string {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		line = ":"
+	}
+	cwd := strings.TrimSpace(ctx.CWD)
+	if cwd == "" || cwd == "~" {
+		return line
+	}
+	return remoteCDCommand(cwd) + " && " + line
+}
+
 type copyEndpoint struct {
-	ctx       commandContext
+	target    shellTarget
 	path      string
 	directory bool
+}
+
+func (e copyEndpoint) context() commandContext {
+	if e.target == nil {
+		return commandContext{}
+	}
+	return e.target.Context()
+}
+
+func (e copyEndpoint) targetPath() copyTargetPath {
+	return copyTargetPath{path: e.path, directory: e.directory}
 }
 
 func (s *shellState) copyPath(command string, stdout, stderr io.Writer) error {
@@ -2059,33 +2237,41 @@ func (s *shellState) copyPath(command string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	switch {
-	case src.ctx.Mode == modeHost && dst.ctx.Mode == modeHost:
-		return copyHostPath(src.path, dst.path)
-	}
-	srcHost, srcOK := s.copyEndpointHostPath(src)
-	dstHost, dstOK := s.copyEndpointHostPath(dst)
+	srcHost, srcOK := src.target.LocalPath(src.path)
+	dstHost, dstOK := dst.target.LocalPath(dst.path)
 	if srcOK && dstOK {
 		return copyHostPath(srcHost, dstHost)
 	}
-	switch {
-	case src.ctx.Mode == modeHost && dst.ctx.Mode == modeVM:
-		return s.copyHostToGuest(src.path, dst, stderr)
-	case src.ctx.Mode == modeVM && dst.ctx.Mode == modeHost:
-		return s.copyGuestToHost(src, dst.path, stderr)
-	default:
-		return fmt.Errorf("@copy between two guest contexts is not supported yet")
+	if srcOK {
+		return dst.target.CopyFromLocal(srcHost, dst.targetPath(), stderr)
 	}
+	if dstOK {
+		return src.target.CopyToLocal(src.targetPath(), dstHost, stderr)
+	}
+	return copyRemoteToRemote(src, dst, stderr)
 }
 
-func (s *shellState) copyEndpointHostPath(ep copyEndpoint) (string, bool) {
-	if ep.ctx.Mode == modeHost {
-		return ep.path, true
+func copyRemoteToRemote(src, dst copyEndpoint, stderr io.Writer) error {
+	tmpRoot, err := os.MkdirTemp("", "vmsh-copy-*")
+	if err != nil {
+		return err
 	}
-	if ep.ctx.Mode == modeVM && !ep.ctx.Isolated {
-		return guestHostPathToHost(s.hostCWD, ep.path)
+	defer os.RemoveAll(tmpRoot)
+	staged := filepath.Join(tmpRoot, copyStageBaseName(src.path))
+	if err := src.target.CopyToLocal(src.targetPath(), staged, stderr); err != nil {
+		return err
 	}
-	return "", false
+	return dst.target.CopyFromLocal(staged, dst.targetPath(), stderr)
+}
+
+func copyStageBaseName(value string) string {
+	name := path.Base(path.Clean(filepath.ToSlash(strings.TrimSpace(value))))
+	switch name {
+	case "", ".", "/":
+		return "copy"
+	default:
+		return name
+	}
 }
 
 func (s *shellState) parseCopyEndpoint(raw string) (copyEndpoint, error) {
@@ -2099,23 +2285,36 @@ func (s *shellState) parseCopyEndpoint(raw string) (copyEndpoint, error) {
 		value = rest
 		switch target {
 		case "host":
-			ctx = s.context.withOptions(commandOptions{})
-			ctx.Mode = modeHost
+			ctx = hostCommandContext(s.context, commandOptions{})
+		case "ssh":
+			host, sshPath, ok := strings.Cut(rest, ":")
+			if !ok || strings.TrimSpace(host) == "" {
+				return copyEndpoint{}, fmt.Errorf("copy endpoint %q must use @ssh:host:path", raw)
+			}
+			ctx = sshCommandContext(s.context, commandOptions{}, strings.TrimSpace(host))
+			value = sshPath
 		case "":
 			ctx = s.context
 		default:
-			ctx = s.context
-			ctx.Mode = modeVM
-			ctx.Image = target
-			if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
-				ctx.CWD = cwd
+			if sshCtx, ok := s.sshSessionContext(target); ok {
+				ctx = sshCtx
+			} else {
+				ctx = vmCommandContext(s.context, commandOptions{}, target)
+				if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
+					ctx.CWD = cwd
+				}
 			}
 		}
 	}
-	if ctx.Mode == modeHost {
-		return copyEndpoint{ctx: ctx, path: s.resolveHostCopyPath(value), directory: copyEndpointDirectoryHint(value)}, nil
+	target, err := s.targetFor(ctx)
+	if err != nil {
+		return copyEndpoint{}, err
 	}
-	return copyEndpoint{ctx: ctx, path: s.resolveGuestCopyPath(ctx, value), directory: copyEndpointDirectoryHint(value)}, nil
+	return copyEndpoint{
+		target:    target,
+		path:      target.ResolveCopyPath(value),
+		directory: copyEndpointDirectoryHint(value),
+	}, nil
 }
 
 func copyEndpointDirectoryHint(value string) bool {
@@ -2161,6 +2360,17 @@ func (s *shellState) resolveGuestCopyPath(ctx commandContext, value string) stri
 	return path.Clean(path.Join(s.currentGuestCWD(ctx), filepath.ToSlash(value)))
 }
 
+func (s *shellState) resolveSSHCopyPath(ctx commandContext, value string) string {
+	value = filepath.ToSlash(strings.TrimSpace(value))
+	if value == "" {
+		value = "."
+	}
+	if strings.HasPrefix(value, "~") || strings.HasPrefix(value, "/") {
+		return path.Clean(value)
+	}
+	return path.Clean(path.Join(s.currentSSHCWD(ctx), value))
+}
+
 func (s *shellState) currentGuestCWD(ctx commandContext) string {
 	if ctx.Mode != modeVM {
 		return ""
@@ -2183,6 +2393,26 @@ func (s *shellState) currentGuestCWD(ctx commandContext) string {
 	return guestCWD
 }
 
+func (s *shellState) currentSSHCWD(ctx commandContext) string {
+	if ctx.Mode != modeSSH {
+		return ""
+	}
+	if ctx.CWD != "" {
+		return ctx.CWD
+	}
+	if shell := s.sshShellForContext(ctx); shell != nil {
+		if cwd := shell.cwd(); cwd != "" {
+			return cwd
+		}
+	}
+	if s.contextCWD != nil {
+		if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
+			return cwd
+		}
+	}
+	return "~"
+}
+
 func copyHostPath(src, dst string) error {
 	info, err := os.Stat(src)
 	if err != nil {
@@ -2195,21 +2425,21 @@ func copyHostPath(src, dst string) error {
 	return copyHostFile(src, target, info.Mode())
 }
 
-func (s *shellState) copyHostToGuest(src string, dst copyEndpoint, stderr io.Writer) error {
+func (s *shellState) copyLocalToGuest(src string, ctx commandContext, dst copyTargetPath, stderr io.Writer) error {
 	info, err := os.Stat(src)
 	if err != nil {
 		return err
 	}
-	if err := s.ensureGuestCopyReady(dst.ctx, stderr); err != nil {
+	if err := s.ensureGuestCopyReady(ctx, stderr); err != nil {
 		return err
 	}
 	if info.IsDir() {
-		return s.copyHostDirToGuest(src, dst, stderr)
+		return s.copyLocalDirToGuest(src, ctx, dst, stderr)
 	}
-	return s.copyHostFileToGuest(src, dst, stderr)
+	return s.copyLocalFileToGuest(src, ctx, dst, stderr)
 }
 
-func (s *shellState) copyHostDirToGuest(src string, dst copyEndpoint, stderr io.Writer) error {
+func (s *shellState) copyLocalDirToGuest(src string, ctx commandContext, dst copyTargetPath, stderr io.Writer) error {
 	targetRoot := dst.path
 	if dst.directory {
 		targetRoot = path.Join(dst.path, filepath.ToSlash(filepath.Base(src)))
@@ -2251,22 +2481,20 @@ func (s *shellState) copyHostDirToGuest(src string, dst copyEndpoint, stderr io.
 	}
 	for _, op := range ops {
 		if op.dir {
-			if err := s.guestFSMkdir(dst.ctx, op.target, stderr); err != nil {
+			if err := s.guestFSMkdir(ctx, op.target, stderr); err != nil {
 				return err
 			}
 			continue
 		}
-		fileDst := dst
-		fileDst.path = op.target
-		fileDst.directory = false
-		if err := s.copyHostFileToGuest(op.hostPath, fileDst, stderr); err != nil {
+		fileDst := copyTargetPath{path: op.target}
+		if err := s.copyLocalFileToGuest(op.hostPath, ctx, fileDst, stderr); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *shellState) copyHostFileToGuest(src string, dst copyEndpoint, stderr io.Writer) error {
+func (s *shellState) copyLocalFileToGuest(src string, ctx commandContext, dst copyTargetPath, stderr io.Writer) error {
 	data, err := os.ReadFile(src)
 	if err != nil {
 		return err
@@ -2275,7 +2503,7 @@ func (s *shellState) copyHostFileToGuest(src string, dst copyEndpoint, stderr io
 	if dst.directory {
 		target = path.Join(target, filepath.ToSlash(filepath.Base(src)))
 	}
-	return s.guestFSWrite(dst.ctx, target, data, stderr)
+	return s.guestFSWrite(ctx, target, data, stderr)
 }
 
 func (s *shellState) guestFSMkdir(ctx commandContext, dir string, stderr io.Writer) error {
@@ -2327,19 +2555,19 @@ func (s *shellState) runGuestFSRequest(ctx commandContext, req client.ExecReques
 	return nil
 }
 
-func (s *shellState) copyGuestToHost(src copyEndpoint, dst string, stderr io.Writer) error {
-	if err := s.ensureGuestCopyReady(src.ctx, stderr); err != nil {
+func (s *shellState) copyGuestToLocal(ctx commandContext, src copyTargetPath, dst string, stderr io.Writer) error {
+	if err := s.ensureGuestCopyReady(ctx, stderr); err != nil {
 		return err
 	}
 	var tarData bytes.Buffer
 	var exitSeen bool
 	var exitCode int
 	var eventErr error
-	if err := s.api.ExecStreamIn(backendVMID(src.ctx), client.ExecRequest{
+	if err := s.api.ExecStreamIn(backendVMID(ctx), client.ExecRequest{
 		Kind:  "fs_archive",
-		Image: localImageName(src.ctx.Image, src.ctx.Arch),
+		Image: localImageName(ctx.Image, ctx.Arch),
 		Path:  src.path,
-		User:  guestRunUser(src.ctx),
+		User:  guestRunUser(ctx),
 	}, nil, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stdout", "output":
@@ -2575,9 +2803,16 @@ func copyHostFile(src, dst string, mode os.FileMode) error {
 
 func (s *shellState) activateContext(ctx commandContext) {
 	s.rememberContextCWD(s.context)
-	if ctx.Mode == modeVM && ctx.CWD == "" {
+	if (ctx.Mode == modeVM || ctx.Mode == modeSSH) && ctx.CWD == "" {
 		if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
 			ctx.CWD = cwd
+		}
+	}
+	if ctx.Mode == modeSSH {
+		if shell := s.sshShellForContext(ctx); shell != nil {
+			if cwd := shell.cwd(); cwd != "" {
+				ctx.CWD = cwd
+			}
 		}
 	}
 	s.context = ctx
@@ -2627,7 +2862,7 @@ func (s *shellState) exitSubshell() bool {
 }
 
 func (s *shellState) rememberContextCWD(ctx commandContext) {
-	if ctx.Mode != modeVM || ctx.CWD == "" {
+	if (ctx.Mode != modeVM && ctx.Mode != modeSSH) || ctx.CWD == "" {
 		return
 	}
 	if s.contextCWD == nil {
@@ -2641,9 +2876,17 @@ func contextCWDKey(ctx commandContext) string {
 		string(ctx.Mode),
 		ctx.VMID,
 		localImageName(ctx.Image, ctx.Arch),
+		ctx.SSHHost,
 		strconv.FormatBool(ctx.Isolated),
-		guestRunUser(ctx),
+		contextUserKey(ctx),
 	}, "\x00")
+}
+
+func contextUserKey(ctx commandContext) string {
+	if ctx.Mode == modeSSH {
+		return strings.TrimSpace(ctx.User)
+	}
+	return guestRunUser(ctx)
 }
 
 func backendVMID(ctx commandContext) string {
@@ -2900,6 +3143,7 @@ func (s *shellState) closeSessions() {
 		s.hostShell.close()
 		s.hostShell = nil
 	}
+	s.closeSSHClients()
 }
 
 func (p *persistentHostShell) close() {
@@ -4457,6 +4701,44 @@ func (s *shellState) stopVM(id string) error {
 	return nil
 }
 
+func (s *shellState) stopSession(at atLine) error {
+	fields, err := splitShellFields(at.Command)
+	if err != nil {
+		return err
+	}
+	if len(fields) > 1 || (at.Options.VMID != "" && len(fields) != 0) {
+		return fmt.Errorf("usage: @stop [session|--vm id]")
+	}
+	if len(fields) == 0 {
+		if at.Options.VMID != "" {
+			ctx := s.context.withOptions(at.Options)
+			return s.stopVM(backendVMID(ctx))
+		}
+		if s.context.Mode == modeSSH {
+			if s.stopSSHSessionForContext(s.context) {
+				return nil
+			}
+			return fmt.Errorf("ssh session %s is not open", s.context.SSHHost)
+		}
+		ctx := s.context.withOptions(at.Options)
+		return s.stopVM(backendVMID(ctx))
+	}
+
+	name := fields[0]
+	if forced, host := parseExplicitSSHStopTarget(name); forced {
+		if s.stopSSHSession(host) {
+			return nil
+		}
+		return fmt.Errorf("ssh session %s is not open", host)
+	}
+	if s.stopSSHSession(name) {
+		return nil
+	}
+	ctx := s.context.withOptions(at.Options)
+	ctx.VMID = name
+	return s.stopVM(backendVMID(ctx))
+}
+
 func (s *shellState) restartVM(id string, ctx commandContext, stderr io.Writer) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -4650,10 +4932,11 @@ func tmuxLaunchArgs(session, command string, insideTmux bool) []string {
 }
 
 func (s *shellState) chdirContext(target string) error {
-	if s.context.Mode == modeVM {
-		return s.chdirGuest(target)
+	shellTarget, err := s.targetFor(s.context)
+	if err != nil {
+		return err
 	}
-	return s.chdirHost(target)
+	return shellTarget.Chdir(target)
 }
 
 func (s *shellState) chdirHost(target string) error {
@@ -4708,19 +4991,83 @@ func (s *shellState) chdirHost(target string) error {
 }
 
 func (s *shellState) chdirGuest(target string) error {
+	return s.chdirGuestContext(s.context, target)
+}
+
+func (s *shellState) chdirSSHContext(ctx commandContext, target string) error {
+	script := sshRemoteCDScript(s.currentSSHCWD(ctx), target)
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	var err error
+	if shell := s.sshShellForContext(ctx); shell != nil {
+		err = shell.run(remoteCDCommand(target)+" && pwd -P", &out)
+	} else {
+		err = s.runSSHCommand(ctx, script, nil, &out, &stderr, false, false)
+	}
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("ssh cd %s: %s", ctx.SSHHost, msg)
+	}
+	cwd := lastNonEmptyLine(out.String())
+	if cwd == "" {
+		return fmt.Errorf("ssh cd %s: remote pwd returned no path", ctx.SSHHost)
+	}
+	ctx.CWD = cwd
+	s.context = ctx
+	s.rememberContextCWD(ctx)
+	return nil
+}
+
+func sshRemoteCDScript(current, target string) string {
+	parts := []string{"set -e"}
+	current = strings.TrimSpace(current)
+	if current != "" && current != "~" {
+		parts = append(parts, remoteCDCommand(current))
+	}
+	parts = append(parts, remoteCDCommand(target), "pwd -P")
+	return strings.Join(parts, "\n")
+}
+
+func remoteCDCommand(target string) string {
+	target = strings.TrimSpace(target)
+	switch {
+	case target == "" || target == "~":
+		return "cd"
+	case strings.HasPrefix(target, "~/"):
+		return "cd \"$HOME\"/" + shellQuote(strings.TrimPrefix(target, "~/"))
+	default:
+		return "cd " + shellQuote(target)
+	}
+}
+
+func lastNonEmptyLine(text string) string {
+	lines := strings.Split(text, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+func (s *shellState) chdirGuestContext(ctx commandContext, target string) error {
 	if s.guestShell != nil {
 		s.guestShell.close()
 		s.guestShell = nil
 	}
-	current := s.context.CWD
+	current := ctx.CWD
 	if current == "" {
-		if s.context.Isolated {
-			current = guestHomeDir(s.context)
+		if ctx.Isolated {
+			current = guestHomeDir(ctx)
 		} else {
 			_, current, _ = guestHostPaths(s.hostCWD)
 		}
 	}
-	home := guestHomeDir(s.context)
+	home := guestHomeDir(ctx)
 	if target == "" || target == "~" {
 		target = home
 	}
@@ -4735,7 +5082,7 @@ func (s *shellState) chdirGuest(target string) error {
 	}
 	target = path.Clean(target)
 	if strings.HasPrefix(target, guestHostMount+"/") || target == guestHostMount {
-		if s.context.Isolated {
+		if ctx.Isolated {
 			return fmt.Errorf("%s is not mounted in isolated context", guestHostMount)
 		}
 		hostPath, ok := guestHostPathToHost(s.hostCWD, target)
@@ -4745,11 +5092,13 @@ func (s *shellState) chdirGuest(target string) error {
 		if err := s.chdirHost(hostPath); err != nil {
 			return err
 		}
-		s.context.CWD = ""
+		ctx.CWD = ""
+		s.context = ctx
 		return nil
 	}
-	s.context.CWD = target
-	s.rememberContextCWD(s.context)
+	ctx.CWD = target
+	s.context = ctx
+	s.rememberContextCWD(ctx)
 	return nil
 }
 
@@ -4770,11 +5119,16 @@ func guestHostPathToHost(hostCWD, guestPath string) (string, bool) {
 
 func (s *shellState) prompt() string {
 	promptCWD := s.hostCWD
-	if s.context.Mode == modeVM {
-		promptCWD = s.currentGuestCWD(s.context)
+	if target, err := s.targetFor(s.context); err == nil {
+		promptCWD = target.CurrentCWD()
 	}
 	leaf := displayPathLeaf(promptCWD, s.context.Mode)
-	base := colorGreen + "➜" + colorReset + "  " + s.promptCWDColor(promptCWD) + leaf + colorReset
+	base := colorGreen + "➜" + colorReset + "  "
+	cwd := s.promptCWDColor(promptCWD) + leaf + colorReset + " "
+	if s.context.Mode == modeSSH {
+		target := "(" + s.context.SSHHost + ")"
+		return base + colorMagenta + "ssh:" + colorReset + colorYellow + target + colorReset + " " + cwd
+	}
 	if s.context.Mode == modeVM {
 		target := "(" + contextImageText(s.context)
 		if s.context.VMID != "" && s.context.VMID != "default" {
@@ -4788,9 +5142,17 @@ func (s *shellState) prompt() string {
 		if isRootGuestContext(s.context) {
 			label = "root " + label
 		}
-		return base + " " + colorMagenta + label + colorReset + colorYellow + target + colorReset + " "
+		return base + colorMagenta + label + colorReset + colorYellow + target + colorReset + " " + cwd
 	}
-	return base + " " + colorBlue + "host" + colorReset + " "
+	return base + colorBlue + localHostPromptName() + colorReset + " " + cwd
+}
+
+func localHostPromptName() string {
+	name, err := os.Hostname()
+	if err != nil || strings.TrimSpace(name) == "" {
+		return "localhost"
+	}
+	return strings.TrimSpace(name)
 }
 
 func (s *shellState) promptCWDColor(cwd string) string {
@@ -4807,7 +5169,7 @@ func (s *shellState) promptCWDColor(cwd string) string {
 }
 
 func displayPathLeaf(value string, mode shellMode) string {
-	if mode == modeVM {
+	if mode == modeVM || mode == modeSSH {
 		leaf := path.Base(value)
 		if leaf == "." || leaf == "/" {
 			return value
@@ -4912,10 +5274,28 @@ func (s *shellState) drawPromptStatus(stdout io.Writer) {
 }
 
 func (s *shellState) printStatus(w io.Writer) error {
+	if s.context.Mode == modeSSH {
+		status := "closed"
+		if s.sshShellForContext(s.context) != nil {
+			status = "open"
+		}
+		_, err := fmt.Fprintf(w, "context: %s\nssh host: %s\nhost cwd: %s\nssh cwd: %s\nssh session: %s\n",
+			s.context.Mode,
+			emptyText(s.context.SSHHost, "-"),
+			s.hostCWD,
+			emptyText(s.currentSSHCWD(s.context), "-"),
+			status,
+		)
+		return err
+	}
 	id := backendVMID(s.context)
 	state, err := s.api.InstanceStatusOf(id)
 	if err != nil {
 		return err
+	}
+	targetCWD := ""
+	if target, err := s.targetFor(s.context); err == nil && target.Mode() == modeVM {
+		targetCWD = target.CurrentCWD()
 	}
 	_, err = fmt.Fprintf(w, "context: %s\nimage: %s\nvm: %s\nbackend vm: %s\nisolated: %t\nhost cwd: %s\nguest cwd: %s\nvm status: %s\n",
 		s.context.Mode,
@@ -4924,7 +5304,7 @@ func (s *shellState) printStatus(w io.Writer) error {
 		emptyText(id, "-"),
 		s.context.Isolated,
 		s.hostCWD,
-		emptyText(s.currentGuestCWD(s.context), "-"),
+		emptyText(targetCWD, "-"),
 		emptyText(state.Status, "unknown"),
 	)
 	if state.NetworkIPv4 != "" {
@@ -4938,8 +5318,9 @@ func (s *shellState) printVMs(w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if len(states) == 0 {
-		_, err = fmt.Fprintln(w, "No VMs")
+	sshSessions := s.sshSessionStates()
+	if len(states) == 0 && len(sshSessions) == 0 {
+		_, err = fmt.Fprintln(w, "No sessions")
 		return err
 	}
 	for _, state := range states {
@@ -4949,6 +5330,18 @@ func (s *shellState) printVMs(w io.Writer) error {
 		}
 		if state.NetworkIPv4 != "" {
 			parts = append(parts, "addr="+state.NetworkIPv4)
+		}
+		if _, err := fmt.Fprintln(w, strings.Join(parts, " ")); err != nil {
+			return err
+		}
+	}
+	for _, session := range sshSessions {
+		parts := []string{session.Name, "ssh"}
+		if session.User != "" {
+			parts = append(parts, "user="+session.User)
+		}
+		if session.CWD != "" {
+			parts = append(parts, "cwd="+session.CWD)
 		}
 		if _, err := fmt.Fprintln(w, strings.Join(parts, " ")); err != nil {
 			return err
@@ -4989,25 +5382,26 @@ func (s *shellState) help(w io.Writer) error {
 	_, err := fmt.Fprintln(w, strings.TrimSpace(`
 @<oci-tag> [opts] [cmd]  run cmd in an OCI image, or make it current if cmd is omitted
 @host [cmd]              run cmd on the host, or make host current if cmd is omitted
+@ssh HOST [cmd]          run cmd through host ssh config, or make SSH host current
 @ [opts] [cmd]           update or use the current context
 @sudo [cmd]              open a root VM subshell, or run cmd as root in the current VM
 @alias [name=value]      list aliases, or set one (example: @alias clear=@host clear)
 @alias -d name           delete an alias
-@ps                      list VMs
+@ps                      list VMs and SSH sessions
 @jobs                    list background jobs
 @status                  show vmsh and selected VM state
 @start [--vm id]         start a blank VM
-@stop [--vm id]          stop a VM
+@stop [session|--vm id]  stop an SSH session or VM
 @restart [--vm id]       restart a VM after confirmation
 @save [--vm id] tag      save the selected VM root filesystem as a local image
 @rmi image               remove a locally cached image
-@copy SRC DST            copy files between @host: and VM contexts
+@copy SRC DST            copy files between @host:, VM, @ssh:host:path, and active @session:path contexts
 @agent codex [args]      run Codex inside the current VM with host ~/.codex mounted
 @agent --proxy codex     run Codex through a host auth proxy without mounting ~/.codex
 @tmux [session]          open tmux with vmsh as the default pane command
 @forward H:G             forward host port H to guest port G
 opts: --vm id --cwd path --user user --sudo --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
-cd <dir>                 change the current host or VM working directory
+cd <dir>                 change the current host, VM, or SSH working directory
 exit                     leave the current subshell, or vmsh at top level
 `))
 	return err
@@ -5040,6 +5434,25 @@ func parseAtLine(line string) (atLine, error) {
 		at.Command = strings.TrimSpace(body[tokens[next].Start:])
 	}
 	return at, nil
+}
+
+func parseSSHAtCommand(command string) (string, string, error) {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return "", "", fmt.Errorf("usage: @ssh HOST [cmd]")
+	}
+	tokens, err := lexShellTokens(command)
+	if err != nil {
+		return "", "", err
+	}
+	if len(tokens) == 0 || strings.TrimSpace(tokens[0].Value) == "" {
+		return "", "", fmt.Errorf("usage: @ssh HOST [cmd]")
+	}
+	rest := ""
+	if len(tokens) > 1 {
+		rest = strings.TrimSpace(command[tokens[1].Start:])
+	}
+	return tokens[0].Value, rest, nil
 }
 
 func parseCommandOptions(tokens []shellToken, start int, target string) (commandOptions, int, error) {
@@ -5220,6 +5633,29 @@ func (c commandContext) withOptions(opts commandOptions) commandContext {
 	return c
 }
 
+func hostCommandContext(base commandContext, opts commandOptions) commandContext {
+	ctx := base.withOptions(opts)
+	ctx.Mode = modeHost
+	ctx.SSHHost = ""
+	ctx.CWD = ""
+	return ctx
+}
+
+func vmCommandContext(base commandContext, opts commandOptions, image string) commandContext {
+	previousKey := ""
+	if base.Mode == modeVM {
+		previousKey = contextCWDKey(base)
+	}
+	ctx := base.withOptions(opts)
+	ctx.Mode = modeVM
+	ctx.Image = image
+	ctx.SSHHost = ""
+	if opts.CWD == "" && (base.Mode != modeVM || previousKey != contextCWDKey(ctx)) {
+		ctx.CWD = ""
+	}
+	return ctx
+}
+
 func sudoCommandContext(ctx commandContext, command string) (commandContext, string) {
 	if ctx.Mode == modeHost {
 		return ctx, "sudo " + command
@@ -5231,6 +5667,21 @@ func sudoCommandContext(ctx commandContext, command string) (commandContext, str
 func sudoSubshellContext(ctx commandContext) commandContext {
 	ctx.Mode = modeVM
 	ctx.User = "root"
+	return ctx
+}
+
+func sshCommandContext(base commandContext, opts commandOptions, host string) commandContext {
+	ctx := base.withOptions(opts)
+	sameHost := base.Mode == modeSSH && base.SSHHost == host
+	ctx.Mode = modeSSH
+	ctx.SSHHost = host
+	ctx.Image = ""
+	ctx.VMID = ""
+	ctx.Arch = ""
+	ctx.Isolated = false
+	if opts.CWD == "" && !sameHost {
+		ctx.CWD = ""
+	}
 	return ctx
 }
 
