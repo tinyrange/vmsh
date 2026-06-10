@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -34,6 +35,10 @@ func main() {
 
 func run() error {
 	args := os.Args[1:]
+	buildDir, args, err := parseBuildDirArg(args)
+	if err != nil {
+		return err
+	}
 	cmd := "build"
 	if len(args) > 0 {
 		switch args[0] {
@@ -48,7 +53,7 @@ func run() error {
 		return nil
 	}
 
-	p, err := makePaths()
+	p, err := makePaths(buildDir)
 	if err != nil {
 		return err
 	}
@@ -76,15 +81,16 @@ func run() error {
 
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `usage:
-  ./tools/build.go [build]
-  ./tools/build.go run [vmsh args...]
-  go run .\tools\build.go [build|run] [vmsh args...]
+  ./tools/build.go [--build-dir DIR] [build]
+  ./tools/build.go [--build-dir DIR] run [vmsh args...]
+  go run .\tools\build.go [--build-dir DIR] [build|run] [vmsh args...]
 
-The default command is build. Outputs are written under build/vmsh.
+The default command is build. Outputs are written under build/vmsh unless
+--build-dir or VMSH_BUILD_DIR is set.
 `)
 }
 
-func makePaths() (paths, error) {
+func makePaths(buildDirArg string) (paths, error) {
 	root, err := findRoot()
 	if err != nil {
 		return paths{}, err
@@ -100,7 +106,7 @@ func makePaths() (paths, error) {
 		suffix = ".exe"
 	}
 
-	buildDir := filepath.Join(root, "build", "vmsh")
+	buildDir := resolveBuildDir(root, buildDirArg)
 	ccDir := filepath.Join(root, "cc")
 	return paths{
 		root:      root,
@@ -112,6 +118,48 @@ func makePaths() (paths, error) {
 		initAMD64: filepath.Join(buildDir, "init-linux-amd64"),
 		initARM64: filepath.Join(buildDir, "init-linux-arm64"),
 	}, nil
+}
+
+func parseBuildDirArg(args []string) (string, []string, error) {
+	var buildDir string
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			out = append(out, args[i:]...)
+			break
+		}
+		switch {
+		case arg == "--build-dir" || arg == "-build-dir":
+			if i+1 >= len(args) {
+				return "", nil, fmt.Errorf("%s requires a directory", arg)
+			}
+			i++
+			buildDir = args[i]
+		case strings.HasPrefix(arg, "--build-dir="):
+			buildDir = strings.TrimPrefix(arg, "--build-dir=")
+		case strings.HasPrefix(arg, "-build-dir="):
+			buildDir = strings.TrimPrefix(arg, "-build-dir=")
+		default:
+			out = append(out, arg)
+		}
+	}
+	return buildDir, out, nil
+}
+
+func resolveBuildDir(root, buildDirArg string) string {
+	buildDir := strings.TrimSpace(buildDirArg)
+	if buildDir == "" {
+		buildDir = strings.TrimSpace(os.Getenv("VMSH_BUILD_DIR"))
+	}
+	if buildDir == "" {
+		return filepath.Join(root, "build", "vmsh")
+	}
+	buildDir = os.ExpandEnv(buildDir)
+	if !filepath.IsAbs(buildDir) {
+		buildDir = filepath.Join(root, buildDir)
+	}
+	return filepath.Clean(buildDir)
 }
 
 func findRoot() (string, error) {
@@ -301,6 +349,9 @@ func runVMSH(p paths, args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
 	if err := cmd.Run(); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {

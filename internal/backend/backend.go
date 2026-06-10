@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +38,7 @@ type API interface {
 	RunStreamIn(string, client.RunRequest, func(client.ExecEvent) error) error
 	RunStreamInContext(context.Context, string, client.RunRequest, func(client.ExecEvent) error) error
 	RunInteractiveStreamIn(string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+	RunInteractiveStreamInContext(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	ExecStreamIn(string, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 }
 
@@ -97,10 +99,21 @@ func CompanionExecutablePath(exePath, suffix string) string {
 	return strings.TrimSuffix(exePath, ext) + suffix + ext
 }
 
+type ConnectOptions struct {
+	OnReuse func(DaemonState)
+}
+
 func ConnectCCVM(launch CCVMLaunch, cacheDir, statePath string) (*client.Client, error) {
+	return ConnectCCVMWithOptions(launch, cacheDir, statePath, ConnectOptions{})
+}
+
+func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts ConnectOptions) (*client.Client, error) {
 	if state, err := ReadDaemonState(statePath); err == nil {
 		api := NewClient(state.Addr)
 		if err := api.HealthCheck(); err == nil {
+			if opts.OnReuse != nil {
+				opts.OnReuse(state)
+			}
 			return api, nil
 		}
 		_ = os.Remove(statePath)
@@ -171,8 +184,8 @@ func NewClient(addr string) *client.Client {
 	})
 }
 
-func StartDaemonLease(api API) (func(), error) {
-	const timeout = 10 * time.Second
+func StartDaemonLease(api watchdogAPI) (func(), error) {
+	timeout := daemonWatchdogTimeout()
 	lease, err := api.CreateWatchdogLease(client.WatchdogLeaseRequest{TimeoutSeconds: timeout.Seconds()})
 	if err != nil {
 		return nil, err
@@ -197,6 +210,31 @@ func StartDaemonLease(api API) (func(), error) {
 		<-stopped
 		_ = api.ReleaseWatchdogLease(lease.LeaseID)
 	}, nil
+}
+
+type watchdogAPI interface {
+	CreateWatchdogLease(client.WatchdogLeaseRequest) (client.WatchdogLeaseResponse, error)
+	FeedWatchdogLease(string) error
+	ReleaseWatchdogLease(string) error
+}
+
+func daemonWatchdogTimeout() time.Duration {
+	const fallback = 3 * time.Second
+	raw := strings.TrimSpace(os.Getenv("VMSH_DAEMON_WATCHDOG_TIMEOUT"))
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("CCX3_DAEMON_WATCHDOG_TIMEOUT"))
+	}
+	if raw == "" {
+		return fallback
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		return d
+	}
+	seconds, err := strconv.ParseFloat(raw, 64)
+	if err != nil || seconds <= 0 {
+		return fallback
+	}
+	return time.Duration(seconds * float64(time.Second))
 }
 
 func ReadDaemonState(path string) (DaemonState, error) {

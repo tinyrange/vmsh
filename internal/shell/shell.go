@@ -35,7 +35,6 @@ const guestHostMount = "/host"
 const defaultGuestUser = "1000:1000"
 const defaultVMSHBootTimeoutSeconds = 60
 const defaultGuestShellReadyTimeout = 5 * time.Second
-
 const (
 	colorReset   = "\x1b[0m"
 	colorGreen   = "\x1b[32m"
@@ -78,6 +77,7 @@ type shellState struct {
 	statusSeq        atomic.Uint64
 	completion       *vmshCompleter
 	tmuxExec         func([]string) error
+	interruptSignals <-chan os.Signal
 }
 
 type shellJob struct {
@@ -98,6 +98,7 @@ type hostShellInit struct {
 type persistentHostShell struct {
 	mu      sync.Mutex
 	cmd     *exec.Cmd
+	tty     *os.File
 	stdin   io.WriteCloser
 	stdout  *bufio.Reader
 	seq     uint64
@@ -145,7 +146,7 @@ func (c *vmshCompleter) Complete(line []rune, pos int) ([]string, int) {
 }
 
 func (c *vmshCompleter) CompleteWithKind(line []rune, pos int) ([]string, int, completionKind) {
-	prefix := string(line[:pos])
+	prefix := currentCompletionSegment(string(line[:pos]))
 	typedTokenStart := lastCompletionTokenStart(prefix)
 	typedToken := prefix[typedTokenStart:]
 	effectivePrefix := c.effectiveCompletionPrefix(prefix)
@@ -172,7 +173,7 @@ func (c *vmshCompleter) CompleteWithKind(line []rune, pos int) ([]string, int, c
 		return candidates, len([]rune(typedToken)), completionAt
 	}
 	if c.shouldCompleteCommand(prefix, tokenStart, isFirstToken, token) {
-		candidates = c.commandCandidates(token)
+		candidates = c.commandCandidates(token, completionCtx)
 		return candidates, len([]rune(typedToken)), completionCommand
 	}
 	if !isFirstToken || token == "" || strings.Contains(token, "/") || token == "." || token == ".." || strings.HasPrefix(token, "~") {
@@ -180,6 +181,32 @@ func (c *vmshCompleter) CompleteWithKind(line []rune, pos int) ([]string, int, c
 		return candidates, pathCompletionReplaceLen(typedToken), completionPath
 	}
 	return nil, 0, completionNone
+}
+
+func currentCompletionSegment(line string) string {
+	start := 0
+	escaped := false
+	var quote rune
+	for i, r := range line {
+		switch {
+		case escaped:
+			escaped = false
+		case r == '\\' && quote != '\'':
+			escaped = true
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			}
+		case r == '\'' || r == '"':
+			quote = r
+		case r == ';' || r == '|' || r == '&':
+			start = i + len(string(r))
+			if (r == '|' || r == '&') && start < len(line) && line[start] == byte(r) {
+				start++
+			}
+		}
+	}
+	return strings.TrimLeft(line[start:], " \t\n")
 }
 
 func (c *vmshCompleter) effectiveCompletionPrefix(prefix string) string {
@@ -357,7 +384,7 @@ func completedShellWords(line string) []string {
 	return words
 }
 
-func (c *vmshCompleter) commandCandidates(token string) []string {
+func (c *vmshCompleter) commandCandidates(token string, ctx commandContext) []string {
 	seen := map[string]bool{}
 	var out []string
 	add := func(name string) {
@@ -369,6 +396,13 @@ func (c *vmshCompleter) commandCandidates(token string) []string {
 	}
 	for _, name := range []string{"cd", "exit", "export", "pwd", "echo", "env", "ls", "cat", "grep", "find", "git", "make", "go", "python", "python3", "sh"} {
 		add(name)
+	}
+	if ctx.Mode == modeVM {
+		for _, name := range c.guestCommandNames(ctx, token) {
+			add(name)
+		}
+		sortCompletionItems(out)
+		return out
 	}
 	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
 		entries, err := os.ReadDir(dir)
@@ -388,6 +422,66 @@ func (c *vmshCompleter) commandCandidates(token string) []string {
 	}
 	sortCompletionItems(out)
 	return out
+}
+
+func (c *vmshCompleter) guestCommandNames(ctx commandContext, token string) []string {
+	if c.shell == nil || c.shell.api == nil || ctx.VMID == "" || ctx.Image == "" {
+		return nil
+	}
+	status, err := c.shell.api.InstanceStatusOf(ctx.VMID)
+	if err != nil || status.Status != "running" {
+		return nil
+	}
+	req := client.RunRequest{
+		Image:   localImageName(ctx.Image, ctx.Arch),
+		Command: []string{"sh", "-lc", guestCommandCompletionScript(token)},
+		WorkDir: c.shell.currentGuestCWD(ctx),
+		User:    guestRunUser(ctx),
+	}
+	var stdout strings.Builder
+	runCtx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	defer cancel()
+	err = c.shell.api.RunStreamInContext(runCtx, ctx.VMID, req, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "stdout", "output":
+			stdout.WriteString(execEventText(event))
+		case "error":
+			if event.Error != "" {
+				return fmt.Errorf("%s", event.Error)
+			}
+			return fmt.Errorf("guest command completion failed")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		name := strings.TrimSpace(line)
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return uniqueStrings(names)
+}
+
+func guestCommandCompletionScript(prefix string) string {
+	return strings.Join([]string{
+		"prefix=" + shellQuote(prefix),
+		`old_ifs=$IFS`,
+		`IFS=:`,
+		`for dir in $PATH; do`,
+		`  [ -d "$dir" ] || continue`,
+		`  for path in "$dir"/"$prefix"*; do`,
+		`    [ -f "$path" ] && [ -x "$path" ] || continue`,
+		`    name=${path##*/}`,
+		`    case "$name" in "$prefix"*) printf '%s\n' "$name" ;; esac`,
+		`  done`,
+		`done`,
+		`IFS=$old_ifs`,
+	}, "\n")
 }
 
 func lastCompletionTokenStart(line string) int {
@@ -726,7 +820,11 @@ func Run(args []string) error {
 			childCCVMPath = abs
 		}
 	}
-	api, err := backend.ConnectCCVM(ccvmLaunch, rootCache, statePath)
+	api, err := backend.ConnectCCVMWithOptions(ccvmLaunch, rootCache, statePath, backend.ConnectOptions{
+		OnReuse: func(state backend.DaemonState) {
+			fmt.Fprintf(os.Stderr, "vmsh: reusing ccvm daemon at %s\n", state.Addr)
+		},
+	})
 	if err != nil {
 		return err
 	}
@@ -822,8 +920,18 @@ func (s *shellState) warmHostShell(stdout, stderr io.Writer) {
 }
 
 func (s *shellState) evalLineEditor(in *os.File, stdout, stderr io.Writer) error {
+	sigCh := make(chan os.Signal, 8)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+	previousInterrupts := s.interruptSignals
+	s.interruptSignals = sigCh
+	defer func() {
+		s.interruptSignals = previousInterrupts
+	}()
+
 	lineEditor := editor.NewLineEditor(in, stdout, s.history, s.completion)
 	for {
+		drainInterruptSignals(s.interruptSignals)
 		s.drawPromptStatus(stdout)
 		line, err := lineEditor.ReadLine(s.prompt())
 		s.statusSeq.Add(1)
@@ -957,7 +1065,9 @@ func (s *shellState) eval(line string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		return s.runPipeline(s.context, segments, stdout, stderr)
+		if shouldRunVMSHPipeline(segments) {
+			return s.runPipeline(s.context, segments, stdout, stderr)
+		}
 	}
 	if isExitCommand(line) {
 		return io.EOF
@@ -1007,23 +1117,36 @@ func (s *shellState) expandAliasLineOnce(line string) (string, bool, error) {
 	if len(s.aliases) == 0 {
 		return line, false, nil
 	}
-	tokens, err := lexShellTokens(line)
+	segments, err := shellCommandSegments(line)
 	if err != nil {
 		return line, false, err
 	}
-	if len(tokens) == 0 {
-		return line, false, nil
+	for _, segment := range segments {
+		commandStart := segment.start + leadingShellSpace(line[segment.start:segment.end])
+		if commandStart >= segment.end {
+			continue
+		}
+		tokens, err := lexShellTokens(line[commandStart:segment.end])
+		if err != nil {
+			return line, false, err
+		}
+		if len(tokens) == 0 {
+			continue
+		}
+		first := tokens[0]
+		replacement, ok := s.aliases[first.Value]
+		if !ok {
+			continue
+		}
+		firstEnd := commandStart + first.End
+		rest := strings.TrimLeft(line[firstEnd:segment.end], " \t\n")
+		expanded := replacement
+		if rest != "" {
+			expanded = strings.TrimRight(replacement, " \t") + " " + rest
+		}
+		return line[:commandStart] + expanded + line[segment.end:], true, nil
 	}
-	first := tokens[0]
-	replacement, ok := s.aliases[first.Value]
-	if !ok {
-		return line, false, nil
-	}
-	rest := strings.TrimLeft(line[first.End:], " \t")
-	if rest == "" {
-		return replacement, true, nil
-	}
-	return strings.TrimRight(replacement, " \t") + " " + rest, true, nil
+	return line, false, nil
 }
 
 func (s *shellState) expandAliasCompletionPrefix(prefix string) (string, error) {
@@ -1083,13 +1206,192 @@ func (s *shellState) runMaybeBackground(ctx commandContext, line string, stdout,
 		}
 		return s.startBackgroundJob(ctx, command, stdout, stderr)
 	}
+	if parts, ok, err := splitCommandListLine(line); ok && commandListHasVMShCommand(parts) {
+		if err != nil {
+			return err
+		}
+		return s.runCommandList(ctx, parts, stdout, stderr)
+	}
 	if segments, ok, err := splitPipelineLine(line); ok || err != nil {
 		if err != nil {
 			return err
 		}
-		return s.runPipeline(ctx, segments, stdout, stderr)
+		if shouldRunVMSHPipeline(segments) {
+			return s.runPipeline(ctx, segments, stdout, stderr)
+		}
 	}
 	return s.runInContext(ctx, line, stdout, stderr)
+}
+
+type shellCommandSegment struct {
+	start int
+	end   int
+}
+
+func shellCommandSegments(line string) ([]shellCommandSegment, error) {
+	segments := []shellCommandSegment{{start: 0, end: len(line)}}
+	inSingle := false
+	inDouble := false
+	escaped := false
+	start := 0
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		switch {
+		case escaped:
+			escaped = false
+		case ch == '\\' && !inSingle:
+			escaped = true
+		case ch == '\'' && !inDouble:
+			inSingle = !inSingle
+		case ch == '"' && !inSingle:
+			inDouble = !inDouble
+		case !inSingle && !inDouble && isShellCommandSeparator(line, i):
+			if start == 0 {
+				segments = segments[:0]
+			}
+			segments = append(segments, shellCommandSegment{start: start, end: i})
+			if (line[i] == '&' || line[i] == '|') && i+1 < len(line) && line[i+1] == line[i] {
+				i++
+			}
+			start = i + 1
+		}
+	}
+	if escaped {
+		return nil, fmt.Errorf("unfinished escape")
+	}
+	if inSingle || inDouble {
+		return nil, fmt.Errorf("unterminated quote")
+	}
+	if start != 0 {
+		segments = append(segments, shellCommandSegment{start: start, end: len(line)})
+	}
+	return segments, nil
+}
+
+func isShellCommandSeparator(line string, i int) bool {
+	switch line[i] {
+	case ';':
+		return true
+	case '&':
+		return i+1 < len(line) && line[i+1] == '&'
+	case '|':
+		return true
+	default:
+		return false
+	}
+}
+
+func leadingShellSpace(value string) int {
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case ' ', '\t', '\n':
+			continue
+		default:
+			return i
+		}
+	}
+	return len(value)
+}
+
+type commandListPart struct {
+	op      string
+	command string
+}
+
+func splitCommandListLine(line string) ([]commandListPart, bool, error) {
+	var parts []commandListPart
+	start := 0
+	op := ""
+	found := false
+	inSingle := false
+	inDouble := false
+	escaped := false
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		switch {
+		case escaped:
+			escaped = false
+		case ch == '\\' && !inSingle:
+			escaped = true
+		case ch == '\'' && !inDouble:
+			inSingle = !inSingle
+		case ch == '"' && !inSingle:
+			inDouble = !inDouble
+		case !inSingle && !inDouble && ch == ';':
+			part := strings.TrimSpace(line[start:i])
+			parts = append(parts, commandListPart{op: op, command: part})
+			if part == "" {
+				return parts, true, fmt.Errorf("empty command before ;")
+			}
+			op = ";"
+			start = i + 1
+			found = true
+		case !inSingle && !inDouble && (ch == '&' || ch == '|') && i+1 < len(line) && line[i+1] == ch:
+			part := strings.TrimSpace(line[start:i])
+			parts = append(parts, commandListPart{op: op, command: part})
+			if part == "" {
+				return parts, true, fmt.Errorf("empty command before %s", line[i:i+2])
+			}
+			op = line[i : i+2]
+			i++
+			start = i + 1
+			found = true
+		}
+	}
+	if !found {
+		return nil, false, nil
+	}
+	if escaped {
+		return parts, true, fmt.Errorf("unfinished escape")
+	}
+	if inSingle || inDouble {
+		return parts, true, fmt.Errorf("unterminated quote")
+	}
+	part := strings.TrimSpace(line[start:])
+	parts = append(parts, commandListPart{op: op, command: part})
+	if part == "" {
+		return parts, true, fmt.Errorf("empty command after %s", op)
+	}
+	return parts, true, nil
+}
+
+func commandListHasVMShCommand(parts []commandListPart) bool {
+	for i := 1; i < len(parts); i++ {
+		if strings.HasPrefix(strings.TrimSpace(parts[i].command), "@") {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *shellState) runCommandList(base commandContext, parts []commandListPart, stdout, stderr io.Writer) error {
+	for i, part := range parts {
+		if i > 0 {
+			switch part.op {
+			case "&&":
+				if s.lastCode != 0 {
+					continue
+				}
+			case "||":
+				if s.lastCode == 0 {
+					continue
+				}
+			}
+		}
+		err := s.runCommandListPart(base, part.command, stdout, stderr)
+		if err != nil && sessionLastCode(err) < 0 {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *shellState) runCommandListPart(base commandContext, command string, stdout, stderr io.Writer) error {
+	command = strings.TrimSpace(command)
+	if strings.HasPrefix(command, "@") {
+		return s.evalAt(command, stdout, stderr)
+	}
+	return s.runMaybeBackground(base, command, stdout, stderr)
 }
 
 type pipelineStage struct {
@@ -1149,6 +1451,15 @@ func splitPipelineLine(line string) ([]string, bool, error) {
 	}
 	segments = append(segments, last)
 	return segments, true, nil
+}
+
+func shouldRunVMSHPipeline(segments []string) bool {
+	for _, segment := range segments {
+		if strings.HasPrefix(strings.TrimSpace(segment), "@") {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *shellState) runPipeline(base commandContext, segments []string, stdout, stderr io.Writer) error {
@@ -1213,6 +1524,10 @@ func (s *shellState) runPipeline(base commandContext, segments []string, stdout,
 		return lastErr
 	}
 	for _, err := range errs[:len(errs)-1] {
+		if sessionLastCode(err) == 130 {
+			s.lastCode = 130
+			return nil
+		}
 		if err != nil && sessionLastCode(err) < 0 {
 			return err
 		}
@@ -1621,7 +1936,18 @@ func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 	if persistentHostCommandAllowed(line) {
 		session, err := s.hostPersistentShell(env, cols, rows, stderr)
 		if err == nil {
-			err = session.run(line, stdout, stderr)
+			var interrupted *atomic.Bool
+			err = session.run(line, stdout, stderr, func() (func(), error) {
+				stop, state, err := s.startHostPTYForwarding(tty, session, stdout, stderr)
+				interrupted = state
+				return stop, err
+			})
+			if interrupted != nil && interrupted.Load() && err != nil && sessionLastCode(err) < 0 {
+				err = persistentShellExit{code: 130}
+				if s.hostShell == session {
+					s.hostShell = nil
+				}
+			}
 			s.lastCode = sessionLastCode(err)
 			if err == nil || s.lastCode >= 0 {
 				if session.cwd() != "" {
@@ -1633,13 +1959,29 @@ func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 		}
 	}
 	args := hostShellCommand(line, tty, s.hostCommandPrelude(tty))
-	cmd := exec.Command(args[0], args[1:]...)
+	var cmd *exec.Cmd
+	var interrupted *atomic.Bool
+	stopInterrupts := func() {}
+	if tty {
+		cmd = exec.Command(args[0], args[1:]...)
+		interrupted = &atomic.Bool{}
+	} else {
+		cmdCtx, stop, state := s.interruptibleCommandContext()
+		stopInterrupts = stop
+		interrupted = state
+		cmd = exec.CommandContext(cmdCtx, args[0], args[1:]...)
+	}
+	defer stopInterrupts()
 	cmd.Dir = s.hostCWD
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.Env = env
 	err := cmd.Run()
+	if interrupted.Load() {
+		s.lastCode = 130
+		return nil
+	}
 	s.lastCode = exitCode(err)
 	if err != nil && s.lastCode < 0 {
 		return err
@@ -1649,7 +1991,9 @@ func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 
 func (s *shellState) runHostWithInput(line string, stdin io.Reader, stdout, stderr io.Writer) error {
 	args := hostShellCommand(line, false, s.hostCommandPrelude(false))
-	cmd := exec.Command(args[0], args[1:]...)
+	cmdCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+	defer stopInterrupts()
+	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
 	cmd.Dir = s.hostCWD
 	if stdin == nil {
 		cmd.Stdin = nil
@@ -1662,6 +2006,9 @@ func (s *shellState) runHostWithInput(line string, stdin io.Reader, stdout, stde
 		cmd.Env = mergedEnv(os.Environ(), shellEnv(s.env))
 	}
 	err := cmd.Run()
+	if interrupted.Load() {
+		return persistentShellExit{code: 130}
+	}
 	code := exitCode(err)
 	if err != nil && code < 0 {
 		return err
@@ -2268,17 +2615,7 @@ func persistentHostCommandAllowed(line string) bool {
 
 func persistentShellCommandAllowed(line string) bool {
 	fields, err := splitShellFields(line)
-	if err != nil || len(fields) == 0 {
-		return false
-	}
-	switch fields[0] {
-	case "vi", "vim", "nvim", "nano", "emacs", "less", "more", "man", "ssh", "top", "htop", "watch", "fg", "bg", "jobs":
-		return false
-	case "cat", "python", "python3", "node", "ruby", "irb", "php", "sqlite3", "mysql", "psql":
-		return len(fields) > 1
-	default:
-		return true
-	}
+	return err == nil && len(fields) > 0
 }
 
 func (s *shellState) hostPersistentShell(env []string, cols, rows int, stderr io.Writer) (*persistentHostShell, error) {
@@ -2315,6 +2652,7 @@ func startPersistentHostShell(cwd string, env []string, cols, rows int, prelude 
 	}
 	session := &persistentHostShell{
 		cmd:     cmd,
+		tty:     tty,
 		stdin:   tty,
 		stdout:  bufio.NewReader(tty),
 		lastCWD: cwd,
@@ -2366,26 +2704,38 @@ func (p *persistentHostShell) waitReady() error {
 	}
 }
 
-func (p *persistentHostShell) run(line string, stdout, stderr io.Writer) error {
+func (p *persistentHostShell) run(line string, stdout, stderr io.Writer, startForwarding func() (func(), error)) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	stopForwarding := func() {}
+	if startForwarding != nil {
+		stop, err := startForwarding()
+		if err != nil {
+			return err
+		}
+		if stop != nil {
+			stopForwarding = stop
+		}
+	}
+	defer stopForwarding()
 	if _, err := fmt.Fprintln(p.stdin, line); err != nil {
 		return err
 	}
+	buf := make([]byte, 4096)
 	for {
-		text, err := p.stdout.ReadString('\n')
-		if text != "" {
-			if before, code, cwd, ok := p.consumeOutput(text); ok {
-				if before != "" {
-					_, _ = io.WriteString(stdout, before)
-				}
+		n, err := p.stdout.Read(buf)
+		if n > 0 {
+			out, code, cwd, done := p.consumeOutputChunk(string(buf[:n]))
+			if out != "" {
+				_, _ = io.WriteString(stdout, out)
+			}
+			if done {
 				p.lastCWD = cwd
 				if code != 0 {
 					return persistentShellExit{code: code}
 				}
 				return nil
 			}
-			_, _ = io.WriteString(stdout, text)
 		}
 		if err != nil {
 			return err
@@ -2393,9 +2743,50 @@ func (p *persistentHostShell) run(line string, stdout, stderr io.Writer) error {
 	}
 }
 
+const persistentDoneMarkerPrefix = "__VMSH_DONE__:"
+
+func (p *persistentHostShell) consumeOutputChunk(text string) (string, int, string, bool) {
+	p.pending += text
+	idx := strings.Index(p.pending, persistentDoneMarkerPrefix)
+	if idx >= 0 {
+		newline := strings.IndexAny(p.pending[idx:], "\r\n")
+		if newline < 0 {
+			if idx > 0 {
+				out := p.pending[:idx]
+				p.pending = p.pending[idx:]
+				return out, 0, "", false
+			}
+			return "", 0, "", false
+		}
+		lineEnd := idx + newline
+		before := p.pending[:idx]
+		marker := p.pending[idx:lineEnd]
+		p.pending = strings.TrimLeft(p.pending[lineEnd:], "\r\n")
+		code, cwd, ok := parsePersistentMarker(marker)
+		return before, code, cwd, ok
+	}
+	keep := persistentMarkerPrefixSuffixLen(p.pending)
+	out := p.pending[:len(p.pending)-keep]
+	p.pending = p.pending[len(p.pending)-keep:]
+	return out, 0, "", false
+}
+
+func persistentMarkerPrefixSuffixLen(text string) int {
+	max := len(persistentDoneMarkerPrefix) - 1
+	if len(text) < max {
+		max = len(text)
+	}
+	for n := max; n > 0; n-- {
+		if strings.HasPrefix(persistentDoneMarkerPrefix, text[len(text)-n:]) {
+			return n
+		}
+	}
+	return 0
+}
+
 func (p *persistentHostShell) consumeOutput(text string) (string, int, string, bool) {
 	p.pending += text
-	idx := strings.Index(p.pending, "__VMSH_DONE__:")
+	idx := strings.Index(p.pending, persistentDoneMarkerPrefix)
 	if idx < 0 {
 		out := p.pending
 		p.pending = ""
@@ -2436,7 +2827,9 @@ func (s *shellState) closeSessions() {
 }
 
 func (p *persistentHostShell) close() {
-	if p.stdin != nil {
+	if p.tty != nil {
+		_ = p.tty.Close()
+	} else if p.stdin != nil {
 		_ = p.stdin.Close()
 	}
 	select {
@@ -2656,7 +3049,7 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 		}
 		var interrupted atomic.Bool
 		err = session.run(line, stdout, stderr, func() (func(), error) {
-			return s.startGuestInputForwarding(req.TTY, false, session.inputs, stdout, stderr, func(name string) {
+			return s.startGuestInputForwarding(req.TTY, true, session.inputs, stdout, stderr, func(name string) {
 				if name == "INT" {
 					interrupted.Store(true)
 				}
@@ -3011,7 +3404,9 @@ func (p *persistentGuestShell) close() {
 func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, stderr io.Writer) error {
 	if !req.TTY {
 		exitCode := 0
-		if err := s.api.RunStreamInContext(context.Background(), id, req, func(event client.ExecEvent) error {
+		runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+		defer stopInterrupts()
+		if err := s.api.RunStreamInContext(runCtx, id, req, func(event client.ExecEvent) error {
 			switch event.Kind {
 			case "stdout", "output":
 				writeExecEventOutput(stdout, event)
@@ -3027,15 +3422,28 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 			}
 			return nil
 		}); err != nil {
+			if interrupted.Load() {
+				s.lastCode = 130
+				return nil
+			}
 			s.lastCode = 1
 			return err
+		}
+		if interrupted.Load() {
+			s.lastCode = 130
+			return nil
 		}
 		s.lastCode = exitCode
 		return nil
 	}
 
 	inputs := make(chan client.ExecInput, 8)
-	stopForwarding, err := s.startGuestInputForwarding(req.TTY, true, inputs, stdout, stderr)
+	var interrupted atomic.Bool
+	stopForwarding, err := s.startGuestInputForwarding(req.TTY, true, inputs, stdout, stderr, func(name string) {
+		if name == "INT" {
+			interrupted.Store(true)
+		}
+	})
 	if err != nil {
 		return err
 	}
@@ -3061,6 +3469,10 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 		}
 		return nil
 	}); err != nil {
+		if interrupted.Load() {
+			s.lastCode = 130
+			return nil
+		}
 		s.lastCode = 1
 		return err
 	}
@@ -3072,9 +3484,11 @@ func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, s
 	req.TTY = false
 	req.Cols = 0
 	req.Rows = 0
-	if stdin == nil {
+	runStream := func(req client.RunRequest) error {
 		exitCode := 0
-		if err := s.api.RunStreamInContext(context.Background(), id, req, func(event client.ExecEvent) error {
+		runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+		defer stopInterrupts()
+		if err := s.api.RunStreamInContext(runCtx, id, req, func(event client.ExecEvent) error {
 			switch event.Kind {
 			case "stdout", "output":
 				writeExecEventOutput(stdout, event)
@@ -3090,23 +3504,44 @@ func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, s
 			}
 			return nil
 		}); err != nil {
+			if interrupted.Load() {
+				return persistentShellExit{code: 130}
+			}
 			return err
+		}
+		if interrupted.Load() {
+			return persistentShellExit{code: 130}
 		}
 		if exitCode != 0 {
 			return persistentShellExit{code: exitCode}
 		}
 		return nil
 	}
+	if stdin == nil {
+		return runStream(req)
+	}
 
 	inputs := make(chan client.ExecInput, 8)
 	inputErr := make(chan error, 1)
 	done := make(chan struct{})
+	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+	defer stopInterrupts()
+	var closeDoneOnce sync.Once
+	closeDone := func() {
+		closeDoneOnce.Do(func() {
+			close(done)
+		})
+	}
 	go func() {
 		inputErr <- streamReaderToGuestInput(stdin, inputs, done)
 		close(inputs)
 	}()
+	go func() {
+		<-runCtx.Done()
+		closeDone()
+	}()
 	exitCode := 0
-	err := s.api.RunInteractiveStreamIn(id, req, inputs, func(event client.ExecEvent) error {
+	err := s.api.RunInteractiveStreamInContext(runCtx, id, req, inputs, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stdout", "output":
 			writeExecEventOutput(stdout, event)
@@ -3122,9 +3557,12 @@ func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, s
 		}
 		return nil
 	})
-	close(done)
+	closeDone()
 	if inErr := <-inputErr; err == nil && inErr != nil {
 		err = inErr
+	}
+	if interrupted.Load() {
+		return persistentShellExit{code: 130}
 	}
 	if err != nil {
 		return err
@@ -3146,7 +3584,6 @@ func streamReaderToGuestInput(r io.Reader, out chan<- client.ExecInput, done <-c
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				_ = sendGuestInputBlocking(out, done, client.ExecInput{Kind: "stdin_close"})
 				return nil
 			}
 			return err
@@ -3280,6 +3717,210 @@ func sendGuestInput(out chan<- client.ExecInput, done <-chan struct{}, input cli
 	case <-done:
 	case out <- input:
 	}
+}
+
+func (s *shellState) startHostPTYForwarding(tty bool, session *persistentHostShell, stdout, stderr io.Writer) (func(), *atomic.Bool, error) {
+	interrupted := &atomic.Bool{}
+	if session == nil || session.tty == nil {
+		return func() {}, interrupted, nil
+	}
+
+	done := make(chan struct{})
+	restore := func() {}
+	cancelRead := func() {}
+	var producers sync.WaitGroup
+	if tty {
+		file, ok := stdout.(*os.File)
+		if ok && terminal.IsTerminalFD(int(file.Fd())) && terminal.IsTerminalFD(int(os.Stdin.Fd())) {
+			terminalRestore, err := terminal.MakeRaw(os.Stdin)
+			if err != nil {
+				return nil, interrupted, err
+			}
+			restore = terminalRestore
+			cancelRead = func() { terminal.InterruptRead(os.Stdin) }
+			producers.Add(1)
+			go func() {
+				defer producers.Done()
+				streamHostPTYStdin(os.Stdin, session.tty, done, interrupted)
+			}()
+		}
+	}
+
+	producers.Add(1)
+	go func() {
+		defer producers.Done()
+		forwardHostPTYSignals(session.tty, done, tty, stdout, stderr, interrupted)
+	}()
+
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			close(done)
+			cancelRead()
+			producers.Wait()
+			restore()
+		})
+	}
+	return stop, interrupted, nil
+}
+
+func streamHostPTYStdin(in *os.File, out *os.File, done <-chan struct{}, interrupted *atomic.Bool) {
+	var buf [4096]byte
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		n, err := in.Read(buf[:])
+		if n > 0 {
+			if bytes.Contains(buf[:n], []byte{0x03}) {
+				interrupted.Store(true)
+			}
+			if !writeHostPTYInput(out, done, buf[:n]) {
+				return
+			}
+		}
+		if err != nil {
+			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+				sleepOrDone(done, 10*time.Millisecond)
+				continue
+			}
+			return
+		}
+	}
+}
+
+func writeHostPTYInput(out *os.File, done <-chan struct{}, data []byte) bool {
+	for len(data) > 0 {
+		select {
+		case <-done:
+			return false
+		default:
+		}
+		n, err := out.Write(data)
+		if err != nil {
+			return false
+		}
+		if n <= 0 {
+			return false
+		}
+		data = data[n:]
+	}
+	return true
+}
+
+func forwardHostPTYSignals(out *os.File, done <-chan struct{}, tty bool, stdout, stderr io.Writer, interrupted *atomic.Bool) {
+	signals := terminal.HostSignals(tty)
+	sigCh := make(chan os.Signal, 8)
+	signal.Notify(sigCh, signals...)
+	defer signal.Stop(sigCh)
+	for {
+		select {
+		case <-done:
+			return
+		case sig := <-sigCh:
+			if sig == nil {
+				continue
+			}
+			if terminal.IsResizeSignal(sig) {
+				resizeHostPTY(out, stdout)
+				continue
+			}
+			name, ok := terminal.SignalName(sig)
+			if !ok {
+				continue
+			}
+			if name == "INT" {
+				interrupted.Store(true)
+				fmt.Fprintln(stderr)
+			}
+			writeHostPTYSignal(out, name)
+		}
+	}
+}
+
+func resizeHostPTY(out *os.File, stdout io.Writer) {
+	file, ok := stdout.(*os.File)
+	if !ok {
+		return
+	}
+	cols, rows, err := terminal.Size(file)
+	if err != nil || cols <= 0 || rows <= 0 {
+		return
+	}
+	_ = pty.Setsize(out, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+}
+
+func writeHostPTYSignal(out *os.File, name string) {
+	switch name {
+	case "INT":
+		_, _ = out.Write([]byte{0x03})
+	case "QUIT":
+		_, _ = out.Write([]byte{0x1c})
+	}
+}
+
+func (s *shellState) interruptibleCommandContext() (context.Context, func(), *atomic.Bool) {
+	ctx, cancel := context.WithCancel(context.Background())
+	stop, interrupted := s.startInterruptWatcher(cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}, interrupted
+}
+
+func (s *shellState) startInterruptWatcher(onInterrupt func()) (func(), *atomic.Bool) {
+	interrupted := &atomic.Bool{}
+	signals := s.interruptSignals
+	drainInterruptSignals(signals)
+	if signals == nil {
+		return func() {}, interrupted
+	}
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case sig := <-signals:
+				if !isInterruptSignal(sig) {
+					continue
+				}
+				interrupted.Store(true)
+				if onInterrupt != nil {
+					onInterrupt()
+				}
+			}
+		}
+	}()
+	return func() {
+		once.Do(func() {
+			close(done)
+		})
+	}, interrupted
+}
+
+func drainInterruptSignals(signals <-chan os.Signal) {
+	for {
+		select {
+		case <-signals:
+		default:
+			return
+		}
+	}
+}
+
+func isInterruptSignal(sig os.Signal) bool {
+	if sig == nil {
+		return false
+	}
+	if sig == os.Interrupt {
+		return true
+	}
+	name, ok := terminal.SignalName(sig)
+	return ok && name == "INT"
 }
 
 func sleepOrDone(done <-chan struct{}, delay time.Duration) {
@@ -3938,7 +4579,7 @@ func (s *shellState) chdirHost(target string) error {
 		return err
 	}
 	if s.hostShell != nil {
-		if err := s.hostShell.run("cd "+shellQuote(target), io.Discard, io.Discard); err != nil {
+		if err := s.hostShell.run("cd "+shellQuote(target), io.Discard, io.Discard, nil); err != nil {
 			s.hostShell.close()
 			s.hostShell = nil
 			return nil
@@ -4017,7 +4658,7 @@ func (s *shellState) prompt() string {
 		promptCWD = s.currentGuestCWD(s.context)
 	}
 	leaf := displayPathLeaf(promptCWD, s.context.Mode)
-	base := colorGreen + "➜" + colorReset + "  " + colorCyan + leaf + colorReset
+	base := colorGreen + "➜" + colorReset + "  " + s.promptCWDColor(promptCWD) + leaf + colorReset
 	if s.context.Mode == modeVM {
 		target := "(" + contextImageText(s.context)
 		if s.context.VMID != "" && s.context.VMID != "default" {
@@ -4031,6 +4672,19 @@ func (s *shellState) prompt() string {
 		return base + " " + colorMagenta + label + colorReset + colorYellow + target + colorReset + " "
 	}
 	return base + " " + colorBlue + "host" + colorReset + " "
+}
+
+func (s *shellState) promptCWDColor(cwd string) string {
+	if s.context.Mode == modeHost {
+		return colorCyan
+	}
+	if s.context.Isolated {
+		return colorMagenta
+	}
+	if cwd == guestHostMount || strings.HasPrefix(cwd, guestHostMount+"/") {
+		return colorCyan
+	}
+	return colorYellow
 }
 
 func displayPathLeaf(value string, mode shellMode) string {
@@ -4582,7 +5236,13 @@ func exitCode(err error) int {
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		return exitErr.ExitCode()
+		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+			return 128 + int(status.Signal())
+		}
+		code := exitErr.ExitCode()
+		if code >= 0 {
+			return code
+		}
 	}
 	return -1
 }

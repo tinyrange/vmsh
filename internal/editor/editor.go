@@ -270,13 +270,7 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 			}
 			historyPos, draft = e.historyMove(historyPos, draft, 1)
 		case keyTab:
-			if e.menu.active {
-				e.moveCompletion(1)
-			} else if onlyTabs(e.buf) {
-				e.insertRune('\t')
-			} else {
-				e.startCompletion()
-			}
+			e.handleTab()
 		case keyBackTab:
 			if e.menu.active {
 				e.moveCompletion(-1)
@@ -289,6 +283,17 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 		}
 		e.refresh()
 	}
+}
+
+func (e *LineEditor) handleTab() {
+	if e.menu.active {
+		return
+	}
+	if onlyTabs(e.buf) {
+		e.insertRune('\t')
+		return
+	}
+	e.startCompletion()
 }
 
 func (e *LineEditor) historyItems() []string {
