@@ -56,6 +56,19 @@ python3 --version
 
 ## Getting Started
 
+Install the latest release to `~/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/tinyrange/vmsh/main/install.sh | sh
+```
+
+The installer supports macOS ARM64 and Linux ARM64/AMD64 release binaries. To
+install a specific release or choose another destination:
+
+```sh
+VMSH_VERSION=v0.1.0 VMSH_INSTALL_DIR=/usr/local/bin sh install.sh
+```
+
 Clone with submodules:
 
 ```sh
