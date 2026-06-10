@@ -43,18 +43,14 @@ python3 --version
   - `linux/arm64` with KVM.
 - Network access when downloading kernels or pulling OCI images.
 
-Fast parser, shell-state, and client tests do not need VM support.
-
 ## Repository Layout
 
-- `cmd/vmsh`: the `vmsh` shell and tests.
+- `cmd/vmsh`: the `vmsh` shell.
 - `cc`: git submodule containing `ccvm`, VM backends, image import, and the
   lower-level `cc` CLI.
 - `tools/build.go`: local build and run helper for `cc`, `ccvm`, and `vmsh`.
   It builds guest init payloads, builds `ccvm` from the submodule, builds
   `vmsh`, signs `ccvm` on macOS, and can launch `vmsh -ccvm build/vmsh/ccvm`.
-- `.github/workflows/ci.yml`: portable Go tests plus opt-in live VM smoke tests
-  for KVM and WHP runners.
 - `.github/workflows/release.yml`: tag-triggered single-binary releases for
   Linux, Windows, and signed macOS ARM64.
 
@@ -92,7 +88,7 @@ go build -o build/vmsh/vmsh ./cmd/vmsh
 ./build/vmsh/vmsh -ccvm /path/to/ccvm
 ```
 
-Run a non-interactive script, which is useful for CI and smoke tests:
+Run a non-interactive script:
 
 ```sh
 ./tools/build.go
@@ -149,65 +145,6 @@ Use `--` when the guest command itself begins with an option:
 ```sh
 @alpine -- --help
 ```
-
-## Development
-
-Run top-level tests:
-
-```sh
-go test ./...
-```
-
-Run the embedded `cc` test suite:
-
-```sh
-(cd cc && go test ./...)
-```
-
-Run tests that intentionally avoid live VM booting:
-
-```sh
-go test -short ./...
-(cd cc && go test -short ./...)
-```
-
-Run selected Linux KVM boot probes on a `linux/amd64` host with `/dev/kvm`:
-
-```sh
-cd cc
-CCX3_KVM_BOOT=1 go test ./internal/hv/kvm ./internal/vm \
-  -run 'Test(KernelBootSerial|InitramfsBootReadyMarker|RuntimeBackendRunCommand)$' \
-  -count=1 -v
-```
-
-Run selected Windows Hypervisor Platform probes on a `windows/amd64` host:
-
-```powershell
-cd cc
-$env:CCX3_WHP_BOOT = "1"
-go test -tags embed_guestinit ./internal/hv/whp ./internal/vm `
-  -run 'Test(WindowsRuntimeBackendRunCommand|RunManagedExecWithAlpineRootFS)$' `
-  -count=1 -v
-```
-
-## Continuous Integration
-
-The workflow is split by capability:
-
-- Hosted `ubuntu-24.04-arm` and `macos-15` jobs run `go test -short` for this
-  module and for the `cc` submodule. These jobs cover code paths that should not
-  require live VM support.
-- A hosted `ubuntu-24.04` job runs normal Go tests, makes `/dev/kvm`
-  accessible to the runner user, enables `CCX3_KVM_BOOT=1` for selected live
-  boot probes, and executes a `vmsh` script against the tracked Alpine SIMG
-  fixture.
-- A hosted `windows-2025` job checks WHP availability and boots an Alpine
-  kernel, then runs live WHP guest runtime probes for vsock, virtio-fs, managed
-  exec, streamed stdin, writable host shares, and a full `vmsh.exe` script smoke
-  against the tracked Alpine SIMG fixture.
-
-The live jobs use the checked-in `cc/fixtures/alpine.simg` fixture so they can
-boot and run simple guest commands without depending on an external image pull.
 
 ## Releases
 
