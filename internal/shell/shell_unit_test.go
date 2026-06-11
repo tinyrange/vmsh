@@ -250,6 +250,71 @@ func TestIsolatedContextUsesSeparateBackendVM(t *testing.T) {
 	}
 }
 
+func TestBareVMTargetStartsVMWhenActivated(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ubuntu --vm work --memory 768 --cpus 1 --no-network", &stdout, &stderr); err != nil {
+		t.Fatalf("activate VM context: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if sh.context.Mode != modeVM || sh.context.Image != "ubuntu" || sh.context.VMID != "work" {
+		t.Fatalf("context = %+v, want ubuntu work VM context", sh.context)
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	start := api.starts[0]
+	if start.id != "work" {
+		t.Fatalf("start id = %q, want work", start.id)
+	}
+	if start.req.Image != "ubuntu" || start.req.MemoryMB != 768 || start.req.CPUs != 1 {
+		t.Fatalf("start request = %+v", start.req)
+	}
+	if start.req.Network != nil {
+		t.Fatalf("start network = %+v, want nil for --no-network", start.req.Network)
+	}
+	if len(api.runs) != 0 {
+		t.Fatalf("runs = %d, want no command run during activation", len(api.runs))
+	}
+}
+
+func TestBareVMOptionsStartVMWhenActivated(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu", Network: true}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ --vm other --memory 512", &stdout, &stderr); err != nil {
+		t.Fatalf("activate VM context with options: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if sh.context.Mode != modeVM || sh.context.Image != "ubuntu" || sh.context.VMID != "other" {
+		t.Fatalf("context = %+v, want ubuntu other VM context", sh.context)
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	if api.starts[0].id != "other" || api.starts[0].req.MemoryMB != 512 {
+		t.Fatalf("start = %+v, want other VM with memory 512", api.starts[0])
+	}
+}
+
+func TestStartIsIdempotentAfterBareVMActivation(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ubuntu --vm work", &stdout, &stderr); err != nil {
+		t.Fatalf("activate VM context: %v", err)
+	}
+	if err := sh.eval("@start --vm work", &stdout, &stderr); err != nil {
+		t.Fatalf("start already-active VM: %v", err)
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want only initial activation start", len(api.starts))
+	}
+}
+
 func TestIsolatedContextDoesNotInheritHostMappedCWD(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	sh := newUnitShell(t, api)
@@ -1150,6 +1215,99 @@ func TestHostCommandInterruptIsNotFatal(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("interrupted host command did not return")
+	}
+}
+
+func TestImagePullInterruptReturnsStatus130(t *testing.T) {
+	api := newRecordingShellAPI()
+	started := make(chan struct{})
+	api.pullStream = func(ctx context.Context, name string, req client.PullImageRequest, onEvent func(client.ProgressEvent) error) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	sh := newUnitShell(t, api)
+	sh.confirmPull = func(string, io.Writer) (bool, error) { return true, nil }
+	interrupts := make(chan os.Signal, 1)
+	sh.interruptSignals = interrupts
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sh.eval("@ubuntu", io.Discard, io.Discard)
+	}()
+	<-started
+	interrupts <- os.Interrupt
+
+	select {
+	case err := <-errCh:
+		if got := sessionLastCode(err); got != 130 {
+			t.Fatalf("interrupted pull code = %d, err = %v; want 130", got, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("interrupted pull did not return")
+	}
+}
+
+func TestVMStartInterruptReturnsStatus130(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	started := make(chan struct{})
+	api.startStream = func(ctx context.Context, id string, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
+		close(started)
+		<-ctx.Done()
+		return client.InstanceState{}, ctx.Err()
+	}
+	sh := newUnitShell(t, api)
+	interrupts := make(chan os.Signal, 1)
+	sh.interruptSignals = interrupts
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sh.eval("@ubuntu true", io.Discard, io.Discard)
+	}()
+	<-started
+	interrupts <- os.Interrupt
+
+	select {
+	case err := <-errCh:
+		if got := sessionLastCode(err); got != 130 {
+			t.Fatalf("interrupted VM start code = %d, err = %v; want 130", got, err)
+		}
+		if len(api.runs) != 0 {
+			t.Fatalf("guest command ran after interrupted start: %+v", api.runs)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("interrupted VM start did not return")
+	}
+}
+
+func TestGuestCopyInterruptReturnsStatus130(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu"}
+	started := make(chan struct{})
+	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	sh := newUnitShell(t, api)
+	interrupts := make(chan os.Signal, 1)
+	sh.interruptSignals = interrupts
+	ctx := commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu"}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sh.copyGuestToLocal(ctx, copyTargetPath{path: "/tmp/source.txt"}, filepath.Join(t.TempDir(), "source.txt"), io.Discard)
+	}()
+	<-started
+	interrupts <- os.Interrupt
+
+	select {
+	case err := <-errCh:
+		if got := sessionLastCode(err); got != 130 {
+			t.Fatalf("interrupted guest copy code = %d, err = %v; want 130", got, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("interrupted guest copy did not return")
 	}
 }
 
@@ -2315,6 +2473,9 @@ type recordingShellAPI struct {
 	deleted        []string
 	runStream      func(context.Context, string, client.RunRequest, func(client.ExecEvent) error) error
 	runInteractive func(string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+	pullStream     func(context.Context, string, client.PullImageRequest, func(client.ProgressEvent) error) error
+	startStream    func(context.Context, string, client.StartInstanceRequest, func(client.BootEvent) error) (client.InstanceState, error)
+	execStream     func(context.Context, string, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 }
 
 type recordedStart struct {
@@ -2367,6 +2528,13 @@ func (a *recordingShellAPI) GetImage(name string) (client.ImageState, error) {
 }
 
 func (a *recordingShellAPI) PullImageStream(name string, req client.PullImageRequest, onEvent func(client.ProgressEvent) error) error {
+	return a.PullImageStreamContext(context.Background(), name, req, onEvent)
+}
+
+func (a *recordingShellAPI) PullImageStreamContext(ctx context.Context, name string, req client.PullImageRequest, onEvent func(client.ProgressEvent) error) error {
+	if a.pullStream != nil {
+		return a.pullStream(ctx, name, req, onEvent)
+	}
 	a.images[name] = client.ImageState{Name: name, Source: req.Source, Status: "ready"}
 	return nil
 }
@@ -2384,6 +2552,13 @@ func (a *recordingShellAPI) SaveInstanceImage(id string, req client.SaveImageReq
 }
 
 func (a *recordingShellAPI) StartInstanceStreamWithID(id string, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
+	return a.StartInstanceStreamWithIDContext(context.Background(), id, req, onEvent)
+}
+
+func (a *recordingShellAPI) StartInstanceStreamWithIDContext(ctx context.Context, id string, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
+	if a.startStream != nil {
+		return a.startStream(ctx, id, req, onEvent)
+	}
 	a.starts = append(a.starts, recordedStart{id: id, req: req})
 	state := client.InstanceState{ID: id, Status: "running", Image: req.Image, MemoryMB: req.MemoryMB, CPUs: req.CPUs, NestedVirt: req.NestedVirt}
 	a.instances[id] = state
@@ -2465,6 +2640,13 @@ func (a *recordingShellAPI) RunInteractiveStreamInContext(ctx context.Context, i
 }
 
 func (a *recordingShellAPI) ExecStreamIn(id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	return a.ExecStreamInContext(context.Background(), id, req, inputs, onEvent)
+}
+
+func (a *recordingShellAPI) ExecStreamInContext(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	if a.execStream != nil {
+		return a.execStream(ctx, id, req, inputs, onEvent)
+	}
 	a.execs = append(a.execs, recordedExec{id: id, req: req})
 	if onEvent != nil {
 		return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})

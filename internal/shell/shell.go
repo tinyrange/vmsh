@@ -86,6 +86,18 @@ type shellState struct {
 	interruptSignals <-chan os.Signal
 }
 
+type imagePullContextAPI interface {
+	PullImageStreamContext(context.Context, string, client.PullImageRequest, func(client.ProgressEvent) error) error
+}
+
+type instanceStartContextAPI interface {
+	StartInstanceStreamWithIDContext(context.Context, string, client.StartInstanceRequest, func(client.BootEvent) error) (client.InstanceState, error)
+}
+
+type execStreamContextAPI interface {
+	ExecStreamInContext(context.Context, string, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+}
+
 type shellJob struct {
 	ID      int
 	Context commandContext
@@ -1097,6 +1109,10 @@ func (s *shellState) evalLineEditor(in *os.File, stdout, stderr io.Writer) error
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
+			if code := sessionLastCode(err); code >= 0 {
+				s.lastCode = code
+				continue
+			}
 			s.lastCode = 1
 			fmt.Fprintln(stderr, "vmsh:", err)
 		}
@@ -1958,6 +1974,9 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			if at.Options.Sudo {
 				return fmt.Errorf("usage: @ --sudo <cmd>")
 			}
+			if err := s.prepareActivatedVMContext(&ctx, stdout, stderr); err != nil {
+				return err
+			}
 			s.activateContext(ctx)
 			return nil
 		}
@@ -2030,8 +2049,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("usage: @start [--vm id]")
 		}
 		ctx := s.context.withOptions(at.Options)
-		id := backendVMID(ctx)
-		return s.startVM(id, ctx, stderr)
+		return s.ensureVMRunning(ctx, stderr)
 	case "stop":
 		return s.stopSession(at)
 	case "restart":
@@ -2088,7 +2106,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			if at.Options.Sudo {
 				return fmt.Errorf("usage: @%s --sudo <cmd>", at.Target)
 			}
-			if err := s.ensureImageAvailable(ctx, stderr); err != nil {
+			if err := s.prepareActivatedVMContext(&ctx, stdout, stderr); err != nil {
 				return err
 			}
 			s.activateContext(ctx)
@@ -2096,6 +2114,34 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		}
 		return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
 	}
+}
+
+func (s *shellState) prepareActivatedVMContext(ctx *commandContext, stdout, stderr io.Writer) error {
+	if ctx == nil || ctx.Mode != modeVM {
+		return nil
+	}
+	if ctx.Image == "" {
+		return nil
+	}
+	tty, cols, rows := terminalRequestSize(stdout)
+	if tty {
+		req, err := s.prepareGuestRunRequest(*ctx, ":", true, cols, rows, stderr)
+		if err != nil {
+			return err
+		}
+		session, err := s.guestPersistentShell(*ctx, req)
+		if err != nil {
+			return err
+		}
+		if cwd := session.cwd(); cwd != "" {
+			ctx.CWD = cwd
+		}
+		return nil
+	}
+	if err := s.ensureImageAvailable(*ctx, stderr); err != nil {
+		return err
+	}
+	return s.ensureVMRunning(*ctx, stderr)
 }
 
 func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
@@ -2111,7 +2157,12 @@ func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 		if err == nil {
 			var interrupted *atomic.Bool
 			err = session.run(line, stdout, stderr, func() (func(), error) {
-				stop, state, err := s.startHostPTYForwarding(tty, session, stdout, stderr)
+				stop, state, err := s.startHostPTYForwarding(tty, session, stdout, stderr, func() {
+					if s.hostShell == session {
+						s.hostShell = nil
+					}
+					go session.close()
+				})
 				interrupted = state
 				return stop, err
 			})
@@ -2529,7 +2580,9 @@ func (s *shellState) runGuestFSRequest(ctx commandContext, req client.ExecReques
 	var exitSeen bool
 	var exitCode int
 	var eventErr error
-	if err := s.api.ExecStreamIn(backendVMID(ctx), req, nil, func(event client.ExecEvent) error {
+	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+	defer stopInterrupts()
+	if err := s.execStreamInContext(runCtx, backendVMID(ctx), req, nil, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stderr":
 			writeExecEventOutput(stderr, event)
@@ -2541,7 +2594,13 @@ func (s *shellState) runGuestFSRequest(ctx commandContext, req client.ExecReques
 		}
 		return nil
 	}); err != nil {
+		if interrupted.Load() {
+			return persistentShellExit{code: 130}
+		}
 		return err
+	}
+	if interrupted.Load() {
+		return persistentShellExit{code: 130}
 	}
 	if eventErr != nil {
 		return eventErr
@@ -2563,7 +2622,9 @@ func (s *shellState) copyGuestToLocal(ctx commandContext, src copyTargetPath, ds
 	var exitSeen bool
 	var exitCode int
 	var eventErr error
-	if err := s.api.ExecStreamIn(backendVMID(ctx), client.ExecRequest{
+	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+	defer stopInterrupts()
+	if err := s.execStreamInContext(runCtx, backendVMID(ctx), client.ExecRequest{
 		Kind:  "fs_archive",
 		Image: localImageName(ctx.Image, ctx.Arch),
 		Path:  src.path,
@@ -2582,7 +2643,13 @@ func (s *shellState) copyGuestToLocal(ctx commandContext, src copyTargetPath, ds
 		}
 		return nil
 	}); err != nil {
+		if interrupted.Load() {
+			return persistentShellExit{code: 130}
+		}
 		return err
+	}
+	if interrupted.Load() {
+		return persistentShellExit{code: 130}
 	}
 	if eventErr != nil {
 		return eventErr
@@ -3384,6 +3451,10 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 			return s.startGuestInputForwarding(req.TTY, true, session.inputs, stdout, stderr, func(name string) {
 				if name == "INT" {
 					interrupted.Store(true)
+					if s.guestShell == session {
+						s.guestShell = nil
+					}
+					go session.close()
 				}
 			})
 		})
@@ -3840,6 +3911,13 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 	return nil
 }
 
+func (s *shellState) execStreamInContext(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	if api, ok := s.api.(execStreamContextAPI); ok {
+		return api.ExecStreamInContext(ctx, id, req, inputs, onEvent)
+	}
+	return s.api.ExecStreamIn(id, req, inputs, onEvent)
+}
+
 func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, stdin io.Reader, stdout, stderr io.Writer) error {
 	req.TTY = false
 	req.Cols = 0
@@ -4079,7 +4157,7 @@ func sendGuestInput(out chan<- client.ExecInput, done <-chan struct{}, input cli
 	}
 }
 
-func (s *shellState) startHostPTYForwarding(tty bool, session *persistentHostShell, stdout, stderr io.Writer) (func(), *atomic.Bool, error) {
+func (s *shellState) startHostPTYForwarding(tty bool, session *persistentHostShell, stdout, stderr io.Writer, onInterrupt ...func()) (func(), *atomic.Bool, error) {
 	interrupted := &atomic.Bool{}
 	if session == nil || session.tty == nil {
 		return func() {}, interrupted, nil
@@ -4109,7 +4187,7 @@ func (s *shellState) startHostPTYForwarding(tty bool, session *persistentHostShe
 	producers.Add(1)
 	go func() {
 		defer producers.Done()
-		forwardHostPTYSignals(session.tty, done, tty, stdout, stderr, interrupted)
+		forwardHostPTYSignals(session.tty, done, tty, stdout, stderr, interrupted, onInterrupt...)
 	}()
 
 	var stopOnce sync.Once
@@ -4170,7 +4248,7 @@ func writeHostPTYInput(out *os.File, done <-chan struct{}, data []byte) bool {
 	return true
 }
 
-func forwardHostPTYSignals(out *os.File, done <-chan struct{}, tty bool, stdout, stderr io.Writer, interrupted *atomic.Bool) {
+func forwardHostPTYSignals(out *os.File, done <-chan struct{}, tty bool, stdout, stderr io.Writer, interrupted *atomic.Bool, onInterrupt ...func()) {
 	signals := terminal.HostSignals(tty)
 	sigCh := make(chan os.Signal, 8)
 	signal.Notify(sigCh, signals...)
@@ -4194,6 +4272,11 @@ func forwardHostPTYSignals(out *os.File, done <-chan struct{}, tty bool, stdout,
 			if name == "INT" {
 				interrupted.Store(true)
 				fmt.Fprintln(stderr)
+				for _, fn := range onInterrupt {
+					if fn != nil {
+						fn()
+					}
+				}
 			}
 			writeHostPTYSignal(out, name)
 		}
@@ -4453,8 +4536,19 @@ func (s *shellState) ensureImageAvailable(ctx commandContext, stderr io.Writer) 
 		}
 		return nil
 	}
-	if err := s.api.PullImageStream(image, client.PullImageRequest{Source: ctx.Image, Architecture: ctx.Arch}, report); err != nil {
-		return err
+	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+	defer stopInterrupts()
+	var pullErr error
+	if api, ok := s.api.(imagePullContextAPI); ok {
+		pullErr = api.PullImageStreamContext(runCtx, image, client.PullImageRequest{Source: ctx.Image, Architecture: ctx.Arch}, report)
+	} else {
+		pullErr = s.api.PullImageStream(image, client.PullImageRequest{Source: ctx.Image, Architecture: ctx.Arch}, report)
+	}
+	if interrupted.Load() {
+		return persistentShellExit{code: 130}
+	}
+	if pullErr != nil {
+		return pullErr
 	}
 	if s.imageCache == nil {
 		s.imageCache = map[string]bool{}
@@ -4520,10 +4614,22 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 	}
 	boot := newBootStatus(stderr)
 	defer boot.Close()
-	state, err := s.api.StartInstanceStreamWithID(id, req, func(event client.BootEvent) error {
+	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+	defer stopInterrupts()
+	var state client.InstanceState
+	var err error
+	onEvent := func(event client.BootEvent) error {
 		boot.Update(event)
 		return nil
-	})
+	}
+	if api, ok := s.api.(instanceStartContextAPI); ok {
+		state, err = api.StartInstanceStreamWithIDContext(runCtx, id, req, onEvent)
+	} else {
+		state, err = s.api.StartInstanceStreamWithID(id, req, onEvent)
+	}
+	if interrupted.Load() {
+		return persistentShellExit{code: 130}
+	}
 	if err != nil {
 		return err
 	}

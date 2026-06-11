@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"bufio"
 	"compress/gzip"
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -208,7 +207,9 @@ func (s *shellState) detectGuestCodexTarget(ctx commandContext, stderr io.Writer
 	}
 	var stdout bytesBuffer
 	exitCode := 0
-	err = s.api.RunStreamInContext(context.Background(), backendVMID(ctx), req, func(event client.ExecEvent) error {
+	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+	defer stopInterrupts()
+	err = s.api.RunStreamInContext(runCtx, backendVMID(ctx), req, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stdout", "output":
 			writeExecEventOutput(&stdout, event)
@@ -222,6 +223,9 @@ func (s *shellState) detectGuestCodexTarget(ctx commandContext, stderr io.Writer
 		}
 		return nil
 	})
+	if interrupted.Load() {
+		return "", persistentShellExit{code: 130}
+	}
 	if err != nil {
 		return "", err
 	}

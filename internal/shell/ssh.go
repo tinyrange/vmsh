@@ -3,6 +3,7 @@ package shell
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -64,7 +66,22 @@ func (s *shellState) runSSH(ctx commandContext, line string, stdout, stderr io.W
 	if sshContextsMatch(s.context, ctx) && persistentSSHCommandAllowed(line) {
 		session, err := s.sshPersistentShell(ctx, stdout, stderr)
 		if err == nil {
+			var interrupted atomic.Bool
+			stopInterrupts, _ := s.startInterruptWatcher(func() {
+				interrupted.Store(true)
+				_ = session.session.Signal(ssh.SIGINT)
+				go func() {
+					time.Sleep(100 * time.Millisecond)
+					session.close()
+				}()
+			})
 			err = session.run(line, stdout)
+			stopInterrupts()
+			if interrupted.Load() && sshPersistentShellEnded(err) {
+				s.closeSSHSessionKey(session.key)
+				s.lastCode = 130
+				return nil
+			}
 			if sshPersistentShellEnded(err) {
 				s.closeSSHSessionKey(session.key)
 				s.lastCode = 1
@@ -116,14 +133,22 @@ func (s *shellState) runSSHCommandWithSize(ctx commandContext, line string, stdi
 }
 
 func (s *shellState) runSSHSession(ctx commandContext, command string, stdin io.Reader, stdout, stderr io.Writer, tty bool, cols, rows int) error {
-	client, err := s.sshClientFor(ctx)
+	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+	defer stopInterrupts()
+	client, err := s.sshClientForContext(runCtx, ctx)
+	if interrupted.Load() {
+		return persistentShellExit{code: 130}
+	}
 	if err != nil {
 		return err
 	}
 	session, err := client.client.NewSession()
 	if err != nil {
 		s.dropSSHClient(client.key)
-		client, err = s.sshClientFor(ctx)
+		client, err = s.sshClientForContext(runCtx, ctx)
+		if interrupted.Load() {
+			return persistentShellExit{code: 130}
+		}
 		if err != nil {
 			return err
 		}
@@ -160,12 +185,13 @@ func (s *shellState) runSSHSession(ctx commandContext, command string, stdin io.
 	for {
 		select {
 		case err := <-done:
-			return err
-		case <-s.interruptSignals:
-			_ = session.Signal(ssh.SIGINT)
-			if !tty {
-				_ = session.Close()
+			if interrupted.Load() {
+				return persistentShellExit{code: 130}
 			}
+			return err
+		case <-runCtx.Done():
+			_ = session.Signal(ssh.SIGINT)
+			_ = session.Close()
 		}
 	}
 }
@@ -175,7 +201,12 @@ func persistentSSHCommandAllowed(line string) bool {
 }
 
 func (s *shellState) sshPersistentShell(ctx commandContext, output, stderr io.Writer) (*persistentSSHShell, error) {
-	client, err := s.sshClientFor(ctx)
+	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+	defer stopInterrupts()
+	client, err := s.sshClientForContext(runCtx, ctx)
+	if interrupted.Load() {
+		return nil, persistentShellExit{code: 130}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +217,10 @@ func (s *shellState) sshPersistentShell(ctx commandContext, output, stderr io.Wr
 	session, err := client.client.NewSession()
 	if err != nil {
 		s.dropSSHClient(client.key)
-		client, err = s.sshClientFor(ctx)
+		client, err = s.sshClientForContext(runCtx, ctx)
+		if interrupted.Load() {
+			return nil, persistentShellExit{code: 130}
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -229,7 +263,17 @@ func (s *shellState) sshPersistentShell(ctx commandContext, output, stderr io.Wr
 	go func() {
 		done <- session.Wait()
 	}()
-	if err := shell.waitReady(); err != nil {
+	waitStop, _ := s.startInterruptWatcher(func() {
+		_ = session.Signal(ssh.SIGINT)
+		_ = session.Close()
+	})
+	err = shell.waitReady()
+	waitStop()
+	if interrupted.Load() {
+		shell.close()
+		return nil, persistentShellExit{code: 130}
+	}
+	if err != nil {
 		shell.close()
 		return nil, err
 	}
@@ -450,6 +494,10 @@ func sshSessionExitCode(err error) int {
 	if err == nil {
 		return 0
 	}
+	var persistentExit persistentShellExit
+	if errors.As(err, &persistentExit) {
+		return persistentExit.code
+	}
 	var exitErr *ssh.ExitError
 	if errors.As(err, &exitErr) {
 		return exitErr.ExitStatus()
@@ -458,6 +506,10 @@ func sshSessionExitCode(err error) int {
 }
 
 func (s *shellState) sshClientFor(ctx commandContext) (*persistentSSHClient, error) {
+	return s.sshClientForContext(context.Background(), ctx)
+}
+
+func (s *shellState) sshClientForContext(runCtx context.Context, ctx commandContext) (*persistentSSHClient, error) {
 	cfg, err := resolveSSHConfig(ctx)
 	if err != nil {
 		return nil, err
@@ -472,7 +524,7 @@ func (s *shellState) sshClientFor(ctx commandContext) (*persistentSSHClient, err
 	}
 	s.sshMu.Unlock()
 
-	client, err := s.dialSSHConfig(cfg)
+	client, err := s.dialSSHConfigContext(runCtx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -587,6 +639,10 @@ func (s *shellState) sshShellList() []*persistentSSHShell {
 }
 
 func (s *shellState) dialSSHConfig(cfg resolvedSSHConfig) (*ssh.Client, error) {
+	return s.dialSSHConfigContext(context.Background(), cfg)
+}
+
+func (s *shellState) dialSSHConfigContext(ctx context.Context, cfg resolvedSSHConfig) (*ssh.Client, error) {
 	clientConfig, closers, err := cfg.clientConfig()
 	if err != nil {
 		return nil, err
@@ -594,7 +650,7 @@ func (s *shellState) dialSSHConfig(cfg resolvedSSHConfig) (*ssh.Client, error) {
 	defer closeAll(closers)
 	addr := net.JoinHostPort(cfg.HostName, cfg.Port)
 	if cfg.ProxyJump != "" {
-		jump, err := s.sshClientFor(commandContext{Mode: modeSSH, SSHHost: cfg.ProxyJump})
+		jump, err := s.sshClientForContext(ctx, commandContext{Mode: modeSSH, SSHHost: cfg.ProxyJump})
 		if err != nil {
 			return nil, err
 		}
@@ -609,7 +665,8 @@ func (s *shellState) dialSSHConfig(cfg resolvedSSHConfig) (*ssh.Client, error) {
 		}
 		return ssh.NewClient(clientConn, chans, reqs), nil
 	}
-	conn, err := net.DialTimeout("tcp", addr, cfg.ConnectTimeout)
+	dialer := net.Dialer{Timeout: cfg.ConnectTimeout}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
