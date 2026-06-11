@@ -652,7 +652,7 @@ func (s *shellState) dialSSHConfig(cfg resolvedSSHConfig) (*ssh.Client, error) {
 }
 
 func (s *shellState) dialSSHConfigContext(ctx context.Context, cfg resolvedSSHConfig) (*ssh.Client, error) {
-	clientConfig, closers, err := cfg.clientConfig()
+	clientConfig, closers, err := s.sshClientConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -800,21 +800,27 @@ func sshSessionDisplayName(ctx commandContext, cfg resolvedSSHConfig) string {
 	return cfg.HostName
 }
 
-func (cfg resolvedSSHConfig) clientConfig() (*ssh.ClientConfig, []io.Closer, error) {
-	callback, err := sshHostKeyCallback(cfg)
+func (s *shellState) sshClientConfig(cfg resolvedSSHConfig) (*ssh.ClientConfig, []io.Closer, error) {
+	callback, err := s.sshHostKeyCallback(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
-	auth, closers := sshAuthMethods(cfg)
-	return &ssh.ClientConfig{
+	auth, closers := sshAuthMethods(cfg, s.sshPassword, s.sshKeyboardAuth)
+	config := &ssh.ClientConfig{
 		User:            cfg.User,
 		Auth:            auth,
 		HostKeyCallback: callback,
 		Timeout:         cfg.ConnectTimeout,
-	}, closers, nil
+	}
+	if s.sshBanner != nil {
+		config.BannerCallback = func(message string) error {
+			return s.sshBanner(cfg, message)
+		}
+	}
+	return config, closers, nil
 }
 
-func sshHostKeyCallback(cfg resolvedSSHConfig) (ssh.HostKeyCallback, error) {
+func (s *shellState) sshHostKeyCallback(cfg resolvedSSHConfig) (ssh.HostKeyCallback, error) {
 	switch strings.ToLower(cfg.StrictHostKeyChecking) {
 	case "no", "off":
 		return ssh.InsecureIgnoreHostKey(), nil
@@ -826,13 +832,69 @@ func sshHostKeyCallback(cfg resolvedSSHConfig) (ssh.HostKeyCallback, error) {
 			files = append(files, file)
 		}
 	}
-	if len(files) == 0 {
-		return nil, fmt.Errorf("no SSH known_hosts files found")
+	callback, err := knownhosts.New(files...)
+	if err != nil {
+		return nil, err
 	}
-	return knownhosts.New(files...)
+	strict := strings.ToLower(cfg.StrictHostKeyChecking)
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		err := callback(hostname, remote, key)
+		if err == nil {
+			return nil
+		}
+		var keyErr *knownhosts.KeyError
+		if !errors.As(err, &keyErr) || len(keyErr.Want) != 0 {
+			return err
+		}
+		switch strict {
+		case "yes", "on":
+			return err
+		case "accept-new":
+			return addSSHKnownHost(hostname, key)
+		}
+		if s.confirmSSHHost == nil {
+			return err
+		}
+		ok, confirmErr := s.confirmSSHHost(cfg, hostname, remote, key)
+		if confirmErr != nil {
+			return confirmErr
+		}
+		if !ok {
+			return fmt.Errorf("ssh host key rejected for %s", hostname)
+		}
+		return addSSHKnownHost(hostname, key)
+	}, nil
 }
 
-func sshAuthMethods(cfg resolvedSSHConfig) ([]ssh.AuthMethod, []io.Closer) {
+func addSSHKnownHost(hostname string, key ssh.PublicKey) error {
+	file := sshUserKnownHostsPath()
+	if file == "" {
+		return fmt.Errorf("no writable SSH known_hosts path configured")
+	}
+	if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(file, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = fmt.Fprintln(f, knownhosts.Line([]string{hostname}, key))
+	return err
+}
+
+func sshUserKnownHostsPath() string {
+	for _, raw := range sshKnownHosts {
+		file := expandUserPath(raw)
+		if file == "" || strings.HasPrefix(file, "/etc/") {
+			continue
+		}
+		return file
+	}
+	return ""
+}
+
+func sshAuthMethods(cfg resolvedSSHConfig, password func(resolvedSSHConfig) (string, error), keyboard func(resolvedSSHConfig, string, string, []string, []bool) ([]string, error)) ([]ssh.AuthMethod, []io.Closer) {
 	var methods []ssh.AuthMethod
 	var closers []io.Closer
 	agentPath := firstNonEmpty(cfg.IdentityAgent, os.Getenv("SSH_AUTH_SOCK"))
@@ -859,7 +921,62 @@ func sshAuthMethods(cfg resolvedSSHConfig) ([]ssh.AuthMethod, []io.Closer) {
 		}
 		methods = append(methods, ssh.PublicKeys(signer))
 	}
+	if password != nil {
+		getPassword := sshCachedPassword(cfg, password)
+		if keyboard == nil {
+			keyboard = func(cfg resolvedSSHConfig, name, instruction string, questions []string, echos []bool) ([]string, error) {
+				return sshPasswordKeyboardAnswers(questions, echos, getPassword)
+			}
+		}
+	}
+	if keyboard != nil {
+		methods = append(methods, ssh.KeyboardInteractive(func(name, instruction string, questions []string, echos []bool) ([]string, error) {
+			return keyboard(cfg, name, instruction, questions, echos)
+		}))
+	}
+	if password != nil {
+		methods = append(methods, ssh.PasswordCallback(sshCachedPassword(cfg, password)))
+	}
 	return methods, closers
+}
+
+func sshPasswordKeyboardAnswers(questions []string, echos []bool, getPassword func() (string, error)) ([]string, error) {
+	answers := make([]string, 0, len(questions))
+	for i := range questions {
+		echo := false
+		if i < len(echos) {
+			echo = echos[i]
+		}
+		if echo {
+			return nil, fmt.Errorf("unsupported keyboard-interactive SSH challenge")
+		}
+		answer, err := getPassword()
+		if err != nil {
+			return nil, err
+		}
+		answers = append(answers, answer)
+	}
+	return answers, nil
+}
+
+func sshCachedPassword(cfg resolvedSSHConfig, password func(resolvedSSHConfig) (string, error)) func() (string, error) {
+	var mu sync.Mutex
+	var cached string
+	var ok bool
+	return func() (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if ok {
+			return cached, nil
+		}
+		value, err := password(cfg)
+		if err != nil {
+			return "", err
+		}
+		cached = value
+		ok = true
+		return cached, nil
+	}
 }
 
 func closeAll(closers []io.Closer) {

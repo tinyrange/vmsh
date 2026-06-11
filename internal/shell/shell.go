@@ -28,6 +28,8 @@ import (
 	"github.com/tinyrange/vmsh/internal/backend"
 	"github.com/tinyrange/vmsh/internal/editor"
 	"github.com/tinyrange/vmsh/internal/terminal"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/term"
 	"j5.nz/cc/client"
 )
 
@@ -75,6 +77,10 @@ type shellState struct {
 	aliases          map[string]string
 	confirmPull      func(string, io.Writer) (bool, error)
 	confirmVMRestart func(string, io.Writer) (bool, error)
+	confirmSSHHost   func(resolvedSSHConfig, string, net.Addr, ssh.PublicKey) (bool, error)
+	sshPassword      func(resolvedSSHConfig) (string, error)
+	sshKeyboardAuth  func(resolvedSSHConfig, string, string, []string, []bool) ([]string, error)
+	sshBanner        func(resolvedSSHConfig, string) error
 	jobs             []shellJob
 	nextJobID        int
 	jobsMu           sync.Mutex
@@ -1020,6 +1026,19 @@ func Run(args []string) error {
 		confirmVMRestart: func(id string, stderr io.Writer) (bool, error) {
 			return promptVMRestartConfirmation(os.Stdin, stderr, id)
 		},
+		confirmSSHHost: func(cfg resolvedSSHConfig, hostname string, remote net.Addr, key ssh.PublicKey) (bool, error) {
+			return promptSSHHostKeyConfirmation(os.Stdin, os.Stderr, cfg, hostname, remote, key)
+		},
+		sshPassword: func(cfg resolvedSSHConfig) (string, error) {
+			return promptSSHPassword(os.Stdin, os.Stderr, cfg)
+		},
+		sshKeyboardAuth: func(cfg resolvedSSHConfig, name, instruction string, questions []string, echos []bool) ([]string, error) {
+			return promptSSHKeyboardInteractive(os.Stdin, os.Stderr, cfg, name, instruction, questions, echos)
+		},
+		sshBanner: func(cfg resolvedSSHConfig, message string) error {
+			_, err := fmt.Fprint(os.Stderr, message)
+			return err
+		},
 	}
 	sh.completion = newVMSHCompleter(sh)
 	defer sh.closeSessions()
@@ -1921,6 +1940,10 @@ func (s *shellState) startBackgroundJob(ctx commandContext, line string, stdout,
 		aliases:          cloneEnv(s.aliases),
 		confirmPull:      s.confirmPull,
 		confirmVMRestart: s.confirmVMRestart,
+		confirmSSHHost:   s.confirmSSHHost,
+		sshPassword:      s.sshPassword,
+		sshKeyboardAuth:  s.sshKeyboardAuth,
+		sshBanner:        s.sshBanner,
 		contextCWD:       cloneEnv(s.contextCWD),
 	}
 	s.jobsMu.Lock()
@@ -4575,6 +4598,92 @@ func promptVMRestartConfirmation(in *os.File, stderr io.Writer, id string) (bool
 	}
 	answer = strings.ToLower(strings.TrimSpace(answer))
 	return answer == "y" || answer == "yes", nil
+}
+
+func promptSSHPassword(in *os.File, stderr io.Writer, cfg resolvedSSHConfig) (string, error) {
+	if in == nil || !terminal.IsTerminalFD(int(in.Fd())) {
+		return "", fmt.Errorf("ssh password auth requires an interactive terminal")
+	}
+	prompt := "SSH password"
+	userHost := cfg.User
+	if cfg.HostName != "" {
+		if userHost != "" {
+			userHost += "@"
+		}
+		userHost += cfg.HostName
+	}
+	if userHost != "" {
+		prompt += " for " + userHost
+	}
+	fmt.Fprintf(stderr, "%s: ", prompt)
+	password, err := term.ReadPassword(int(in.Fd()))
+	fmt.Fprintln(stderr)
+	if err != nil {
+		return "", err
+	}
+	return string(password), nil
+}
+
+func promptSSHKeyboardInteractive(in *os.File, stderr io.Writer, cfg resolvedSSHConfig, name, instruction string, questions []string, echos []bool) ([]string, error) {
+	if in == nil || !terminal.IsTerminalFD(int(in.Fd())) {
+		return nil, fmt.Errorf("ssh keyboard-interactive auth requires an interactive terminal")
+	}
+	if name = strings.TrimSpace(name); name != "" {
+		fmt.Fprintln(stderr, name)
+	}
+	if instruction = strings.TrimSpace(instruction); instruction != "" {
+		fmt.Fprintln(stderr, instruction)
+	}
+	answers := make([]string, 0, len(questions))
+	reader := bufio.NewReader(in)
+	for i, question := range questions {
+		if strings.TrimSpace(question) == "" {
+			question = "SSH keyboard-interactive response: "
+		}
+		echo := false
+		if i < len(echos) {
+			echo = echos[i]
+		}
+		fmt.Fprint(stderr, question)
+		if echo {
+			answer, err := reader.ReadString('\n')
+			if err != nil && !errors.Is(err, io.EOF) {
+				return nil, err
+			}
+			answers = append(answers, strings.TrimRight(answer, "\r\n"))
+			continue
+		}
+		answer, err := term.ReadPassword(int(in.Fd()))
+		fmt.Fprintln(stderr)
+		if err != nil {
+			return nil, err
+		}
+		answers = append(answers, string(answer))
+	}
+	return answers, nil
+}
+
+func promptSSHHostKeyConfirmation(in *os.File, stderr io.Writer, cfg resolvedSSHConfig, hostname string, remote net.Addr, key ssh.PublicKey) (bool, error) {
+	if in == nil || !terminal.IsTerminalFD(int(in.Fd())) {
+		return false, fmt.Errorf("ssh host key for %s is unknown", hostname)
+	}
+	display := cfg.HostName
+	if display == "" {
+		display = hostname
+	}
+	if remote != nil && remote.String() != "" {
+		display += " (" + remote.String() + ")"
+	}
+	fmt.Fprintf(stderr, "The authenticity of host %q can't be established.\n", display)
+	fmt.Fprintf(stderr, "%s key fingerprint is %s.\n", key.Type(), ssh.FingerprintSHA256(key))
+	fmt.Fprint(stderr, "Trust this host and add it to known_hosts? (yes/no) [no]: ")
+	reader := bufio.NewReader(in)
+	answer, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	answer = strings.ToLower(strings.TrimSpace(answer))
+	return answer == "yes", nil
 }
 
 func displayPullSource(source string) string {

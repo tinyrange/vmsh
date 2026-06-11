@@ -347,7 +347,7 @@ func TestVMContextDoesNotInheritSSHCWD(t *testing.T) {
 	sh := newUnitShell(t, api)
 	sh.context = commandContext{
 		Mode:    modeSSH,
-		SSHHost: "ws1",
+		SSHHost: "test-ssh-a",
 		CWD:     "/home/joshua/dev/tmp",
 		Network: true,
 	}
@@ -1146,7 +1146,7 @@ func TestCompletionsUseCurrentCommandSegmentAndGuestCommands(t *testing.T) {
 		t.Fatalf("guest command completion runs = %+v", api.runs)
 	}
 
-	sh.context = commandContext{Mode: modeSSH, SSHHost: "ws1"}
+	sh.context = commandContext{Mode: modeSSH, SSHHost: "test-ssh-a"}
 	line = []rune("cat ./")
 	candidates, _, kind = c.CompleteWithKind(line, len(line))
 	if kind != completionPath || len(candidates) != 0 {
@@ -1817,17 +1817,17 @@ func TestSSHAtCommandUsesHostSSHConfigAlias(t *testing.T) {
 		_, _ = io.WriteString(stdout, "ssh-ok\n")
 		return 0
 	})
-	server.installConfig(t, "ws1")
+	server.installConfig(t, "test-ssh-a")
 
 	sh := newUnitShell(t, newRecordingShellAPI())
 	var stdout, stderr bytes.Buffer
-	if err := sh.eval("@ssh ws1 printf ok", &stdout, &stderr); err != nil {
+	if err := sh.eval("@ssh test-ssh-a printf ok", &stdout, &stderr); err != nil {
 		t.Fatalf("run ssh command: %v\nstderr:\n%s", err, stderr.String())
 	}
 	if stdout.String() != "ssh-ok\n" {
 		t.Fatalf("ssh stdout = %q", stdout.String())
 	}
-	cfg, err := resolveSSHConfig(commandContext{Mode: modeSSH, SSHHost: "ws1"})
+	cfg, err := resolveSSHConfig(commandContext{Mode: modeSSH, SSHHost: "test-ssh-a"})
 	if err != nil {
 		t.Fatalf("resolve ssh config: %v", err)
 	}
@@ -1836,6 +1836,174 @@ func TestSSHAtCommandUsesHostSSHConfigAlias(t *testing.T) {
 	}
 	if commands := server.commands(); len(commands) != 1 || !strings.Contains(commands[0], "printf ok") {
 		t.Fatalf("ssh commands = %q", commands)
+	}
+}
+
+func TestSSHPasswordAuthentication(t *testing.T) {
+	server := startPasswordTestSSHServer(t, "secret", func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		_, _ = io.WriteString(stdout, "password-ok\n")
+		return 0
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var prompts atomic.Int32
+	sh.sshPassword = func(cfg resolvedSSHConfig) (string, error) {
+		prompts.Add(1)
+		if cfg.User != "testuser" || cfg.HostName != "127.0.0.1" {
+			t.Fatalf("password prompt cfg = %+v", cfg)
+		}
+		return "secret", nil
+	}
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ssh test-ssh-a printf ok", &stdout, &stderr); err != nil {
+		t.Fatalf("ssh password command: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if stdout.String() != "password-ok\n" {
+		t.Fatalf("ssh stdout = %q", stdout.String())
+	}
+	if prompts.Load() != 1 {
+		t.Fatalf("password prompts = %d, want 1", prompts.Load())
+	}
+}
+
+func TestSSHKeyboardInteractivePasswordAuthentication(t *testing.T) {
+	server := startKeyboardInteractiveTestSSHServer(t, "secret", func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		_, _ = io.WriteString(stdout, "keyboard-ok\n")
+		return 0
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var prompts atomic.Int32
+	sh.sshPassword = func(cfg resolvedSSHConfig) (string, error) {
+		prompts.Add(1)
+		return "secret", nil
+	}
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ssh test-ssh-a printf ok", &stdout, &stderr); err != nil {
+		t.Fatalf("ssh keyboard-interactive command: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if stdout.String() != "keyboard-ok\n" {
+		t.Fatalf("ssh stdout = %q", stdout.String())
+	}
+	if prompts.Load() != 1 {
+		t.Fatalf("password prompts = %d, want 1", prompts.Load())
+	}
+}
+
+func TestSSHKeyboardInteractiveChallengeAuthentication(t *testing.T) {
+	server := startKeyboardInteractiveChallengeTestSSHServer(t, []string{"Password: ", "Duo passcode: "}, []bool{false, true}, []string{"secret", "123456"}, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		_, _ = io.WriteString(stdout, "challenge-ok\n")
+		return 0
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var prompts atomic.Int32
+	var passwordPrompts atomic.Int32
+	sh.sshPassword = func(cfg resolvedSSHConfig) (string, error) {
+		passwordPrompts.Add(1)
+		return "unexpected", nil
+	}
+	sh.sshKeyboardAuth = func(cfg resolvedSSHConfig, name, instruction string, questions []string, echos []bool) ([]string, error) {
+		prompts.Add(1)
+		if !reflect.DeepEqual(questions, []string{"Password: ", "Duo passcode: "}) {
+			t.Fatalf("questions = %#v", questions)
+		}
+		if !reflect.DeepEqual(echos, []bool{false, true}) {
+			t.Fatalf("echos = %#v", echos)
+		}
+		return []string{"secret", "123456"}, nil
+	}
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ssh test-ssh-a printf ok", &stdout, &stderr); err != nil {
+		t.Fatalf("ssh keyboard-interactive challenge command: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if stdout.String() != "challenge-ok\n" {
+		t.Fatalf("ssh stdout = %q", stdout.String())
+	}
+	if prompts.Load() != 1 {
+		t.Fatalf("keyboard-interactive prompts = %d, want 1", prompts.Load())
+	}
+	if passwordPrompts.Load() != 0 {
+		t.Fatalf("plain password prompts = %d, want 0", passwordPrompts.Load())
+	}
+}
+
+func TestSSHKeyboardInteractiveRepeatedPasswordAndPushAuthentication(t *testing.T) {
+	questions := []string{
+		"(user@example.invalid) Password:",
+		"(user@example.invalid) Password:",
+		"(user@example.invalid) Password:",
+		"(user@example.invalid) Push code sent, press Enter to continue or 'n' Enter to decline",
+	}
+	answers := []string{"bad-1", "bad-2", "secret", ""}
+	server := startKeyboardInteractiveChallengeTestSSHServer(t, questions, []bool{false, false, false, false}, answers, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		_, _ = io.WriteString(stdout, "uq-ok\n")
+		return 0
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var prompts atomic.Int32
+	sh.sshKeyboardAuth = func(cfg resolvedSSHConfig, name, instruction string, gotQuestions []string, echos []bool) ([]string, error) {
+		prompts.Add(1)
+		if !reflect.DeepEqual(gotQuestions, questions) {
+			t.Fatalf("questions = %#v", gotQuestions)
+		}
+		if !reflect.DeepEqual(echos, []bool{false, false, false, false}) {
+			t.Fatalf("echos = %#v", echos)
+		}
+		return answers, nil
+	}
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ssh test-ssh-a printf ok", &stdout, &stderr); err != nil {
+		t.Fatalf("ssh keyboard-interactive repeated prompt command: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if stdout.String() != "uq-ok\n" {
+		t.Fatalf("ssh stdout = %q", stdout.String())
+	}
+	if prompts.Load() != 1 {
+		t.Fatalf("keyboard-interactive prompts = %d, want 1", prompts.Load())
+	}
+}
+
+func TestSSHUnknownHostKeyCanBeAccepted(t *testing.T) {
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		_, _ = io.WriteString(stdout, "known-now\n")
+		return 0
+	})
+	installTestSSHConfigsWithKnownHostsAndStrict(t, map[string]*testSSHServer{"test-ssh-a": server}, false, "")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var prompts atomic.Int32
+	sh.confirmSSHHost = func(cfg resolvedSSHConfig, hostname string, remote net.Addr, key cryptossh.PublicKey) (bool, error) {
+		prompts.Add(1)
+		if hostname != net.JoinHostPort("127.0.0.1", server.port) {
+			t.Fatalf("hostname = %q, want test server address", hostname)
+		}
+		if key.Type() == "" {
+			t.Fatalf("empty host key type")
+		}
+		return true, nil
+	}
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ssh test-ssh-a printf ok", &stdout, &stderr); err != nil {
+		t.Fatalf("ssh unknown host command: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if stdout.String() != "known-now\n" {
+		t.Fatalf("ssh stdout = %q", stdout.String())
+	}
+	if prompts.Load() != 1 {
+		t.Fatalf("host key prompts = %d, want 1", prompts.Load())
+	}
+	data, err := os.ReadFile(expandUserPath(sshKnownHosts[0]))
+	if err != nil {
+		t.Fatalf("read known_hosts: %v", err)
+	}
+	if !strings.Contains(string(data), "[127.0.0.1]:"+server.port) {
+		t.Fatalf("known_hosts = %q, want saved test server host", string(data))
 	}
 }
 
@@ -1848,28 +2016,28 @@ func TestSSHContextTracksRemoteCWD(t *testing.T) {
 			for scanner.Scan() {
 				line := scanner.Text()
 				remoteLines <- line
-				_, _ = io.WriteString(stdout, "/srv/ws1\n__VMSH_DONE__:0:/srv/ws1\n")
+				_, _ = io.WriteString(stdout, "/srv/test-ssh-a\n__VMSH_DONE__:0:/srv/test-ssh-a\n")
 			}
 			return 0
 		}
-		_, _ = io.WriteString(stdout, "/srv/ws1\n")
+		_, _ = io.WriteString(stdout, "/srv/test-ssh-a\n")
 		return 0
 	})
-	server.installConfig(t, "ws1")
+	server.installConfig(t, "test-ssh-a")
 
 	sh := newUnitShell(t, newRecordingShellAPI())
 	var stdout, stderr bytes.Buffer
-	if err := sh.eval("@ssh ws1", &stdout, &stderr); err != nil {
+	if err := sh.eval("@ssh test-ssh-a", &stdout, &stderr); err != nil {
 		t.Fatalf("enter ssh context: %v", err)
 	}
-	if sh.context.Mode != modeSSH || sh.context.SSHHost != "ws1" {
+	if sh.context.Mode != modeSSH || sh.context.SSHHost != "test-ssh-a" {
 		t.Fatalf("ssh context = %+v", sh.context)
 	}
 	if err := sh.eval("cd project", &stdout, &stderr); err != nil {
 		t.Fatalf("ssh cd: %v\nstderr:\n%s", err, stderr.String())
 	}
-	if sh.context.CWD != "/srv/ws1" {
-		t.Fatalf("ssh cwd = %q, want /srv/ws1", sh.context.CWD)
+	if sh.context.CWD != "/srv/test-ssh-a" {
+		t.Fatalf("ssh cwd = %q, want /srv/test-ssh-a", sh.context.CWD)
 	}
 	select {
 	case line := <-remoteLines:
@@ -1891,11 +2059,11 @@ func TestSSHPipelineStreamsHostInputToSSH(t *testing.T) {
 		}
 		return 0
 	})
-	server.installConfig(t, "ws1")
+	server.installConfig(t, "test-ssh-a")
 
 	sh := newUnitShell(t, newRecordingShellAPI())
 	var stdout, stderr bytes.Buffer
-	if err := sh.eval("printf ssh-data | @ssh ws1 cat", &stdout, &stderr); err != nil {
+	if err := sh.eval("printf ssh-data | @ssh test-ssh-a cat", &stdout, &stderr); err != nil {
 		t.Fatalf("run ssh pipeline: %v\nstderr:\n%s", err, stderr.String())
 	}
 	if stdout.String() != "ssh-data" {
@@ -1925,14 +2093,14 @@ func TestSSHConnectionIsPersistentPerHost(t *testing.T) {
 		_, _ = io.WriteString(stdout, "ok\n")
 		return 0
 	})
-	server.installConfig(t, "ws1")
+	server.installConfig(t, "test-ssh-a")
 
 	sh := newUnitShell(t, newRecordingShellAPI())
 	var stdout, stderr bytes.Buffer
-	if err := sh.eval("@ssh ws1 first", &stdout, &stderr); err != nil {
+	if err := sh.eval("@ssh test-ssh-a first", &stdout, &stderr); err != nil {
 		t.Fatalf("first ssh command: %v", err)
 	}
-	if err := sh.eval("@ssh ws1 second", &stdout, &stderr); err != nil {
+	if err := sh.eval("@ssh test-ssh-a second", &stdout, &stderr); err != nil {
 		t.Fatalf("second ssh command: %v", err)
 	}
 	if got := server.connectionCount(); got != 1 {
@@ -1960,11 +2128,11 @@ func TestSSHContextKeepsPersistentShellUntilStop(t *testing.T) {
 		}
 		return 0
 	})
-	server.installConfig(t, "ws1")
+	server.installConfig(t, "test-ssh-a")
 
 	sh := newUnitShell(t, newRecordingShellAPI())
 	var stdout, stderr bytes.Buffer
-	if err := sh.eval("@ssh ws1", &stdout, &stderr); err != nil {
+	if err := sh.eval("@ssh test-ssh-a", &stdout, &stderr); err != nil {
 		t.Fatalf("enter ssh context: %v", err)
 	}
 	if got := server.ptyCount(); got != 1 {
@@ -1973,7 +2141,7 @@ func TestSSHContextKeepsPersistentShellUntilStop(t *testing.T) {
 	if err := sh.eval("@host", &stdout, &stderr); err != nil {
 		t.Fatalf("switch to host: %v", err)
 	}
-	if err := sh.eval("@ws1", &stdout, &stderr); err != nil {
+	if err := sh.eval("@test-ssh-a", &stdout, &stderr); err != nil {
 		t.Fatalf("return to ssh context by session name: %v", err)
 	}
 	if err := sh.eval("printf still-open", &stdout, &stderr); err != nil {
@@ -1990,7 +2158,7 @@ func TestSSHContextKeepsPersistentShellUntilStop(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatalf("persistent ssh shell did not receive command after @host")
 	}
-	if err := sh.eval("@stop ws1", &stdout, &stderr); err != nil {
+	if err := sh.eval("@stop test-ssh-a", &stdout, &stderr); err != nil {
 		t.Fatalf("stop ssh session: %v", err)
 	}
 	select {
@@ -2076,7 +2244,7 @@ func TestSSHCopyStreamsTarOverConnection(t *testing.T) {
 			return 0
 		}
 	})
-	server.installConfig(t, "ws1")
+	server.installConfig(t, "test-ssh-a")
 
 	sh := newUnitShell(t, newRecordingShellAPI())
 	src := filepath.Join(sh.hostCWD, "local.txt")
@@ -2084,7 +2252,7 @@ func TestSSHCopyStreamsTarOverConnection(t *testing.T) {
 		t.Fatalf("write local source: %v", err)
 	}
 	var stdout, stderr bytes.Buffer
-	if err := sh.copyPath("@host:local.txt @ssh:ws1:/tmp/remote.txt", &stdout, &stderr); err != nil {
+	if err := sh.copyPath("@host:local.txt @ssh:test-ssh-a:/tmp/remote.txt", &stdout, &stderr); err != nil {
 		t.Fatalf("copy local to ssh: %v\nstderr:\n%s", err, stderr.String())
 	}
 	select {
@@ -2097,7 +2265,7 @@ func TestSSHCopyStreamsTarOverConnection(t *testing.T) {
 	}
 
 	dst := filepath.Join(sh.hostCWD, "from-ssh.txt")
-	if err := sh.copyPath("@ssh:ws1:/tmp/remote.txt @host:from-ssh.txt", &stdout, &stderr); err != nil {
+	if err := sh.copyPath("@ssh:test-ssh-a:/tmp/remote.txt @host:from-ssh.txt", &stdout, &stderr); err != nil {
 		t.Fatalf("copy ssh to local: %v\nstderr:\n%s", err, stderr.String())
 	}
 	data, err := os.ReadFile(dst)
@@ -2158,11 +2326,11 @@ func TestCopyGuestFileToSSHHost(t *testing.T) {
 		received <- header.Name + ":" + string(data)
 		return 0
 	})
-	server.installConfig(t, "ws1")
+	server.installConfig(t, "test-ssh-a")
 
 	sh := newUnitShell(t, api)
 	var stdout, stderr bytes.Buffer
-	if err := sh.copyPath("@vm:work:/tmp/from-vm.txt @ssh:ws1:/tmp/to-ssh.txt", &stdout, &stderr); err != nil {
+	if err := sh.copyPath("@vm:work:/tmp/from-vm.txt @ssh:test-ssh-a:/tmp/to-ssh.txt", &stdout, &stderr); err != nil {
 		t.Fatalf("copy guest to ssh: %v\nstderr:\n%s", err, stderr.String())
 	}
 	select {
@@ -2203,11 +2371,11 @@ func TestCopySSHHostFileToGuest(t *testing.T) {
 		_ = tw.Close()
 		return 0
 	})
-	server.installConfig(t, "ws1")
+	server.installConfig(t, "test-ssh-a")
 
 	sh := newUnitShell(t, api)
 	var stdout, stderr bytes.Buffer
-	if err := sh.copyPath("@ssh:ws1:/tmp/from-ssh.txt @vm:work:/tmp/to-vm.txt", &stdout, &stderr); err != nil {
+	if err := sh.copyPath("@ssh:test-ssh-a:/tmp/from-ssh.txt @vm:work:/tmp/to-vm.txt", &stdout, &stderr); err != nil {
 		t.Fatalf("copy ssh to guest: %v\nstderr:\n%s", err, stderr.String())
 	}
 	select {
@@ -2270,20 +2438,20 @@ func TestSSHCopyBetweenActiveSessions(t *testing.T) {
 		}
 	})
 	installTestSSHConfigs(t, map[string]*testSSHServer{
-		"ws1":       srcServer,
-		"astra-pi5": dstServer,
+		"test-ssh-a": srcServer,
+		"test-ssh-b": dstServer,
 	})
 
 	sh := newUnitShell(t, newRecordingShellAPI())
 	t.Cleanup(sh.closeSessions)
 	var stdout, stderr bytes.Buffer
-	if err := sh.eval("@ssh astra-pi5", &stdout, &stderr); err != nil {
+	if err := sh.eval("@ssh test-ssh-b", &stdout, &stderr); err != nil {
 		t.Fatalf("enter destination ssh context: %v\nstderr:\n%s", err, stderr.String())
 	}
-	if err := sh.eval("@ssh ws1", &stdout, &stderr); err != nil {
+	if err := sh.eval("@ssh test-ssh-a", &stdout, &stderr); err != nil {
 		t.Fatalf("enter source ssh context: %v\nstderr:\n%s", err, stderr.String())
 	}
-	if err := sh.copyPath("@ws1:./go.mod @astra-pi5:.", &stdout, &stderr); err != nil {
+	if err := sh.copyPath("@test-ssh-a:./go.mod @test-ssh-b:.", &stdout, &stderr); err != nil {
 		t.Fatalf("copy between active ssh sessions: %v\nstderr:\n%s", err, stderr.String())
 	}
 	select {
@@ -2313,25 +2481,25 @@ func TestSSHCompletionUsesConfigAndRemotePath(t *testing.T) {
 			return 0
 		}
 	})
-	server.installConfig(t, "ws1")
+	server.installConfig(t, "test-ssh-a")
 
 	sh := newUnitShell(t, newRecordingShellAPI())
 	c := newVMSHCompleter(sh)
-	candidates, replaceLen, kind := c.CompleteWithKind([]rune("@ssh w"), len("@ssh w"))
-	if kind != completionAt || replaceLen != len("w") || !hasString(candidates, "s1") {
+	candidates, replaceLen, kind := c.CompleteWithKind([]rune("@ssh test-ssh-"), len("@ssh test-ssh-"))
+	if kind != completionAt || replaceLen != len("test-ssh-") || !hasString(candidates, "a") {
 		t.Fatalf("ssh host completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 
 	var stdout, stderr bytes.Buffer
-	if err := sh.eval("@ssh ws1", &stdout, &stderr); err != nil {
+	if err := sh.eval("@ssh test-ssh-a", &stdout, &stderr); err != nil {
 		t.Fatalf("enter ssh context: %v\nstderr:\n%s", err, stderr.String())
 	}
-	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@w"), len("@w"))
-	if kind != completionAt || replaceLen != len("@w") || !hasString(candidates, "s1") {
+	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@test-ssh-"), len("@test-ssh-"))
+	if kind != completionAt || replaceLen != len("@test-ssh-") || !hasString(candidates, "a") {
 		t.Fatalf("ssh session target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
-	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@stop w"), len("@stop w"))
-	if kind != completionAt || replaceLen != len("w") || !hasString(candidates, "s1") {
+	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@stop test-ssh-"), len("@stop test-ssh-"))
+	if kind != completionAt || replaceLen != len("test-ssh-") || !hasString(candidates, "a") {
 		t.Fatalf("stop completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 	candidates, replaceLen, kind = c.CompleteWithKind([]rune("cat /tmp/fi"), len("cat /tmp/fi"))
@@ -2373,11 +2541,11 @@ func TestCopyEndpointResolutionAndGuestHostPathSafety(t *testing.T) {
 		t.Fatalf("named guest endpoint = %+v", ubuntu)
 	}
 
-	ssh, err := sh.parseCopyEndpoint("@ssh:ws1:relative.txt")
+	ssh, err := sh.parseCopyEndpoint("@ssh:test-ssh-a:relative.txt")
 	if err != nil {
 		t.Fatalf("parse ssh endpoint: %v", err)
 	}
-	if ssh.context().Mode != modeSSH || ssh.context().SSHHost != "ws1" || ssh.path != "~/relative.txt" {
+	if ssh.context().Mode != modeSSH || ssh.context().SSHHost != "test-ssh-a" || ssh.path != "~/relative.txt" {
 		t.Fatalf("ssh endpoint = %+v context=%+v", ssh, ssh.context())
 	}
 
@@ -2452,17 +2620,41 @@ func TestExtractTarToHostRejectsTraversal(t *testing.T) {
 }
 
 type testSSHServer struct {
-	listener net.Listener
-	signer   cryptossh.Signer
-	port     string
-	handler  func(string, io.Reader, io.Writer, io.Writer) uint32
-	mu       sync.Mutex
-	conns    int
-	ptys     int
-	execs    []string
+	listener  net.Listener
+	signer    cryptossh.Signer
+	port      string
+	password  string
+	keyboard  bool
+	questions []string
+	echos     []bool
+	answers   []string
+	handler   func(string, io.Reader, io.Writer, io.Writer) uint32
+	mu        sync.Mutex
+	conns     int
+	ptys      int
+	execs     []string
 }
 
 func startTestSSHServer(t *testing.T, handler func(string, io.Reader, io.Writer, io.Writer) uint32) *testSSHServer {
+	return startConfiguredTestSSHServer(t, "", false, nil, nil, nil, handler)
+}
+
+func startPasswordTestSSHServer(t *testing.T, password string, handler func(string, io.Reader, io.Writer, io.Writer) uint32) *testSSHServer {
+	t.Helper()
+	return startConfiguredTestSSHServer(t, password, false, nil, nil, nil, handler)
+}
+
+func startKeyboardInteractiveTestSSHServer(t *testing.T, password string, handler func(string, io.Reader, io.Writer, io.Writer) uint32) *testSSHServer {
+	t.Helper()
+	return startConfiguredTestSSHServer(t, password, true, []string{"Password: "}, []bool{false}, []string{password}, handler)
+}
+
+func startKeyboardInteractiveChallengeTestSSHServer(t *testing.T, questions []string, echos []bool, answers []string, handler func(string, io.Reader, io.Writer, io.Writer) uint32) *testSSHServer {
+	t.Helper()
+	return startConfiguredTestSSHServer(t, "", true, questions, echos, answers, handler)
+}
+
+func startConfiguredTestSSHServer(t *testing.T, password string, keyboard bool, questions []string, echos []bool, answers []string, handler func(string, io.Reader, io.Writer, io.Writer) uint32) *testSSHServer {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -2480,7 +2672,17 @@ func startTestSSHServer(t *testing.T, handler func(string, io.Reader, io.Writer,
 	if err != nil {
 		t.Fatalf("split ssh addr: %v", err)
 	}
-	server := &testSSHServer{listener: listener, signer: signer, port: port, handler: handler}
+	server := &testSSHServer{
+		listener:  listener,
+		signer:    signer,
+		port:      port,
+		password:  password,
+		keyboard:  keyboard,
+		questions: questions,
+		echos:     echos,
+		answers:   answers,
+		handler:   handler,
+	}
 	t.Cleanup(func() {
 		_ = listener.Close()
 	})
@@ -2494,6 +2696,14 @@ func (s *testSSHServer) installConfig(t *testing.T, alias string) {
 }
 
 func installTestSSHConfigs(t *testing.T, hosts map[string]*testSSHServer) {
+	installTestSSHConfigsWithKnownHostsAndStrict(t, hosts, true, "yes")
+}
+
+func installTestSSHConfigsWithKnownHosts(t *testing.T, hosts map[string]*testSSHServer, writeKnownHosts bool) {
+	installTestSSHConfigsWithKnownHostsAndStrict(t, hosts, writeKnownHosts, "yes")
+}
+
+func installTestSSHConfigsWithKnownHostsAndStrict(t *testing.T, hosts map[string]*testSSHServer, writeKnownHosts bool, strictHostKeyChecking string) {
 	t.Helper()
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config")
@@ -2507,15 +2717,20 @@ func installTestSSHConfigs(t *testing.T, hosts map[string]*testSSHServer) {
 	var knownHosts strings.Builder
 	for _, alias := range aliases {
 		server := hosts[alias]
-		_, _ = fmt.Fprintf(&config, "Host %s\n  HostName 127.0.0.1\n  Port %s\n  User testuser\n  StrictHostKeyChecking yes\n", alias, server.port)
+		_, _ = fmt.Fprintf(&config, "Host %s\n  HostName 127.0.0.1\n  Port %s\n  User testuser\n", alias, server.port)
+		if strictHostKeyChecking != "" {
+			_, _ = fmt.Fprintf(&config, "  StrictHostKeyChecking %s\n", strictHostKeyChecking)
+		}
 		hostKey := strings.TrimSpace(string(cryptossh.MarshalAuthorizedKey(server.signer.PublicKey())))
 		_, _ = fmt.Fprintf(&knownHosts, "[127.0.0.1]:%s %s\n", server.port, hostKey)
 	}
 	if err := os.WriteFile(configPath, []byte(config.String()), 0o600); err != nil {
 		t.Fatalf("write ssh config: %v", err)
 	}
-	if err := os.WriteFile(knownHostsPath, []byte(knownHosts.String()), 0o600); err != nil {
-		t.Fatalf("write known_hosts: %v", err)
+	if writeKnownHosts {
+		if err := os.WriteFile(knownHostsPath, []byte(knownHosts.String()), 0o600); err != nil {
+			t.Fatalf("write known_hosts: %v", err)
+		}
 	}
 	oldConfigPaths := sshConfigPaths
 	oldKnownHosts := sshKnownHosts
@@ -2528,7 +2743,26 @@ func installTestSSHConfigs(t *testing.T, hosts map[string]*testSSHServer) {
 }
 
 func (s *testSSHServer) serve(t *testing.T) {
-	config := &cryptossh.ServerConfig{NoClientAuth: true}
+	config := &cryptossh.ServerConfig{NoClientAuth: s.password == "" && !s.keyboard}
+	if s.keyboard {
+		config.KeyboardInteractiveCallback = func(conn cryptossh.ConnMetadata, challenge cryptossh.KeyboardInteractiveChallenge) (*cryptossh.Permissions, error) {
+			answers, err := challenge("", "", s.questions, s.echos)
+			if err != nil {
+				return nil, err
+			}
+			if conn.User() == "testuser" && reflect.DeepEqual(answers, s.answers) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("keyboard-interactive rejected")
+		}
+	} else if s.password != "" {
+		config.PasswordCallback = func(conn cryptossh.ConnMetadata, password []byte) (*cryptossh.Permissions, error) {
+			if conn.User() == "testuser" && string(password) == s.password {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("password rejected")
+		}
+	}
 	config.AddHostKey(s.signer)
 	for {
 		conn, err := s.listener.Accept()
