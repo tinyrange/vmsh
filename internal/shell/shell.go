@@ -3146,6 +3146,18 @@ func (s *shellState) closeSessions() {
 	s.closeSSHClients()
 }
 
+func (s *shellState) closeGuestSession() {
+	if s.guestShell == nil {
+		return
+	}
+	if cwd := s.guestShell.cwd(); cwd != "" && s.context.Mode == modeVM {
+		s.context.CWD = cwd
+		s.rememberContextCWD(s.context)
+	}
+	s.guestShell.close()
+	s.guestShell = nil
+}
+
 func (p *persistentHostShell) close() {
 	if p.tty != nil {
 		_ = p.tty.Close()
@@ -4690,10 +4702,7 @@ func (s *shellState) stopVM(id string) error {
 	if id == "" {
 		return fmt.Errorf("vm id is required")
 	}
-	if s.guestShell != nil {
-		s.guestShell.close()
-		s.guestShell = nil
-	}
+	s.closeGuestSession()
 	if err := s.api.ShutdownInstanceWithID(id); err != nil {
 		return err
 	}
@@ -4759,10 +4768,7 @@ func (s *shellState) restartVM(id string, ctx commandContext, stderr io.Writer) 
 		return err
 	}
 	ctx = restartContextFromState(ctx, state)
-	if s.guestShell != nil {
-		s.guestShell.close()
-		s.guestShell = nil
-	}
+	s.closeGuestSession()
 	if err := s.stopVM(id); err != nil {
 		return err
 	}
@@ -4805,6 +4811,7 @@ func (s *shellState) saveVM(at atLine, stdout io.Writer) error {
 	if strings.TrimSpace(id) == "" {
 		return fmt.Errorf("vm id is required")
 	}
+	s.closeGuestSession()
 	state, err := s.api.SaveInstanceImage(id, client.SaveImageRequest{
 		Name:  name,
 		Image: localImageName(ctx.Image, ctx.Arch),
@@ -5055,10 +5062,7 @@ func lastNonEmptyLine(text string) string {
 }
 
 func (s *shellState) chdirGuestContext(ctx commandContext, target string) error {
-	if s.guestShell != nil {
-		s.guestShell.close()
-		s.guestShell = nil
-	}
+	s.closeGuestSession()
 	current := ctx.CWD
 	if current == "" {
 		if ctx.Isolated {

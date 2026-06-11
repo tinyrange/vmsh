@@ -143,6 +143,82 @@ func TestVMIntegrationManagesVMAndImages(t *testing.T) {
 	}
 }
 
+func TestVMIntegrationSavesLoadedVMFilesystemFiles(t *testing.T) {
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+
+	savedImage := "vmsh-integration-loaded-save"
+	t.Cleanup(func() {
+		_ = env.api.DeleteImage(savedImage)
+	})
+
+	mustWriteTestFile(t, filepath.Join(sh.hostCWD, "seed", "root.txt"), "loaded-root\n")
+	mustWriteTestFile(t, filepath.Join(sh.hostCWD, "seed", "nested", "child.txt"), "loaded-child\n")
+	script := strings.Join([]string{
+		"@" + env.image + " --vm save-load --memory 768 --cpus 1 --no-network",
+		"@copy @host:seed/root.txt @:~/loaded/root.txt",
+		"@copy @host:seed/nested/child.txt @:~/loaded/nested/child.txt",
+		"printf 'before-save:%s:%s\\n' \"$(cat ~/loaded/root.txt)\" \"$(cat ~/loaded/nested/child.txt)\"",
+		"@save --vm save-load " + savedImage,
+		"@stop --vm save-load",
+		"@" + savedImage + " --vm saved-load --memory 768 --cpus 1 --no-network",
+		"printf 'after-save:%s:%s\\n' \"$(cat ~/loaded/root.txt)\" \"$(cat ~/loaded/nested/child.txt)\"",
+		"@rmi " + savedImage,
+		"@stop --vm saved-load",
+	}, "\n")
+
+	stdout, stderr, err := sh.runTestScript(script)
+	if err != nil {
+		t.Fatalf("run vmsh save loaded filesystem script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	requireContains(t, stdout, "before-save:loaded-root:loaded-child")
+	requireContains(t, stdout, "Saved save-load as "+savedImage)
+	requireContains(t, stdout, "after-save:loaded-root:loaded-child")
+	requireContains(t, stdout, "Removed "+savedImage)
+	if _, err := env.api.GetImage(savedImage); err == nil {
+		t.Fatalf("saved image %q still exists after @rmi", savedImage)
+	}
+}
+
+func TestVMIntegrationSavesAfterPersistentTTYGuestShell(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("persistent TTY shell test requires a Unix PTY")
+	}
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+
+	savedImage := "vmsh-integration-tty-save"
+	t.Cleanup(func() {
+		_ = env.api.DeleteImage(savedImage)
+	})
+
+	stdout, stderr, err := sh.runTestScript("@" + env.image + " --vm tty-save --memory 768 --cpus 1 --no-network\n")
+	if err != nil {
+		t.Fatalf("select VM context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+
+	out, err := sh.evalOnTestPTY("mkdir -p ~/saved && printf tty-persist > ~/saved/value.txt")
+	if err != nil {
+		t.Fatalf("write persistent TTY shell file: %v\noutput:\n%s", err, out)
+	}
+
+	script := strings.Join([]string{
+		"@save --vm tty-save " + savedImage,
+		"@stop --vm tty-save",
+		"@" + savedImage + " --vm tty-saved --memory 768 --cpus 1 --no-network",
+		"printf 'saved-tty:%s\\n' \"$(cat ~/saved/value.txt)\"",
+		"@rmi " + savedImage,
+		"@stop --vm tty-saved",
+	}, "\n")
+	stdout, stderr, err = sh.runTestScript(script)
+	if err != nil {
+		t.Fatalf("run vmsh TTY save script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	requireContains(t, stdout, "Saved tty-save as "+savedImage)
+	requireContains(t, stdout, "saved-tty:tty-persist")
+	requireContains(t, stdout, "Removed "+savedImage)
+}
+
 func TestVMIntegrationPersistentTTYGuestShellState(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("persistent TTY shell test requires a Unix PTY")
@@ -320,7 +396,7 @@ func (e *vmIntegrationTestEnv) newShell(t *testing.T) *shellState {
 	sh.completion = newVMSHCompleter(sh)
 	t.Cleanup(sh.closeSessions)
 	t.Cleanup(func() {
-		for _, id := range []string{"default", "script", "manage", "tty"} {
+		for _, id := range []string{"default", "script", "manage", "save-load", "saved-load", "tty-save", "tty-saved", "tty", "sudo-tty"} {
 			_ = e.api.ShutdownInstanceWithID(id)
 		}
 	})
