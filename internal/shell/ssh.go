@@ -67,14 +67,15 @@ func (s *shellState) runSSH(ctx commandContext, line string, stdout, stderr io.W
 		session, err := s.sshPersistentShell(ctx, stdout, stderr)
 		if err == nil {
 			var interrupted atomic.Bool
-			stopInterrupts, _ := s.startInterruptWatcher(func() {
+			interrupts := newCommandInterruptEscalator(line, stderr, func() {
 				interrupted.Store(true)
 				_ = session.session.Signal(ssh.SIGINT)
+			}, func() {
 				go func() {
-					time.Sleep(100 * time.Millisecond)
 					session.close()
 				}()
 			})
+			stopInterrupts, _ := s.startInterruptWatcher(interrupts.Interrupt)
 			err = session.run(line, stdout)
 			stopInterrupts()
 			if interrupted.Load() && sshPersistentShellEnded(err) {
@@ -134,21 +135,25 @@ func (s *shellState) runSSHCommandWithSize(ctx commandContext, line string, stdi
 
 func (s *shellState) runSSHSession(ctx commandContext, command string, stdin io.Reader, stdout, stderr io.Writer, tty bool, cols, rows int) error {
 	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
-	defer stopInterrupts()
 	client, err := s.sshClientForContext(runCtx, ctx)
 	if interrupted.Load() {
+		stopInterrupts()
 		return persistentShellExit{code: 130}
 	}
+	stopInterrupts()
 	if err != nil {
 		return err
 	}
 	session, err := client.client.NewSession()
 	if err != nil {
 		s.dropSSHClient(client.key)
+		runCtx, stopInterrupts, interrupted = s.interruptibleCommandContext()
 		client, err = s.sshClientForContext(runCtx, ctx)
 		if interrupted.Load() {
+			stopInterrupts()
 			return persistentShellExit{code: 130}
 		}
+		stopInterrupts()
 		if err != nil {
 			return err
 		}
@@ -182,16 +187,20 @@ func (s *shellState) runSSHSession(ctx commandContext, command string, stdin io.
 	go func() {
 		done <- session.Run(command)
 	}()
+	interrupts := newCommandInterruptEscalator(command, stderr, func() {
+		_ = session.Signal(ssh.SIGINT)
+	}, func() {
+		_ = session.Close()
+	})
+	stopRunInterrupts, runInterrupted := s.startInterruptWatcher(interrupts.Interrupt)
+	defer stopRunInterrupts()
 	for {
 		select {
 		case err := <-done:
-			if interrupted.Load() {
+			if runInterrupted.Load() {
 				return persistentShellExit{code: 130}
 			}
 			return err
-		case <-runCtx.Done():
-			_ = session.Signal(ssh.SIGINT)
-			_ = session.Close()
 		}
 	}
 }

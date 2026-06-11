@@ -2157,12 +2157,13 @@ func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 		if err == nil {
 			var interrupted *atomic.Bool
 			err = session.run(line, stdout, stderr, func() (func(), error) {
-				stop, state, err := s.startHostPTYForwarding(tty, session, stdout, stderr, func() {
+				interrupts := newCommandInterruptEscalator(line, stderr, nil, func() {
 					if s.hostShell == session {
 						s.hostShell = nil
 					}
 					go session.close()
 				})
+				stop, state, err := s.startHostPTYForwarding(tty, session, stdout, stderr, interrupts.Interrupt)
 				interrupted = state
 				return stop, err
 			})
@@ -2183,15 +2184,27 @@ func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 		}
 	}
 	args := hostShellCommand(line, tty, s.hostCommandPrelude(tty))
-	cmdCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
-	defer stopInterrupts()
-	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
+	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Dir = s.hostCWD
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.Env = env
-	err := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		s.lastCode = exitCode(err)
+		if s.lastCode < 0 {
+			return err
+		}
+		return nil
+	}
+	interrupts := newCommandInterruptEscalator(line, stderr, func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+	}, func() {
+		_ = cmd.Process.Kill()
+	})
+	stopInterrupts, interrupted := s.startInterruptWatcher(interrupts.Interrupt)
+	err := cmd.Wait()
+	stopInterrupts()
 	if interrupted.Load() {
 		s.lastCode = 130
 		return nil
@@ -3437,14 +3450,17 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 			return err
 		}
 		var interrupted atomic.Bool
+		interrupts := newCommandInterruptEscalator(line, stderr, nil, func() {
+			if s.guestShell == session {
+				s.guestShell = nil
+			}
+			go session.close()
+		})
 		err = session.run(line, stdout, stderr, func() (func(), error) {
 			return s.startGuestInputForwarding(req.TTY, true, session.inputs, stdout, stderr, func(name string) {
 				if name == "INT" {
 					interrupted.Store(true)
-					if s.guestShell == session {
-						s.guestShell = nil
-					}
-					go session.close()
+					interrupts.Interrupt()
 				}
 			})
 		})
@@ -3861,7 +3877,11 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 	inputs := make(chan client.ExecInput, 8)
 	var interrupted atomic.Bool
 	runCtx, cancel := context.WithCancel(context.Background())
-	stopInterrupts, contextInterrupted := s.startInterruptWatcher(cancel)
+	interrupts := newCommandInterruptEscalator(commandDisplay(req.Command), stderr, nil, cancel)
+	stopInterrupts, contextInterrupted := s.startInterruptWatcher(func() {
+		interrupted.Store(true)
+		interrupts.Interrupt()
+	})
 	defer func() {
 		stopInterrupts()
 		cancel()
@@ -3869,7 +3889,7 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 	stopForwarding, err := s.startGuestInputForwarding(req.TTY, true, inputs, stdout, stderr, func(name string) {
 		if name == "INT" {
 			interrupted.Store(true)
-			cancel()
+			interrupts.Interrupt()
 		}
 	})
 	if err != nil {
@@ -4315,6 +4335,65 @@ func writeHostPTYSignal(out *os.File, name string) {
 	case "QUIT":
 		_, _ = out.Write([]byte{0x1c})
 	}
+}
+
+type commandInterruptEscalator struct {
+	command string
+	stderr  io.Writer
+	soft    func()
+	hard    func()
+	count   atomic.Int32
+}
+
+func newCommandInterruptEscalator(command string, stderr io.Writer, soft, hard func()) *commandInterruptEscalator {
+	return &commandInterruptEscalator{
+		command: command,
+		stderr:  stderr,
+		soft:    soft,
+		hard:    hard,
+	}
+}
+
+func (e *commandInterruptEscalator) Interrupt() {
+	if e == nil {
+		return
+	}
+	count := e.count.Add(1)
+	switch count {
+	case 1:
+		if e.soft != nil {
+			e.soft()
+		}
+	case 2:
+		fmt.Fprintf(e.stderr, "\nvmsh: command %q is not responding to SIGINT; press Ctrl+C again to hard terminate it\n", compactCommandForMessage(e.command))
+		if e.soft != nil {
+			e.soft()
+		}
+	default:
+		if e.hard != nil {
+			e.hard()
+		}
+	}
+}
+
+func compactCommandForMessage(command string) string {
+	command = compactStatusMessage(command)
+	const max = 120
+	if len(command) <= max {
+		return command
+	}
+	return command[:max-3] + "..."
+}
+
+func commandDisplay(command []string) string {
+	if len(command) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(command))
+	for _, part := range command {
+		parts = append(parts, shellQuote(part))
+	}
+	return strings.Join(parts, " ")
 }
 
 func (s *shellState) interruptibleCommandContext() (context.Context, func(), *atomic.Bool) {

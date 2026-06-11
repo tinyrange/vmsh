@@ -1327,12 +1327,30 @@ func TestTTYGuestRunInterruptCancelsContext(t *testing.T) {
 	interrupts := make(chan os.Signal, 1)
 	sh.interruptSignals = interrupts
 	req := client.RunRequest{Image: "ubuntu", Command: guestCommand("sleep 30", true), TTY: true, Cols: 80, Rows: 24}
+	var stderr bytes.Buffer
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- sh.streamGuestRun("default", req, io.Discard, io.Discard)
+		errCh <- sh.streamGuestRun("default", req, io.Discard, &stderr)
 	}()
 	<-started
+	interrupts <- os.Interrupt
+	select {
+	case err := <-errCh:
+		t.Fatalf("TTY guest run returned after first interrupt: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	interrupts <- os.Interrupt
+	select {
+	case err := <-errCh:
+		t.Fatalf("TTY guest run returned after second interrupt: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if !strings.Contains(stderr.String(), "is not responding to SIGINT") {
+		t.Fatalf("stderr = %q, want SIGINT warning", stderr.String())
+	}
+
 	interrupts <- os.Interrupt
 
 	select {
