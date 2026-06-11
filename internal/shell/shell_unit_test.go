@@ -2109,6 +2109,117 @@ func TestSSHCopyStreamsTarOverConnection(t *testing.T) {
 	}
 }
 
+func TestCopyGuestFileToSSHHost(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu"}
+	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		if req.Kind != "fs_archive" {
+			t.Fatalf("exec kind = %q, want fs_archive", req.Kind)
+		}
+		if id != "work" || req.Image != "ubuntu" || req.Path != "/tmp/from-vm.txt" {
+			t.Fatalf("archive request = id %q req %+v", id, req)
+		}
+		var archive bytes.Buffer
+		tw := tar.NewWriter(&archive)
+		data := []byte("from-vm")
+		if err := tw.WriteHeader(&tar.Header{Name: "from-vm.txt", Mode: 0o644, Size: int64(len(data))}); err != nil {
+			t.Fatalf("write tar header: %v", err)
+		}
+		if _, err := tw.Write(data); err != nil {
+			t.Fatalf("write tar data: %v", err)
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatalf("close tar: %v", err)
+		}
+		if onEvent != nil {
+			if err := onEvent(client.ExecEvent{Kind: "stdout", Data: archive.Bytes()}); err != nil {
+				return err
+			}
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
+	received := make(chan string, 1)
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		if !strings.Contains(command, "tar -xf -") {
+			return 0
+		}
+		tr := tar.NewReader(stdin)
+		header, err := tr.Next()
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "read tar: %v", err)
+			return 1
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "read file: %v", err)
+			return 1
+		}
+		received <- header.Name + ":" + string(data)
+		return 0
+	})
+	server.installConfig(t, "ws1")
+
+	sh := newUnitShell(t, api)
+	var stdout, stderr bytes.Buffer
+	if err := sh.copyPath("@vm:work:/tmp/from-vm.txt @ssh:ws1:/tmp/to-ssh.txt", &stdout, &stderr); err != nil {
+		t.Fatalf("copy guest to ssh: %v\nstderr:\n%s", err, stderr.String())
+	}
+	select {
+	case got := <-received:
+		if got != "to-ssh.txt:from-vm" {
+			t.Fatalf("ssh received = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("ssh host did not receive guest file")
+	}
+}
+
+func TestCopySSHHostFileToGuest(t *testing.T) {
+	guestWrites := make(chan string, 1)
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu"}
+	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		if req.Kind != "fs_write" {
+			t.Fatalf("exec kind = %q, want fs_write", req.Kind)
+		}
+		if id != "work" || req.Image != "ubuntu" || req.Path != "/tmp/to-vm.txt" {
+			t.Fatalf("write request = id %q req %+v", id, req)
+		}
+		guestWrites <- string(req.Stdin)
+		if onEvent != nil {
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		if !strings.Contains(command, "tar -cf -") {
+			return 0
+		}
+		tw := tar.NewWriter(stdout)
+		data := []byte("from-ssh")
+		_ = tw.WriteHeader(&tar.Header{Name: "from-ssh.txt", Mode: 0o644, Size: int64(len(data))})
+		_, _ = tw.Write(data)
+		_ = tw.Close()
+		return 0
+	})
+	server.installConfig(t, "ws1")
+
+	sh := newUnitShell(t, api)
+	var stdout, stderr bytes.Buffer
+	if err := sh.copyPath("@ssh:ws1:/tmp/from-ssh.txt @vm:work:/tmp/to-vm.txt", &stdout, &stderr); err != nil {
+		t.Fatalf("copy ssh to guest: %v\nstderr:\n%s", err, stderr.String())
+	}
+	select {
+	case got := <-guestWrites:
+		if got != "from-ssh" {
+			t.Fatalf("guest write = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("guest did not receive ssh file")
+	}
+}
+
 func TestSSHCopyBetweenActiveSessions(t *testing.T) {
 	payload := "module github.com/tinyrange/vmsh\n"
 	srcServer := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {

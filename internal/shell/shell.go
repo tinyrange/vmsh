@@ -2340,6 +2340,17 @@ func (s *shellState) parseCopyEndpoint(raw string) (copyEndpoint, error) {
 		switch target {
 		case "host":
 			ctx = hostCommandContext(s.context, commandOptions{})
+		case "vm":
+			vmID, vmPath, ok := strings.Cut(rest, ":")
+			if !ok || strings.TrimSpace(vmID) == "" {
+				return copyEndpoint{}, fmt.Errorf("copy endpoint %q must use @vm:id:path", raw)
+			}
+			resolved, err := s.vmCopyEndpointContext(strings.TrimSpace(vmID))
+			if err != nil {
+				return copyEndpoint{}, err
+			}
+			ctx = resolved
+			value = vmPath
 		case "ssh":
 			host, sshPath, ok := strings.Cut(rest, ":")
 			if !ok || strings.TrimSpace(host) == "" {
@@ -2369,6 +2380,39 @@ func (s *shellState) parseCopyEndpoint(raw string) (copyEndpoint, error) {
 		path:      target.ResolveCopyPath(value),
 		directory: copyEndpointDirectoryHint(value),
 	}, nil
+}
+
+func (s *shellState) vmCopyEndpointContext(id string) (commandContext, error) {
+	if s.context.Mode == modeVM && backendVMID(s.context) == backendVMIDFor(id, false) {
+		return s.context, nil
+	}
+	for _, ctx := range s.contextStack {
+		if ctx.Mode == modeVM && backendVMID(ctx) == backendVMIDFor(id, false) {
+			return ctx, nil
+		}
+	}
+	state, err := s.api.InstanceStatusOf(id)
+	if err != nil {
+		return commandContext{}, err
+	}
+	if strings.TrimSpace(state.Image) == "" {
+		return commandContext{}, fmt.Errorf("VM %s has no image; use @<image>:path or switch to the VM first", id)
+	}
+	ctx := commandContext{
+		Mode:       modeVM,
+		VMID:       firstNonEmpty(state.ID, id),
+		Image:      state.Image,
+		MemoryMB:   state.MemoryMB,
+		CPUs:       state.CPUs,
+		NestedVirt: state.NestedVirt,
+		Network:    state.NetworkIPv4 != "",
+	}
+	if s.contextCWD != nil {
+		if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
+			ctx.CWD = cwd
+		}
+	}
+	return ctx, nil
 }
 
 func copyEndpointDirectoryHint(value string) bool {
@@ -5597,7 +5641,7 @@ func (s *shellState) help(w io.Writer) error {
 @restart [--vm id]       restart a VM after confirmation
 @save [--vm id] tag      save the selected VM root filesystem as a local image
 @rmi image               remove a locally cached image
-@copy SRC DST            copy files between @host:, VM, @ssh:host:path, and active @session:path contexts
+@copy SRC DST            copy files between @host:, @vm:id:path, VM, @ssh:host:path, and active @session:path contexts
 @agent codex [args]      run Codex inside the current VM with host ~/.codex mounted
 @agent --proxy codex     run Codex through a host auth proxy without mounting ~/.codex
 @tmux [session]          open tmux with vmsh as the default pane command
