@@ -2183,19 +2183,9 @@ func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 		}
 	}
 	args := hostShellCommand(line, tty, s.hostCommandPrelude(tty))
-	var cmd *exec.Cmd
-	var interrupted *atomic.Bool
-	stopInterrupts := func() {}
-	if tty {
-		cmd = exec.Command(args[0], args[1:]...)
-		interrupted = &atomic.Bool{}
-	} else {
-		cmdCtx, stop, state := s.interruptibleCommandContext()
-		stopInterrupts = stop
-		interrupted = state
-		cmd = exec.CommandContext(cmdCtx, args[0], args[1:]...)
-	}
+	cmdCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
 	defer stopInterrupts()
+	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
 	cmd.Dir = s.hostCWD
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = stdout
@@ -3870,9 +3860,16 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 
 	inputs := make(chan client.ExecInput, 8)
 	var interrupted atomic.Bool
+	runCtx, cancel := context.WithCancel(context.Background())
+	stopInterrupts, contextInterrupted := s.startInterruptWatcher(cancel)
+	defer func() {
+		stopInterrupts()
+		cancel()
+	}()
 	stopForwarding, err := s.startGuestInputForwarding(req.TTY, true, inputs, stdout, stderr, func(name string) {
 		if name == "INT" {
 			interrupted.Store(true)
+			cancel()
 		}
 	})
 	if err != nil {
@@ -3884,7 +3881,7 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 	}()
 
 	exitCode := 0
-	if err := s.api.RunInteractiveStreamIn(id, req, inputs, func(event client.ExecEvent) error {
+	if err := s.api.RunInteractiveStreamInContext(runCtx, id, req, inputs, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stdout", "output":
 			writeExecEventOutput(stdout, event)
@@ -3900,12 +3897,16 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 		}
 		return nil
 	}); err != nil {
-		if interrupted.Load() {
+		if interrupted.Load() || contextInterrupted.Load() {
 			s.lastCode = 130
 			return nil
 		}
 		s.lastCode = 1
 		return err
+	}
+	if interrupted.Load() || contextInterrupted.Load() {
+		s.lastCode = 130
+		return nil
 	}
 	s.lastCode = exitCode
 	return nil
@@ -4055,7 +4056,7 @@ func (s *shellState) startGuestInputForwarding(tty, forwardStdin bool, inputs ch
 			producers.Add(1)
 			go func() {
 				defer producers.Done()
-				streamGuestStdin(os.Stdin, inputs, done)
+				streamGuestStdin(os.Stdin, inputs, done, onSignal...)
 			}()
 		}
 	}
@@ -4083,7 +4084,7 @@ func stopGuestInputForwarding(restore func(), stopProducers func()) func() {
 	}
 }
 
-func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan struct{}) {
+func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan struct{}, onSignal ...func(string)) {
 	var buf [4096]byte
 	for {
 		select {
@@ -4093,6 +4094,13 @@ func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan st
 		}
 		n, err := file.Read(buf[:])
 		if n > 0 {
+			if bytes.Contains(buf[:n], []byte{0x03}) {
+				for _, fn := range onSignal {
+					if fn != nil {
+						fn("INT")
+					}
+				}
+			}
 			sendGuestInput(out, done, client.ExecInput{Kind: "stdin", Data: append([]byte(nil), buf[:n]...)})
 		}
 		if err != nil {
@@ -4179,7 +4187,7 @@ func (s *shellState) startHostPTYForwarding(tty bool, session *persistentHostShe
 			producers.Add(1)
 			go func() {
 				defer producers.Done()
-				streamHostPTYStdin(os.Stdin, session.tty, done, interrupted)
+				streamHostPTYStdin(os.Stdin, session.tty, done, interrupted, onInterrupt...)
 			}()
 		}
 	}
@@ -4202,7 +4210,7 @@ func (s *shellState) startHostPTYForwarding(tty bool, session *persistentHostShe
 	return stop, interrupted, nil
 }
 
-func streamHostPTYStdin(in *os.File, out *os.File, done <-chan struct{}, interrupted *atomic.Bool) {
+func streamHostPTYStdin(in *os.File, out *os.File, done <-chan struct{}, interrupted *atomic.Bool, onInterrupt ...func()) {
 	var buf [4096]byte
 	for {
 		select {
@@ -4214,6 +4222,11 @@ func streamHostPTYStdin(in *os.File, out *os.File, done <-chan struct{}, interru
 		if n > 0 {
 			if bytes.Contains(buf[:n], []byte{0x03}) {
 				interrupted.Store(true)
+				for _, fn := range onInterrupt {
+					if fn != nil {
+						fn()
+					}
+				}
 			}
 			if !writeHostPTYInput(out, done, buf[:n]) {
 				return

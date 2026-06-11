@@ -1311,6 +1311,84 @@ func TestGuestCopyInterruptReturnsStatus130(t *testing.T) {
 	}
 }
 
+func TestTTYGuestRunInterruptCancelsContext(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu"}
+	started := make(chan struct{})
+	api.runInteractiveContext = func(ctx context.Context, id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		if !req.TTY {
+			t.Fatalf("TTY guest run used non-TTY request: %+v", req)
+		}
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	sh := newUnitShell(t, api)
+	interrupts := make(chan os.Signal, 1)
+	sh.interruptSignals = interrupts
+	req := client.RunRequest{Image: "ubuntu", Command: guestCommand("sleep 30", true), TTY: true, Cols: 80, Rows: 24}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sh.streamGuestRun("default", req, io.Discard, io.Discard)
+	}()
+	<-started
+	interrupts <- os.Interrupt
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("interrupted TTY guest run returned error: %v", err)
+		}
+		if sh.lastCode != 130 {
+			t.Fatalf("lastCode = %d, want 130", sh.lastCode)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("interrupted TTY guest run did not return")
+	}
+}
+
+func TestStreamHostPTYStdinControlCCallsInterruptHook(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PTY stdin test uses os.Pipe readiness semantics")
+	}
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("input pipe: %v", err)
+	}
+	defer inR.Close()
+	defer inW.Close()
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("output pipe: %v", err)
+	}
+	defer outR.Close()
+	defer outW.Close()
+	done := make(chan struct{})
+	defer close(done)
+	interrupted := &atomic.Bool{}
+	called := make(chan struct{})
+	var once sync.Once
+
+	go streamHostPTYStdin(inR, outW, done, interrupted, func() {
+		once.Do(func() {
+			close(called)
+		})
+	})
+	if _, err := inW.Write([]byte{0x03}); err != nil {
+		t.Fatalf("write ctrl-c: %v", err)
+	}
+
+	select {
+	case <-called:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("interrupt hook was not called")
+	}
+	if !interrupted.Load() {
+		t.Fatalf("interrupted flag was not set")
+	}
+}
+
 func TestPersistentHostShellRunsShortCommandsAndPipelines(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("persistent host shell requires a Unix PTY")
@@ -2463,19 +2541,20 @@ func (w *notifyWriter) String() string {
 }
 
 type recordingShellAPI struct {
-	images         map[string]client.ImageState
-	instances      map[string]client.InstanceState
-	starts         []recordedStart
-	runs           []recordedRun
-	execs          []recordedExec
-	forwards       []recordedForward
-	servicePorts   []recordedServiceProxyPort
-	deleted        []string
-	runStream      func(context.Context, string, client.RunRequest, func(client.ExecEvent) error) error
-	runInteractive func(string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
-	pullStream     func(context.Context, string, client.PullImageRequest, func(client.ProgressEvent) error) error
-	startStream    func(context.Context, string, client.StartInstanceRequest, func(client.BootEvent) error) (client.InstanceState, error)
-	execStream     func(context.Context, string, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+	images                map[string]client.ImageState
+	instances             map[string]client.InstanceState
+	starts                []recordedStart
+	runs                  []recordedRun
+	execs                 []recordedExec
+	forwards              []recordedForward
+	servicePorts          []recordedServiceProxyPort
+	deleted               []string
+	runStream             func(context.Context, string, client.RunRequest, func(client.ExecEvent) error) error
+	runInteractive        func(string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+	runInteractiveContext func(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+	pullStream            func(context.Context, string, client.PullImageRequest, func(client.ProgressEvent) error) error
+	startStream           func(context.Context, string, client.StartInstanceRequest, func(client.BootEvent) error) (client.InstanceState, error)
+	execStream            func(context.Context, string, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 }
 
 type recordedStart struct {
@@ -2633,6 +2712,9 @@ func (a *recordingShellAPI) RunInteractiveStreamIn(id string, req client.RunRequ
 }
 
 func (a *recordingShellAPI) RunInteractiveStreamInContext(ctx context.Context, id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	if a.runInteractiveContext != nil {
+		return a.runInteractiveContext(ctx, id, req, inputs, onEvent)
+	}
 	if a.runInteractive != nil {
 		return a.runInteractive(id, req, inputs, onEvent)
 	}
