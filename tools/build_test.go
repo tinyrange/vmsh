@@ -34,3 +34,18 @@ func TestResolveBuildDir(t *testing.T) {
 		t.Fatalf("default build dir = %q", got)
 	}
 }
+
+func TestHasRecordArg(t *testing.T) {
+	if !hasRecordArg([]string{"-record", "session.cast"}) {
+		t.Fatalf("-record was not detected")
+	}
+	if !hasRecordArg([]string{"--record=session.cast"}) {
+		t.Fatalf("--record= was not detected")
+	}
+	if hasRecordArg([]string{"--", "-record", "script-arg"}) {
+		t.Fatalf("-record after -- should not be treated as a build wrapper vmsh flag")
+	}
+	if hasRecordArg([]string{"@alpine"}) {
+		t.Fatalf("unexpected record arg detected")
+	}
+}

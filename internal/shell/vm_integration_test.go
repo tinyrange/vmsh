@@ -462,6 +462,19 @@ func buildVMIntegrationCCVM(t *testing.T) string {
 		out := filepath.Join(buildDir, backend.HostExecutableName("ccvm"))
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
+		for _, goarch := range []string{"arm64", "amd64"} {
+			payload := filepath.Join(root, "cc", "internal", "guestinit", "guest-init-linux-"+goarch)
+			cmd := exec.CommandContext(ctx, "go", "build", "-o", payload, "./internal/cmd/init")
+			cmd.Dir = filepath.Join(root, "cc")
+			cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+goarch)
+			var output bytes.Buffer
+			cmd.Stdout = &output
+			cmd.Stderr = &output
+			if err := cmd.Run(); err != nil {
+				vmIntegrationCCVMBuild.err = fmt.Errorf("go build guest init %s: %w\n%s", goarch, err, output.String())
+				return
+			}
+		}
 		cmd := exec.CommandContext(ctx, "go", "build", "-tags", "embed_guestinit", "-o", out, "./cmd/ccvm")
 		cmd.Dir = filepath.Join(root, "cc")
 		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")

@@ -53,6 +53,28 @@ func MakeRaw(file *os.File) (func(), error) {
 	}, nil
 }
 
+func MakeAttachedRaw(file *os.File) (func(), error) {
+	fd := int(file.Fd())
+	termios, err := unix.IoctlGetTermios(fd, unix.TIOCGETA)
+	if err != nil {
+		return nil, err
+	}
+	originalTermios := *termios
+	raw := *termios
+	raw.Iflag |= unix.IGNPAR
+	raw.Iflag &^= unix.ISTRIP | unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON | unix.IXANY | unix.IXOFF
+	raw.Lflag &^= unix.ISIG | unix.ICANON | unix.ECHO | unix.ECHOE | unix.ECHOK | unix.ECHONL | unix.IEXTEN
+	raw.Oflag &^= unix.OPOST
+	raw.Cc[unix.VMIN] = 1
+	raw.Cc[unix.VTIME] = 0
+	if err := unix.IoctlSetTermios(fd, unix.TIOCSETAW, &raw); err != nil {
+		return nil, err
+	}
+	return func() {
+		_ = unix.IoctlSetTermios(fd, unix.TIOCSETAW, &originalTermios)
+	}, nil
+}
+
 func InterruptRead(*os.File) {}
 
 func PrepareOutput(*os.File) func() {

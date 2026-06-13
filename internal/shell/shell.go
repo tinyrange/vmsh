@@ -37,7 +37,7 @@ const guestHostMount = "/host"
 const isolatedVMSuffix = "-isolated"
 const defaultGuestUser = "1000:1000"
 const defaultVMSHBootTimeoutSeconds = 60
-const defaultGuestShellReadyTimeout = 5 * time.Second
+const defaultGuestShellReadyTimeout = 30 * time.Second
 const (
 	colorReset   = "\x1b[0m"
 	colorGreen   = "\x1b[32m"
@@ -120,15 +120,19 @@ type hostShellInit struct {
 }
 
 type persistentHostShell struct {
-	mu      sync.Mutex
-	cmd     *exec.Cmd
-	tty     *os.File
-	stdin   io.WriteCloser
-	stdout  *bufio.Reader
-	seq     uint64
-	lastCWD string
-	pending string
-	done    chan error
+	mu          sync.Mutex
+	outputMu    sync.Mutex
+	cmd         *exec.Cmd
+	tty         *os.File
+	stdin       io.WriteCloser
+	stdout      *bufio.Reader
+	control     *bufio.Reader
+	controlFile *os.File
+	output      io.Writer
+	seq         uint64
+	lastCWD     string
+	pending     string
+	done        chan error
 }
 
 type persistentGuestShell struct {
@@ -138,7 +142,6 @@ type persistentGuestShell struct {
 	events  chan client.ExecEvent
 	done    chan error
 	lastCWD string
-	pending string
 }
 
 type vmshCompleter struct {
@@ -961,6 +964,7 @@ func Run(args []string) error {
 	vmID := fs.String("vm", "default", "Initial VM id")
 	startVM := fs.Bool("start", false, "Start the selected blank VM before entering the shell")
 	script := fs.String("script", "", "Internal test hook: read vmsh commands from this file")
+	recordPath := fs.String("record", "", "Record terminal output to an asciinema v2 .cast file")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -988,9 +992,29 @@ func Run(args []string) error {
 			childCCVMPath = abs
 		}
 	}
+	stdout := io.Writer(os.Stdout)
+	stderr := io.Writer(os.Stderr)
+	var recorder *asciinemaRecorder
+	if strings.TrimSpace(*recordPath) != "" {
+		_, cols, rows := terminalRequestSize(os.Stdout)
+		if cols <= 0 {
+			cols = 80
+		}
+		if rows <= 0 {
+			rows = 24
+		}
+		rec, err := newAsciinemaRecorder(strings.TrimSpace(*recordPath), cols, rows)
+		if err != nil {
+			return err
+		}
+		defer rec.Close()
+		recorder = rec
+		stdout = newRecordingTerminalWriter(os.Stdout, recorder)
+		stderr = newRecordingTerminalWriter(os.Stderr, recorder)
+	}
 	api, err := backend.ConnectCCVMWithOptions(ccvmLaunch, rootCache, statePath, backend.ConnectOptions{
 		OnReuse: func(state backend.DaemonState) {
-			fmt.Fprintf(os.Stderr, "vmsh: reusing ccvm daemon at %s\n", state.Addr)
+			fmt.Fprintf(stderr, "vmsh: reusing ccvm daemon at %s\n", state.Addr)
 		},
 	})
 	if err != nil {
@@ -1016,7 +1040,7 @@ func Run(args []string) error {
 		imageCache: map[string]bool{},
 		vmRunning:  map[string]bool{},
 		contextCWD: map[string]string{},
-		promptOut:  os.Stdout,
+		promptOut:  stdout,
 		history:    filepath.Join(rootCache, "vmsh_history"),
 		env:        map[string]string{},
 		aliases:    map[string]string{},
@@ -1027,16 +1051,16 @@ func Run(args []string) error {
 			return promptVMRestartConfirmation(os.Stdin, stderr, id)
 		},
 		confirmSSHHost: func(cfg resolvedSSHConfig, hostname string, remote net.Addr, key ssh.PublicKey) (bool, error) {
-			return promptSSHHostKeyConfirmation(os.Stdin, os.Stderr, cfg, hostname, remote, key)
+			return promptSSHHostKeyConfirmation(os.Stdin, stderr, cfg, hostname, remote, key)
 		},
 		sshPassword: func(cfg resolvedSSHConfig) (string, error) {
-			return promptSSHPassword(os.Stdin, os.Stderr, cfg)
+			return promptSSHPassword(os.Stdin, stderr, cfg)
 		},
 		sshKeyboardAuth: func(cfg resolvedSSHConfig, name, instruction string, questions []string, echos []bool) ([]string, error) {
-			return promptSSHKeyboardInteractive(os.Stdin, os.Stderr, cfg, name, instruction, questions, echos)
+			return promptSSHKeyboardInteractive(os.Stdin, stderr, cfg, name, instruction, questions, echos)
 		},
 		sshBanner: func(cfg resolvedSSHConfig, message string) error {
-			_, err := fmt.Fprint(os.Stderr, message)
+			_, err := fmt.Fprint(stderr, message)
 			return err
 		},
 	}
@@ -1046,7 +1070,7 @@ func Run(args []string) error {
 		return err
 	}
 	if *startVM {
-		if err := sh.startVM(sh.context.VMID, sh.context, os.Stderr); err != nil {
+		if err := sh.startVM(sh.context.VMID, sh.context, stderr); err != nil {
 			return err
 		}
 	}
@@ -1056,9 +1080,9 @@ func Run(args []string) error {
 			return err
 		}
 		defer f.Close()
-		return sh.runScript(f, os.Stdout, os.Stderr)
+		return sh.runScript(f, stdout, stderr)
 	}
-	return sh.loop(os.Stdin, os.Stdout, os.Stderr)
+	return sh.loop(os.Stdin, stdout, stderr)
 }
 
 func defaultContext(vmID, image string, nestedVirt bool) commandContext {
@@ -1075,7 +1099,7 @@ func (s *shellState) loop(in io.Reader, stdout, stderr io.Writer) error {
 	if !readerIsTerminal(in) || !writerIsTerminal(stdout) {
 		return fmt.Errorf("vmsh requires an interactive terminal")
 	}
-	if outFile, ok := stdout.(*os.File); ok {
+	if outFile, ok := terminalWriterFile(stdout); ok {
 		restoreOutput := terminal.PrepareOutput(outFile)
 		defer restoreOutput()
 	}
@@ -3088,11 +3112,17 @@ func (s *shellState) hostPersistentShell(env []string, cols, rows int, stderr io
 
 func startPersistentHostShell(cwd string, env []string, cols, rows int, prelude string) (*persistentHostShell, error) {
 	script := prelude + persistentHostShellScript()
-	cmd := exec.Command(hostShell(), "-lc", script)
+	cmd := exec.Command(hostShell(), "-ic", script)
 	cmd.Dir = cwd
 	if env != nil {
 		cmd.Env = env
 	}
+	controlRead, controlWrite, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	defer controlWrite.Close()
+	cmd.ExtraFiles = []*os.File{controlWrite}
 	if cols <= 0 {
 		cols = 80
 	}
@@ -3104,19 +3134,23 @@ func startPersistentHostShell(cwd string, env []string, cols, rows int, prelude 
 		Rows: uint16(rows),
 	})
 	if err != nil {
+		_ = controlRead.Close()
 		return nil, err
 	}
 	session := &persistentHostShell{
-		cmd:     cmd,
-		tty:     tty,
-		stdin:   tty,
-		stdout:  bufio.NewReader(tty),
-		lastCWD: cwd,
-		done:    make(chan error, 1),
+		cmd:         cmd,
+		tty:         tty,
+		stdin:       tty,
+		stdout:      bufio.NewReader(tty),
+		control:     bufio.NewReader(controlRead),
+		controlFile: controlRead,
+		lastCWD:     cwd,
+		done:        make(chan error, 1),
 	}
 	go func() {
 		session.done <- cmd.Wait()
 	}()
+	go session.forwardPTYOutput()
 	if err := session.waitReady(); err != nil {
 		session.close()
 		return nil, err
@@ -3126,38 +3160,113 @@ func startPersistentHostShell(cwd string, env []string, cols, rows int, prelude 
 
 func persistentHostShellScript() string {
 	lines := []string{
-		"set +m 2>/dev/null || true",
+		"set -m 2>/dev/null || true",
 		"stty -echo 2>/dev/null || true",
 	}
 	if filepath.Base(hostShell()) == "bash" {
 		lines = append(lines, bashHostShellOptionsPrelude())
 	}
 	lines = append(lines, []string{
-		"printf '__VMSH_READY__:%s\\n' \"$PWD\"",
-		"while IFS= read -r __vmsh_line; do",
+		"__vmsh_control_fd=3",
+		"__vmsh_report() {",
+		"  printf '%s\\t%s\\t%s\\n' \"$1\" \"$2\" \"$PWD\" >&$__vmsh_control_fd",
+		"}",
+		"__vmsh_run() {",
 		"  stty echo 2>/dev/null || true",
-		"  eval \"$__vmsh_line\"",
+		"  eval \"$1\"",
 		"  __vmsh_status=$?",
 		"  stty -echo 2>/dev/null || true",
-		"  printf '__VMSH_DONE__:%s:%s\\n' \"$__vmsh_status\" \"$PWD\"",
-		"done",
+		"  __vmsh_report done \"$__vmsh_status\"",
+		"}",
+		"__vmsh_report ready 0",
+		"while IFS= read -r __vmsh_line; do eval \"$__vmsh_line\"; done",
 	}...)
 	return strings.Join(lines, "\n")
 }
 
 func (p *persistentHostShell) waitReady() error {
 	for {
-		text, err := p.stdout.ReadString('\n')
-		if text != "" {
-			if cwd, ok := parsePersistentReady(text); ok {
-				p.lastCWD = cwd
-				return nil
-			}
-		}
+		record, err := p.readControlRecord()
 		if err != nil {
 			return err
 		}
+		if record.kind == "ready" {
+			p.lastCWD = record.cwd
+			return nil
+		}
 	}
+}
+
+type persistentHostControlRecord struct {
+	kind string
+	code int
+	cwd  string
+}
+
+func (p *persistentHostShell) readControlRecord() (persistentHostControlRecord, error) {
+	return readPersistentControlRecord(p.control)
+}
+
+func readPersistentControlRecord(reader *bufio.Reader) (persistentHostControlRecord, error) {
+	text, err := reader.ReadString('\n')
+	if err != nil {
+		return persistentHostControlRecord{}, err
+	}
+	return parsePersistentControlRecord(text)
+}
+
+func parsePersistentControlRecord(text string) (persistentHostControlRecord, error) {
+	text = strings.TrimRight(text, "\r\n")
+	parts := strings.SplitN(text, "\t", 3)
+	if len(parts) != 3 {
+		return persistentHostControlRecord{}, fmt.Errorf("invalid host shell control record %q", text)
+	}
+	code, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return persistentHostControlRecord{}, fmt.Errorf("invalid host shell control status %q", parts[1])
+	}
+	return persistentHostControlRecord{kind: parts[0], code: code, cwd: parts[2]}, nil
+}
+
+func (p *persistentHostShell) forwardPTYOutput() {
+	buf := make([]byte, 4096)
+	for {
+		n, err := p.stdout.Read(buf)
+		if n > 0 {
+			p.outputMu.Lock()
+			output := p.output
+			if output != nil {
+				writePTYOutput(output, buf[:n])
+			}
+			p.outputMu.Unlock()
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func writePTYOutput(output io.Writer, data []byte) {
+	for len(data) > 0 {
+		n, err := output.Write(data)
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil || n <= 0 {
+			return
+		}
+	}
+}
+
+func (p *persistentHostShell) setOutput(output io.Writer) {
+	p.outputMu.Lock()
+	p.output = output
+	p.outputMu.Unlock()
+}
+
+func (p *persistentHostShell) clearOutputSoon() {
+	time.Sleep(20 * time.Millisecond)
+	p.setOutput(nil)
 }
 
 func (p *persistentHostShell) run(line string, stdout, stderr io.Writer, startForwarding func() (func(), error)) error {
@@ -3173,59 +3282,31 @@ func (p *persistentHostShell) run(line string, stdout, stderr io.Writer, startFo
 			stopForwarding = stop
 		}
 	}
-	defer stopForwarding()
-	if _, err := fmt.Fprintln(p.stdin, line); err != nil {
+	p.setOutput(stdout)
+	defer func() {
+		p.clearOutputSoon()
+		stopForwarding()
+	}()
+	if _, err := fmt.Fprintln(p.stdin, "__vmsh_run "+shellQuote(line)); err != nil {
 		return err
 	}
-	buf := make([]byte, 4096)
 	for {
-		n, err := p.stdout.Read(buf)
-		if n > 0 {
-			out, code, cwd, done := p.consumeOutputChunk(string(buf[:n]))
-			if out != "" {
-				_, _ = io.WriteString(stdout, out)
-			}
-			if done {
-				p.lastCWD = cwd
-				if code != 0 {
-					return persistentShellExit{code: code}
-				}
-				return nil
-			}
-		}
+		record, err := p.readControlRecord()
 		if err != nil {
 			return err
 		}
+		if record.kind != "done" {
+			continue
+		}
+		p.lastCWD = record.cwd
+		if record.code != 0 {
+			return persistentShellExit{code: record.code}
+		}
+		return nil
 	}
 }
 
 const persistentDoneMarkerPrefix = "__VMSH_DONE__:"
-
-func (p *persistentHostShell) consumeOutputChunk(text string) (string, int, string, bool) {
-	p.pending += text
-	idx := strings.Index(p.pending, persistentDoneMarkerPrefix)
-	if idx >= 0 {
-		newline := strings.IndexAny(p.pending[idx:], "\r\n")
-		if newline < 0 {
-			if idx > 0 {
-				out := p.pending[:idx]
-				p.pending = p.pending[idx:]
-				return out, 0, "", false
-			}
-			return "", 0, "", false
-		}
-		lineEnd := idx + newline
-		before := p.pending[:idx]
-		marker := p.pending[idx:lineEnd]
-		p.pending = strings.TrimLeft(p.pending[lineEnd:], "\r\n")
-		code, cwd, ok := parsePersistentMarker(marker)
-		return before, code, cwd, ok
-	}
-	keep := persistentMarkerPrefixSuffixLen(p.pending)
-	out := p.pending[:len(p.pending)-keep]
-	p.pending = p.pending[len(p.pending)-keep:]
-	return out, 0, "", false
-}
 
 func persistentMarkerPrefixSuffixLen(text string) int {
 	max := len(persistentDoneMarkerPrefix) - 1
@@ -3238,31 +3319,6 @@ func persistentMarkerPrefixSuffixLen(text string) int {
 		}
 	}
 	return 0
-}
-
-func (p *persistentHostShell) consumeOutput(text string) (string, int, string, bool) {
-	p.pending += text
-	idx := strings.Index(p.pending, persistentDoneMarkerPrefix)
-	if idx < 0 {
-		out := p.pending
-		p.pending = ""
-		return out, 0, "", false
-	}
-	newline := strings.IndexAny(p.pending[idx:], "\r\n")
-	if newline < 0 {
-		if idx > 0 {
-			out := p.pending[:idx]
-			p.pending = p.pending[idx:]
-			return out, 0, "", false
-		}
-		return "", 0, "", false
-	}
-	lineEnd := idx + newline
-	before := p.pending[:idx]
-	marker := p.pending[idx:lineEnd]
-	p.pending = strings.TrimLeft(p.pending[lineEnd:], "\r\n")
-	code, cwd, ok := parsePersistentMarker(marker)
-	return before, code, cwd, ok
 }
 
 func (p *persistentHostShell) cwd() string {
@@ -3300,6 +3356,9 @@ func (p *persistentHostShell) close() {
 		_ = p.tty.Close()
 	} else if p.stdin != nil {
 		_ = p.stdin.Close()
+	}
+	if p.controlFile != nil {
+		_ = p.controlFile.Close()
 	}
 	select {
 	case <-p.done:
@@ -3617,6 +3676,7 @@ func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequ
 	}
 	req.Command = guestPersistentCommand()
 	req.TTY = true
+	req.ControlFD = true
 	if req.Cols == 0 {
 		req.Cols = 80
 	}
@@ -3681,14 +3741,19 @@ func guestPersistentCommand() []string {
 	return []string{"sh", "-lc", guestShellPrelude() + strings.Join([]string{
 		"stty -echo 2>/dev/null || true",
 		colorPrelude("ls --color=always -C -w ${COLUMNS:-80}", "ls -G -C", false),
-		"printf '__VMSH_READY__:%s\\n' \"$PWD\"",
-		"while IFS= read -r __vmsh_line; do",
+		"__vmsh_control_fd=3",
+		"__vmsh_report() {",
+		"  printf '%s\\t%s\\t%s\\n' \"$1\" \"$2\" \"$PWD\" >&$__vmsh_control_fd",
+		"}",
+		"__vmsh_run() {",
 		"  stty echo 2>/dev/null || true",
-		"  eval \"$__vmsh_line\"",
+		"  eval \"$1\"",
 		"  __vmsh_status=$?",
 		"  stty -echo 2>/dev/null || true",
-		"  printf '__VMSH_DONE__:%s:%s\\n' \"$__vmsh_status\" \"$PWD\"",
-		"done",
+		"  __vmsh_report done \"$__vmsh_status\"",
+		"}",
+		"__vmsh_report ready 0",
+		"while IFS= read -r __vmsh_line; do eval \"$__vmsh_line\"; done",
 	}, "\n")}
 }
 
@@ -3706,12 +3771,18 @@ func (p *persistentGuestShell) waitReady() error {
 				return fmt.Errorf("persistent guest shell closed before ready")
 			}
 			switch event.Kind {
-			case "stdout", "output":
-				text := execEventText(event)
-				if cwd, ok := parsePersistentReady(text); ok {
-					p.lastCWD = cwd
+			case "control":
+				record, err := parsePersistentControlRecord(execEventText(event))
+				if err != nil {
+					appendPersistentStartupOutput(&startup, err.Error())
+					continue
+				}
+				if record.kind == "ready" {
+					p.lastCWD = record.cwd
 					return nil
 				}
+			case "stdout", "output":
+				text := execEventText(event)
 				appendPersistentStartupOutput(&startup, text)
 			case "stderr":
 				appendPersistentStartupOutput(&startup, execEventText(event))
@@ -3786,7 +3857,7 @@ func parsePersistentReady(text string) (string, bool) {
 func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer, startForwarding func() (func(), error)) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.inputs <- client.ExecInput{Kind: "stdin", Data: []byte(line + "\n")}
+	p.inputs <- client.ExecInput{Kind: "stdin", Data: []byte("__vmsh_run " + shellQuote(line) + "\n")}
 	stopForwarding := func() {}
 	if startForwarding != nil {
 		stop, err := startForwarding()
@@ -3800,18 +3871,20 @@ func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer, startF
 	defer stopForwarding()
 	for event := range p.events {
 		switch event.Kind {
-		case "stdout", "output":
-			text := execEventText(event)
-			if before, code, cwd, ok := p.consumeOutput(text); ok {
-				if before != "" {
-					_, _ = io.WriteString(stdout, before)
-				}
-				p.lastCWD = cwd
-				if code != 0 {
-					return persistentShellExit{code: code}
-				}
-				return nil
+		case "control":
+			record, err := parsePersistentControlRecord(execEventText(event))
+			if err != nil {
+				return err
 			}
+			if record.kind != "done" {
+				continue
+			}
+			p.lastCWD = record.cwd
+			if record.code != 0 {
+				return persistentShellExit{code: record.code}
+			}
+			return nil
+		case "stdout", "output":
 			writeExecEventOutput(stdout, event)
 		case "stderr":
 			writeExecEventOutput(stderr, event)
@@ -3829,31 +3902,6 @@ func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer, startF
 
 func persistentGuestShellEnded(err error) bool {
 	return errors.Is(err, errPersistentGuestShellExited) || errors.Is(err, errPersistentGuestShellClosed)
-}
-
-func (p *persistentGuestShell) consumeOutput(text string) (string, int, string, bool) {
-	p.pending += text
-	idx := strings.Index(p.pending, "__VMSH_DONE__:")
-	if idx < 0 {
-		out := p.pending
-		p.pending = ""
-		return out, 0, "", false
-	}
-	newline := strings.IndexAny(p.pending[idx:], "\r\n")
-	if newline < 0 {
-		if idx > 0 {
-			out := p.pending[:idx]
-			p.pending = p.pending[idx:]
-			return out, 0, "", false
-		}
-		return "", 0, "", false
-	}
-	lineEnd := idx + newline
-	before := p.pending[:idx]
-	marker := p.pending[idx:lineEnd]
-	p.pending = strings.TrimLeft(p.pending[lineEnd:], "\r\n")
-	code, cwd, ok := parsePersistentMarker(marker)
-	return before, code, cwd, ok
 }
 
 func parsePersistentMarker(line string) (int, string, bool) {
@@ -4132,18 +4180,24 @@ func (s *shellState) startGuestInputForwarding(tty, forwardStdin bool, inputs ch
 	cancelRead := func() {}
 	var producers sync.WaitGroup
 	if tty && forwardStdin {
-		file, ok := stdout.(*os.File)
+		file, ok := terminalWriterFile(stdout)
 		if ok && terminal.IsTerminalFD(int(file.Fd())) && terminal.IsTerminalFD(int(os.Stdin.Fd())) {
-			terminalRestore, err := terminal.MakeRaw(os.Stdin)
+			terminalRestore, err := terminal.MakeAttachedRaw(os.Stdin)
 			if err != nil {
 				return nil, err
 			}
+			inputCancel, err := newPTYInputCanceller(os.Stdin)
+			if err != nil {
+				terminalRestore()
+				return nil, err
+			}
 			restore = terminalRestore
-			cancelRead = func() { terminal.InterruptRead(os.Stdin) }
+			cancelRead = inputCancel.cancel
 			producers.Add(1)
 			go func() {
 				defer producers.Done()
-				streamGuestStdin(os.Stdin, inputs, done, onSignal...)
+				defer inputCancel.close()
+				streamGuestStdin(os.Stdin, inputs, done, inputCancel, terminalWriterRecorder(stdout), onSignal...)
 			}()
 		}
 	}
@@ -4171,7 +4225,7 @@ func stopGuestInputForwarding(restore func(), stopProducers func()) func() {
 	}
 }
 
-func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan struct{}, onSignal ...func(string)) {
+func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan struct{}, inputCancel *ptyInputCanceller, recorder *asciinemaRecorder, onSignal ...func(string)) {
 	var buf [4096]byte
 	for {
 		select {
@@ -4179,8 +4233,11 @@ func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan st
 			return
 		default:
 		}
-		n, err := file.Read(buf[:])
+		n, err := readPTYInput(file, buf[:], done, inputCancel)
 		if n > 0 {
+			if recorder != nil {
+				recorder.recordInput(buf[:n])
+			}
 			if bytes.Contains(buf[:n], []byte{0x03}) {
 				for _, fn := range onSignal {
 					if fn != nil {
@@ -4191,10 +4248,6 @@ func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan st
 			sendGuestInput(out, done, client.ExecInput{Kind: "stdin", Data: append([]byte(nil), buf[:n]...)})
 		}
 		if err != nil {
-			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
-				sleepOrDone(done, 10*time.Millisecond)
-				continue
-			}
 			if errors.Is(err, io.EOF) {
 				sendGuestInput(out, done, client.ExecInput{Kind: "stdin_close"})
 			}
@@ -4217,7 +4270,7 @@ func forwardGuestSignals(out chan<- client.ExecInput, done <-chan struct{}, tty 
 				continue
 			}
 			if terminal.IsResizeSignal(sig) {
-				file, ok := stdout.(*os.File)
+				file, ok := terminalWriterFile(stdout)
 				if !ok {
 					continue
 				}
@@ -4263,18 +4316,24 @@ func (s *shellState) startHostPTYForwarding(tty bool, session *persistentHostShe
 	cancelRead := func() {}
 	var producers sync.WaitGroup
 	if tty {
-		file, ok := stdout.(*os.File)
+		file, ok := terminalWriterFile(stdout)
 		if ok && terminal.IsTerminalFD(int(file.Fd())) && terminal.IsTerminalFD(int(os.Stdin.Fd())) {
-			terminalRestore, err := terminal.MakeRaw(os.Stdin)
+			terminalRestore, err := terminal.MakeAttachedRaw(os.Stdin)
 			if err != nil {
 				return nil, interrupted, err
 			}
+			inputCancel, err := newPTYInputCanceller(os.Stdin)
+			if err != nil {
+				terminalRestore()
+				return nil, interrupted, err
+			}
 			restore = terminalRestore
-			cancelRead = func() { terminal.InterruptRead(os.Stdin) }
+			cancelRead = inputCancel.cancel
 			producers.Add(1)
 			go func() {
 				defer producers.Done()
-				streamHostPTYStdin(os.Stdin, session.tty, done, interrupted, onInterrupt...)
+				defer inputCancel.close()
+				streamHostPTYStdin(os.Stdin, session.tty, done, inputCancel, interrupted, terminalWriterRecorder(stdout), onInterrupt...)
 			}()
 		}
 	}
@@ -4297,7 +4356,7 @@ func (s *shellState) startHostPTYForwarding(tty bool, session *persistentHostShe
 	return stop, interrupted, nil
 }
 
-func streamHostPTYStdin(in *os.File, out *os.File, done <-chan struct{}, interrupted *atomic.Bool, onInterrupt ...func()) {
+func streamHostPTYStdin(in *os.File, out *os.File, done <-chan struct{}, inputCancel *ptyInputCanceller, interrupted *atomic.Bool, recorder *asciinemaRecorder, onInterrupt ...func()) {
 	var buf [4096]byte
 	for {
 		select {
@@ -4305,8 +4364,11 @@ func streamHostPTYStdin(in *os.File, out *os.File, done <-chan struct{}, interru
 			return
 		default:
 		}
-		n, err := in.Read(buf[:])
+		n, err := readPTYInput(in, buf[:], done, inputCancel)
 		if n > 0 {
+			if recorder != nil {
+				recorder.recordInput(buf[:n])
+			}
 			if bytes.Contains(buf[:n], []byte{0x03}) {
 				interrupted.Store(true)
 				for _, fn := range onInterrupt {
@@ -4320,10 +4382,6 @@ func streamHostPTYStdin(in *os.File, out *os.File, done <-chan struct{}, interru
 			}
 		}
 		if err != nil {
-			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
-				sleepOrDone(done, 10*time.Millisecond)
-				continue
-			}
 			return
 		}
 	}
@@ -4384,7 +4442,7 @@ func forwardHostPTYSignals(out *os.File, done <-chan struct{}, tty bool, stdout,
 }
 
 func resizeHostPTY(out *os.File, stdout io.Writer) {
-	file, ok := stdout.(*os.File)
+	file, ok := terminalWriterFile(stdout)
 	if !ok {
 		return
 	}
@@ -4426,14 +4484,26 @@ func (e *commandInterruptEscalator) Interrupt() {
 		return
 	}
 	count := e.count.Add(1)
+	e.handleCount(count, true)
+}
+
+func (e *commandInterruptEscalator) ForwardedInterrupt() {
+	if e == nil {
+		return
+	}
+	count := e.count.Add(1)
+	e.handleCount(count, false)
+}
+
+func (e *commandInterruptEscalator) handleCount(count int32, runSoft bool) {
 	switch count {
 	case 1:
-		if e.soft != nil {
+		if runSoft && e.soft != nil {
 			e.soft()
 		}
 	case 2:
 		fmt.Fprintf(e.stderr, "\nvmsh: command %q is not responding to SIGINT; press Ctrl+C again to hard terminate it\n", compactCommandForMessage(e.command))
-		if e.soft != nil {
+		if runSoft && e.soft != nil {
 			e.soft()
 		}
 	default:
@@ -4952,7 +5022,7 @@ func newTerminalHoldStatus(w io.Writer, fallback string) *terminalHoldStatus {
 		finished: make(chan struct{}),
 		fallback: fallback,
 	}
-	if file, ok := w.(*os.File); ok && terminal.IsTerminalFD(int(file.Fd())) {
+	if file, ok := terminalWriterFile(w); ok && terminal.IsTerminalFD(int(file.Fd())) {
 		b.tty = true
 		b.active = true
 		go b.spin()
@@ -5358,7 +5428,7 @@ func (s *shellState) chdirSSHContext(ctx commandContext, target string) error {
 	var stderr bytes.Buffer
 	var err error
 	if shell := s.sshShellForContext(ctx); shell != nil {
-		err = shell.run(remoteCDCommand(target)+" && pwd -P", &out)
+		err = shell.run(remoteCDCommand(target)+" && pwd -P", &out, &stderr)
 	} else {
 		err = s.runSSHCommand(ctx, script, nil, &out, &stderr, false, false)
 	}
@@ -5551,7 +5621,7 @@ func isRootGuestContext(ctx commandContext) bool {
 }
 
 func terminalRequestSize(stdout io.Writer) (bool, int, int) {
-	file, ok := stdout.(*os.File)
+	file, ok := terminalWriterFile(stdout)
 	if !ok || !terminal.IsTerminalFD(int(file.Fd())) {
 		return false, 0, 0
 	}
@@ -5605,7 +5675,7 @@ func (s *shellState) drawPromptStatus(stdout io.Writer) {
 	if code == 0 {
 		return
 	}
-	file, ok := stdout.(*os.File)
+	file, ok := terminalWriterFile(stdout)
 	if !ok || !terminal.IsTerminalFD(int(file.Fd())) {
 		return
 	}
@@ -6034,6 +6104,9 @@ func sshCommandContext(base commandContext, opts commandOptions, host string) co
 	ctx.VMID = ""
 	ctx.Arch = ""
 	ctx.Isolated = false
+	if opts.User == "" && !sameHost {
+		ctx.User = ""
+	}
 	if opts.CWD == "" && !sameHost {
 		ctx.CWD = ""
 	}
@@ -6372,6 +6445,6 @@ func readerIsTerminal(r io.Reader) bool {
 }
 
 func writerIsTerminal(w io.Writer) bool {
-	file, ok := w.(*os.File)
+	file, ok := terminalWriterFile(w)
 	return ok && terminal.IsTerminalFD(int(file.Fd()))
 }

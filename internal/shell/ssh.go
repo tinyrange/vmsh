@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"os/user"
 	"path"
 	"path/filepath"
@@ -19,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/tinyrange/vmsh/internal/terminal"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -36,17 +40,22 @@ type persistentSSHClient struct {
 }
 
 type persistentSSHShell struct {
-	mu      sync.Mutex
-	key     string
-	name    string
-	ctx     commandContext
-	client  *persistentSSHClient
-	session *ssh.Session
-	stdin   io.WriteCloser
-	stdout  *bufio.Reader
-	done    chan error
-	lastCWD string
-	pending string
+	mu             sync.Mutex
+	outputMu       sync.Mutex
+	key            string
+	name           string
+	ctx            commandContext
+	client         *persistentSSHClient
+	session        *ssh.Session
+	controlClient  *ssh.Client
+	controlSession *ssh.Session
+	stdin          io.WriteCloser
+	stdout         *bufio.Reader
+	control        *bufio.Reader
+	output         io.Writer
+	done           chan error
+	controlDone    chan error
+	lastCWD        string
 }
 
 type resolvedSSHConfig struct {
@@ -76,7 +85,7 @@ func (s *shellState) runSSH(ctx commandContext, line string, stdout, stderr io.W
 				}()
 			})
 			stopInterrupts, _ := s.startInterruptWatcher(interrupts.Interrupt)
-			err = session.run(line, stdout)
+			err = session.run(line, stdout, stderr, interrupts.ForwardedInterrupt)
 			stopInterrupts()
 			if interrupted.Load() && sshPersistentShellEnded(err) {
 				s.closeSSHSessionKey(session.key)
@@ -171,10 +180,13 @@ func (s *shellState) runSSHSession(ctx commandContext, command string, stdin io.
 			rows = 24
 		}
 		term := firstNonEmpty(os.Getenv("TERM"), "xterm-256color")
-		if err := session.RequestPty(term, rows, cols, ssh.TerminalModes{ssh.ECHO: 1}); err != nil {
+		modes := terminal.SSHTerminalModes(os.Stdin)
+		modes[ssh.ECHO] = 1
+		if err := session.RequestPty(term, rows, cols, modes); err != nil {
 			return err
 		}
 	}
+	setOpenSSHStyleEnv(session)
 	if stdin != nil {
 		session.Stdin = stdin
 	} else if tty {
@@ -217,74 +229,24 @@ func (s *shellState) sshPersistentShell(ctx commandContext, output, stderr io.Wr
 		return nil, persistentShellExit{code: 130}
 	}
 	if err != nil {
-		return nil, err
+		return nil, wrapSSHStartupEOF(ctx, err)
 	}
 	key := persistentSSHShellKey(client.key, ctx)
 	if shell := s.sshShellForKey(key); shell != nil {
 		return shell, nil
 	}
-	session, err := client.client.NewSession()
-	if err != nil {
-		s.dropSSHClient(client.key)
-		client, err = s.sshClientForContext(runCtx, ctx)
-		if interrupted.Load() {
-			return nil, persistentShellExit{code: 130}
-		}
-		if err != nil {
-			return nil, err
-		}
-		session, err = client.client.NewSession()
-		if err != nil {
-			return nil, err
-		}
-	}
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		_ = session.Close()
-		return nil, err
-	}
-	stdout, err := session.StdoutPipe()
-	if err != nil {
-		_ = session.Close()
-		return nil, err
-	}
-	if err := requestPersistentSSHPty(session, output); err != nil {
-		_ = session.Close()
-		return nil, err
-	}
-	session.Stderr = stderr
-	done := make(chan error, 1)
-	shell := &persistentSSHShell{
-		key:     key,
-		name:    sshSessionDisplayName(ctx, client.config),
-		ctx:     ctx,
-		client:  client,
-		session: session,
-		stdin:   stdin,
-		stdout:  bufio.NewReader(stdout),
-		done:    done,
-		lastCWD: s.currentSSHCWD(ctx),
-	}
-	if err := session.Start("sh -ic " + shellQuote(sshPersistentShellScript(ctx))); err != nil {
-		_ = session.Close()
-		return nil, err
-	}
-	go func() {
-		done <- session.Wait()
-	}()
-	waitStop, _ := s.startInterruptWatcher(func() {
-		_ = session.Signal(ssh.SIGINT)
-		_ = session.Close()
-	})
-	err = shell.waitReady()
-	waitStop()
+	shell, err := s.startPersistentSSHShell(runCtx, ctx, client, key, output, stderr)
 	if interrupted.Load() {
-		shell.close()
+		if shell != nil {
+			shell.close()
+		}
 		return nil, persistentShellExit{code: 130}
 	}
 	if err != nil {
-		shell.close()
-		return nil, err
+		if shell != nil {
+			shell.close()
+		}
+		return nil, wrapSSHStartupEOF(ctx, err)
 	}
 	shell.ctx.CWD = shell.lastCWD
 	s.sshMu.Lock()
@@ -301,6 +263,101 @@ func (s *shellState) sshPersistentShell(ctx commandContext, output, stderr io.Wr
 	return shell, nil
 }
 
+func (s *shellState) startPersistentSSHShell(runCtx context.Context, ctx commandContext, client *persistentSSHClient, key string, output, stderr io.Writer) (*persistentSSHShell, error) {
+	session, err := client.client.NewSession()
+	if err != nil {
+		s.dropSSHClient(client.key)
+		reconnectCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+		client, err = s.sshClientForContext(reconnectCtx, ctx)
+		stopInterrupts()
+		if interrupted.Load() {
+			return nil, persistentShellExit{code: 130}
+		}
+		if err != nil {
+			return nil, wrapSSHStartupEOF(ctx, err)
+		}
+		session, err = client.client.NewSession()
+		if err != nil {
+			return nil, wrapSSHStartupEOF(ctx, err)
+		}
+	}
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		_ = session.Close()
+		return nil, wrapSSHStartupEOF(ctx, err)
+	}
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		_ = session.Close()
+		return nil, wrapSSHStartupEOF(ctx, err)
+	}
+	if err := requestPersistentSSHPty(session, output); err != nil {
+		_ = session.Close()
+		return nil, wrapSSHStartupEOF(ctx, err)
+	}
+	session.Stderr = stderr
+	done := make(chan error, 1)
+	controlClient, err := s.dialSSHConfigContext(runCtx, client.config)
+	if err != nil {
+		_ = session.Close()
+		return nil, wrapSSHStartupEOF(ctx, err)
+	}
+	controlSession, controlReader, controlDone, controlPath, err := startSSHControlSideband(controlClient, stderr)
+	if err != nil {
+		_ = session.Close()
+		_ = controlClient.Close()
+		return nil, wrapSSHStartupEOF(ctx, err)
+	}
+	shell := &persistentSSHShell{
+		key:            key,
+		name:           sshSessionDisplayName(ctx, client.config),
+		ctx:            ctx,
+		client:         client,
+		session:        session,
+		controlClient:  controlClient,
+		controlSession: controlSession,
+		stdin:          stdin,
+		stdout:         bufio.NewReader(stdout),
+		control:        controlReader,
+		done:           done,
+		controlDone:    controlDone,
+		lastCWD:        s.currentSSHCWD(ctx),
+	}
+	setOpenSSHStyleEnv(session)
+	script := sshPersistentShellSidebandScript(ctx, controlPath)
+	if err := session.Start("sh -ic " + shellQuote(script)); err != nil {
+		_ = session.Close()
+		_ = controlSession.Close()
+		_ = controlClient.Close()
+		return nil, wrapSSHStartupEOF(ctx, err)
+	}
+	go func() {
+		done <- session.Wait()
+	}()
+	go shell.forwardOutput()
+	waitStop, _ := s.startInterruptWatcher(func() {
+		_ = session.Signal(ssh.SIGINT)
+		_ = session.Close()
+	})
+	err = shell.waitReady()
+	waitStop()
+	if err != nil {
+		return shell, wrapSSHStartupEOF(ctx, err)
+	}
+	return shell, nil
+}
+
+func wrapSSHStartupEOF(ctx commandContext, err error) error {
+	if err == nil || !errors.Is(err, io.EOF) {
+		return err
+	}
+	host := strings.TrimSpace(ctx.SSHHost)
+	if host == "" {
+		host = "remote host"
+	}
+	return fmt.Errorf("ssh %s closed the connection before the shell was ready", host)
+}
+
 func requestPersistentSSHPty(session *ssh.Session, stdout io.Writer) error {
 	_, cols, rows := terminalRequestSize(stdout)
 	if cols <= 0 {
@@ -310,11 +367,105 @@ func requestPersistentSSHPty(session *ssh.Session, stdout io.Writer) error {
 		rows = 24
 	}
 	term := firstNonEmpty(os.Getenv("TERM"), "xterm-256color")
-	return session.RequestPty(term, rows, cols, ssh.TerminalModes{ssh.ECHO: 0})
+	return session.RequestPty(term, rows, cols, terminal.SSHTerminalModes(os.Stdin))
+}
+
+func setOpenSSHStyleEnv(session *ssh.Session) {
+	if session == nil {
+		return
+	}
+	for _, env := range os.Environ() {
+		name, value, ok := strings.Cut(env, "=")
+		if !ok {
+			continue
+		}
+		if name != "LANG" && !strings.HasPrefix(name, "LC_") {
+			continue
+		}
+		_ = session.Setenv(name, value)
+	}
 }
 
 func persistentSSHShellKey(clientKey string, ctx commandContext) string {
 	return clientKey
+}
+
+func startSSHControlSideband(client *ssh.Client, stderr io.Writer) (*ssh.Session, *bufio.Reader, chan error, string, error) {
+	session, err := client.NewSession()
+	if err != nil {
+		return nil, nil, nil, "", err
+	}
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		_ = session.Close()
+		return nil, nil, nil, "", err
+	}
+	session.Stderr = stderr
+	path := remoteControlFIFOPath()
+	command := sshControlSidebandCommand(path)
+	if err := session.Start("sh -lc " + shellQuote(command)); err != nil {
+		_ = session.Close()
+		return nil, nil, nil, "", err
+	}
+	reader := bufio.NewReader(stdout)
+	done := make(chan error, 1)
+	go func() {
+		done <- session.Wait()
+	}()
+	if err := waitSSHControlSidebandReady(reader, done); err != nil {
+		_ = session.Close()
+		return nil, nil, nil, "", err
+	}
+	return session, reader, done, path, nil
+}
+
+func waitSSHControlSidebandReady(reader *bufio.Reader, done <-chan error) error {
+	ready := make(chan error, 1)
+	go func() {
+		record, err := readPersistentControlRecord(reader)
+		if err != nil {
+			ready <- err
+			return
+		}
+		if record.kind != "control-ready" {
+			ready <- fmt.Errorf("unexpected ssh control record %q", record.kind)
+			return
+		}
+		ready <- nil
+	}()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-ready:
+		return err
+	case err := <-done:
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("ssh control sideband exited before ready")
+	case <-timer.C:
+		return fmt.Errorf("ssh control sideband did not become ready")
+	}
+}
+
+func remoteControlFIFOPath() string {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err == nil {
+		return "/tmp/vmsh-control-" + hex.EncodeToString(nonce[:]) + ".fifo"
+	}
+	return fmt.Sprintf("/tmp/vmsh-control-%d.fifo", time.Now().UnixNano())
+}
+
+func sshControlSidebandCommand(path string) string {
+	quoted := shellQuote(path)
+	return strings.Join([]string{
+		"__vmsh_control_path=" + quoted,
+		"rm -f \"$__vmsh_control_path\"",
+		"(umask 077 && mkfifo \"$__vmsh_control_path\") || exit 125",
+		"trap 'rm -f \"$__vmsh_control_path\"' EXIT HUP INT TERM",
+		"printf 'control-ready\\t0\\t%s\\n' \"$PWD\"",
+		"cat \"$__vmsh_control_path\"",
+	}, "\n")
 }
 
 func sshContextsMatch(a, b commandContext) bool {
@@ -343,7 +494,7 @@ func sshPersistentShellMatchesContext(shell *persistentSSHShell, ctx commandCont
 	return shell.key == persistentSSHShellKey(cfg.cacheKey(), ctx)
 }
 
-func sshPersistentShellScript(ctx commandContext) string {
+func sshPersistentShellSidebandScript(ctx commandContext, controlPath string) string {
 	var lines []string
 	cwd := strings.TrimSpace(ctx.CWD)
 	if cwd != "" && cwd != "~" {
@@ -351,15 +502,23 @@ func sshPersistentShellScript(ctx commandContext) string {
 	}
 	lines = append(lines,
 		"PS1= PS2= PS4=",
-		"set +m 2>/dev/null || true",
+		"set -m 2>/dev/null || true",
 		"stty -echo 2>/dev/null || true",
 		sshColorPrelude(),
-		"printf '__VMSH_READY__:%s\\n' \"$PWD\"",
-		"while IFS= read -r __vmsh_line; do",
-		"  eval \"$__vmsh_line\" 2>&1",
+		"__vmsh_control_path="+shellQuote(controlPath),
+		"exec 3>\"$__vmsh_control_path\" || exit",
+		"__vmsh_report() {",
+		"  printf '%s\\t%s\\t%s\\n' \"$1\" \"$2\" \"$PWD\" >&3",
+		"}",
+		"__vmsh_run() {",
+		"  stty echo 2>/dev/null || true",
+		"  eval \"$1\" 2>&1",
 		"  __vmsh_status=$?",
-		"  printf '__VMSH_DONE__:%s:%s\\n' \"$__vmsh_status\" \"$PWD\"",
-		"done",
+		"  stty -echo 2>/dev/null || true",
+		"  __vmsh_report done \"$__vmsh_status\"",
+		"}",
+		"__vmsh_report ready 0",
+		"while IFS= read -r __vmsh_line; do eval \"$__vmsh_line\"; done",
 	)
 	return strings.Join(lines, "\n")
 }
@@ -379,42 +538,15 @@ func sshPersistentShellEnded(err error) bool {
 }
 
 func (p *persistentSSHShell) waitReady() error {
-	type result struct {
-		cwd string
-		err error
-	}
-	ready := make(chan result, 1)
+	ready := make(chan error, 1)
 	go func() {
-		var startup strings.Builder
-		for {
-			line, err := p.stdout.ReadString('\n')
-			if line != "" {
-				if cwd, ok := parsePersistentReady(line); ok {
-					ready <- result{cwd: cwd}
-					return
-				}
-				appendPersistentStartupOutput(&startup, line)
-			}
-			if err != nil {
-				msg := persistentStartupMessage(startup.String())
-				if msg != "" {
-					ready <- result{err: fmt.Errorf("persistent ssh shell closed before ready: %s", msg)}
-					return
-				}
-				ready <- result{err: err}
-				return
-			}
-		}
+		ready <- p.waitReadySideband()
 	}()
 	timer := time.NewTimer(defaultGuestShellReadyTimeout)
 	defer timer.Stop()
 	select {
-	case result := <-ready:
-		if result.err != nil {
-			return result.err
-		}
-		p.lastCWD = result.cwd
-		return nil
+	case err := <-ready:
+		return err
 	case err := <-p.done:
 		if err != nil {
 			return err
@@ -425,59 +557,237 @@ func (p *persistentSSHShell) waitReady() error {
 	}
 }
 
-func (p *persistentSSHShell) run(line string, stdout io.Writer) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if _, err := fmt.Fprintln(p.stdin, line); err != nil {
-		return err
-	}
-	buf := make([]byte, 4096)
+func (p *persistentSSHShell) waitReadySideband() error {
 	for {
-		n, err := p.stdout.Read(buf)
-		if n > 0 {
-			out, code, cwd, done := p.consumeOutputChunk(string(buf[:n]))
-			if out != "" {
-				_, _ = io.WriteString(stdout, out)
-			}
-			if done {
-				p.lastCWD = cwd
-				p.ctx.CWD = cwd
-				if code != 0 {
-					return persistentShellExit{code: code}
-				}
-				return nil
-			}
-		}
+		record, err := readPersistentControlRecord(p.control)
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return fmt.Errorf("persistent ssh control sideband closed before ready")
+			}
 			return err
+		}
+		if record.kind == "ready" {
+			p.lastCWD = record.cwd
+			return nil
 		}
 	}
 }
 
-func (p *persistentSSHShell) consumeOutputChunk(text string) (string, int, string, bool) {
-	p.pending += text
-	idx := strings.Index(p.pending, persistentDoneMarkerPrefix)
-	if idx >= 0 {
-		newline := strings.IndexAny(p.pending[idx:], "\r\n")
-		if newline < 0 {
-			if idx > 0 {
-				out := p.pending[:idx]
-				p.pending = p.pending[idx:]
-				return out, 0, "", false
-			}
-			return "", 0, "", false
-		}
-		lineEnd := idx + newline
-		before := p.pending[:idx]
-		marker := p.pending[idx:lineEnd]
-		p.pending = strings.TrimLeft(p.pending[lineEnd:], "\r\n")
-		code, cwd, ok := parsePersistentMarker(marker)
-		return before, code, cwd, ok
+func (p *persistentSSHShell) run(line string, stdout, stderr io.Writer, onInterrupt ...func()) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.runSideband(line, stdout, stderr, onInterrupt...)
+}
+
+func (p *persistentSSHShell) runSideband(line string, stdout, stderr io.Writer, onInterrupt ...func()) error {
+	p.setOutput(stdout)
+	stopForwarding := func() {}
+	defer func() {
+		p.clearOutputSoon()
+		stopForwarding()
+	}()
+	stop, err := startSSHPTYForwarding(p, true, stdout, stderr, onInterrupt...)
+	if err != nil {
+		return err
 	}
-	keep := persistentMarkerPrefixSuffixLen(p.pending)
-	out := p.pending[:len(p.pending)-keep]
-	p.pending = p.pending[len(p.pending)-keep:]
-	return out, 0, "", false
+	if stop != nil {
+		stopForwarding = stop
+	}
+	if _, err := fmt.Fprintln(p.stdin, "__vmsh_run "+shellQuote(line)); err != nil {
+		return err
+	}
+	for {
+		record, err := readPersistentControlRecord(p.control)
+		if err != nil {
+			return err
+		}
+		if record.kind != "done" {
+			continue
+		}
+		p.lastCWD = record.cwd
+		p.ctx.CWD = record.cwd
+		if record.code != 0 {
+			return persistentShellExit{code: record.code}
+		}
+		return nil
+	}
+}
+
+func (p *persistentSSHShell) forwardOutput() {
+	buf := make([]byte, 4096)
+	for {
+		n, err := p.stdout.Read(buf)
+		if n > 0 {
+			p.outputMu.Lock()
+			output := p.output
+			if output != nil {
+				writePTYOutput(output, buf[:n])
+			}
+			p.outputMu.Unlock()
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (p *persistentSSHShell) setOutput(output io.Writer) {
+	p.outputMu.Lock()
+	p.output = output
+	p.outputMu.Unlock()
+}
+
+func (p *persistentSSHShell) clearOutputSoon() {
+	time.Sleep(20 * time.Millisecond)
+	p.setOutput(nil)
+}
+
+func startSSHPTYForwarding(p *persistentSSHShell, tty bool, stdout, stderr io.Writer, onInterrupt ...func()) (func(), error) {
+	done := make(chan struct{})
+	restore := func() {}
+	cancelRead := func() {}
+	var producers sync.WaitGroup
+	if tty {
+		resizeSSHPTY(p, stdout)
+	}
+	if tty {
+		file, ok := terminalWriterFile(stdout)
+		if ok && terminal.IsTerminalFD(int(file.Fd())) && terminal.IsTerminalFD(int(os.Stdin.Fd())) {
+			terminalRestore, err := terminal.MakeAttachedRaw(os.Stdin)
+			if err != nil {
+				return nil, err
+			}
+			inputCancel, err := newPTYInputCanceller(os.Stdin)
+			if err != nil {
+				terminalRestore()
+				return nil, err
+			}
+			restore = terminalRestore
+			cancelRead = inputCancel.cancel
+			producers.Add(1)
+			go func() {
+				defer producers.Done()
+				defer inputCancel.close()
+				streamSSHPTYStdin(os.Stdin, p.stdin, done, inputCancel, terminalWriterRecorder(stdout), onInterrupt...)
+			}()
+		}
+	}
+
+	producers.Add(1)
+	go func() {
+		defer producers.Done()
+		forwardSSHPTYSignals(p, done, tty, stdout, stderr)
+	}()
+
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			close(done)
+			cancelRead()
+			producers.Wait()
+			restore()
+		})
+	}
+	return stop, nil
+}
+
+func streamSSHPTYStdin(in *os.File, out io.Writer, done <-chan struct{}, inputCancel *ptyInputCanceller, recorder *asciinemaRecorder, onInterrupt ...func()) {
+	var buf [4096]byte
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		n, err := readPTYInput(in, buf[:], done, inputCancel)
+		if n > 0 {
+			if recorder != nil {
+				recorder.recordInput(buf[:n])
+			}
+			if bytes.Contains(buf[:n], []byte{0x03}) {
+				for _, fn := range onInterrupt {
+					if fn != nil {
+						fn()
+					}
+				}
+			}
+			if !writeSSHPTYInput(out, done, buf[:n]) {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func writeSSHPTYInput(out io.Writer, done <-chan struct{}, data []byte) bool {
+	for len(data) > 0 {
+		select {
+		case <-done:
+			return false
+		default:
+		}
+		n, err := out.Write(data)
+		if err != nil {
+			return false
+		}
+		if n <= 0 {
+			return false
+		}
+		data = data[n:]
+	}
+	return true
+}
+
+func forwardSSHPTYSignals(p *persistentSSHShell, done <-chan struct{}, tty bool, stdout, stderr io.Writer) {
+	signals := terminal.HostSignals(tty)
+	sigCh := make(chan os.Signal, 8)
+	signal.Notify(sigCh, signals...)
+	defer signal.Stop(sigCh)
+	for {
+		select {
+		case <-done:
+			return
+		case sig := <-sigCh:
+			if sig == nil {
+				continue
+			}
+			if terminal.IsResizeSignal(sig) {
+				resizeSSHPTY(p, stdout)
+				continue
+			}
+			name, ok := terminal.SignalName(sig)
+			if !ok {
+				continue
+			}
+			if name == "INT" {
+				fmt.Fprintln(stderr)
+			}
+			writeSSHPTYSignal(p, name)
+		}
+	}
+}
+
+func resizeSSHPTY(p *persistentSSHShell, stdout io.Writer) {
+	file, ok := terminalWriterFile(stdout)
+	if !ok {
+		return
+	}
+	cols, rows, err := terminal.Size(file)
+	if err != nil || cols <= 0 || rows <= 0 {
+		return
+	}
+	_ = p.session.WindowChange(rows, cols)
+}
+
+func writeSSHPTYSignal(p *persistentSSHShell, name string) {
+	switch name {
+	case "INT":
+		_, _ = p.stdin.Write([]byte{0x03})
+	case "QUIT":
+		_, _ = p.stdin.Write([]byte{0x1c})
+	}
 }
 
 func (p *persistentSSHShell) cwd() string {
@@ -493,9 +803,21 @@ func (p *persistentSSHShell) close() {
 	if p.session != nil {
 		_ = p.session.Close()
 	}
+	if p.controlSession != nil {
+		_ = p.controlSession.Close()
+	}
+	if p.controlClient != nil {
+		_ = p.controlClient.Close()
+	}
 	select {
 	case <-p.done:
 	case <-time.After(2 * time.Second):
+	}
+	if p.controlDone != nil {
+		select {
+		case <-p.controlDone:
+		case <-time.After(2 * time.Second):
+		}
 	}
 }
 

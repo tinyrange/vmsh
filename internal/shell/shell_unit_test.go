@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -28,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -149,7 +151,10 @@ func TestGuestPersistentShellRestartsWhenIsolationChanges(t *testing.T) {
 		starts = append(starts, req)
 		mu.Unlock()
 		if onEvent != nil {
-			if err := onEvent(client.ExecEvent{Kind: "stdout", Output: "__VMSH_READY__:" + req.WorkDir + "\n"}); err != nil {
+			if !req.ControlFD {
+				return fmt.Errorf("persistent shell did not request control fd")
+			}
+			if err := onEvent(client.ExecEvent{Kind: "control", Output: "ready\t0\t" + req.WorkDir + "\n"}); err != nil {
 				return err
 			}
 		}
@@ -158,7 +163,10 @@ func TestGuestPersistentShellRestartsWhenIsolationChanges(t *testing.T) {
 				return nil
 			}
 			if input.Kind == "stdin" && onEvent != nil {
-				if err := onEvent(client.ExecEvent{Kind: "stdout", Output: "__VMSH_DONE__:0:" + req.WorkDir + "\n"}); err != nil {
+				if !strings.HasPrefix(string(input.Data), "__vmsh_run ") {
+					return fmt.Errorf("persistent shell command = %q, want wrapped command", string(input.Data))
+				}
+				if err := onEvent(client.ExecEvent{Kind: "control", Output: "done\t0\t" + req.WorkDir + "\n"}); err != nil {
 					return err
 				}
 			}
@@ -1388,7 +1396,7 @@ func TestStreamHostPTYStdinControlCCallsInterruptHook(t *testing.T) {
 	called := make(chan struct{})
 	var once sync.Once
 
-	go streamHostPTYStdin(inR, outW, done, interrupted, func() {
+	go streamHostPTYStdin(inR, outW, done, nil, interrupted, nil, func() {
 		once.Do(func() {
 			close(called)
 		})
@@ -1404,6 +1412,118 @@ func TestStreamHostPTYStdinControlCCallsInterruptHook(t *testing.T) {
 	}
 	if !interrupted.Load() {
 		t.Fatalf("interrupted flag was not set")
+	}
+}
+
+func TestStreamSSHPTYStdinForwardsDelayedInputBytes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PTY stdin test uses os.Pipe readiness semantics")
+	}
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("input pipe: %v", err)
+	}
+	defer inR.Close()
+	defer inW.Close()
+	if err := syscall.SetNonblock(int(inR.Fd()), true); err != nil {
+		t.Fatalf("set nonblock: %v", err)
+	}
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("output pipe: %v", err)
+	}
+	defer outR.Close()
+	defer outW.Close()
+	done := make(chan struct{})
+	defer close(done)
+
+	go streamSSHPTYStdin(inR, outW, done, nil, nil)
+	input := "press-key\x1b[I"
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		_, _ = inW.Write([]byte(input))
+	}()
+	buf := make([]byte, len(input))
+	if _, err := io.ReadFull(outR, buf); err != nil {
+		t.Fatalf("read forwarded input: %v", err)
+	}
+	if string(buf) != input {
+		t.Fatalf("forwarded input = %q", string(buf))
+	}
+}
+
+func TestStreamSSHPTYStdinControlCCallsInterruptHook(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PTY stdin test uses os.Pipe readiness semantics")
+	}
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("input pipe: %v", err)
+	}
+	defer inR.Close()
+	defer inW.Close()
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("output pipe: %v", err)
+	}
+	defer outR.Close()
+	defer outW.Close()
+	done := make(chan struct{})
+	defer close(done)
+	called := make(chan struct{})
+	var once sync.Once
+
+	go streamSSHPTYStdin(inR, outW, done, nil, nil, func() {
+		once.Do(func() {
+			close(called)
+		})
+	})
+	if _, err := inW.Write([]byte{0x03}); err != nil {
+		t.Fatalf("write ctrl-c: %v", err)
+	}
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(outR, buf); err != nil {
+		t.Fatalf("read forwarded ctrl-c: %v", err)
+	}
+	if buf[0] != 0x03 {
+		t.Fatalf("forwarded byte = %#x, want ctrl-c", buf[0])
+	}
+	select {
+	case <-called:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("interrupt hook was not called")
+	}
+}
+
+func TestCommandInterruptEscalatorForwardedInterruptSkipsSoftSignal(t *testing.T) {
+	var stderr bytes.Buffer
+	var soft atomic.Int32
+	var hard atomic.Int32
+	interrupts := newCommandInterruptEscalator("vim file.svg", &stderr, func() {
+		soft.Add(1)
+	}, func() {
+		hard.Add(1)
+	})
+
+	interrupts.ForwardedInterrupt()
+	if got := soft.Load(); got != 0 {
+		t.Fatalf("soft interrupts after forwarded ctrl-c = %d, want 0", got)
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr after first forwarded ctrl-c = %q", stderr.String())
+	}
+
+	interrupts.ForwardedInterrupt()
+	if got := soft.Load(); got != 0 {
+		t.Fatalf("soft interrupts after second forwarded ctrl-c = %d, want 0", got)
+	}
+	if !strings.Contains(stderr.String(), "not responding to SIGINT") {
+		t.Fatalf("stderr after second forwarded ctrl-c = %q", stderr.String())
+	}
+
+	interrupts.ForwardedInterrupt()
+	if got := hard.Load(); got != 1 {
+		t.Fatalf("hard interrupts after third forwarded ctrl-c = %d, want 1", got)
 	}
 }
 
@@ -1503,19 +1623,17 @@ func TestPersistentHostShellStreamsPartialOutputBeforeCompletion(t *testing.T) {
 	}
 }
 
-func TestPersistentHostShellMarkerScannerHandlesSplitMarker(t *testing.T) {
-	p := &persistentHostShell{}
-	out, _, _, done := p.consumeOutputChunk("frame")
-	if out != "frame" || done {
-		t.Fatalf("first chunk out=%q done=%t", out, done)
+func TestPersistentHostShellReadsControlRecordsOutOfBand(t *testing.T) {
+	var control bytes.Buffer
+	control.WriteString("done\t7\t/tmp/project\n")
+	p := &persistentHostShell{control: bufio.NewReader(&control)}
+
+	record, err := p.readControlRecord()
+	if err != nil {
+		t.Fatalf("read control record: %v", err)
 	}
-	out, _, _, done = p.consumeOutputChunk("__VMSH_")
-	if out != "" || done {
-		t.Fatalf("marker prefix chunk out=%q done=%t", out, done)
-	}
-	out, code, cwd, done := p.consumeOutputChunk("DONE__:7:/tmp\r\n")
-	if out != "" || !done || code != 7 || cwd != "/tmp" {
-		t.Fatalf("marker completion out=%q done=%t code=%d cwd=%q", out, done, code, cwd)
+	if record.kind != "done" || record.code != 7 || record.cwd != "/tmp/project" {
+		t.Fatalf("control record = %+v", record)
 	}
 }
 
@@ -1812,6 +1930,79 @@ func TestGuestPipelineStreamsLargeInputInChunks(t *testing.T) {
 	}
 }
 
+func TestAsciinemaRecorderWritesV2OutputEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.cast")
+	rec, err := newAsciinemaRecorder(path, 120, 40)
+	if err != nil {
+		t.Fatalf("create recorder: %v", err)
+	}
+	terminalOut, err := os.Create(filepath.Join(t.TempDir(), "terminal.out"))
+	if err != nil {
+		t.Fatalf("create terminal output: %v", err)
+	}
+	defer terminalOut.Close()
+	writer := newRecordingTerminalWriter(terminalOut, rec)
+	if _, err := writer.Write([]byte("hello\x1b[31m\n")); err != nil {
+		t.Fatalf("write recorded output: %v", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("close recorder: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read cast: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("cast lines = %d, want 2\n%s", len(lines), string(data))
+	}
+	var header struct {
+		Version int `json:"version"`
+		Width   int `json:"width"`
+		Height  int `json:"height"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &header); err != nil {
+		t.Fatalf("parse header: %v", err)
+	}
+	if header.Version != 2 || header.Width != 120 || header.Height != 40 {
+		t.Fatalf("header = %+v", header)
+	}
+	var event []any
+	if err := json.Unmarshal([]byte(lines[1]), &event); err != nil {
+		t.Fatalf("parse event: %v", err)
+	}
+	if len(event) != 3 || event[1] != "o" || event[2] != "hello\x1b[31m\n" {
+		t.Fatalf("event = %#v", event)
+	}
+}
+
+func TestAsciinemaRecorderWritesInputEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.cast")
+	rec, err := newAsciinemaRecorder(path, 80, 24)
+	if err != nil {
+		t.Fatalf("create recorder: %v", err)
+	}
+	rec.recordInput([]byte("\x1b[6;10R"))
+	if err := rec.Close(); err != nil {
+		t.Fatalf("close recorder: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read cast: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("cast lines = %d, want 2\n%s", len(lines), string(data))
+	}
+	var event []any
+	if err := json.Unmarshal([]byte(lines[1]), &event); err != nil {
+		t.Fatalf("parse event: %v", err)
+	}
+	if len(event) != 3 || event[1] != "i" || event[2] != "\x1b[6;10R" {
+		t.Fatalf("event = %#v", event)
+	}
+}
+
 func TestSSHAtCommandUsesHostSSHConfigAlias(t *testing.T) {
 	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
 		_, _ = io.WriteString(stdout, "ssh-ok\n")
@@ -2008,21 +2199,11 @@ func TestSSHUnknownHostKeyCanBeAccepted(t *testing.T) {
 }
 
 func TestSSHContextTracksRemoteCWD(t *testing.T) {
-	remoteLines := make(chan string, 4)
-	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
-		if strings.Contains(command, "__VMSH_READY__") {
-			_, _ = io.WriteString(stdout, "__VMSH_READY__:/home/test\n")
-			scanner := bufio.NewScanner(stdin)
-			for scanner.Scan() {
-				line := scanner.Text()
-				remoteLines <- line
-				_, _ = io.WriteString(stdout, "/srv/test-ssh-a\n__VMSH_DONE__:0:/srv/test-ssh-a\n")
-			}
-			return 0
-		}
+	sideband := newTestSSHSideband(t, "/home/test", func(line string, stdout io.Writer) (int, string) {
 		_, _ = io.WriteString(stdout, "/srv/test-ssh-a\n")
-		return 0
+		return 0, "/srv/test-ssh-a"
 	})
+	server := startTestSSHServer(t, sideband.handler(t))
 	server.installConfig(t, "test-ssh-a")
 
 	sh := newUnitShell(t, newRecordingShellAPI())
@@ -2040,12 +2221,162 @@ func TestSSHContextTracksRemoteCWD(t *testing.T) {
 		t.Fatalf("ssh cwd = %q, want /srv/test-ssh-a", sh.context.CWD)
 	}
 	select {
-	case line := <-remoteLines:
+	case line := <-sideband.lines:
 		if !strings.Contains(line, "cd ") || !strings.Contains(line, "project") {
 			t.Fatalf("remote persistent line = %q, want cd project", line)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("persistent ssh shell did not receive cd command")
+	}
+}
+
+func TestSSHPersistentShellUsesSidebandControl(t *testing.T) {
+	controlRecords := make(chan string, 8)
+	controlStarted := make(chan struct{})
+	mainLines := make(chan string, 2)
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		switch {
+		case strings.Contains(command, "mkfifo") && strings.Contains(command, "cat"):
+			_, _ = io.WriteString(stdout, "control-ready\t0\t/tmp\n")
+			close(controlStarted)
+			for record := range controlRecords {
+				_, _ = io.WriteString(stdout, record)
+			}
+			return 0
+		case strings.Contains(command, "__vmsh_control_path"):
+			if strings.Contains(command, "__VMSH_READY__") || strings.Contains(command, "__VMSH_DONE__") {
+				_, _ = io.WriteString(stderr, "terminal marker leaked into sideband shell")
+				return 1
+			}
+			select {
+			case <-controlStarted:
+			case <-time.After(2 * time.Second):
+				_, _ = io.WriteString(stderr, "control sideband did not start")
+				return 1
+			}
+			controlRecords <- "ready\t0\t/home/test\n"
+			scanner := bufio.NewScanner(stdin)
+			for scanner.Scan() {
+				line := scanner.Text()
+				mainLines <- line
+				_, _ = io.WriteString(stdout, "sideband-output\n")
+				controlRecords <- "done\t0\t/srv/sideband\n"
+			}
+			close(controlRecords)
+			return 0
+		default:
+			return 0
+		}
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ssh test-ssh-a", &stdout, &stderr); err != nil {
+		t.Fatalf("enter ssh context: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if err := sh.eval("printf hi", &stdout, &stderr); err != nil {
+		t.Fatalf("run persistent ssh command: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "sideband-output") {
+		t.Fatalf("stdout = %q, want sideband command output", stdout.String())
+	}
+	if sh.context.CWD != "/srv/sideband" {
+		t.Fatalf("ssh cwd = %q, want /srv/sideband", sh.context.CWD)
+	}
+	select {
+	case line := <-mainLines:
+		if !strings.HasPrefix(line, "__vmsh_run ") || !strings.Contains(line, "printf hi") {
+			t.Fatalf("persistent ssh line = %q, want wrapped command", line)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("persistent ssh shell did not receive wrapped command")
+	}
+	for _, command := range server.commands() {
+		if strings.Contains(command, "__VMSH_READY__") || strings.Contains(command, "__VMSH_DONE__") {
+			t.Fatalf("server command contains terminal marker: %q", command)
+		}
+	}
+}
+
+func TestSSHPersistentShellStartupEOFDoesNotExit(t *testing.T) {
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		return 0
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var stdout, stderr bytes.Buffer
+	err := sh.eval("@ssh test-ssh-a", &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("enter ssh context succeeded, want startup error")
+	}
+	if errors.Is(err, io.EOF) {
+		t.Fatalf("ssh startup returned io.EOF, which exits the vmsh line editor")
+	}
+	if !strings.Contains(err.Error(), "before") || !strings.Contains(err.Error(), "ready") {
+		t.Fatalf("ssh startup error = %q, want before-ready message", err.Error())
+	}
+	if sh.context.Mode == modeSSH {
+		t.Fatalf("ssh context changed after failed startup: %+v", sh.context)
+	}
+}
+
+func TestSSHPersistentShellDoesNotUseTerminalMarkersWhenSidebandClosesBeforeReady(t *testing.T) {
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		switch {
+		case strings.Contains(command, "mkfifo") && strings.Contains(command, "cat"):
+			_, _ = io.WriteString(stdout, "control-ready\t0\t/tmp\n")
+			return 0
+		case strings.Contains(command, "__vmsh_control_path"):
+			return 0
+		default:
+			return 0
+		}
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var stdout, stderr bytes.Buffer
+	err := sh.eval("@ssh test-ssh-a", &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("enter ssh context succeeded, want sideband startup error")
+	}
+	for _, command := range server.commands() {
+		if strings.Contains(command, "__VMSH_READY__") || strings.Contains(command, "__VMSH_DONE__") {
+			t.Fatalf("server command contains legacy terminal marker: %q", command)
+		}
+	}
+}
+
+func TestSSHContextDoesNotInheritVMUser(t *testing.T) {
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		switch {
+		case strings.Contains(command, "mkfifo") && strings.Contains(command, "cat"):
+			_, _ = io.WriteString(stdout, "control-ready\t0\t/tmp\n")
+			io.Copy(io.Discard, stdin)
+			return 0
+		case strings.Contains(command, "__vmsh_control_path"):
+			_, _ = io.WriteString(stderr, "sideband main shell should not start for wrong user test")
+			return 1
+		default:
+			return 0
+		}
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.context = commandContext{Mode: modeVM, Image: "alpine", User: "root", CWD: "/root"}
+	ctx := sshCommandContext(sh.context, commandOptions{}, "test-ssh-a")
+	cfg, err := resolveSSHConfig(ctx)
+	if err != nil {
+		t.Fatalf("resolve ssh config: %v", err)
+	}
+	if cfg.User != "testuser" {
+		t.Fatalf("ssh user = %q, want config user testuser", cfg.User)
+	}
+	if ctx.User != "" {
+		t.Fatalf("ssh context user inherited %q from VM", ctx.User)
 	}
 }
 
@@ -2113,20 +2444,39 @@ func TestSSHConnectionIsPersistentPerHost(t *testing.T) {
 
 func TestSSHContextKeepsPersistentShellUntilStop(t *testing.T) {
 	closed := make(chan struct{})
-	remoteLines := make(chan string, 2)
 	var readyCount atomic.Int32
+	sideband := newTestSSHSideband(t, "/home/test", func(line string, stdout io.Writer) (int, string) {
+		return 0, "/home/test"
+	})
 	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
-		if strings.Contains(command, "__VMSH_READY__") {
+		switch {
+		case strings.Contains(command, "mkfifo") && strings.Contains(command, "cat"):
+			_, _ = io.WriteString(stdout, "control-ready\t0\t/tmp\n")
+			sideband.once.Do(func() { close(sideband.ready) })
+			for record := range sideband.records {
+				_, _ = io.WriteString(stdout, record)
+			}
+			return 0
+		case strings.Contains(command, "__vmsh_control_path"):
 			readyCount.Add(1)
-			_, _ = io.WriteString(stdout, "__VMSH_READY__:/home/test\n")
+			select {
+			case <-sideband.ready:
+			case <-time.After(2 * time.Second):
+				_, _ = io.WriteString(stderr, "control sideband did not start")
+				return 1
+			}
+			sideband.records <- "ready\t0\t/home/test\n"
 			scanner := bufio.NewScanner(stdin)
 			for scanner.Scan() {
-				remoteLines <- scanner.Text()
-				_, _ = io.WriteString(stdout, "__VMSH_DONE__:0:/home/test\n")
+				sideband.lines <- scanner.Text()
+				sideband.records <- "done\t0\t/home/test\n"
 			}
+			close(sideband.records)
 			close(closed)
+			return 0
+		default:
+			return 0
 		}
-		return 0
 	})
 	server.installConfig(t, "test-ssh-a")
 
@@ -2151,7 +2501,7 @@ func TestSSHContextKeepsPersistentShellUntilStop(t *testing.T) {
 		t.Fatalf("persistent ssh shell starts = %d, want one reused shell", got)
 	}
 	select {
-	case line := <-remoteLines:
+	case line := <-sideband.lines:
 		if !strings.Contains(line, "printf still-open") {
 			t.Fatalf("remote persistent line = %q, want printf command", line)
 		}
@@ -2172,10 +2522,21 @@ func TestSSHPersistentShellSurvivesDotFailure(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("persistent ssh shell script uses POSIX sh")
 	}
-	cmd := exec.Command("sh", "-ic", sshPersistentShellScript(commandContext{}))
-	var stdout bytes.Buffer
+	controlPath := filepath.Join(t.TempDir(), "control.fifo")
+	if err := exec.Command("mkfifo", controlPath).Run(); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	cat := exec.Command("cat", controlPath)
+	var control bytes.Buffer
+	cat.Stdout = &control
+	if err := cat.Start(); err != nil {
+		t.Fatalf("start control reader: %v", err)
+	}
+
+	cmd := exec.Command("sh", "-ic", sshPersistentShellSidebandScript(commandContext{}, controlPath))
+	var terminal bytes.Buffer
 	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	cmd.Stdout = &terminal
 	cmd.Stderr = &stderr
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -2184,8 +2545,8 @@ func TestSSHPersistentShellSurvivesDotFailure(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start shell: %v", err)
 	}
-	_, _ = io.WriteString(stdin, ". profile\n")
-	_, _ = io.WriteString(stdin, "echo after\n")
+	_, _ = fmt.Fprintln(stdin, "__vmsh_run "+shellQuote(". profile"))
+	_, _ = fmt.Fprintln(stdin, "__vmsh_run "+shellQuote("echo after"))
 	_ = stdin.Close()
 
 	done := make(chan error, 1)
@@ -2195,23 +2556,30 @@ func TestSSHPersistentShellSurvivesDotFailure(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("shell exited with %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+			t.Fatalf("shell exited with %v\nterminal:\n%s\ncontrol:\n%s\nstderr:\n%s", err, terminal.String(), control.String(), stderr.String())
 		}
 	case <-time.After(2 * time.Second):
 		_ = cmd.Process.Kill()
-		t.Fatalf("persistent shell script hung\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+		t.Fatalf("persistent shell script hung\nterminal:\n%s\ncontrol:\n%s\nstderr:\n%s", terminal.String(), control.String(), stderr.String())
+	}
+	if err := cat.Wait(); err != nil {
+		t.Fatalf("control reader exited with %v\ncontrol:\n%s", err, control.String())
 	}
 
 	var codes []int
-	normalized := strings.ReplaceAll(stdout.String(), "\r\n", "\n")
-	for _, line := range strings.Split(normalized, "\n") {
-		code, _, ok := parsePersistentMarker(line)
-		if ok {
-			codes = append(codes, code)
+	scanner := bufio.NewScanner(strings.NewReader(control.String()))
+	for scanner.Scan() {
+		record, err := parsePersistentControlRecord(scanner.Text())
+		if err != nil {
+			t.Fatalf("parse control record: %v", err)
+		}
+		if record.kind == "done" {
+			codes = append(codes, record.code)
 		}
 	}
-	if !strings.Contains(normalized, "after") || !reflect.DeepEqual(codes, []int{1, 0}) {
-		t.Fatalf("persistent shell output did not survive dot failure; codes=%v\nstdout:\n%s\nstderr:\n%s", codes, stdout.String(), stderr.String())
+	normalized := strings.ReplaceAll(terminal.String(), "\r\n", "\n")
+	if !strings.Contains(normalized, "after") || len(codes) != 2 || codes[0] == 0 || codes[1] != 0 {
+		t.Fatalf("persistent shell output did not survive dot failure; codes=%v\nterminal:\n%s\ncontrol:\n%s\nstderr:\n%s", codes, terminal.String(), control.String(), stderr.String())
 	}
 }
 
@@ -2390,15 +2758,13 @@ func TestCopySSHHostFileToGuest(t *testing.T) {
 
 func TestSSHCopyBetweenActiveSessions(t *testing.T) {
 	payload := "module github.com/tinyrange/vmsh\n"
+	srcSideband := newTestSSHSideband(t, "/home/test", func(line string, stdout io.Writer) (int, string) {
+		return 0, "/home/test"
+	})
 	srcServer := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
 		switch {
-		case strings.Contains(command, "__VMSH_READY__"):
-			_, _ = io.WriteString(stdout, "__VMSH_READY__:/home/test\n")
-			scanner := bufio.NewScanner(stdin)
-			for scanner.Scan() {
-				_, _ = io.WriteString(stdout, "__VMSH_DONE__:0:/home/test\n")
-			}
-			return 0
+		case strings.Contains(command, "mkfifo") || strings.Contains(command, "__vmsh_control_path"):
+			return srcSideband.handler(t)(command, stdin, stdout, stderr)
 		case strings.Contains(command, "tar -cf -"):
 			tw := tar.NewWriter(stdout)
 			_ = tw.WriteHeader(&tar.Header{Name: "go.mod", Mode: 0o644, Size: int64(len(payload))})
@@ -2410,15 +2776,13 @@ func TestSSHCopyBetweenActiveSessions(t *testing.T) {
 		}
 	})
 	received := make(chan string, 1)
+	dstSideband := newTestSSHSideband(t, "/home/test", func(line string, stdout io.Writer) (int, string) {
+		return 0, "/home/test"
+	})
 	dstServer := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
 		switch {
-		case strings.Contains(command, "__VMSH_READY__"):
-			_, _ = io.WriteString(stdout, "__VMSH_READY__:/home/test\n")
-			scanner := bufio.NewScanner(stdin)
-			for scanner.Scan() {
-				_, _ = io.WriteString(stdout, "__VMSH_DONE__:0:/home/test\n")
-			}
-			return 0
+		case strings.Contains(command, "mkfifo") || strings.Contains(command, "__vmsh_control_path"):
+			return dstSideband.handler(t)(command, stdin, stdout, stderr)
 		case strings.Contains(command, "tar -xf -"):
 			tr := tar.NewReader(stdin)
 			header, err := tr.Next()
@@ -2465,15 +2829,13 @@ func TestSSHCopyBetweenActiveSessions(t *testing.T) {
 }
 
 func TestSSHCompletionUsesConfigAndRemotePath(t *testing.T) {
+	sideband := newTestSSHSideband(t, "/home/test", func(line string, stdout io.Writer) (int, string) {
+		return 0, "/home/test"
+	})
 	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
 		switch {
-		case strings.Contains(command, "__VMSH_READY__"):
-			_, _ = io.WriteString(stdout, "__VMSH_READY__:/home/test\n")
-			scanner := bufio.NewScanner(stdin)
-			for scanner.Scan() {
-				_, _ = io.WriteString(stdout, "__VMSH_DONE__:0:/home/test\n")
-			}
-			return 0
+		case strings.Contains(command, "mkfifo") || strings.Contains(command, "__vmsh_control_path"):
+			return sideband.handler(t)(command, stdin, stdout, stderr)
 		case strings.Contains(command, "for p in"):
 			_, _ = io.WriteString(stdout, "le\nfolder/\n")
 			return 0
@@ -2654,6 +3016,60 @@ func startKeyboardInteractiveChallengeTestSSHServer(t *testing.T, questions []st
 	return startConfiguredTestSSHServer(t, "", true, questions, echos, answers, handler)
 }
 
+type testSSHSideband struct {
+	lines    chan string
+	records  chan string
+	ready    chan struct{}
+	once     sync.Once
+	readyCWD string
+	run      func(string, io.Writer) (int, string)
+}
+
+func newTestSSHSideband(t *testing.T, readyCWD string, run func(string, io.Writer) (int, string)) *testSSHSideband {
+	t.Helper()
+	return &testSSHSideband{
+		lines:    make(chan string, 8),
+		records:  make(chan string, 16),
+		ready:    make(chan struct{}),
+		readyCWD: readyCWD,
+		run:      run,
+	}
+}
+
+func (h *testSSHSideband) handler(t *testing.T) func(string, io.Reader, io.Writer, io.Writer) uint32 {
+	t.Helper()
+	return func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		switch {
+		case strings.Contains(command, "mkfifo") && strings.Contains(command, "cat"):
+			_, _ = io.WriteString(stdout, "control-ready\t0\t/tmp\n")
+			h.once.Do(func() { close(h.ready) })
+			for record := range h.records {
+				_, _ = io.WriteString(stdout, record)
+			}
+			return 0
+		case strings.Contains(command, "__vmsh_control_path"):
+			select {
+			case <-h.ready:
+			case <-time.After(2 * time.Second):
+				_, _ = io.WriteString(stderr, "control sideband did not start")
+				return 1
+			}
+			h.records <- "ready\t0\t" + h.readyCWD + "\n"
+			scanner := bufio.NewScanner(stdin)
+			for scanner.Scan() {
+				line := scanner.Text()
+				h.lines <- line
+				code, cwd := h.run(line, stdout)
+				h.records <- fmt.Sprintf("done\t%d\t%s\n", code, cwd)
+			}
+			close(h.records)
+			return 0
+		default:
+			return 0
+		}
+	}
+}
+
 func startConfiguredTestSSHServer(t *testing.T, password string, keyboard bool, questions []string, echos []bool, answers []string, handler func(string, io.Reader, io.Writer, io.Writer) uint32) *testSSHServer {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -2800,6 +3216,8 @@ func (s *testSSHServer) handleChannel(channel cryptossh.Channel, requests <-chan
 	defer channel.Close()
 	for req := range requests {
 		switch req.Type {
+		case "env":
+			_ = req.Reply(true, nil)
 		case "pty-req":
 			s.mu.Lock()
 			s.ptys++
