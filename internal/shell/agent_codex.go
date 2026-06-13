@@ -78,6 +78,8 @@ func (s *shellState) runAgent(at atLine, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	progress := newTerminalHoldStatus(stderr, "Codex: preparing agent")
+	defer progress.Close()
 	if at.Options.AgentProxy {
 		opts.Proxy = true
 	}
@@ -89,6 +91,9 @@ func (s *shellState) runAgent(at atLine, stdout, stderr io.Writer) error {
 	if at.Options.Network == nil {
 		ctx.Network = true
 	}
+	if ctx.Isolated {
+		opts.Proxy = true
+	}
 	hostCodexHome, err := hostCodexHomeDir()
 	if err != nil {
 		return err
@@ -96,37 +101,56 @@ func (s *shellState) runAgent(at atLine, stdout, stderr io.Writer) error {
 	if err := os.MkdirAll(hostCodexHome, 0o700); err != nil {
 		return err
 	}
-	target, err := s.detectGuestCodexTarget(ctx, stderr)
+	progress.Update("Codex: ensuring guest image")
+	if err := s.ensureImageAvailable(ctx, stderr); err != nil {
+		return err
+	}
+	progress.Update("Codex: starting guest VM")
+	if err := s.ensureVMRunning(ctx, stderr); err != nil {
+		return err
+	}
+	progress.Update("Codex: detecting guest platform")
+	target, err := s.detectGuestCodexTarget(ctx)
 	if err != nil {
 		return err
 	}
+	progress.Update("Codex: ensuring CLI release for " + target)
 	release, err := ensureHostCodexRelease(hostCodexHome, target, opts, stderr)
 	if err != nil {
 		return err
 	}
 	if opts.Proxy {
+		progress.Update("Codex: starting host auth proxy")
 		proxy, err := startCodexAgentProxy(hostCodexHome)
 		if err != nil {
 			return err
 		}
 		defer proxy.Close()
+		progress.Update("Codex: allowing proxy access from guest")
 		if err := s.allowRunningCodexAgentProxyPort(ctx, proxy.Port()); err != nil {
 			return err
 		}
+		progress.Update("Codex: preparing isolated guest launch")
 		req, err := s.prepareCodexAgentProxyRunRequest(ctx, hostCodexHome, release, opts.Args, proxy.Port(), proxy.Token(), stdout, stderr)
 		if err != nil {
 			return err
 		}
+		progress.Update("Codex: launching guest agent")
+		progress.Close()
 		return s.streamGuestRun(backendVMID(ctx), req, stdout, stderr)
 	}
+	progress.Update("Codex: preparing guest home")
 	agentHome, err := prepareCodexAgentHome(hostCodexHome, ctx, target)
 	if err != nil {
 		return err
 	}
+	progress.Update("Codex: preparing guest launch")
 	req, err := s.prepareCodexAgentRunRequest(ctx, hostCodexHome, agentHome, release, opts.Args, stdout, stderr)
 	if err != nil {
 		return err
 	}
+	progress.Update("Codex: launching guest agent")
+	progress.Close()
 	return s.streamGuestRun(backendVMID(ctx), req, stdout, stderr)
 }
 
@@ -200,43 +224,12 @@ func parseCodexAgentCommand(command string) (codexAgentOptions, error) {
 	return opts, nil
 }
 
-func (s *shellState) detectGuestCodexTarget(ctx commandContext, stderr io.Writer) (string, error) {
-	req, err := s.prepareGuestRunRequest(ctx, "printf '%s\\n' \"$(uname -s)\" \"$(uname -m)\"", false, 0, 0, stderr)
-	if err != nil {
-		return "", err
+func (s *shellState) detectGuestCodexTarget(ctx commandContext) (string, error) {
+	arch := normalizeVMSHArchitecture(ctx.Arch)
+	if arch == "" {
+		arch = runtime.GOARCH
 	}
-	var stdout bytesBuffer
-	exitCode := 0
-	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
-	defer stopInterrupts()
-	err = s.api.RunStreamInContext(runCtx, backendVMID(ctx), req, func(event client.ExecEvent) error {
-		switch event.Kind {
-		case "stdout", "output":
-			writeExecEventOutput(&stdout, event)
-		case "exit":
-			exitCode = event.ExitCode
-		case "error":
-			if event.Error != "" {
-				return fmt.Errorf("%s", event.Error)
-			}
-			return fmt.Errorf("guest platform probe failed")
-		}
-		return nil
-	})
-	if interrupted.Load() {
-		return "", persistentShellExit{code: 130}
-	}
-	if err != nil {
-		return "", err
-	}
-	if exitCode != 0 {
-		return "", fmt.Errorf("guest platform probe exited with status %d", exitCode)
-	}
-	fields := strings.Fields(stdout.String())
-	if len(fields) < 2 {
-		return "", fmt.Errorf("guest platform probe returned %q", stdout.String())
-	}
-	return codexGuestTarget(fields[0], fields[1])
+	return codexGuestTarget("linux", arch)
 }
 
 func codexGuestTarget(osName, machine string) (string, error) {
@@ -643,7 +636,12 @@ func (s *shellState) prepareCodexAgentProxyRunRequest(ctx commandContext, hostCo
 	if rows <= 0 {
 		rows = 24
 	}
-	req, err := s.prepareGuestRunRequest(ctx, ":", true, cols, rows, stderr)
+	rootAgent := codexAgentRunsAsRoot(ctx)
+	launchCtx := ctx
+	if rootAgent && ctx.Isolated {
+		launchCtx.User = "0:0"
+	}
+	req, err := s.prepareGuestRunRequest(launchCtx, ":", true, cols, rows, stderr)
 	if err != nil {
 		return client.RunRequest{}, err
 	}
@@ -652,12 +650,17 @@ func (s *shellState) prepareCodexAgentProxyRunRequest(ctx commandContext, hostCo
 	}
 	req.Network.AllowedServiceProxyPorts = appendAllowedServiceProxyPort(req.Network.AllowedServiceProxyPorts, proxyPort)
 	proxyHome := codexGuestProxyHomeDir(ctx)
-	commandLine, err := codexProxyAgentCommandLine(proxyHome, release.CodexGuestBin, args, proxyPort, req.WorkDir)
+	ensureGitWorkDir := ctx.Isolated
+	agentWorkDir := req.WorkDir
+	if rootAgent && ctx.Isolated {
+		agentWorkDir = firstNonEmpty(ctx.CWD, guestHomeDir(ctx))
+	}
+	commandLine, err := codexProxyAgentCommandLine(proxyHome, release.CodexGuestBin, args, proxyPort, agentWorkDir, ensureGitWorkDir)
 	if err != nil {
 		return client.RunRequest{}, err
 	}
-	if codexAgentRunsAsRoot(ctx) {
-		commandLine, err = codexProxyRootAgentCommandLine(proxyHome, release, args, proxyPort, req.WorkDir)
+	if rootAgent {
+		commandLine, err = codexProxyRootAgentCommandLine(proxyHome, release, args, proxyPort, agentWorkDir, ensureGitWorkDir)
 		if err != nil {
 			return client.RunRequest{}, err
 		}
@@ -707,26 +710,30 @@ func codexRootAgentCommandLine(release codexHostRelease, args []string) string {
 	stageRoot := path.Join("/run/vmsh-codex", release.Name)
 	stageBin := path.Join(stageRoot, filepath.ToSlash(release.CodexRelPath))
 	fields := []string{
+		codexShellStatusCommand("Codex: preparing sudo staging area"),
 		"rm -rf -- " + shellQuote(stageRoot),
 		"mkdir -p -- " + shellQuote(path.Dir(stageRoot)),
-		"cp -a -- " + shellQuote(sourceRoot) + " " + shellQuote(stageRoot),
+		codexShellRunWithSpinnerCommand("Codex: staging CLI release for sudo", "cp -a -- "+shellQuote(sourceRoot)+" "+shellQuote(stageRoot)),
+		codexShellStatusCommand("Codex: starting"),
+		codexShellClearStatusCommand(),
 		codexAgentCommandLine(stageBin, args),
 	}
-	return strings.Join(fields, "; ")
+	return strings.Join(fields, "\n")
 }
 
-func codexProxyRootAgentCommandLine(proxyHome string, release codexHostRelease, args []string, proxyPort int, guestWorkDir string) (string, error) {
+func codexProxyRootAgentCommandLine(proxyHome string, release codexHostRelease, args []string, proxyPort int, guestWorkDir string, ensureGitWorkDir bool) (string, error) {
 	sourceRoot := path.Join(codexGuestStandaloneMount, "releases", release.Name)
 	stageRoot := path.Join("/run/vmsh-codex", release.Name)
 	stageBin := path.Join(stageRoot, filepath.ToSlash(release.CodexRelPath))
-	agentCommand, err := codexProxyAgentCommandLine(proxyHome, stageBin, args, proxyPort, guestWorkDir)
+	agentCommand, err := codexProxyAgentCommandLine(proxyHome, stageBin, args, proxyPort, guestWorkDir, ensureGitWorkDir)
 	if err != nil {
 		return "", err
 	}
 	fields := []string{
+		codexShellStatusCommand("Codex: preparing sudo staging area"),
 		"rm -rf -- " + shellQuote(stageRoot),
 		"mkdir -p -- " + shellQuote(path.Dir(stageRoot)),
-		"cp -a -- " + shellQuote(sourceRoot) + " " + shellQuote(stageRoot),
+		codexShellRunWithSpinnerCommand("Codex: staging CLI release for sudo", "cp -a -- "+shellQuote(sourceRoot)+" "+shellQuote(stageRoot)),
 		agentCommand,
 	}
 	return strings.Join(fields, "\n"), nil
@@ -744,7 +751,7 @@ func codexAgentCommandLine(binary string, args []string) string {
 	return strings.Join(fields, "; ")
 }
 
-func codexProxyAgentCommandLine(proxyHome, binary string, args []string, proxyPort int, guestWorkDir string) (string, error) {
+func codexProxyAgentCommandLine(proxyHome, binary string, args []string, proxyPort int, guestWorkDir string, ensureGitWorkDir bool) (string, error) {
 	config, err := codexProxyAgentConfig(proxyPort, guestWorkDir)
 	if err != nil {
 		return "", err
@@ -754,15 +761,54 @@ func codexProxyAgentCommandLine(proxyHome, binary string, args []string, proxyPo
 		execLine += " " + shellQuote(arg)
 	}
 	fields := []string{
+		codexShellStatusCommand("Codex: preparing proxy home"),
 		"rm -rf -- " + shellQuote(proxyHome),
 		"mkdir -p -- " + shellQuote(proxyHome),
 		"umask 077",
+		codexShellStatusCommand("Codex: writing proxy config"),
 		"cat > " + shellQuote(path.Join(proxyHome, "config.toml")) + " <<'VMSH_CODEX_CONFIG'\n" + config + "VMSH_CODEX_CONFIG",
-		"export CODEX_HOME=" + shellQuote(proxyHome),
-		"export PATH=" + shellQuote(strings.Join(codexAgentPathDirs(binary), ":")) + `:"$PATH"`,
-		execLine,
 	}
+	if ensureGitWorkDir {
+		fields = append(fields, codexShellStatusCommand("Codex: preparing trusted workspace"))
+		fields = append(fields, codexEnsureGitWorkDirCommand(guestWorkDir))
+	}
+	fields = append(fields,
+		codexShellStatusCommand("Codex: starting"),
+		codexShellClearStatusCommand(),
+		"export CODEX_HOME="+shellQuote(proxyHome),
+		"export PATH="+shellQuote(strings.Join(codexAgentPathDirs(binary), ":"))+`:"$PATH"`,
+		execLine,
+	)
 	return strings.Join(fields, "\n"), nil
+}
+
+func codexShellStatusCommand(message string) string {
+	return "printf '\\r\\033[2K%s' " + shellQuote(message) + " >&2"
+}
+
+func codexShellClearStatusCommand() string {
+	return "printf '\\r\\033[2K' >&2"
+}
+
+func codexShellRunWithSpinnerCommand(message, command string) string {
+	message = shellQuote(message)
+	return strings.Join([]string{
+		"(" + command + ") &",
+		"__vmsh_codex_pid=$!",
+		"__vmsh_codex_i=0",
+		"while kill -0 \"$__vmsh_codex_pid\" 2>/dev/null; do",
+		"  case $__vmsh_codex_i in 0) __vmsh_codex_frame=- ;; 1) __vmsh_codex_frame=+ ;; 2) __vmsh_codex_frame='|' ;; *) __vmsh_codex_frame=/ ;; esac",
+		"  printf '\\r\\033[2K%s %s' \"$__vmsh_codex_frame\" " + message + " >&2",
+		"  __vmsh_codex_i=$(( (__vmsh_codex_i + 1) % 4 ))",
+		"  sleep 0.2",
+		"done",
+		"wait \"$__vmsh_codex_pid\"",
+		"__vmsh_codex_status=$?",
+		"unset __vmsh_codex_pid __vmsh_codex_i __vmsh_codex_frame",
+		codexShellClearStatusCommand(),
+		"if [ \"$__vmsh_codex_status\" -ne 0 ]; then exit \"$__vmsh_codex_status\"; fi",
+		"unset __vmsh_codex_status",
+	}, "\n")
 }
 
 func codexProxyAgentConfig(proxyPort int, guestWorkDir string) (string, error) {
@@ -792,6 +838,23 @@ func codexProxyAgentConfig(proxyPort int, guestWorkDir string) (string, error) {
 		b.WriteString("trust_level = \"trusted\"\n")
 	}
 	return b.String(), nil
+}
+
+func codexEnsureGitWorkDirCommand(guestWorkDir string) string {
+	guestWorkDir = strings.TrimSpace(guestWorkDir)
+	if guestWorkDir == "" {
+		return ":"
+	}
+	gitDir := path.Join(guestWorkDir, ".git")
+	fields := []string{
+		"mkdir -p -- " + shellQuote(guestWorkDir),
+		"if [ ! -e " + shellQuote(gitDir) + " ]; then",
+		"  mkdir -p -- " + shellQuote(path.Join(gitDir, "refs", "heads")) + " " + shellQuote(path.Join(gitDir, "refs", "tags")) + " " + shellQuote(path.Join(gitDir, "objects")),
+		"  printf '%s\\n' 'ref: refs/heads/main' > " + shellQuote(path.Join(gitDir, "HEAD")),
+		"  cat > " + shellQuote(path.Join(gitDir, "config")) + " <<'VMSH_CODEX_GIT_CONFIG'\n[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\nVMSH_CODEX_GIT_CONFIG",
+		"fi",
+	}
+	return strings.Join(fields, "\n")
 }
 
 func codexAgentPathDirs(binary string) []string {

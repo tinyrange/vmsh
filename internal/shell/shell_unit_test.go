@@ -279,11 +279,66 @@ func TestBareVMTargetStartsVMWhenActivated(t *testing.T) {
 	if start.req.Image != "ubuntu" || start.req.MemoryMB != 768 || start.req.CPUs != 1 {
 		t.Fatalf("start request = %+v", start.req)
 	}
+	if start.req.InitSystem != "systemd" {
+		t.Fatalf("start init = %q, want systemd", start.req.InitSystem)
+	}
 	if start.req.Network != nil {
 		t.Fatalf("start network = %+v, want nil for --no-network", start.req.Network)
 	}
 	if len(api.runs) != 0 {
 		t.Fatalf("runs = %d, want no command run during activation", len(api.runs))
+	}
+}
+
+func TestUbuntuInitCanBeDisabled(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ubuntu --no-init --vm work", &stdout, &stderr); err != nil {
+		t.Fatalf("activate VM context: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	if api.starts[0].req.InitSystem != "" {
+		t.Fatalf("start init = %q, want disabled", api.starts[0].req.InitSystem)
+	}
+}
+
+func TestUbuntuInitRefusesRunningUntrackedVM(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu"}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	err := sh.eval("@ubuntu --init --vm work", &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("activate VM context succeeded, want init mismatch error")
+	}
+	if !strings.Contains(err.Error(), `VM "work" is already running without tracked init "systemd"`) {
+		t.Fatalf("error = %v", err)
+	}
+	if len(api.starts) != 0 {
+		t.Fatalf("starts = %d, want no restart of existing VM", len(api.starts))
+	}
+}
+
+func TestUbuntuNoInitRefusesRunningSystemdVM(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", InitSystem: "systemd"}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	err := sh.eval("@ubuntu --no-init --vm work", &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("activate VM context succeeded, want init mismatch error")
+	}
+	if !strings.Contains(err.Error(), `VM "work" is already running with init "systemd"`) {
+		t.Fatalf("error = %v", err)
+	}
+	if len(api.starts) != 0 {
+		t.Fatalf("starts = %d, want no restart of existing VM", len(api.starts))
 	}
 }
 
@@ -447,6 +502,7 @@ func TestAgentCodexUsesGuestReleaseWithoutChangingGlobalCurrent(t *testing.T) {
 	}
 
 	api := newRecordingShellAPI("ubuntu")
+	api.images["ubuntu@amd64"] = client.ImageState{Name: "ubuntu@amd64", Status: "ready"}
 	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu"}
 	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
 		api.runs = append(api.runs, recordedRun{id: id, req: req})
@@ -470,14 +526,11 @@ func TestAgentCodexUsesGuestReleaseWithoutChangingGlobalCurrent(t *testing.T) {
 		return nil
 	}
 	sh := newUnitShell(t, api)
-	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu"}
+	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu", Arch: "amd64"}
 
 	var stdout, stderr bytes.Buffer
 	if err := sh.eval("@agent codex --version", &stdout, &stderr); err != nil {
 		t.Fatalf("run @agent codex: %v\nstderr:\n%s", err, stderr.String())
-	}
-	if len(api.runs) != 1 {
-		t.Fatalf("platform probe runs = %d, want 1", len(api.runs))
 	}
 	if !agentRun.TTY || agentRun.Cols != 80 || agentRun.Rows != 24 {
 		t.Fatalf("agent TTY = %t cols=%d rows=%d", agentRun.TTY, agentRun.Cols, agentRun.Rows)
@@ -558,6 +611,7 @@ func TestAgentCodexProxyUsesHostAuthProxyWithoutCodexHomeMount(t *testing.T) {
 	linuxRelease := makeFakeCodexRelease(t, codexHome, "9.8.7", "x86_64-unknown-linux-musl")
 
 	api := newRecordingShellAPI("ubuntu")
+	api.images["ubuntu@amd64"] = client.ImageState{Name: "ubuntu@amd64", Status: "ready"}
 	api.instances["default-isolated"] = client.InstanceState{ID: "default-isolated", Status: "running", Image: "ubuntu"}
 	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
 		if onEvent != nil {
@@ -577,7 +631,7 @@ func TestAgentCodexProxyUsesHostAuthProxyWithoutCodexHomeMount(t *testing.T) {
 		return nil
 	}
 	sh := newUnitShell(t, api)
-	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu", Isolated: true}
+	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu", Arch: "amd64", Isolated: true}
 
 	var stdout, stderr bytes.Buffer
 	if err := sh.eval("@agent --proxy codex --version", &stdout, &stderr); err != nil {
@@ -629,6 +683,8 @@ func TestAgentCodexProxyUsesHostAuthProxyWithoutCodexHomeMount(t *testing.T) {
 		fmt.Sprintf("base_url = \"http://10.42.0.100:%d/v1\"", proxyPort),
 		"requires_openai_auth = false",
 		"\"" + codexAgentProxyTokenHeader + "\" = \"" + codexAgentProxyTokenEnv + "\"",
+		"mkdir -p -- '/home/ubuntu/.git/refs/heads' '/home/ubuntu/.git/refs/tags' '/home/ubuntu/.git/objects'",
+		"ref: refs/heads/main",
 	} {
 		if !strings.Contains(command, want) {
 			t.Fatalf("agent command = %q, want %q", command, want)
@@ -641,6 +697,164 @@ func TestAgentCodexProxyUsesHostAuthProxyWithoutCodexHomeMount(t *testing.T) {
 		if strings.Contains(command, forbidden) {
 			t.Fatalf("agent command = %q, should not contain %q", command, forbidden)
 		}
+	}
+}
+
+func TestAgentCodexIsolatedDefaultsToProxy(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), []byte(`{"auth_mode":"api-key","OPENAI_API_KEY":"sk-test"}`), 0o600); err != nil {
+		t.Fatalf("write host auth: %v", err)
+	}
+	linuxRelease := makeFakeCodexRelease(t, codexHome, "9.8.7", "x86_64-unknown-linux-musl")
+
+	api := newRecordingShellAPI("ubuntu")
+	api.images["ubuntu@amd64"] = client.ImageState{Name: "ubuntu@amd64", Status: "ready"}
+	api.instances["default-isolated"] = client.InstanceState{ID: "default-isolated", Status: "running", Image: "ubuntu"}
+	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
+		if onEvent != nil {
+			if err := onEvent(client.ExecEvent{Kind: "stdout", Output: "Linux\nx86_64\n"}); err != nil {
+				return err
+			}
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
+	var agentRun client.RunRequest
+	api.runInteractive = func(id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		agentRun = req
+		if onEvent != nil {
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu", Arch: "amd64", Isolated: true}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@agent --sudo codex --version", &stdout, &stderr); err != nil {
+		t.Fatalf("run isolated @agent codex: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if agentRun.User != "0:0" {
+		t.Fatalf("agent request user = %q, want numeric root for isolated sudo", agentRun.User)
+	}
+	if agentRun.Network == nil || !agentRun.Network.BlockHostAccess || len(agentRun.Network.AllowedServiceProxyPorts) != 1 {
+		t.Fatalf("agent network = %+v, want isolated proxy network", agentRun.Network)
+	}
+	if len(api.servicePorts) != 1 || api.servicePorts[0].id != "default-isolated" || api.servicePorts[0].port != agentRun.Network.AllowedServiceProxyPorts[0] {
+		t.Fatalf("service proxy port updates = %+v, want default-isolated port %d", api.servicePorts, agentRun.Network.AllowedServiceProxyPorts[0])
+	}
+	wantProxyHome := codexGuestProxyHomeDir(commandContext{User: "root"})
+	if !hasString(agentRun.Env, "CODEX_HOME="+wantProxyHome) {
+		t.Fatalf("agent env = %#v, want proxy CODEX_HOME", agentRun.Env)
+	}
+	for _, share := range agentRun.Shares {
+		if share.Mount == codexGuestHomeMount {
+			t.Fatalf("isolated proxy agent mounted Codex home: %+v", share)
+		}
+	}
+	wantStagedBin := path.Join("/run/vmsh-codex", filepath.Base(linuxRelease), "bin/codex")
+	if !strings.Contains(agentRun.Command[2], wantStagedBin) {
+		t.Fatalf("agent command = %q, want staged binary %s", agentRun.Command[2], wantStagedBin)
+	}
+	if !strings.Contains(agentRun.Command[2], "/root/.git/refs/heads") || !strings.Contains(agentRun.Command[2], "[projects.\"/root\"]") {
+		t.Fatalf("agent command = %q, want isolated root git marker", agentRun.Command[2])
+	}
+}
+
+func TestVMTargetCanRunScopedAgentCommand(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), []byte(`{"auth_mode":"api-key","OPENAI_API_KEY":"sk-test"}`), 0o600); err != nil {
+		t.Fatalf("write host auth: %v", err)
+	}
+	target, err := codexGuestTarget("linux", runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("host arch target: %v", err)
+	}
+	linuxRelease := makeFakeCodexRelease(t, codexHome, "9.8.7", target)
+
+	api := newRecordingShellAPI("ubuntu")
+	var agentRun client.RunRequest
+	api.runInteractive = func(id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		agentRun = req
+		if id != "default-isolated" {
+			t.Fatalf("agent run id = %q, want default-isolated", id)
+		}
+		if onEvent != nil {
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{Mode: modeHost}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ubuntu --isolated --memory 4g @agent --sudo codex --version", &stdout, &stderr); err != nil {
+		t.Fatalf("run scoped @agent command: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if sh.context.Mode != modeHost {
+		t.Fatalf("context after scoped command = %+v, want original host context", sh.context)
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want scoped VM start", len(api.starts))
+	}
+	if api.starts[0].id != "default-isolated" || api.starts[0].req.MemoryMB != 4096 {
+		t.Fatalf("start = %+v, want isolated default VM with 4g memory", api.starts[0])
+	}
+	if agentRun.User != "0:0" {
+		t.Fatalf("agent request user = %q, want numeric root for isolated sudo", agentRun.User)
+	}
+	if agentRun.Network == nil || !agentRun.Network.BlockHostAccess || len(agentRun.Network.AllowedServiceProxyPorts) != 1 {
+		t.Fatalf("agent network = %+v, want isolated proxy network", agentRun.Network)
+	}
+	wantStagedBin := path.Join("/run/vmsh-codex", filepath.Base(linuxRelease), "bin/codex")
+	if !strings.Contains(agentRun.Command[2], wantStagedBin) || !strings.Contains(agentRun.Command[2], "--version") {
+		t.Fatalf("agent command = %q, want staged binary %s and --version", agentRun.Command[2], wantStagedBin)
+	}
+}
+
+func TestAgentCodexProxySudoSharedContextTrustsActualWorkDir(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), []byte(`{"auth_mode":"api-key","OPENAI_API_KEY":"sk-test"}`), 0o600); err != nil {
+		t.Fatalf("write host auth: %v", err)
+	}
+	makeFakeCodexRelease(t, codexHome, "9.8.7", "x86_64-unknown-linux-musl")
+
+	api := newRecordingShellAPI("ubuntu")
+	api.images["ubuntu@amd64"] = client.ImageState{Name: "ubuntu@amd64", Status: "ready"}
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu"}
+	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
+		if onEvent != nil {
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
+	var agentRun client.RunRequest
+	api.runInteractive = func(id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		agentRun = req
+		if onEvent != nil {
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu", Arch: "amd64", User: "root"}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@agent --proxy codex --version", &stdout, &stderr); err != nil {
+		t.Fatalf("run shared sudo proxied @agent codex: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if agentRun.WorkDir == "" {
+		t.Fatalf("agent workdir is empty")
+	}
+	command := agentRun.Command[2]
+	if !strings.Contains(command, "[projects.\""+agentRun.WorkDir+"\"]") {
+		t.Fatalf("agent command = %q, want trusted actual workdir %q", command, agentRun.WorkDir)
+	}
+	if strings.Contains(command, "[projects.\"/root\"]") || strings.Contains(command, "/root/.git/refs/heads") {
+		t.Fatalf("agent command = %q, should not switch shared sudo agent trust to /root", command)
 	}
 }
 
@@ -838,6 +1052,7 @@ func TestAgentCodexNoInstallReportsMissingGuestTarget(t *testing.T) {
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
 	api := newRecordingShellAPI("ubuntu")
+	api.images["ubuntu@arm64"] = client.ImageState{Name: "ubuntu@arm64", Status: "ready"}
 	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu"}
 	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
 		if onEvent != nil {
@@ -853,7 +1068,7 @@ func TestAgentCodexNoInstallReportsMissingGuestTarget(t *testing.T) {
 		return nil
 	}
 	sh := newUnitShell(t, api)
-	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu"}
+	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu", Arch: "arm64"}
 
 	var stdout, stderr bytes.Buffer
 	err := sh.eval("@agent codex --no-install", &stdout, &stderr)
@@ -867,6 +1082,7 @@ func TestAgentCodexSudoRunsAsRoot(t *testing.T) {
 	t.Setenv("CODEX_HOME", codexHome)
 	linuxRelease := makeFakeCodexRelease(t, codexHome, "9.8.7", "x86_64-unknown-linux-musl")
 	api := newRecordingShellAPI("ubuntu")
+	api.images["ubuntu@amd64"] = client.ImageState{Name: "ubuntu@amd64", Status: "ready"}
 	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu"}
 	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
 		api.runs = append(api.runs, recordedRun{id: id, req: req})
@@ -887,7 +1103,7 @@ func TestAgentCodexSudoRunsAsRoot(t *testing.T) {
 		return nil
 	}
 	sh := newUnitShell(t, api)
-	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu"}
+	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu", Arch: "amd64"}
 
 	var stdout, stderr bytes.Buffer
 	if err := sh.eval("@agent --sudo codex --version", &stdout, &stderr); err != nil {
@@ -950,6 +1166,15 @@ func TestPrepareCodexAgentHomeSeedsOnlySafeCodexData(t *testing.T) {
 	}
 	if link != codexGuestStandaloneMount {
 		t.Fatalf("standalone symlink = %q, want %q", link, codexGuestStandaloneMount)
+	}
+}
+
+func TestGuestTERMMapsGhosttyToPortableXterm(t *testing.T) {
+	if got := guestTERM("xterm-ghostty"); got != "xterm-256color" {
+		t.Fatalf("guestTERM(xterm-ghostty) = %q, want xterm-256color", got)
+	}
+	if got := guestTERM("screen-256color"); got != "screen-256color" {
+		t.Fatalf("guestTERM(screen-256color) = %q, want unchanged", got)
 	}
 }
 
@@ -1253,6 +1478,62 @@ func TestImagePullInterruptReturnsStatus130(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("interrupted pull did not return")
+	}
+}
+
+func TestUbuntuPullUsesCloudRootFSTar(t *testing.T) {
+	api := newRecordingShellAPI()
+	var gotName string
+	var gotReq client.PullImageRequest
+	api.pullStream = func(ctx context.Context, name string, req client.PullImageRequest, onEvent func(client.ProgressEvent) error) error {
+		gotName = name
+		gotReq = req
+		api.images[name] = client.ImageState{Name: name, Status: "ready"}
+		return nil
+	}
+	sh := newUnitShell(t, api)
+	sh.confirmPull = func(string, io.Writer) (bool, error) { return true, nil }
+
+	if err := sh.ensureImageAvailable(commandContext{Mode: modeVM, Image: "ubuntu", Arch: "arm64"}, io.Discard); err != nil {
+		t.Fatalf("ensure ubuntu image: %v", err)
+	}
+	if gotName != "ubuntu@arm64" {
+		t.Fatalf("pulled image name = %q, want ubuntu@arm64", gotName)
+	}
+	if gotReq.SourceRef == nil || gotReq.SourceRef.Type != "rootfs-tar" {
+		t.Fatalf("source ref = %+v, want rootfs-tar", gotReq.SourceRef)
+	}
+	if gotReq.Architecture != "arm64" {
+		t.Fatalf("architecture = %q, want arm64", gotReq.Architecture)
+	}
+	if !strings.Contains(gotReq.SourceRef.Path, "cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64-root.tar.xz") {
+		t.Fatalf("source path = %q", gotReq.SourceRef.Path)
+	}
+}
+
+func TestUbuntuPullReplacesCachedOCISource(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.images["ubuntu"] = client.ImageState{Name: "ubuntu", Source: "ubuntu", SourceKind: "oci", Status: "ready"}
+	pulled := false
+	api.pullStream = func(ctx context.Context, name string, req client.PullImageRequest, onEvent func(client.ProgressEvent) error) error {
+		pulled = true
+		if name != "ubuntu" {
+			t.Fatalf("image name = %q, want ubuntu", name)
+		}
+		if req.SourceRef == nil || req.SourceRef.Type != "rootfs-tar" {
+			t.Fatalf("source ref = %+v, want rootfs-tar", req.SourceRef)
+		}
+		api.images[name] = client.ImageState{Name: name, Source: "rootfs-tar:" + req.SourceRef.Path, SourceKind: "rootfs-tar", Status: "ready"}
+		return nil
+	}
+	sh := newUnitShell(t, api)
+	sh.confirmPull = func(string, io.Writer) (bool, error) { return true, nil }
+
+	if err := sh.ensureImageAvailable(commandContext{Mode: modeVM, Image: "ubuntu"}, io.Discard); err != nil {
+		t.Fatalf("ensure ubuntu image: %v", err)
+	}
+	if !pulled {
+		t.Fatalf("cached OCI ubuntu was accepted without pulling cloud rootfs")
 	}
 }
 
@@ -3420,7 +3701,7 @@ func (a *recordingShellAPI) StartInstanceStreamWithIDContext(ctx context.Context
 		return a.startStream(ctx, id, req, onEvent)
 	}
 	a.starts = append(a.starts, recordedStart{id: id, req: req})
-	state := client.InstanceState{ID: id, Status: "running", Image: req.Image, MemoryMB: req.MemoryMB, CPUs: req.CPUs, NestedVirt: req.NestedVirt}
+	state := client.InstanceState{ID: id, Status: "running", Image: req.Image, InitSystem: req.InitSystem, MemoryMB: req.MemoryMB, CPUs: req.CPUs, NestedVirt: req.NestedVirt}
 	a.instances[id] = state
 	if onEvent != nil {
 		if err := onEvent(client.BootEvent{Kind: "ready", State: state}); err != nil {

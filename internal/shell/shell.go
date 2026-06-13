@@ -38,6 +38,7 @@ const isolatedVMSuffix = "-isolated"
 const defaultGuestUser = "1000:1000"
 const defaultVMSHBootTimeoutSeconds = 60
 const defaultGuestShellReadyTimeout = 30 * time.Second
+const ubuntuCloudRootFSBaseURL = "https://cloud-images.ubuntu.com/releases/noble/release"
 const (
 	colorReset   = "\x1b[0m"
 	colorGreen   = "\x1b[32m"
@@ -922,6 +923,7 @@ type commandContext struct {
 	VMID       string    `json:"vm,omitempty"`
 	CWD        string    `json:"cwd,omitempty"`
 	User       string    `json:"user,omitempty"`
+	InitSystem string    `json:"init,omitempty"`
 	MemoryMB   uint64    `json:"memory_mb,omitempty"`
 	CPUs       int       `json:"cpus,omitempty"`
 	Network    bool      `json:"network,omitempty"`
@@ -942,6 +944,7 @@ type commandOptions struct {
 	Arch         string
 	Sudo         bool
 	AgentProxy   bool
+	InitSystem   *string
 	MemoryMB     uint64
 	CPUs         int
 	Network      *bool
@@ -1090,6 +1093,7 @@ func defaultContext(vmID, image string, nestedVirt bool) commandContext {
 		Mode:       modeHost,
 		VMID:       firstNonEmpty(vmID, "default"),
 		Image:      image,
+		InitSystem: defaultInitSystemForImage(image),
 		Network:    true,
 		NestedVirt: nestedVirt,
 	}
@@ -1410,6 +1414,10 @@ func (s *shellState) runInContext(ctx commandContext, line string, stdout, stder
 }
 
 func (s *shellState) runMaybeBackground(ctx commandContext, line string, stdout, stderr io.Writer) error {
+	line = strings.TrimSpace(line)
+	if strings.HasPrefix(line, "@") {
+		return s.evalScopedAt(ctx, line, stdout, stderr)
+	}
 	if command, ok, err := stripBackground(line); ok || err != nil {
 		if err != nil {
 			return err
@@ -1431,6 +1439,18 @@ func (s *shellState) runMaybeBackground(ctx commandContext, line string, stdout,
 		}
 	}
 	return s.runInContext(ctx, line, stdout, stderr)
+}
+
+func (s *shellState) evalScopedAt(ctx commandContext, line string, stdout, stderr io.Writer) error {
+	previous := s.context
+	s.context = ctx
+	defer func() {
+		if (s.context.Mode == modeVM || s.context.Mode == modeSSH) && s.context.CWD != "" {
+			s.rememberContextCWD(s.context)
+		}
+		s.context = previous
+	}()
+	return s.evalAt(line, stdout, stderr)
 }
 
 type shellCommandSegment struct {
@@ -2170,21 +2190,6 @@ func (s *shellState) prepareActivatedVMContext(ctx *commandContext, stdout, stde
 	if ctx.Image == "" {
 		return nil
 	}
-	tty, cols, rows := terminalRequestSize(stdout)
-	if tty {
-		req, err := s.prepareGuestRunRequest(*ctx, ":", true, cols, rows, stderr)
-		if err != nil {
-			return err
-		}
-		session, err := s.guestPersistentShell(*ctx, req)
-		if err != nil {
-			return err
-		}
-		if cwd := session.cwd(); cwd != "" {
-			ctx.CWD = cwd
-		}
-		return nil
-	}
 	if err := s.ensureImageAvailable(*ctx, stderr); err != nil {
 		return err
 	}
@@ -2449,6 +2454,7 @@ func (s *shellState) vmCopyEndpointContext(id string) (commandContext, error) {
 		Mode:       modeVM,
 		VMID:       firstNonEmpty(state.ID, id),
 		Image:      state.Image,
+		InitSystem: state.InitSystem,
 		MemoryMB:   state.MemoryMB,
 		CPUs:       state.CPUs,
 		NestedVirt: state.NestedVirt,
@@ -3620,6 +3626,7 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 	workDir := ctx.CWD
 	req := client.RunRequest{
 		Image:      localImageName(ctx.Image, ctx.Arch),
+		InitSystem: ctx.InitSystem,
 		Command:    guestCommand(line, tty),
 		WorkDir:    workDir,
 		User:       guestRunUser(ctx),
@@ -4757,6 +4764,9 @@ func promptSSHHostKeyConfirmation(in *os.File, stderr io.Writer, cfg resolvedSSH
 }
 
 func displayPullSource(source string) string {
+	if ubuntuCloudRootFSSource(source, "") != nil {
+		return "Ubuntu 24.04 cloud rootfs"
+	}
 	source = strings.TrimSpace(source)
 	if source == "" {
 		return source
@@ -4812,12 +4822,45 @@ func localImageName(image, architecture string) string {
 	return image + "@" + arch
 }
 
-func (s *shellState) ensureImageAvailable(ctx commandContext, stderr io.Writer) error {
-	image := localImageName(ctx.Image, ctx.Arch)
-	if s.imageCache != nil && s.imageCache[image] {
+func pullImageRequestForContext(ctx commandContext) client.PullImageRequest {
+	if source := ubuntuCloudRootFSSource(ctx.Image, ctx.Arch); source != nil {
+		return client.PullImageRequest{SourceRef: source, Architecture: ubuntuCloudRootFSArchitecture(ctx.Arch)}
+	}
+	return client.PullImageRequest{Source: ctx.Image, Architecture: ctx.Arch}
+}
+
+func ubuntuCloudRootFSSource(image, architecture string) *client.ImageSource {
+	if strings.TrimSpace(image) != "ubuntu" {
 		return nil
 	}
-	if _, err := s.api.GetImage(image); err == nil {
+	arch := ubuntuCloudRootFSArchitecture(architecture)
+	return &client.ImageSource{
+		Type: "rootfs-tar",
+		Path: fmt.Sprintf("%s/ubuntu-24.04-server-cloudimg-%s-root.tar.xz", ubuntuCloudRootFSBaseURL, arch),
+	}
+}
+
+func ubuntuCloudRootFSArchitecture(architecture string) string {
+	if arch := normalizeVMSHArchitecture(architecture); arch != "" {
+		return arch
+	}
+	switch runtime.GOARCH {
+	case "amd64", "arm64":
+		return runtime.GOARCH
+	default:
+		return "amd64"
+	}
+}
+
+func (s *shellState) ensureImageAvailable(ctx commandContext, stderr io.Writer) error {
+	image := localImageName(ctx.Image, ctx.Arch)
+	req := pullImageRequestForContext(ctx)
+	requiredSource, requiredKind := requiredImageSource(req)
+	requireExactSource := requiredSource != ""
+	if !requireExactSource && s.imageCache != nil && s.imageCache[image] {
+		return nil
+	}
+	if state, err := s.api.GetImage(image); err == nil && imageStateSatisfiesSource(state, requiredSource, requiredKind) {
 		if s.imageCache == nil {
 			s.imageCache = map[string]bool{}
 		}
@@ -4855,9 +4898,9 @@ func (s *shellState) ensureImageAvailable(ctx commandContext, stderr io.Writer) 
 	defer stopInterrupts()
 	var pullErr error
 	if api, ok := s.api.(imagePullContextAPI); ok {
-		pullErr = api.PullImageStreamContext(runCtx, image, client.PullImageRequest{Source: ctx.Image, Architecture: ctx.Arch}, report)
+		pullErr = api.PullImageStreamContext(runCtx, image, req, report)
 	} else {
-		pullErr = s.api.PullImageStream(image, client.PullImageRequest{Source: ctx.Image, Architecture: ctx.Arch}, report)
+		pullErr = s.api.PullImageStream(image, req, report)
 	}
 	if interrupted.Load() {
 		return persistentShellExit{code: 130}
@@ -4870,6 +4913,27 @@ func (s *shellState) ensureImageAvailable(ctx commandContext, stderr io.Writer) 
 	}
 	s.imageCache[image] = true
 	return nil
+}
+
+func requiredImageSource(req client.PullImageRequest) (source, kind string) {
+	if req.SourceRef == nil {
+		return "", ""
+	}
+	source, err := req.SourceString()
+	if err != nil {
+		return "", ""
+	}
+	return source, strings.ToLower(strings.TrimSpace(req.SourceRef.Type))
+}
+
+func imageStateSatisfiesSource(state client.ImageState, source, kind string) bool {
+	if source == "" {
+		return true
+	}
+	if state.Source == "" && state.SourceKind == "" {
+		return true
+	}
+	return state.Source == source && state.SourceKind == kind
 }
 
 func guestHostPaths(hostCWD string) (hostRoot, guestCWD string, err error) {
@@ -4895,7 +4959,7 @@ func guestHostPaths(hostCWD string) (hostRoot, guestCWD string, err error) {
 
 func (s *shellState) ensureVMRunning(ctx commandContext, stderr io.Writer) error {
 	id := backendVMID(ctx)
-	if s.vmRunning != nil && s.vmRunning[id] {
+	if s.vmRunning != nil && s.vmRunning[id] && strings.TrimSpace(ctx.InitSystem) == "" {
 		return nil
 	}
 	state, err := s.api.InstanceStatusOf(id)
@@ -4903,6 +4967,9 @@ func (s *shellState) ensureVMRunning(ctx commandContext, stderr io.Writer) error
 		return err
 	}
 	if state.Status == "running" {
+		if err := validateRunningVMContext(id, ctx, state); err != nil {
+			return err
+		}
 		if s.vmRunning == nil {
 			s.vmRunning = map[string]bool{}
 		}
@@ -4912,6 +4979,22 @@ func (s *shellState) ensureVMRunning(ctx commandContext, stderr io.Writer) error
 	return s.startVM(id, ctx, stderr)
 }
 
+func validateRunningVMContext(id string, ctx commandContext, state client.InstanceState) error {
+	wantInit := strings.TrimSpace(ctx.InitSystem)
+	gotInit := strings.TrimSpace(state.InitSystem)
+	if wantInit == gotInit {
+		return nil
+	}
+	displayID := firstNonEmpty(state.ID, id)
+	if wantInit == "" {
+		return fmt.Errorf("VM %q is already running with init %q; stop or restart it before using --no-init", displayID, gotInit)
+	}
+	if gotInit == "" {
+		return fmt.Errorf("VM %q is already running without tracked init %q; run @restart or @stop before using --init", displayID, wantInit)
+	}
+	return fmt.Errorf("VM %q is already running with init %q, not %q; run @restart or @stop first", displayID, gotInit, wantInit)
+}
+
 func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -4919,6 +5002,7 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 	}
 	req := client.StartInstanceRequest{
 		Image:          localImageName(ctx.Image, ctx.Arch),
+		InitSystem:     ctx.InitSystem,
 		MemoryMB:       ctx.MemoryMB,
 		CPUs:           ctx.CPUs,
 		NestedVirt:     ctx.NestedVirt,
@@ -5199,6 +5283,9 @@ func (s *shellState) restartVM(id string, ctx commandContext, stderr io.Writer) 
 func restartContextFromState(ctx commandContext, state client.InstanceState) commandContext {
 	if strings.TrimSpace(ctx.Image) == "" {
 		ctx.Image = state.Image
+	}
+	if strings.TrimSpace(ctx.InitSystem) == "" {
+		ctx.InitSystem = state.InitSystem
 	}
 	if ctx.MemoryMB == 0 {
 		ctx.MemoryMB = state.MemoryMB
@@ -5651,6 +5738,7 @@ func terminalEnv(cols, rows int) []string {
 		}
 		if key == "TERM" {
 			termSeen = true
+			value = guestTERM(value)
 		}
 		env = append(env, key+"="+value)
 	}
@@ -5667,6 +5755,15 @@ func terminalEnv(cols, rows int) []string {
 		env = append(env, "LINES="+strconv.Itoa(rows))
 	}
 	return env
+}
+
+func guestTERM(term string) string {
+	switch strings.TrimSpace(term) {
+	case "xterm-ghostty":
+		return "xterm-256color"
+	default:
+		return term
+	}
 }
 
 func (s *shellState) drawPromptStatus(stdout io.Writer) {
@@ -5753,6 +5850,9 @@ func (s *shellState) printVMs(w io.Writer) error {
 		if state.Image != "" {
 			parts = append(parts, "image="+state.Image)
 		}
+		if state.InitSystem != "" {
+			parts = append(parts, "init="+state.InitSystem)
+		}
 		if state.NetworkIPv4 != "" {
 			parts = append(parts, "addr="+state.NetworkIPv4)
 		}
@@ -5825,7 +5925,7 @@ func (s *shellState) help(w io.Writer) error {
 @agent --proxy codex     run Codex through a host auth proxy without mounting ~/.codex
 @tmux [session]          open tmux with vmsh as the default pane command
 @forward H:G             forward host port H to guest port G
-opts: --vm id --cwd path --user user --sudo --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
+opts: --vm id --cwd path --user user --sudo --init --no-init --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
 cd <dir>                 change the current host, VM, or SSH working directory
 exit                     leave the current subshell, or vmsh at top level
 `))
@@ -5937,6 +6037,18 @@ func parseCommandOptions(tokens []shellToken, start int, target string) (command
 				return opts, i, fmt.Errorf("--sudo does not take a value")
 			}
 			opts.Sudo = true
+		case "--init":
+			if hasInlineValue {
+				return opts, i, fmt.Errorf("--init does not take a value")
+			}
+			initSystem := "systemd"
+			opts.InitSystem = &initSystem
+		case "--no-init":
+			if hasInlineValue {
+				return opts, i, fmt.Errorf("--no-init does not take a value")
+			}
+			initSystem := ""
+			opts.InitSystem = &initSystem
 		case "--proxy":
 			if target != "agent" {
 				return opts, i, fmt.Errorf("unknown vmsh option %q", name)
@@ -6037,6 +6149,9 @@ func (c commandContext) withOptions(opts commandOptions) commandContext {
 	if opts.Sudo {
 		c.User = "root"
 	}
+	if opts.InitSystem != nil {
+		c.InitSystem = *opts.InitSystem
+	}
 	if opts.MemoryMB != 0 {
 		c.MemoryMB = opts.MemoryMB
 	}
@@ -6075,10 +6190,21 @@ func vmCommandContext(base commandContext, opts commandOptions, image string) co
 	ctx.Mode = modeVM
 	ctx.Image = image
 	ctx.SSHHost = ""
+	if opts.InitSystem == nil {
+		ctx.InitSystem = defaultInitSystemForImage(image)
+	}
 	if opts.CWD == "" && (base.Mode != modeVM || previousKey != contextCWDKey(ctx)) {
 		ctx.CWD = ""
 	}
 	return ctx
+}
+
+func defaultInitSystemForImage(image string) string {
+	image = strings.ToLower(strings.TrimSpace(image))
+	if image == "ubuntu" || strings.HasPrefix(image, "ubuntu:") || strings.HasSuffix(image, "/ubuntu") || strings.Contains(image, "/ubuntu:") {
+		return "systemd"
+	}
+	return ""
 }
 
 func sudoCommandContext(ctx commandContext, command string) (commandContext, string) {
