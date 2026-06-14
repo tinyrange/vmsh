@@ -924,6 +924,7 @@ type commandContext struct {
 	CWD        string    `json:"cwd,omitempty"`
 	User       string    `json:"user,omitempty"`
 	InitSystem string    `json:"init,omitempty"`
+	Kernel     string    `json:"kernel,omitempty"`
 	MemoryMB   uint64    `json:"memory_mb,omitempty"`
 	CPUs       int       `json:"cpus,omitempty"`
 	Network    bool      `json:"network,omitempty"`
@@ -945,6 +946,7 @@ type commandOptions struct {
 	Sudo         bool
 	AgentProxy   bool
 	InitSystem   *string
+	Kernel       *string
 	MemoryMB     uint64
 	CPUs         int
 	Network      *bool
@@ -1094,6 +1096,7 @@ func defaultContext(vmID, image string, nestedVirt bool) commandContext {
 		VMID:       firstNonEmpty(vmID, "default"),
 		Image:      image,
 		InitSystem: defaultInitSystemForImage(image),
+		Kernel:     defaultKernelForImage(image),
 		Network:    true,
 		NestedVirt: nestedVirt,
 	}
@@ -2455,6 +2458,7 @@ func (s *shellState) vmCopyEndpointContext(id string) (commandContext, error) {
 		VMID:       firstNonEmpty(state.ID, id),
 		Image:      state.Image,
 		InitSystem: state.InitSystem,
+		Kernel:     state.Kernel,
 		MemoryMB:   state.MemoryMB,
 		CPUs:       state.CPUs,
 		NestedVirt: state.NestedVirt,
@@ -3617,6 +3621,9 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 	if ctx.Image == "" {
 		return client.RunRequest{}, fmt.Errorf("no guest image selected; run @<oci-tag> or set one with @<oci-tag>")
 	}
+	if strings.TrimSpace(ctx.Kernel) == "" {
+		ctx.Kernel = defaultKernelForImage(ctx.Image)
+	}
 	if err := s.ensureImageAvailable(ctx, stderr); err != nil {
 		return client.RunRequest{}, err
 	}
@@ -3627,6 +3634,7 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 	req := client.RunRequest{
 		Image:      localImageName(ctx.Image, ctx.Arch),
 		InitSystem: ctx.InitSystem,
+		Kernel:     ctx.Kernel,
 		Command:    guestCommand(line, tty),
 		WorkDir:    workDir,
 		User:       guestRunUser(ctx),
@@ -4958,8 +4966,11 @@ func guestHostPaths(hostCWD string) (hostRoot, guestCWD string, err error) {
 }
 
 func (s *shellState) ensureVMRunning(ctx commandContext, stderr io.Writer) error {
+	if strings.TrimSpace(ctx.Kernel) == "" {
+		ctx.Kernel = defaultKernelForImage(ctx.Image)
+	}
 	id := backendVMID(ctx)
-	if s.vmRunning != nil && s.vmRunning[id] && strings.TrimSpace(ctx.InitSystem) == "" {
+	if s.vmRunning != nil && s.vmRunning[id] && strings.TrimSpace(ctx.InitSystem) == "" && strings.TrimSpace(ctx.Kernel) == "" {
 		return nil
 	}
 	state, err := s.api.InstanceStatusOf(id)
@@ -4982,10 +4993,21 @@ func (s *shellState) ensureVMRunning(ctx commandContext, stderr io.Writer) error
 func validateRunningVMContext(id string, ctx commandContext, state client.InstanceState) error {
 	wantInit := strings.TrimSpace(ctx.InitSystem)
 	gotInit := strings.TrimSpace(state.InitSystem)
-	if wantInit == gotInit {
+	wantKernel := strings.TrimSpace(ctx.Kernel)
+	gotKernel := strings.TrimSpace(state.Kernel)
+	if kernelStateEqual(wantKernel, gotKernel) && wantInit == gotInit {
 		return nil
 	}
 	displayID := firstNonEmpty(state.ID, id)
+	if !kernelStateEqual(wantKernel, gotKernel) {
+		if kernelStateIsDefault(wantKernel) {
+			return fmt.Errorf("VM %q is already running with kernel %q; run @restart or @stop before using --kernel default", displayID, gotKernel)
+		}
+		if kernelStateIsDefault(gotKernel) {
+			return fmt.Errorf("VM %q is already running with the default kernel; run @restart or @stop before using --kernel %s", displayID, wantKernel)
+		}
+		return fmt.Errorf("VM %q is already running with kernel %q, not %q; run @restart or @stop first", displayID, gotKernel, wantKernel)
+	}
 	if wantInit == "" {
 		return fmt.Errorf("VM %q is already running with init %q; stop or restart it before using --no-init", displayID, gotInit)
 	}
@@ -5000,9 +5022,13 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 	if id == "" {
 		return fmt.Errorf("vm id is required")
 	}
+	if strings.TrimSpace(ctx.Kernel) == "" {
+		ctx.Kernel = defaultKernelForImage(ctx.Image)
+	}
 	req := client.StartInstanceRequest{
 		Image:          localImageName(ctx.Image, ctx.Arch),
 		InitSystem:     ctx.InitSystem,
+		Kernel:         ctx.Kernel,
 		MemoryMB:       ctx.MemoryMB,
 		CPUs:           ctx.CPUs,
 		NestedVirt:     ctx.NestedVirt,
@@ -5286,6 +5312,9 @@ func restartContextFromState(ctx commandContext, state client.InstanceState) com
 	}
 	if strings.TrimSpace(ctx.InitSystem) == "" {
 		ctx.InitSystem = state.InitSystem
+	}
+	if strings.TrimSpace(ctx.Kernel) == "" {
+		ctx.Kernel = state.Kernel
 	}
 	if ctx.MemoryMB == 0 {
 		ctx.MemoryMB = state.MemoryMB
@@ -5853,6 +5882,9 @@ func (s *shellState) printVMs(w io.Writer) error {
 		if state.InitSystem != "" {
 			parts = append(parts, "init="+state.InitSystem)
 		}
+		if state.Kernel != "" {
+			parts = append(parts, "kernel="+state.Kernel)
+		}
 		if state.NetworkIPv4 != "" {
 			parts = append(parts, "addr="+state.NetworkIPv4)
 		}
@@ -5925,7 +5957,7 @@ func (s *shellState) help(w io.Writer) error {
 @agent --proxy codex     run Codex through a host auth proxy without mounting ~/.codex
 @tmux [session]          open tmux with vmsh as the default pane command
 @forward H:G             forward host port H to guest port G
-opts: --vm id --cwd path --user user --sudo --init --no-init --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
+opts: --vm id --cwd path --user user --sudo --init --no-init --kernel default|ubuntu --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
 cd <dir>                 change the current host, VM, or SSH working directory
 exit                     leave the current subshell, or vmsh at top level
 `))
@@ -6049,6 +6081,16 @@ func parseCommandOptions(tokens []shellToken, start int, target string) (command
 			}
 			initSystem := ""
 			opts.InitSystem = &initSystem
+		case "--kernel":
+			v, err := readValue()
+			if err != nil {
+				return opts, i, err
+			}
+			kernel, err := normalizeVMSHKernel(v)
+			if err != nil {
+				return opts, i, err
+			}
+			opts.Kernel = &kernel
 		case "--proxy":
 			if target != "agent" {
 				return opts, i, fmt.Errorf("unknown vmsh option %q", name)
@@ -6152,6 +6194,9 @@ func (c commandContext) withOptions(opts commandOptions) commandContext {
 	if opts.InitSystem != nil {
 		c.InitSystem = *opts.InitSystem
 	}
+	if opts.Kernel != nil {
+		c.Kernel = *opts.Kernel
+	}
 	if opts.MemoryMB != 0 {
 		c.MemoryMB = opts.MemoryMB
 	}
@@ -6193,6 +6238,9 @@ func vmCommandContext(base commandContext, opts commandOptions, image string) co
 	if opts.InitSystem == nil {
 		ctx.InitSystem = defaultInitSystemForImage(image)
 	}
+	if opts.Kernel == nil {
+		ctx.Kernel = defaultKernelForImage(image)
+	}
 	if opts.CWD == "" && (base.Mode != modeVM || previousKey != contextCWDKey(ctx)) {
 		ctx.CWD = ""
 	}
@@ -6205,6 +6253,38 @@ func defaultInitSystemForImage(image string) string {
 		return "systemd"
 	}
 	return ""
+}
+
+func defaultKernelForImage(image string) string {
+	image = strings.ToLower(strings.TrimSpace(image))
+	if image == "ubuntu" || strings.HasPrefix(image, "ubuntu:") || strings.HasSuffix(image, "/ubuntu") || strings.Contains(image, "/ubuntu:") {
+		return "ubuntu"
+	}
+	return ""
+}
+
+func normalizeVMSHKernel(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "", "default", "alpine":
+		return "default", nil
+	case "ubuntu":
+		return "ubuntu", nil
+	default:
+		return "", fmt.Errorf("invalid --kernel value %q; expected default or ubuntu", value)
+	}
+}
+
+func kernelStateIsDefault(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return value == "" || value == "default" || value == "alpine"
+}
+
+func kernelStateEqual(a, b string) bool {
+	if kernelStateIsDefault(a) && kernelStateIsDefault(b) {
+		return true
+	}
+	return strings.TrimSpace(a) == strings.TrimSpace(b)
 }
 
 func sudoCommandContext(ctx commandContext, command string) (commandContext, string) {

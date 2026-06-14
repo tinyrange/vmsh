@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>vmsh Ubuntu Guest Compatibility Fixes</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f8fb;
+      --fg: #17202a;
+      --muted: #5b6673;
+      --panel: #ffffff;
+      --line: #d9dee7;
+      --accent: #0f766e;
+      --warn: #9a3412;
+      --bad: #991b1b;
+      --code: #eef2f7;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111418;
+        --fg: #e6e8eb;
+        --muted: #a5adb8;
+        --panel: #181d23;
+        --line: #2d3440;
+        --accent: #2dd4bf;
+        --warn: #fdba74;
+        --bad: #fca5a5;
+        --code: #202732;
+      }
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 16px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(1040px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 40px 0 64px;
+    }
+
+    header {
+      margin-bottom: 28px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: clamp(2rem, 4vw, 3.4rem);
+      line-height: 1.08;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 34px 0 12px;
+      font-size: 1.35rem;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 22px 0 8px;
+      font-size: 1.05rem;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0 0 14px;
+    }
+
+    code {
+      background: var(--code);
+      border-radius: 4px;
+      padding: 0.12em 0.35em;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.94em;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      margin: 14px 0 22px;
+    }
+
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      font-size: 0.86rem;
+      text-transform: uppercase;
+      color: var(--muted);
+      letter-spacing: 0.04em;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    ul, ol {
+      margin: 0 0 18px 1.2rem;
+      padding: 0;
+    }
+
+    li {
+      margin: 7px 0;
+    }
+
+    .summary {
+      max-width: 820px;
+      color: var(--muted);
+      font-size: 1.08rem;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      padding: 18px;
+      margin: 18px 0;
+    }
+
+    .callout {
+      border-left: 4px solid var(--accent);
+    }
+
+    .warning {
+      border-left: 4px solid var(--warn);
+    }
+
+    .danger {
+      border-left: 4px solid var(--bad);
+    }
+
+    .tag {
+      display: inline-block;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 1px 6px;
+      color: var(--muted);
+      font-size: 0.82rem;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Ubuntu Guest Compatibility Fixes</h1>
+      <p class="summary">
+        The current Ubuntu guest is useful as a lightweight native arm64 dev box, but it is not yet a boring full Ubuntu VM.
+        The most plausible next step is to let vmsh boot Ubuntu with Ubuntu's own kernel and modules by default.
+      </p>
+    </header>
+
+    <section class="panel callout">
+      <h2>Proposed Default</h2>
+      <p>
+        <code>@ubuntu</code> should default to a real Ubuntu cloud root filesystem, systemd init, and an Ubuntu kernel/module set.
+        Other images should keep the current lightweight kernel unless the user opts into the Ubuntu kernel with <code>--kernel ubuntu</code>.
+      </p>
+      <p>
+        The goal is no new requirement for ordinary users. The alias should pick the boring path automatically:
+        <code>@ubuntu</code> means “boot the closest thing to a normal Ubuntu server VM that vmsh can provide.”
+      </p>
+    </section>
+
+    <h2>Observed Problems</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Area</th>
+          <th>Finding</th>
+          <th>Likely Fix</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Kernel identity</td>
+          <td>Ubuntu 24.04 arm64 userland is running on an Alpine-built virt kernel.</td>
+          <td><span class="tag">Ubuntu kernel</span> Boot the Ubuntu cloud kernel and matching modules for <code>@ubuntu</code>.</td>
+        </tr>
+        <tr>
+          <td>Overlayfs</td>
+          <td><code>mount -t overlay</code> fails and the module is unavailable.</td>
+          <td><span class="tag">Ubuntu kernel</span> Use Ubuntu's kernel config/modules. This is required for many Docker-like workflows.</td>
+        </tr>
+        <tr>
+          <td>TUN/TAP</td>
+          <td><code>/dev/net/tun</code> is absent and <code>modprobe tun</code> fails.</td>
+          <td><span class="tag">Ubuntu kernel</span> Ship the module and create the device node during guest init when supported.</td>
+        </tr>
+        <tr>
+          <td>Netfilter</td>
+          <td><code>nft</code> and <code>iptables</code> fail with protocol support errors.</td>
+          <td><span class="tag">Ubuntu kernel</span> Boot a kernel with nftables/netfilter support and matching modules.</td>
+        </tr>
+        <tr>
+          <td>binfmt_misc</td>
+          <td>No binfmt registrations; foreign architecture binaries fail with exec format errors.</td>
+          <td><span class="tag">Ubuntu kernel</span> Ensure <code>binfmt_misc</code> exists, then optionally install/register QEMU user emulation.</td>
+        </tr>
+        <tr>
+          <td>Nested VMs</td>
+          <td><code>/dev/kvm</code> opens, but KVM reports a reduced IPA size.</td>
+          <td><span class="tag">partly kernel</span> Ubuntu's kernel may improve module availability, but Apple HVF constraints may remain.</td>
+        </tr>
+        <tr>
+          <td>Filesystem</td>
+          <td>Root is virtiofs. User xattrs are missing and hardlink behavior appears unsafe on writable root paths.</td>
+          <td><span class="tag">not just kernel</span> Use a real writable block filesystem or overlay strategy for the mutable root.</td>
+        </tr>
+        <tr>
+          <td>Package metadata</td>
+          <td><code>apt update</code> was slow and package candidates were missing after interruption.</td>
+          <td><span class="tag">network/cache</span> Fix apt reliability, mirrors, caching, and progress reporting. Kernel is unlikely to be the whole issue.</td>
+        </tr>
+        <tr>
+          <td>Base tooling</td>
+          <td>Python exists, but pip, compilers, Node, Go, Rust, and Java are absent.</td>
+          <td><span class="tag">image policy</span> Decide whether vmsh's Ubuntu image should stay cloud-minimal or include a dev baseline.</td>
+        </tr>
+        <tr>
+          <td>Time and logs</td>
+          <td>No RTC, inactive clock sync, rsyslog errors, and journald is more reliable than syslog.</td>
+          <td><span class="tag">init policy</span> Seed time from host, keep systemd-timesyncd healthy where possible, and prefer journald diagnostics.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <section class="panel danger">
+      <h2>Highest Risk: Writable Root Filesystem</h2>
+      <p>
+        The reported hardlink behavior on virtiofs is the most dangerous issue because it may be silent.
+        A clear unsupported feature like missing overlayfs fails loudly; incorrect hardlink semantics can corrupt package stores, caches,
+        build systems, and deduplicated data structures.
+      </p>
+      <p>
+        Booting an Ubuntu kernel will not by itself make a virtiofs writable root behave like ext4. The long-term boring VM design should
+        give Ubuntu a normal writable root filesystem, or at least move high-risk writable paths to a filesystem with POSIX-correct hardlinks.
+      </p>
+    </section>
+
+    <h2>Kernel Plan</h2>
+    <ol>
+      <li>
+        Add a kernel selector to VM start requests and shell parsing: <code>--kernel default</code> and <code>--kernel ubuntu</code>.
+      </li>
+      <li>
+        Make <code>@ubuntu</code> imply <code>--kernel ubuntu</code> and <code>--init</code> unless explicitly overridden.
+      </li>
+      <li>
+        For non-Ubuntu images, keep the current lightweight kernel unless <code>--kernel ubuntu</code> is requested.
+      </li>
+      <li>
+        Download/cache the Ubuntu cloud kernel and matching module tree alongside the Ubuntu cloud rootfs.
+      </li>
+      <li>
+        Teach ccvm boot construction to use the selected kernel, initrd/module payloads, and kernel command line.
+      </li>
+      <li>
+        Extend guest init to load or expose expected device/kernel features: <code>tun</code>, <code>overlay</code>, netfilter modules,
+        <code>binfmt_misc</code>, and any Ubuntu module dependencies.
+      </li>
+      <li>
+        Add feature probes after boot and surface degraded compatibility clearly in diagnostics.
+      </li>
+    </ol>
+
+    <h2>Shell UX Plan</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Command</th>
+          <th>Behavior</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>@ubuntu</code></td>
+          <td>Ubuntu cloud rootfs, systemd, Ubuntu kernel by default.</td>
+        </tr>
+        <tr>
+          <td><code>@ubuntu --kernel default</code></td>
+          <td>Explicit escape hatch to the current lightweight kernel.</td>
+        </tr>
+        <tr>
+          <td><code>@alpine</code></td>
+          <td>Current lightweight kernel and image behavior.</td>
+        </tr>
+        <tr>
+          <td><code>@alpine --kernel ubuntu</code></td>
+          <td>Boot Alpine userland with the Ubuntu kernel if the backend can satisfy it.</td>
+        </tr>
+        <tr>
+          <td><code>@ubuntu --isolated --memory 4g</code></td>
+          <td>Still uses the boring Ubuntu default; isolation should not imply the lightweight kernel.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <section class="panel warning">
+      <h2>Tradeoffs</h2>
+      <ul>
+        <li>Ubuntu kernel boot will be larger to download and cache than the current tiny kernel path.</li>
+        <li>Boot time may increase, especially on first run and when module payloads are unpacked.</li>
+        <li>Supporting an Ubuntu kernel across arbitrary userlands is useful, but not guaranteed to make every image behave like Ubuntu.</li>
+        <li>The root filesystem issue needs a storage design fix; kernel selection alone should not be marketed as solving POSIX disk semantics.</li>
+        <li>More kernel features mean a larger compatibility surface and a bigger test matrix.</li>
+      </ul>
+    </section>
+
+    <h2>Validation Matrix</h2>
+    <p>
+      The Ubuntu kernel path should not be considered done until these probes pass or fail with documented limitations:
+    </p>
+    <ul>
+      <li><code>mount -t overlay</code> with lower/upper/work/merged directories.</li>
+      <li><code>test -c /dev/net/tun</code> and a minimal TUN open/ioctl probe.</li>
+      <li><code>nft list ruleset</code> and basic iptables/nftables availability.</li>
+      <li><code>mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc</code>.</li>
+      <li>Optional QEMU user registration and a tiny foreign-arch ELF execution test.</li>
+      <li>Hardlink and xattr probes on <code>/</code>, <code>/root</code>, <code>/home</code>, <code>/tmp</code>, and any proposed writable-root replacement.</li>
+      <li><code>apt update</code>, <code>apt install python3-pip build-essential</code>, and package candidate checks for universe packages.</li>
+      <li>Systemd service listing, journald reads, time sync status, and long-lived clock drift checks.</li>
+      <li>Docker/podman smoke tests only after overlayfs, netfilter, cgroups, namespaces, and TUN expectations are explicit.</li>
+    </ul>
+
+    <h2>Open Design Questions</h2>
+    <ul>
+      <li>Should Ubuntu kernel artifacts come from the same cloud image release as the rootfs, or from Ubuntu package repositories?</li>
+      <li>Do we build a normal writable disk image for Ubuntu, or use an overlay/block layer over the cloud rootfs?</li>
+      <li>How do we cache kernel/module/rootfs artifacts by architecture and Ubuntu release without surprising disk usage?</li>
+      <li>Should <code>--kernel ubuntu</code> imply Ubuntu module loading only, or also Ubuntu-specific initramfs behavior?</li>
+      <li>What compatibility promise do we make for non-Ubuntu userlands booted with the Ubuntu kernel?</li>
+    </ul>
+  </main>
+</body>
+</html>

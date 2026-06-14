@@ -141,7 +141,7 @@ func TestSudoWithoutCommandOpensRootSubshell(t *testing.T) {
 
 func TestGuestPersistentShellRestartsWhenIsolationChanges(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
-	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu"}
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	sh := newUnitShell(t, api)
 
 	var mu sync.Mutex
@@ -282,6 +282,9 @@ func TestBareVMTargetStartsVMWhenActivated(t *testing.T) {
 	if start.req.InitSystem != "systemd" {
 		t.Fatalf("start init = %q, want systemd", start.req.InitSystem)
 	}
+	if start.req.Kernel != "ubuntu" {
+		t.Fatalf("start kernel = %q, want ubuntu", start.req.Kernel)
+	}
 	if start.req.Network != nil {
 		t.Fatalf("start network = %+v, want nil for --no-network", start.req.Network)
 	}
@@ -304,11 +307,30 @@ func TestUbuntuInitCanBeDisabled(t *testing.T) {
 	if api.starts[0].req.InitSystem != "" {
 		t.Fatalf("start init = %q, want disabled", api.starts[0].req.InitSystem)
 	}
+	if api.starts[0].req.Kernel != "ubuntu" {
+		t.Fatalf("start kernel = %q, want ubuntu", api.starts[0].req.Kernel)
+	}
+}
+
+func TestUbuntuKernelCanUseDefault(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ubuntu --kernel default --vm work", &stdout, &stderr); err != nil {
+		t.Fatalf("activate VM context: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	if api.starts[0].req.Kernel != "default" {
+		t.Fatalf("start kernel = %q, want default", api.starts[0].req.Kernel)
+	}
 }
 
 func TestUbuntuInitRefusesRunningUntrackedVM(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
-	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu"}
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	sh := newUnitShell(t, api)
 
 	var stdout, stderr bytes.Buffer
@@ -326,7 +348,7 @@ func TestUbuntuInitRefusesRunningUntrackedVM(t *testing.T) {
 
 func TestUbuntuNoInitRefusesRunningSystemdVM(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
-	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", InitSystem: "systemd"}
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu", InitSystem: "systemd"}
 	sh := newUnitShell(t, api)
 
 	var stdout, stderr bytes.Buffer
@@ -503,7 +525,7 @@ func TestAgentCodexUsesGuestReleaseWithoutChangingGlobalCurrent(t *testing.T) {
 
 	api := newRecordingShellAPI("ubuntu")
 	api.images["ubuntu@amd64"] = client.ImageState{Name: "ubuntu@amd64", Status: "ready"}
-	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu"}
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
 		api.runs = append(api.runs, recordedRun{id: id, req: req})
 		if !strings.Contains(req.Command[2], "uname -s") {
@@ -612,7 +634,7 @@ func TestAgentCodexProxyUsesHostAuthProxyWithoutCodexHomeMount(t *testing.T) {
 
 	api := newRecordingShellAPI("ubuntu")
 	api.images["ubuntu@amd64"] = client.ImageState{Name: "ubuntu@amd64", Status: "ready"}
-	api.instances["default-isolated"] = client.InstanceState{ID: "default-isolated", Status: "running", Image: "ubuntu"}
+	api.instances["default-isolated"] = client.InstanceState{ID: "default-isolated", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
 		if onEvent != nil {
 			if err := onEvent(client.ExecEvent{Kind: "stdout", Output: "Linux\nx86_64\n"}); err != nil {
@@ -710,7 +732,7 @@ func TestAgentCodexIsolatedDefaultsToProxy(t *testing.T) {
 
 	api := newRecordingShellAPI("ubuntu")
 	api.images["ubuntu@amd64"] = client.ImageState{Name: "ubuntu@amd64", Status: "ready"}
-	api.instances["default-isolated"] = client.InstanceState{ID: "default-isolated", Status: "running", Image: "ubuntu"}
+	api.instances["default-isolated"] = client.InstanceState{ID: "default-isolated", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
 		if onEvent != nil {
 			if err := onEvent(client.ExecEvent{Kind: "stdout", Output: "Linux\nx86_64\n"}); err != nil {
@@ -824,7 +846,7 @@ func TestAgentCodexProxySudoSharedContextTrustsActualWorkDir(t *testing.T) {
 
 	api := newRecordingShellAPI("ubuntu")
 	api.images["ubuntu@amd64"] = client.ImageState{Name: "ubuntu@amd64", Status: "ready"}
-	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu"}
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
 		if onEvent != nil {
 			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
@@ -1053,7 +1075,7 @@ func TestAgentCodexNoInstallReportsMissingGuestTarget(t *testing.T) {
 	t.Setenv("CODEX_HOME", codexHome)
 	api := newRecordingShellAPI("ubuntu")
 	api.images["ubuntu@arm64"] = client.ImageState{Name: "ubuntu@arm64", Status: "ready"}
-	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu"}
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
 		if onEvent != nil {
 			if err := onEvent(client.ExecEvent{Kind: "stdout", Output: "Linux\naarch64\n"}); err != nil {
@@ -1083,7 +1105,7 @@ func TestAgentCodexSudoRunsAsRoot(t *testing.T) {
 	linuxRelease := makeFakeCodexRelease(t, codexHome, "9.8.7", "x86_64-unknown-linux-musl")
 	api := newRecordingShellAPI("ubuntu")
 	api.images["ubuntu@amd64"] = client.ImageState{Name: "ubuntu@amd64", Status: "ready"}
-	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu"}
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
 		api.runs = append(api.runs, recordedRun{id: id, req: req})
 		if onEvent != nil {
@@ -1571,7 +1593,7 @@ func TestVMStartInterruptReturnsStatus130(t *testing.T) {
 
 func TestGuestCopyInterruptReturnsStatus130(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
-	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu"}
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	started := make(chan struct{})
 	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 		close(started)
@@ -1602,7 +1624,7 @@ func TestGuestCopyInterruptReturnsStatus130(t *testing.T) {
 
 func TestTTYGuestRunInterruptCancelsContext(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
-	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu"}
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	started := make(chan struct{})
 	api.runInteractiveContext = func(ctx context.Context, id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 		if !req.TTY {
@@ -2928,7 +2950,7 @@ func TestSSHCopyStreamsTarOverConnection(t *testing.T) {
 
 func TestCopyGuestFileToSSHHost(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
-	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu"}
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 		if req.Kind != "fs_archive" {
 			t.Fatalf("exec kind = %q, want fs_archive", req.Kind)
@@ -2995,7 +3017,7 @@ func TestCopyGuestFileToSSHHost(t *testing.T) {
 func TestCopySSHHostFileToGuest(t *testing.T) {
 	guestWrites := make(chan string, 1)
 	api := newRecordingShellAPI("ubuntu")
-	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu"}
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 		if req.Kind != "fs_write" {
 			t.Fatalf("exec kind = %q, want fs_write", req.Kind)
@@ -3701,7 +3723,7 @@ func (a *recordingShellAPI) StartInstanceStreamWithIDContext(ctx context.Context
 		return a.startStream(ctx, id, req, onEvent)
 	}
 	a.starts = append(a.starts, recordedStart{id: id, req: req})
-	state := client.InstanceState{ID: id, Status: "running", Image: req.Image, InitSystem: req.InitSystem, MemoryMB: req.MemoryMB, CPUs: req.CPUs, NestedVirt: req.NestedVirt}
+	state := client.InstanceState{ID: id, Status: "running", Image: req.Image, InitSystem: req.InitSystem, Kernel: req.Kernel, MemoryMB: req.MemoryMB, CPUs: req.CPUs, NestedVirt: req.NestedVirt}
 	a.instances[id] = state
 	if onEvent != nil {
 		if err := onEvent(client.BootEvent{Kind: "ready", State: state}); err != nil {
