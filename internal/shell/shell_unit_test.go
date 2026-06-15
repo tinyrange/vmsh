@@ -2118,6 +2118,20 @@ func TestTTYGuestRunInterruptCancelsContext(t *testing.T) {
 	}
 }
 
+func TestTTYExecEventOutputNormalizesBareLF(t *testing.T) {
+	var out bytes.Buffer
+	writeTTYExecEventOutput(&out, client.ExecEvent{Kind: "stdout", Output: "one\ntwo\r\nthree"})
+	if got, want := out.String(), "one\r\ntwo\r\nthree"; got != want {
+		t.Fatalf("TTY output = %q, want %q", got, want)
+	}
+
+	out.Reset()
+	writeExecEventOutput(&out, client.ExecEvent{Kind: "stdout", Output: "one\ntwo"})
+	if got, want := out.String(), "one\ntwo"; got != want {
+		t.Fatalf("non-TTY output = %q, want %q", got, want)
+	}
+}
+
 func TestStreamHostPTYStdinControlCCallsInterruptHook(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("PTY stdin test uses os.Pipe readiness semantics")

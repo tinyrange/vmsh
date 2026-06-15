@@ -4364,9 +4364,9 @@ func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer, startF
 			}
 			return nil
 		case "stdout", "output":
-			writeExecEventOutput(stdout, event)
+			writeTTYExecEventOutput(stdout, event)
 		case "stderr":
-			writeExecEventOutput(stderr, event)
+			writeTTYExecEventOutput(stderr, event)
 		case "exit":
 			return errPersistentGuestShellExited
 		case "error":
@@ -4498,9 +4498,9 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 	if err := s.api.RunInteractiveStreamInContext(runCtx, id, req, inputs, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stdout", "output":
-			writeExecEventOutput(stdout, event)
+			writeTTYExecEventOutput(stdout, event)
 		case "stderr":
-			writeExecEventOutput(stderr, event)
+			writeTTYExecEventOutput(stderr, event)
 		case "exit":
 			exitCode = event.ExitCode
 		case "error":
@@ -5091,6 +5091,30 @@ func writeExecEventOutput(w io.Writer, event client.ExecEvent) {
 	if event.Output != "" {
 		_, _ = fmt.Fprint(w, event.Output)
 	}
+}
+
+func writeTTYExecEventOutput(w io.Writer, event client.ExecEvent) {
+	if len(event.Data) > 0 {
+		_, _ = w.Write(normalizeTTYNewlines(event.Data))
+		return
+	}
+	if event.Output != "" {
+		_, _ = w.Write(normalizeTTYNewlines([]byte(event.Output)))
+	}
+}
+
+func normalizeTTYNewlines(data []byte) []byte {
+	if len(data) == 0 || !bytes.Contains(data, []byte{'\n'}) {
+		return data
+	}
+	out := make([]byte, 0, len(data)+bytes.Count(data, []byte{'\n'}))
+	for i, b := range data {
+		if b == '\n' && (i == 0 || data[i-1] != '\r') {
+			out = append(out, '\r')
+		}
+		out = append(out, b)
+	}
+	return out
 }
 
 func guestCommand(line string, tty bool) []string {
