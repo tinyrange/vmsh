@@ -140,12 +140,13 @@ type persistentHostShell struct {
 }
 
 type persistentGuestShell struct {
-	mu      sync.Mutex
-	key     string
-	inputs  chan client.ExecInput
-	events  chan client.ExecEvent
-	done    chan error
-	lastCWD string
+	mu        sync.Mutex
+	closeOnce sync.Once
+	key       string
+	inputs    chan client.ExecInput
+	events    chan client.ExecEvent
+	done      chan error
+	lastCWD   string
 }
 
 type vmshCompleter struct {
@@ -4046,7 +4047,13 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 			return err
 		}
 		var interrupted atomic.Bool
-		interrupts := newCommandInterruptEscalator(line, stderr, nil, func() {
+		sendSignal := func(name string) {
+			sendGuestInputNonBlocking(session.inputs, client.ExecInput{Kind: "signal", Signal: name})
+		}
+		interrupts := newCommandInterruptEscalator(line, stderr, func() {
+			sendSignal("INT")
+		}, func() {
+			sendSignal("KILL")
 			if s.guestShell == session {
 				s.guestShell = nil
 			}
@@ -4421,15 +4428,14 @@ func (p *persistentGuestShell) cwd() string {
 }
 
 func (p *persistentGuestShell) close() {
-	select {
-	case p.inputs <- client.ExecInput{Kind: "stdin_close"}:
-	default:
-	}
-	close(p.inputs)
-	select {
-	case <-p.done:
-	case <-time.After(2 * time.Second):
-	}
+	p.closeOnce.Do(func() {
+		sendGuestInputNonBlocking(p.inputs, client.ExecInput{Kind: "stdin_close"})
+		close(p.inputs)
+		select {
+		case <-p.done:
+		case <-time.After(2 * time.Second):
+		}
+	})
 }
 
 func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, stderr io.Writer) error {
@@ -4778,9 +4784,22 @@ func forwardGuestSignals(out chan<- client.ExecInput, done <-chan struct{}, tty 
 }
 
 func sendGuestInput(out chan<- client.ExecInput, done <-chan struct{}, input client.ExecInput) {
+	defer func() {
+		_ = recover()
+	}()
 	select {
 	case <-done:
 	case out <- input:
+	}
+}
+
+func sendGuestInputNonBlocking(out chan<- client.ExecInput, input client.ExecInput) {
+	defer func() {
+		_ = recover()
+	}()
+	select {
+	case out <- input:
+	default:
 	}
 }
 

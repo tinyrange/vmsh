@@ -2132,6 +2132,24 @@ func TestTTYExecEventOutputNormalizesBareLF(t *testing.T) {
 	}
 }
 
+func TestGuestInputSendIgnoresClosedChannel(t *testing.T) {
+	inputs := make(chan client.ExecInput)
+	close(inputs)
+	done := make(chan struct{})
+	sendGuestInput(inputs, done, client.ExecInput{Kind: "stdin", Data: []byte{0x03}})
+	sendGuestInputNonBlocking(inputs, client.ExecInput{Kind: "stdin_close"})
+}
+
+func TestPersistentGuestShellCloseIsIdempotent(t *testing.T) {
+	session := &persistentGuestShell{
+		inputs: make(chan client.ExecInput, 1),
+		done:   make(chan error),
+	}
+	close(session.done)
+	session.close()
+	session.close()
+}
+
 func TestStreamHostPTYStdinControlCCallsInterruptHook(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("PTY stdin test uses os.Pipe readiness semantics")
