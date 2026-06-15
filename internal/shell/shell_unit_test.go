@@ -1741,6 +1741,86 @@ func TestPromptCWDColorDistinguishesContextStorage(t *testing.T) {
 	}
 }
 
+func TestStatusShowsHostContext(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.hostCWD = "/tmp/vmsh-host"
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@status", &stdout, &stderr); err != nil {
+		t.Fatalf("status: %v\nstderr:\n%s", err, stderr.String())
+	}
+	got := stdout.String()
+	for _, want := range []string{
+		"context chain:\n",
+		"1. host cwd=/tmp/vmsh-host [current]",
+		"current: host cwd=/tmp/vmsh-host [current]",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("status output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "backend vm:") {
+		t.Fatalf("host status reported old VM leaf fields:\n%s", got)
+	}
+}
+
+func TestStatusShowsFullContextChain(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{
+		ID:          "work",
+		Status:      "running",
+		Image:       "ubuntu",
+		InitSystem:  "systemd",
+		Kernel:      "ubuntu",
+		NetworkIPv4: "10.42.0.2",
+	}
+	sh := newUnitShell(t, api)
+	sh.hostCWD = "/tmp/vmsh-host"
+	hostCtx := hostCommandContext(sh.context, commandOptions{})
+	vmCtx := commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", CWD: "/srv/app", InitSystem: "systemd", Kernel: "ubuntu"}
+	sshCtx := commandContext{Mode: modeSSH, SSHHost: "test-ssh-a", User: "deploy", CWD: "/srv/remote"}
+	sh.contextStack = []commandContext{hostCtx, vmCtx}
+	sh.context = sshCtx
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@status", &stdout, &stderr); err != nil {
+		t.Fatalf("status: %v\nstderr:\n%s", err, stderr.String())
+	}
+	got := stdout.String()
+	for _, want := range []string{
+		"1. host cwd=/tmp/vmsh-host",
+		"2. vm work image=ubuntu backend=work isolated=false user=1000:1000 cwd=/srv/app status=running init=systemd kernel=ubuntu addr=10.42.0.2",
+		"3. ssh test-ssh-a user=deploy cwd=/srv/remote session=closed [current]",
+		"current: ssh test-ssh-a user=deploy cwd=/srv/remote session=closed [current]",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("status output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestStatusShowsIsolatedVMContext(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work-isolated"] = client.InstanceState{ID: "work-isolated", Status: "running", Image: "ubuntu"}
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Isolated: true, CWD: "/home/ubuntu"}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@status", &stdout, &stderr); err != nil {
+		t.Fatalf("status: %v\nstderr:\n%s", err, stderr.String())
+	}
+	got := stdout.String()
+	for _, want := range []string{
+		"1. host cwd=",
+		"2. vm work image=ubuntu backend=work-isolated isolated=true user=1000:1000 cwd=/home/ubuntu status=running [current]",
+		"current: vm work image=ubuntu backend=work-isolated isolated=true user=1000:1000 cwd=/home/ubuntu status=running [current]",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("status output missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestHostCommandInterruptIsNotFatal(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("host interrupt test uses POSIX shell commands")

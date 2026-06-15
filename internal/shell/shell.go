@@ -6552,7 +6552,112 @@ func (s *shellState) drawPromptStatus(stdout io.Writer) {
 }
 
 func (s *shellState) printStatus(w io.Writer) error {
-	if s.context.Mode == modeSSH {
+	chain := s.activeContextChain()
+	if _, err := fmt.Fprintln(w, "context chain:"); err != nil {
+		return err
+	}
+	for i, ctx := range chain {
+		line, err := s.contextStatusLine(ctx, i == len(chain)-1)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "  %d. %s\n", i+1, line); err != nil {
+			return err
+		}
+	}
+	current, err := s.contextStatusLine(s.context, true)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "current: %s\n", current); err != nil {
+		return err
+	}
+	return s.printCurrentStatusDetails(w)
+}
+
+func (s *shellState) activeContextChain() []commandContext {
+	chain := make([]commandContext, 0, len(s.contextStack)+1)
+	chain = append(chain, s.contextStack...)
+	chain = append(chain, s.context)
+	if len(chain) == 0 || chain[0].Mode != modeHost {
+		chain = append([]commandContext{hostCommandContext(s.context, commandOptions{})}, chain...)
+	}
+	return chain
+}
+
+func (s *shellState) contextStatusLine(ctx commandContext, current bool) (string, error) {
+	var parts []string
+	switch ctx.Mode {
+	case modeHost:
+		parts = []string{"host", "cwd=" + emptyText(s.hostCWD, "-")}
+	case modeVM:
+		id := backendVMID(ctx)
+		state, err := s.api.InstanceStatusOf(id)
+		if err != nil {
+			return "", err
+		}
+		parts = []string{
+			"vm",
+			emptyText(normalizedVMID(ctx.VMID), "default"),
+			"image=" + emptyText(contextImageText(ctx), "-"),
+			"backend=" + emptyText(id, "-"),
+			"isolated=" + strconv.FormatBool(ctx.Isolated),
+			"user=" + emptyText(guestRunUser(ctx), "-"),
+			"cwd=" + emptyText(s.currentGuestCWD(ctx), "-"),
+			"status=" + emptyText(state.Status, "unknown"),
+		}
+		if state.InitSystem != "" {
+			parts = append(parts, "init="+state.InitSystem)
+		}
+		if state.Kernel != "" {
+			parts = append(parts, "kernel="+state.Kernel)
+		}
+		if state.NetworkIPv4 != "" {
+			parts = append(parts, "addr="+state.NetworkIPv4)
+		}
+	case modeSSH:
+		session := "closed"
+		if s.sshShellForContext(ctx) != nil {
+			session = "open"
+		}
+		parts = []string{
+			"ssh",
+			emptyText(ctx.SSHHost, "-"),
+			"user=" + emptyText(s.sshStatusUser(ctx), "-"),
+			"cwd=" + emptyText(s.currentSSHCWD(ctx), "-"),
+			"session=" + session,
+		}
+	default:
+		parts = []string{string(ctx.Mode)}
+	}
+	if current {
+		parts = append(parts, "[current]")
+	}
+	return strings.Join(parts, " "), nil
+}
+
+func (s *shellState) sshStatusUser(ctx commandContext) string {
+	if strings.TrimSpace(ctx.User) != "" {
+		return strings.TrimSpace(ctx.User)
+	}
+	if shell := s.sshShellForContext(ctx); shell != nil && shell.client != nil {
+		return shell.client.config.User
+	}
+	if cfg, err := resolveSSHConfig(ctx); err == nil {
+		return cfg.User
+	}
+	return ""
+}
+
+func (s *shellState) printCurrentStatusDetails(w io.Writer) error {
+	switch s.context.Mode {
+	case modeHost:
+		_, err := fmt.Fprintf(w, "context: %s\nhost cwd: %s\n",
+			s.context.Mode,
+			s.hostCWD,
+		)
+		return err
+	case modeSSH:
 		status := "closed"
 		if s.sshShellForContext(s.context) != nil {
 			status = "open"
@@ -6565,30 +6670,33 @@ func (s *shellState) printStatus(w io.Writer) error {
 			status,
 		)
 		return err
-	}
-	id := backendVMID(s.context)
-	state, err := s.api.InstanceStatusOf(id)
-	if err != nil {
+	case modeVM:
+		id := backendVMID(s.context)
+		state, err := s.api.InstanceStatusOf(id)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(w, "context: %s\nimage: %s\nvm: %s\nbackend vm: %s\nisolated: %t\nhost cwd: %s\nguest cwd: %s\nvm status: %s\n",
+			s.context.Mode,
+			emptyText(contextImageText(s.context), "-"),
+			emptyText(s.context.VMID, "-"),
+			emptyText(id, "-"),
+			s.context.Isolated,
+			s.hostCWD,
+			emptyText(s.currentGuestCWD(s.context), "-"),
+			emptyText(state.Status, "unknown"),
+		)
+		if err != nil {
+			return err
+		}
+		if state.NetworkIPv4 != "" {
+			_, err = fmt.Fprintf(w, "vm address: %s\n", state.NetworkIPv4)
+		}
+		return err
+	default:
+		_, err := fmt.Fprintf(w, "context: %s\n", s.context.Mode)
 		return err
 	}
-	targetCWD := ""
-	if target, err := s.targetFor(s.context); err == nil && target.Mode() == modeVM {
-		targetCWD = target.CurrentCWD()
-	}
-	_, err = fmt.Fprintf(w, "context: %s\nimage: %s\nvm: %s\nbackend vm: %s\nisolated: %t\nhost cwd: %s\nguest cwd: %s\nvm status: %s\n",
-		s.context.Mode,
-		emptyText(contextImageText(s.context), "-"),
-		emptyText(s.context.VMID, "-"),
-		emptyText(id, "-"),
-		s.context.Isolated,
-		s.hostCWD,
-		emptyText(targetCWD, "-"),
-		emptyText(state.Status, "unknown"),
-	)
-	if state.NetworkIPv4 != "" {
-		_, err = fmt.Fprintf(w, "vm address: %s\n", state.NetworkIPv4)
-	}
-	return err
 }
 
 func (s *shellState) printVMs(w io.Writer) error {
