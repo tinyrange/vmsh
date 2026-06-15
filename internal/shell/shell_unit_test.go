@@ -199,6 +199,113 @@ func TestSudoWithoutCommandOpensRootSubshell(t *testing.T) {
 	}
 }
 
+func TestExitPromptsForActiveResourcesAndCancels(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu"}
+	api.instances["old"] = client.InstanceState{ID: "old", Status: "stopped", Image: "ubuntu"}
+	sh := newUnitShell(t, api)
+	sh.sshClients = map[string]*persistentSSHClient{
+		"test-ssh": {
+			key: "test-ssh",
+			config: resolvedSSHConfig{
+				Alias:    "test-ssh-a",
+				HostName: "127.0.0.1",
+				User:     "testuser",
+			},
+		},
+	}
+	sh.jobs = append(sh.jobs, shellJob{ID: 1, Command: "@host sleep 30"})
+
+	var prompted []exitResource
+	sh.confirmExit = func(resources []exitResource, stderr io.Writer) (bool, error) {
+		prompted = append([]exitResource(nil), resources...)
+		_, _ = fmt.Fprintln(stderr, "prompted")
+		return false, nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("exit", &stdout, &stderr); err != nil {
+		t.Fatalf("exit after declined prompt: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "prompted") {
+		t.Fatalf("stderr = %q, want prompt output", stderr.String())
+	}
+	if sh.lastCode != 1 {
+		t.Fatalf("lastCode = %d, want 1 after cancelled exit", sh.lastCode)
+	}
+	for _, want := range []struct {
+		kind string
+		name string
+	}{
+		{kind: "VM", name: "work"},
+		{kind: "SSH connection", name: "test-ssh-a"},
+		{kind: "background job", name: "[1]"},
+	} {
+		if !hasExitResource(prompted, want.kind, want.name) {
+			t.Fatalf("prompted resources = %#v, missing %s %s", prompted, want.kind, want.name)
+		}
+	}
+	if hasExitResource(prompted, "VM", "old") {
+		t.Fatalf("prompted resources = %#v, should not include stopped VM", prompted)
+	}
+}
+
+func TestExitAcceptedAndForceExitReturnEOF(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu"}
+	sh := newUnitShell(t, api)
+	var prompts int
+	sh.confirmExit = func(resources []exitResource, stderr io.Writer) (bool, error) {
+		prompts++
+		return true, nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("exit", &stdout, &stderr); !errors.Is(err, io.EOF) {
+		t.Fatalf("accepted exit error = %v, want EOF", err)
+	}
+	if prompts != 1 {
+		t.Fatalf("prompts = %d, want 1", prompts)
+	}
+
+	prompts = 0
+	if err := sh.eval("exit --force", &stdout, &stderr); !errors.Is(err, io.EOF) {
+		t.Fatalf("forced exit error = %v, want EOF", err)
+	}
+	if prompts != 0 {
+		t.Fatalf("forced exit prompts = %d, want 0", prompts)
+	}
+}
+
+func TestExitWithoutInteractiveConfirmationIsScriptSafe(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu"}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("exit", &stdout, &stderr); !errors.Is(err, io.EOF) {
+		t.Fatalf("script-safe exit error = %v, want EOF", err)
+	}
+}
+
+func TestExitUsageRejectsUnknownArguments(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var stdout, stderr bytes.Buffer
+	err := sh.eval("exit now", &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "usage: exit [--force]") {
+		t.Fatalf("exit now error = %v, want usage", err)
+	}
+}
+
+func hasExitResource(resources []exitResource, kind, name string) bool {
+	for _, resource := range resources {
+		if resource.Kind == kind && resource.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func TestGuestPersistentShellRestartsWhenIsolationChanges(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}

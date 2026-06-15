@@ -79,6 +79,7 @@ type shellState struct {
 	confirmPull      func(string, io.Writer) (bool, error)
 	confirmVMRestart func(string, io.Writer) (bool, error)
 	confirmSSHHost   func(resolvedSSHConfig, string, net.Addr, ssh.PublicKey) (bool, error)
+	confirmExit      func([]exitResource, io.Writer) (bool, error)
 	sshPassword      func(resolvedSSHConfig) (string, error)
 	sshKeyboardAuth  func(resolvedSSHConfig, string, string, []string, []bool) ([]string, error)
 	sshBanner        func(resolvedSSHConfig, string) error
@@ -1058,6 +1059,9 @@ func Run(args []string) error {
 		confirmSSHHost: func(cfg resolvedSSHConfig, hostname string, remote net.Addr, key ssh.PublicKey) (bool, error) {
 			return promptSSHHostKeyConfirmation(os.Stdin, stderr, cfg, hostname, remote, key)
 		},
+		confirmExit: func(resources []exitResource, stderr io.Writer) (bool, error) {
+			return promptExitConfirmation(os.Stdin, stderr, resources)
+		},
 		sshPassword: func(cfg resolvedSSHConfig) (string, error) {
 			return promptSSHPassword(os.Stdin, stderr, cfg)
 		},
@@ -1470,10 +1474,23 @@ func (s *shellState) eval(line string, stdout, stderr io.Writer) error {
 			return s.runPipeline(s.context, segments, stdout, stderr)
 		}
 	}
-	if isExitCommand(line) {
+	if exit, force, err := parseExitCommand(line); exit || err != nil {
+		if err != nil {
+			return err
+		}
 		if s.exitSubshell() {
 			s.lastCode = 0
 			return nil
+		}
+		if !force {
+			ok, err := s.confirmExitIfNeeded(stderr)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				s.lastCode = 1
+				return nil
+			}
 		}
 		return io.EOF
 	}
@@ -3352,6 +3369,97 @@ func (s *shellState) exitSubshell() bool {
 	return true
 }
 
+type exitResource struct {
+	Kind   string
+	Name   string
+	Detail string
+}
+
+func (s *shellState) confirmExitIfNeeded(stderr io.Writer) (bool, error) {
+	if s.confirmExit == nil {
+		return true, nil
+	}
+	resources, err := s.activeExitResources()
+	if err != nil {
+		return false, err
+	}
+	if len(resources) == 0 {
+		return true, nil
+	}
+	return s.confirmExit(resources, stderr)
+}
+
+func (s *shellState) activeExitResources() ([]exitResource, error) {
+	var resources []exitResource
+	if s.api != nil {
+		states, err := s.api.InstanceStatuses()
+		if err != nil {
+			return nil, err
+		}
+		for _, state := range states {
+			status := strings.TrimSpace(state.Status)
+			if status == "" || strings.EqualFold(status, "stopped") {
+				continue
+			}
+			kind := "VM"
+			name := firstNonEmpty(strings.TrimSpace(state.ID), "default")
+			if strings.HasSuffix(name, isolatedVMSuffix) {
+				kind = "isolated VM"
+			}
+			var details []string
+			details = append(details, status)
+			if state.Image != "" {
+				details = append(details, "image="+state.Image)
+			}
+			resources = append(resources, exitResource{
+				Kind:   kind,
+				Name:   name,
+				Detail: strings.Join(details, ", "),
+			})
+		}
+	}
+	for _, session := range s.sshSessionStates() {
+		var details []string
+		if session.User != "" {
+			details = append(details, "user="+session.User)
+		}
+		if session.CWD != "" {
+			details = append(details, "cwd="+session.CWD)
+		}
+		resources = append(resources, exitResource{
+			Kind:   "SSH session",
+			Name:   session.Name,
+			Detail: strings.Join(details, ", "),
+		})
+	}
+	for _, conn := range s.sshConnectionStates() {
+		resources = append(resources, exitResource{
+			Kind:   "SSH connection",
+			Name:   conn.Name,
+			Detail: conn.Detail,
+		})
+	}
+	s.jobsMu.Lock()
+	for _, job := range s.jobs {
+		if job.Done {
+			continue
+		}
+		resources = append(resources, exitResource{
+			Kind:   "background job",
+			Name:   fmt.Sprintf("[%d]", job.ID),
+			Detail: strings.TrimSpace(job.Command),
+		})
+	}
+	s.jobsMu.Unlock()
+	sort.SliceStable(resources, func(i, j int) bool {
+		if resources[i].Kind != resources[j].Kind {
+			return resources[i].Kind < resources[j].Kind
+		}
+		return resources[i].Name < resources[j].Name
+	})
+	return resources, nil
+}
+
 func (s *shellState) rememberContextCWD(ctx commandContext) {
 	if (ctx.Mode != modeVM && ctx.Mode != modeSSH) || ctx.CWD == "" {
 		return
@@ -5008,6 +5116,28 @@ func promptVMRestartConfirmation(in *os.File, stderr io.Writer, id string) (bool
 	return answer == "y" || answer == "yes", nil
 }
 
+func promptExitConfirmation(in *os.File, stderr io.Writer, resources []exitResource) (bool, error) {
+	if in == nil || !terminal.IsTerminalFD(int(in.Fd())) {
+		return false, nil
+	}
+	fmt.Fprintln(stderr, "vmsh still has active resources:")
+	for _, resource := range resources {
+		line := fmt.Sprintf("  - %s %s", resource.Kind, resource.Name)
+		if resource.Detail != "" {
+			line += " (" + resource.Detail + ")"
+		}
+		fmt.Fprintln(stderr, line)
+	}
+	fmt.Fprint(stderr, "Exit anyway? (yes/no) [no]: ")
+	reader := bufio.NewReader(in)
+	answer, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	answer = strings.ToLower(strings.TrimSpace(answer))
+	return answer == "y" || answer == "yes", nil
+}
+
 func promptSSHPassword(in *os.File, stderr io.Writer, cfg resolvedSSHConfig) (string, error) {
 	if in == nil || !terminal.IsTerminalFD(int(in.Fd())) {
 		return "", fmt.Errorf("ssh password auth requires an interactive terminal")
@@ -6288,7 +6418,7 @@ func (s *shellState) help(w io.Writer) error {
 @forward H:G             forward host port H to guest port G
 opts: --vm id --cwd path --user user --sudo --init --no-init --kernel default|ubuntu --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
 cd <dir>                 change the current host, VM, or SSH working directory
-exit                     leave the current subshell, or vmsh at top level
+exit [--force]           leave the current subshell, or vmsh at top level
 `))
 	return err
 }
@@ -6702,9 +6832,22 @@ func parseCD(line string) (string, bool, error) {
 	return fields[1], true, nil
 }
 
-func isExitCommand(line string) bool {
+func parseExitCommand(line string) (bool, bool, error) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed != "exit" && !strings.HasPrefix(trimmed, "exit ") && !strings.HasPrefix(trimmed, "exit\t") {
+		return false, false, nil
+	}
 	fields, err := splitShellFields(line)
-	return err == nil && len(fields) == 1 && fields[0] == "exit"
+	if err != nil || len(fields) == 0 || fields[0] != "exit" {
+		return false, false, err
+	}
+	if len(fields) == 1 {
+		return true, false, nil
+	}
+	if len(fields) == 2 && fields[1] == "--force" {
+		return true, true, nil
+	}
+	return true, false, fmt.Errorf("usage: exit [--force]")
 }
 
 func splitShellFields(input string) ([]string, error) {

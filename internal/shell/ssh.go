@@ -961,6 +961,44 @@ func (s *shellState) sshSessionStates() []sshSessionState {
 	return states
 }
 
+type sshConnectionState struct {
+	Name   string
+	Detail string
+}
+
+func (s *shellState) sshConnectionStates() []sshConnectionState {
+	s.sshMu.Lock()
+	defer s.sshMu.Unlock()
+	if len(s.sshClients) == 0 {
+		return nil
+	}
+	shellClientKeys := map[string]bool{}
+	for _, shell := range s.sshShells {
+		if shell != nil && shell.client != nil {
+			shellClientKeys[shell.client.key] = true
+		}
+	}
+	states := make([]sshConnectionState, 0, len(s.sshClients))
+	for key, client := range s.sshClients {
+		if client == nil || shellClientKeys[key] {
+			continue
+		}
+		var details []string
+		if client.config.User != "" {
+			details = append(details, "user="+client.config.User)
+		}
+		if client.config.HostName != "" {
+			details = append(details, "host="+client.config.HostName)
+		}
+		states = append(states, sshConnectionState{
+			Name:   firstNonEmpty(client.config.Alias, client.config.HostName),
+			Detail: strings.Join(details, ", "),
+		})
+	}
+	sort.Slice(states, func(i, j int) bool { return states[i].Name < states[j].Name })
+	return states
+}
+
 func (s *shellState) sshShellList() []*persistentSSHShell {
 	s.sshMu.Lock()
 	defer s.sshMu.Unlock()
