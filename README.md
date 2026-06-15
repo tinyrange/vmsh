@@ -147,6 +147,15 @@ Common forms:
 @stop --vm work                 # stop a named VM
 ```
 
+Copy endpoints use explicit context prefixes so accidental names fail early:
+
+```sh
+@copy @host:./file.txt @:~/file.txt          # host to current context
+@copy @:~/file.txt @host:./file.txt          # current context to host
+@copy @vm:work:/tmp/out @ssh:build:/tmp/out  # named VM to SSH host
+@copy @image:alpine:/tmp/out @host:./out     # image context by name
+```
+
 Supported options:
 
 ```sh

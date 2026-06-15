@@ -3217,12 +3217,37 @@ func TestCopyEndpointResolutionAndGuestHostPathSafety(t *testing.T) {
 		t.Fatalf("named guest endpoint = %+v", ubuntu)
 	}
 
+	image, err := sh.parseCopyEndpoint("@image:ubuntu:~/image-result.txt")
+	if err != nil {
+		t.Fatalf("parse explicit image endpoint: %v", err)
+	}
+	if image.context().Image != "ubuntu" || image.path != "/home/ubuntu/image-result.txt" {
+		t.Fatalf("explicit image endpoint = %+v", image)
+	}
+
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	vm, err := sh.parseCopyEndpoint("@vm:work:/tmp/result.txt")
+	if err != nil {
+		t.Fatalf("parse explicit vm endpoint: %v", err)
+	}
+	if vm.context().VMID != "work" || vm.context().Image != "ubuntu" || vm.path != "/tmp/result.txt" {
+		t.Fatalf("explicit vm endpoint = %+v", vm)
+	}
+
 	ssh, err := sh.parseCopyEndpoint("@ssh:test-ssh-a:relative.txt")
 	if err != nil {
 		t.Fatalf("parse ssh endpoint: %v", err)
 	}
 	if ssh.context().Mode != modeSSH || ssh.context().SSHHost != "test-ssh-a" || ssh.path != "~/relative.txt" {
 		t.Fatalf("ssh endpoint = %+v context=%+v", ssh, ssh.context())
+	}
+
+	if _, err := sh.parseCopyEndpoint("@missing:notes.txt"); err == nil || !strings.Contains(err.Error(), "does not name an active SSH session") {
+		t.Fatalf("parse unknown endpoint error = %v", err)
+	}
+	api.images["work"] = client.ImageState{Name: "work", Status: "ready"}
+	if _, err := sh.parseCopyEndpoint("@work:notes.txt"); err == nil || !strings.Contains(err.Error(), "ambiguous") || !strings.Contains(err.Error(), "@vm:work:path") || !strings.Contains(err.Error(), "@image:work:path") {
+		t.Fatalf("parse ambiguous endpoint error = %v", err)
 	}
 
 	if _, err := sh.parseCopyEndpoint("@ubuntu"); err == nil || !strings.Contains(err.Error(), "must use @target:path") {

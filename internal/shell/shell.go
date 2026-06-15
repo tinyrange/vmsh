@@ -2413,17 +2413,21 @@ func (s *shellState) parseCopyEndpoint(raw string) (copyEndpoint, error) {
 			}
 			ctx = sshCommandContext(s.context, commandOptions{}, strings.TrimSpace(host))
 			value = sshPath
+		case "image":
+			image, imagePath, ok := strings.Cut(rest, ":")
+			if !ok || strings.TrimSpace(image) == "" {
+				return copyEndpoint{}, fmt.Errorf("copy endpoint %q must use @image:name:path", raw)
+			}
+			ctx = vmCommandContext(s.context, commandOptions{}, strings.TrimSpace(image))
+			value = imagePath
 		case "":
 			ctx = s.context
 		default:
-			if sshCtx, ok := s.sshSessionContext(target); ok {
-				ctx = sshCtx
-			} else {
-				ctx = vmCommandContext(s.context, commandOptions{}, target)
-				if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
-					ctx.CWD = cwd
-				}
+			resolved, err := s.resolveImplicitCopyEndpointTarget(target, raw)
+			if err != nil {
+				return copyEndpoint{}, err
 			}
+			ctx = resolved
 		}
 	}
 	target, err := s.targetFor(ctx)
@@ -2435,6 +2439,113 @@ func (s *shellState) parseCopyEndpoint(raw string) (copyEndpoint, error) {
 		path:      target.ResolveCopyPath(value),
 		directory: copyEndpointDirectoryHint(value),
 	}, nil
+}
+
+type copyEndpointTargetMatch struct {
+	kind     string
+	explicit string
+	ctx      commandContext
+}
+
+func (s *shellState) resolveImplicitCopyEndpointTarget(name, raw string) (commandContext, error) {
+	name = strings.TrimSpace(name)
+	var matches []copyEndpointTargetMatch
+	if sshCtx, ok := s.sshSessionContext(name); ok {
+		matches = append(matches, copyEndpointTargetMatch{
+			kind:     "active SSH session",
+			explicit: fmt.Sprintf("@ssh:%s:path", name),
+			ctx:      sshCtx,
+		})
+	}
+	if vmCtx, ok, err := s.knownVMCopyEndpointContext(name); err != nil {
+		return commandContext{}, err
+	} else if ok {
+		matches = append(matches, copyEndpointTargetMatch{
+			kind:     "VM",
+			explicit: fmt.Sprintf("@vm:%s:path", name),
+			ctx:      vmCtx,
+		})
+	}
+	if imageCtx, ok := s.knownImageCopyEndpointContext(name); ok {
+		matches = append(matches, copyEndpointTargetMatch{
+			kind:     "image",
+			explicit: fmt.Sprintf("@image:%s:path", name),
+			ctx:      imageCtx,
+		})
+	}
+	switch len(matches) {
+	case 0:
+		return commandContext{}, fmt.Errorf("copy endpoint %q does not name an active SSH session, known VM, or known image; use @:path, @host:path, @vm:name:path, @ssh:host:path, or @image:name:path", raw)
+	case 1:
+		return matches[0].ctx, nil
+	default:
+		parts := make([]string, 0, len(matches))
+		for _, match := range matches {
+			parts = append(parts, match.kind+" ("+match.explicit+")")
+		}
+		return commandContext{}, fmt.Errorf("copy endpoint %q is ambiguous: %s", raw, strings.Join(parts, ", "))
+	}
+}
+
+func (s *shellState) knownImageCopyEndpointContext(name string) (commandContext, bool) {
+	name = strings.TrimSpace(name)
+	if name == "" || s.api == nil {
+		return commandContext{}, false
+	}
+	state, err := s.api.GetImage(name)
+	if err != nil || strings.TrimSpace(state.Name) == "" {
+		return commandContext{}, false
+	}
+	ctx := vmCommandContext(s.context, commandOptions{}, name)
+	if s.contextCWD != nil {
+		if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
+			ctx.CWD = cwd
+		}
+	}
+	return ctx, true
+}
+
+func (s *shellState) knownVMCopyEndpointContext(id string) (commandContext, bool, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return commandContext{}, false, nil
+	}
+	if s.context.Mode == modeVM && backendVMID(s.context) == backendVMIDFor(id, false) && s.context.Image != "" {
+		return s.context, true, nil
+	}
+	for _, ctx := range s.contextStack {
+		if ctx.Mode == modeVM && backendVMID(ctx) == backendVMIDFor(id, false) && ctx.Image != "" {
+			return ctx, true, nil
+		}
+	}
+	if s.api == nil {
+		return commandContext{}, false, nil
+	}
+	state, err := s.api.InstanceStatusOf(id)
+	if err != nil {
+		return commandContext{}, false, err
+	}
+	if strings.TrimSpace(state.Image) == "" {
+		return commandContext{}, false, nil
+	}
+	ctx := commandContext{
+		Mode:       modeVM,
+		VMID:       firstNonEmpty(state.ID, id),
+		Image:      state.Image,
+		InitSystem: state.InitSystem,
+		Kernel:     state.Kernel,
+		MemoryMB:   state.MemoryMB,
+		CPUs:       state.CPUs,
+		NestedVirt: state.NestedVirt,
+		Network:    state.NetworkIPv4 != "",
+		Isolated:   strings.HasSuffix(firstNonEmpty(state.ID, id), "-isolated"),
+	}
+	if s.contextCWD != nil {
+		if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
+			ctx.CWD = cwd
+		}
+	}
+	return ctx, true, nil
 }
 
 func (s *shellState) vmCopyEndpointContext(id string) (commandContext, error) {
@@ -5952,7 +6063,7 @@ func (s *shellState) help(w io.Writer) error {
 @restart [--vm id]       restart a VM after confirmation
 @save [--vm id] tag      save the selected VM root filesystem as a local image
 @rmi image               remove a locally cached image
-@copy SRC DST            copy files between @host:, @vm:id:path, VM, @ssh:host:path, and active @session:path contexts
+@copy SRC DST            copy paths between @:path, @host:path, @vm:id:path, @ssh:host:path, @image:name:path, and active @session:path
 @agent codex [args]      run Codex inside the current VM with host ~/.codex mounted
 @agent --proxy codex     run Codex through a host auth proxy without mounting ~/.codex
 @tmux [session]          open tmux with vmsh as the default pane command
