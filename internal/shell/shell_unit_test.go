@@ -3095,6 +3095,114 @@ func TestSSHCopyPreservesDirectoryMetadataHostToSSHToHost(t *testing.T) {
 	assertCopiedMetadataTree(t, src, dst)
 }
 
+func TestCopyPreservesWeirdFilenamesHostAndSSH(t *testing.T) {
+	remoteRoot := t.TempDir()
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		switch {
+		case strings.Contains(command, "tar -xf -"):
+			if err := extractTarToHost(stdin, copyTargetPath{path: remoteRoot, directory: true}); err != nil {
+				_, _ = fmt.Fprintf(stderr, "extract remote tar: %v", err)
+				return 1
+			}
+			return 0
+		case strings.Contains(command, "tar -cf -"):
+			if err := writePathTar(stdout, filepath.Join(remoteRoot, "weird-src"), "weird-src"); err != nil {
+				_, _ = fmt.Fprintf(stderr, "write remote tar: %v", err)
+				return 1
+			}
+			return 0
+		default:
+			return 0
+		}
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	names := createWeirdNameCopyFixture(t, filepath.Join(sh.hostCWD, "weird-src"))
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.copyPath("@host:weird-src @host:host-back", &stdout, &stderr); err != nil {
+		t.Fatalf("copy weird names host to host: %v\nstderr:\n%s", err, stderr.String())
+	}
+	assertWeirdNameCopyTree(t, filepath.Join(sh.hostCWD, "host-back"), names)
+
+	if err := sh.copyPath("@host:weird-src @ssh:test-ssh-a:/tmp/weird-src", &stdout, &stderr); err != nil {
+		t.Fatalf("copy weird names host to ssh: %v\nstderr:\n%s", err, stderr.String())
+	}
+	assertWeirdNameCopyTree(t, filepath.Join(remoteRoot, "weird-src"), names)
+
+	if err := sh.copyPath("@ssh:test-ssh-a:/tmp/weird-src @host:ssh-back", &stdout, &stderr); err != nil {
+		t.Fatalf("copy weird names ssh to host: %v\nstderr:\n%s", err, stderr.String())
+	}
+	assertWeirdNameCopyTree(t, filepath.Join(sh.hostCWD, "ssh-back"), names)
+}
+
+func TestSSHCopyQuotesLeadingDashRemoteSource(t *testing.T) {
+	commands := make(chan string, 1)
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		if strings.Contains(command, "tar -cf -") {
+			commands <- command
+			tw := tar.NewWriter(stdout)
+			data := []byte("dash")
+			_ = tw.WriteHeader(&tar.Header{Name: "-leading", Mode: 0o644, Size: int64(len(data))})
+			_, _ = tw.Write(data)
+			_ = tw.Close()
+		}
+		return 0
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var stdout, stderr bytes.Buffer
+	if err := sh.copyPath("@ssh:test-ssh-a:/tmp/-leading @host:leading-back", &stdout, &stderr); err != nil {
+		t.Fatalf("copy leading dash remote source: %v\nstderr:\n%s", err, stderr.String())
+	}
+	select {
+	case command := <-commands:
+		if !strings.Contains(command, "tar -cf - -- ") || !strings.Contains(command, "-leading") {
+			t.Fatalf("remote tar command = %q, want -- before leading dash source", command)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("remote tar command was not observed")
+	}
+	if got := readTestFile(t, filepath.Join(sh.hostCWD, "leading-back")); got != "dash" {
+		t.Fatalf("copied leading dash file = %q, want dash", got)
+	}
+}
+
+func TestCopyEndpointResolutionAllowsColonsAndQuotedPaths(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	sh := newUnitShell(t, api)
+
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{raw: "@host:two words/colon:file", want: filepath.Join(sh.hostCWD, "two words", "colon:file")},
+		{raw: "@ssh:test-ssh-a:/tmp/path:with:colons/two words.txt", want: "/tmp/path:with:colons/two words.txt"},
+		{raw: "@vm:work:/tmp/path:with:colons/quote'file", want: "/tmp/path:with:colons/quote'file"},
+	}
+	for _, tc := range cases {
+		ep, err := sh.parseCopyEndpoint(tc.raw)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.raw, err)
+		}
+		if ep.path != tc.want {
+			t.Fatalf("endpoint %q path = %q, want %q", tc.raw, ep.path, tc.want)
+		}
+	}
+
+	fields, err := splitShellFields("@copy '@host:two words/quote'\"'\"'file' '@ssh:test-ssh-a:/tmp/line\nbreak'")
+	if err != nil {
+		t.Fatalf("split quoted copy command: %v", err)
+	}
+	want := []string{"@copy", "@host:two words/quote'file", "@ssh:test-ssh-a:/tmp/line\nbreak"}
+	if !reflect.DeepEqual(fields, want) {
+		t.Fatalf("quoted copy fields = %#v, want %#v", fields, want)
+	}
+}
+
 func TestCopySSHDirectoryMetadataToGuest(t *testing.T) {
 	remoteRoot := t.TempDir()
 	createMetadataCopyFixture(t, filepath.Join(remoteRoot, "ssh-meta"))

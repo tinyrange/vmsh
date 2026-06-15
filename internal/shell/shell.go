@@ -5899,15 +5899,21 @@ func sshRemoteCDScript(current, target string) string {
 }
 
 func remoteCDCommand(target string) string {
-	target = strings.TrimSpace(target)
 	switch {
 	case target == "" || target == "~":
 		return "cd"
 	case strings.HasPrefix(target, "~/"):
 		return "cd \"$HOME\"/" + shellQuote(strings.TrimPrefix(target, "~/"))
 	default:
-		return "cd " + shellQuote(target)
+		return "cd " + shellQuote(shellPathOperandForOptions(target))
 	}
+}
+
+func shellPathOperandForOptions(target string) string {
+	if strings.HasPrefix(target, "-") {
+		return "./" + target
+	}
+	return target
 }
 
 func lastNonEmptyLine(text string) string {

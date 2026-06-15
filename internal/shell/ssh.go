@@ -1646,7 +1646,7 @@ func (s *shellState) copySSHToLocal(ctx commandContext, src, dst copyTargetPath,
 		remoteDir = s.currentSSHCWD(ctx)
 	}
 	var archive bytes.Buffer
-	command := remoteCDCommand(remoteDir) + " && tar -cf - " + shellQuote(base)
+	command := remoteCDCommand(remoteDir) + " && tar -cf - -- " + shellQuote(base)
 	if err := s.runSSHCommand(ctx, command, nil, &archive, stderr, false, false); err != nil {
 		return err
 	}
@@ -1654,13 +1654,12 @@ func (s *shellState) copySSHToLocal(ctx commandContext, src, dst copyTargetPath,
 }
 
 func remoteMkdirCommand(dir string) string {
-	dir = strings.TrimSpace(dir)
 	switch {
 	case dir == "" || dir == "~" || dir == ".":
 		return ":"
 	case strings.HasPrefix(dir, "~/"):
-		return "mkdir -p \"$HOME\"/" + shellQuote(strings.TrimPrefix(dir, "~/"))
+		return "mkdir -p -- \"$HOME\"/" + shellQuote(strings.TrimPrefix(dir, "~/"))
 	default:
-		return "mkdir -p " + shellQuote(dir)
+		return "mkdir -p -- " + shellQuote(dir)
 	}
 }

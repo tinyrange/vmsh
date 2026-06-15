@@ -9,7 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -223,6 +225,36 @@ func TestVMIntegrationCopiesDirectoryMetadataBetweenVMs(t *testing.T) {
 		t.Fatalf("run VM-to-VM metadata copy script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
 	assertCopiedMetadataTree(t, src, dst)
+}
+
+func TestVMIntegrationCopiesWeirdFilenamesThroughVMAndIsolatedVM(t *testing.T) {
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+	t.Cleanup(func() {
+		_ = env.api.ShutdownInstanceWithID("copy-weird")
+		_ = env.api.ShutdownInstanceWithID("copy-weird-iso-isolated")
+	})
+
+	src := filepath.Join(sh.hostCWD, "weird-src")
+	vmBack := filepath.Join(sh.hostCWD, "vm-back")
+	isoBack := filepath.Join(sh.hostCWD, "iso-back")
+	names := createWeirdNameCopyFixture(t, src)
+
+	script := strings.Join([]string{
+		"@" + env.image + " --vm copy-weird --memory 768 --cpus 1 --no-network",
+		"@copy @host:weird-src @vm:copy-weird:/tmp/weird-vm",
+		"@copy @vm:copy-weird:/tmp/weird-vm @host:vm-back",
+		"@" + env.image + " --vm copy-weird-iso --isolated --memory 768 --cpus 1 --no-network",
+		"@copy @host:weird-src @:/tmp/weird-iso",
+		"@copy @:/tmp/weird-iso @host:iso-back",
+	}, "\n")
+
+	stdout, stderr, err := sh.runTestScriptWithTimeout(script, 75*time.Second)
+	if err != nil {
+		t.Fatalf("run weird filename VM copy script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	assertWeirdNameCopyTree(t, vmBack, names)
+	assertWeirdNameCopyTree(t, isoBack, names)
 }
 
 func TestVMIntegrationPastedCopyDirectoryMetadataHostToVMToHost(t *testing.T) {
@@ -955,6 +987,57 @@ func assertCopiedMetadataTree(t *testing.T, src, dst string) {
 	}
 	if info, err := os.Stat(filepath.Join(dst, "empty")); err != nil || !info.IsDir() {
 		t.Fatalf("copied empty dir info = %v err=%v, want directory", info, err)
+	}
+}
+
+func createWeirdNameCopyFixture(t *testing.T, src string) []string {
+	t.Helper()
+	names := []string{
+		"two words.txt",
+		"quote'file",
+		"dash - file",
+		"-leading",
+	}
+	if runtime.GOOS != "windows" {
+		names = append(names, "colon:file", "line\nbreak")
+	}
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatalf("create weird source dir: %v", err)
+	}
+	for _, name := range names {
+		payload := "payload:" + name + "\n"
+		if err := os.WriteFile(filepath.Join(src, name), []byte(payload), 0o644); err != nil {
+			t.Fatalf("write weird file %q: %v", name, err)
+		}
+	}
+	return names
+}
+
+func assertWeirdNameCopyTree(t *testing.T, dst string, names []string) {
+	t.Helper()
+	entries, err := os.ReadDir(dst)
+	if err != nil {
+		t.Fatalf("read weird copy dir %s: %v", dst, err)
+	}
+	gotNames := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		gotNames = append(gotNames, entry.Name())
+	}
+	sort.Strings(gotNames)
+	wantNames := append([]string(nil), names...)
+	sort.Strings(wantNames)
+	if !reflect.DeepEqual(gotNames, wantNames) {
+		t.Fatalf("copied weird names = %#v, want %#v", gotNames, wantNames)
+	}
+	for _, name := range names {
+		path := filepath.Join(dst, name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read weird copied file %q: %v", name, err)
+		}
+		if want := "payload:" + name + "\n"; string(data) != want {
+			t.Fatalf("weird copied file %q = %q, want %q", name, string(data), want)
+		}
 	}
 }
 
