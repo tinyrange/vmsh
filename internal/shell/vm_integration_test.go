@@ -118,6 +118,60 @@ func TestVMIntegrationScriptCommandsStartVMAndUseShellFeatures(t *testing.T) {
 	}
 }
 
+func TestVMIntegrationFreeBSDBuiltinRunsCommandsAndCopiesFiles(t *testing.T) {
+	if os.Getenv("VMSH_TEST_FREEBSD") == "" {
+		t.Skip("set VMSH_TEST_FREEBSD=1 to run FreeBSD vmsh integration test")
+	}
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+	t.Cleanup(func() {
+		_ = env.api.ShutdownInstanceWithID("freebsd")
+	})
+
+	mustWriteTestFile(t, filepath.Join(sh.hostCWD, "host-input.txt"), "from-host\n")
+	script := strings.Join([]string{
+		"@freebsd --vm freebsd --memory 1024 --cpus 1",
+		"printf 'guest:%s:%s\\n' \"$(uname -s)\" \"$(id -u)\"",
+		"@status",
+		"pwd",
+		"printf root-workdir > root-workdir.txt",
+		"cat root-workdir.txt",
+		"@copy @host:host-input.txt @:/tmp/vmsh-freebsd-input.txt",
+		"cat /tmp/vmsh-freebsd-input.txt",
+		"printf freebsd-output > /tmp/vmsh-freebsd-output.txt",
+		"@copy @:/tmp/vmsh-freebsd-output.txt @host:guest-output.txt",
+		"@vm:freebsd printf 'direct:%s\\n' \"$(cat /tmp/vmsh-freebsd-input.txt)\"",
+		"@stop --vm freebsd",
+	}, "\n")
+
+	stdout, stderr, err := sh.runTestScriptWithTimeout(script, 3*time.Minute)
+	if err != nil {
+		t.Fatalf("run FreeBSD vmsh script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	requireContains(t, stdout, "guest:FreeBSD:0")
+	requireContains(t, stdout, "context: vm")
+	requireContains(t, stdout, "image: @freebsd")
+	requireContains(t, stdout, "vm: freebsd")
+	requireContains(t, stdout, "/root")
+	requireContains(t, stdout, "root-workdir")
+	requireContains(t, stdout, "from-host")
+	requireContains(t, stdout, "direct:from-host")
+	copied, err := os.ReadFile(filepath.Join(sh.hostCWD, "guest-output.txt"))
+	if err != nil {
+		t.Fatalf("read copied FreeBSD file: %v", err)
+	}
+	if string(copied) != "freebsd-output" {
+		t.Fatalf("copied FreeBSD file = %q, want freebsd-output", string(copied))
+	}
+	state, err := env.api.InstanceStatusOf("freebsd")
+	if err != nil {
+		t.Fatalf("status after FreeBSD stop: %v", err)
+	}
+	if state.Status != "stopped" {
+		t.Fatalf("FreeBSD VM status after @stop = %q, want stopped", state.Status)
+	}
+}
+
 func TestVMIntegrationCopiesDirectoryMetadataHostToVMToHost(t *testing.T) {
 	env := newVMIntegrationTestEnv(t)
 	sh := env.newShell(t)
@@ -619,7 +673,7 @@ func (e *vmIntegrationTestEnv) newShell(t *testing.T) *shellState {
 	sh.completion = newVMSHCompleter(sh)
 	t.Cleanup(sh.closeSessions)
 	t.Cleanup(func() {
-		for _, id := range []string{"default", "script", "manage", "save-load", "saved-load", "tty-save", "tty-saved", "tty", "sudo-tty"} {
+		for _, id := range []string{"default", "script", "freebsd", "manage", "save-load", "saved-load", "tty-save", "tty-saved", "tty", "sudo-tty"} {
 			_ = e.api.ShutdownInstanceWithID(id)
 		}
 	})

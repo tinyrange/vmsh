@@ -686,6 +686,43 @@ func TestUbuntuNoInitRefusesRunningSystemdVM(t *testing.T) {
 	}
 }
 
+func TestBuiltInFreeBSDRunSkipsHostShare(t *testing.T) {
+	api := newRecordingShellAPI()
+	sh := newUnitShell(t, api)
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@freebsd --vm fbsd --memory 1024 --cpus 1 --no-network", &stdout, &stderr); err != nil {
+		t.Fatalf("enter FreeBSD context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	if err := sh.eval("uname -s", &stdout, &stderr); err != nil {
+		t.Fatalf("run FreeBSD command: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	if api.starts[0].req.Image != "@freebsd" {
+		t.Fatalf("started image = %q, want @freebsd", api.starts[0].req.Image)
+	}
+	if len(api.runs) != 1 {
+		t.Fatalf("runs = %d, want 1", len(api.runs))
+	}
+	run := api.runs[0].req
+	if run.Image != "@freebsd" {
+		t.Fatalf("run image = %q, want @freebsd", run.Image)
+	}
+	if len(run.Shares) != 0 {
+		t.Fatalf("FreeBSD run shares = %+v, want none", run.Shares)
+	}
+	if run.User != "root" {
+		t.Fatalf("FreeBSD run user = %q, want root", run.User)
+	}
+	if run.WorkDir != "/root" {
+		t.Fatalf("FreeBSD run workdir = %q, want /root", run.WorkDir)
+	}
+	if run.WorkDir == guestHostMount || strings.HasPrefix(run.WorkDir, guestHostMount+"/") {
+		t.Fatalf("FreeBSD run workdir = %q, should not use host mount", run.WorkDir)
+	}
+}
+
 func TestBareVMOptionsStartVMWhenActivated(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	sh := newUnitShell(t, api)
@@ -2106,6 +2143,26 @@ func TestBuiltInOpenBSDImageDoesNotPull(t *testing.T) {
 	}
 	if got := localImageName("openbsd", "amd64"); got != "@openbsd" {
 		t.Fatalf("local OpenBSD image name = %q, want @openbsd", got)
+	}
+}
+
+func TestBuiltInFreeBSDImageDoesNotPull(t *testing.T) {
+	api := newRecordingShellAPI()
+	api.pullStream = func(context.Context, string, client.PullImageRequest, func(client.ProgressEvent) error) error {
+		t.Fatal("built-in FreeBSD image attempted to pull")
+		return nil
+	}
+	sh := newUnitShell(t, api)
+	sh.confirmPull = func(source string, stderr io.Writer) (bool, error) {
+		t.Fatalf("built-in FreeBSD image prompted to pull %q", source)
+		return false, nil
+	}
+
+	if err := sh.ensureImageAvailable(commandContext{Mode: modeVM, Image: "@freebsd", Arch: "amd64"}, io.Discard); err != nil {
+		t.Fatalf("ensure built-in FreeBSD image: %v", err)
+	}
+	if got := localImageName("freebsd", "amd64"); got != "@freebsd" {
+		t.Fatalf("local FreeBSD image name = %q, want @freebsd", got)
 	}
 }
 

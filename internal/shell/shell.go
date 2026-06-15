@@ -37,6 +37,7 @@ const guestHostMount = "/host"
 const isolatedVMSuffix = "-isolated"
 const defaultGuestUser = "1000:1000"
 const defaultVMSHBootTimeoutSeconds = 60
+const defaultBuiltInBSDBootTimeoutSeconds = 180
 const defaultGuestShellReadyTimeout = 30 * time.Second
 const maxEmbeddedHostInitPreludeBytes = 64 * 1024
 const ubuntuCloudRootFSBaseURL = "https://cloud-images.ubuntu.com/releases/noble/release"
@@ -5472,6 +5473,8 @@ func isBuiltInGuestImage(image string) bool {
 	switch strings.ToLower(strings.TrimSpace(image)) {
 	case "@openbsd", "openbsd":
 		return true
+	case "@freebsd", "freebsd":
+		return true
 	default:
 		return false
 	}
@@ -5481,6 +5484,8 @@ func canonicalBuiltInGuestImage(image string) string {
 	switch strings.ToLower(strings.TrimSpace(image)) {
 	case "@openbsd", "openbsd":
 		return "@openbsd"
+	case "@freebsd", "freebsd":
+		return "@freebsd"
 	default:
 		return strings.TrimSpace(image)
 	}
@@ -5720,7 +5725,7 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 		MemoryMB:       ctx.MemoryMB,
 		CPUs:           ctx.CPUs,
 		NestedVirt:     ctx.NestedVirt,
-		TimeoutSeconds: vmshBootTimeoutSeconds(),
+		TimeoutSeconds: vmshBootTimeoutSeconds(ctx.Image),
 	}
 	if ctx.Network {
 		req.Network = networkConfigForContext(ctx)
@@ -5754,12 +5759,16 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 	return nil
 }
 
-func vmshBootTimeoutSeconds() float64 {
+func vmshBootTimeoutSeconds(image string) float64 {
 	raw := strings.TrimSpace(os.Getenv("VMSH_VM_BOOT_TIMEOUT"))
 	if raw == "" {
 		raw = strings.TrimSpace(os.Getenv("CCX3_VM_BOOT_TIMEOUT"))
 	}
 	if raw == "" {
+		switch canonicalBuiltInGuestImage(image) {
+		case "@freebsd", "@openbsd":
+			return defaultBuiltInBSDBootTimeoutSeconds
+		}
 		return defaultVMSHBootTimeoutSeconds
 	}
 	seconds, err := strconv.ParseFloat(raw, 64)
@@ -7361,6 +7370,9 @@ func hostCommandContext(base commandContext, opts commandOptions) commandContext
 }
 
 func vmCommandContext(base commandContext, opts commandOptions, image string) commandContext {
+	if isBuiltInGuestImage(image) {
+		image = canonicalBuiltInGuestImage(image)
+	}
 	previousKey := ""
 	if base.Mode == modeVM {
 		previousKey = contextCWDKey(base)
