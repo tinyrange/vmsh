@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -3993,6 +3994,9 @@ func guestHomeDir(ctx commandContext) string {
 	case user == "root" || strings.HasPrefix(user, "0:"):
 		return "/root"
 	case user == defaultGuestUser || user == strconv.Itoa(defaultGuestUID) || strings.HasPrefix(user, strconv.Itoa(defaultGuestUID)+":"):
+		if home := defaultGuestUserHome(ctx); home != "" {
+			return home
+		}
 		return "/home/" + defaultGuestUserName(ctx)
 	case user != "" && !strings.ContainsAny(user, ":0123456789"):
 		return "/home/" + user
@@ -4006,7 +4010,24 @@ func defaultGuestUserName(ctx commandContext) string {
 	if image == "ubuntu" || strings.HasPrefix(image, "ubuntu:") || strings.HasSuffix(image, "/ubuntu") || strings.Contains(image, "/ubuntu:") {
 		return "ubuntu"
 	}
+	if current, err := user.Current(); err == nil && strings.TrimSpace(current.Username) != "" {
+		name := filepath.Base(filepath.ToSlash(current.Username))
+		if name != "." && name != "/" && strings.TrimSpace(name) != "" {
+			return name
+		}
+	}
 	return "cc"
+}
+
+func defaultGuestUserHome(ctx commandContext) string {
+	image := strings.ToLower(strings.TrimSpace(ctx.Image))
+	if image == "ubuntu" || strings.HasPrefix(image, "ubuntu:") || strings.HasSuffix(image, "/ubuntu") || strings.Contains(image, "/ubuntu:") {
+		return "/home/ubuntu"
+	}
+	if current, err := user.Current(); err == nil && strings.HasPrefix(current.HomeDir, "/") {
+		return path.Clean(current.HomeDir)
+	}
+	return ""
 }
 
 func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io.Writer) error {

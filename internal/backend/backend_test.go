@@ -130,6 +130,10 @@ func TestConnectCCVMWithOptionsReportsDaemonReuse(t *testing.T) {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+	mux.HandleFunc("/capabilities", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"host":"test","vm_supported":true}`))
+	})
 	srv := &http.Server{Handler: mux}
 	go func() {
 		_ = srv.Serve(ln)
@@ -158,6 +162,45 @@ func TestConnectCCVMWithOptionsReportsDaemonReuse(t *testing.T) {
 	}
 	if err := api.HealthCheck(); err != nil {
 		t.Fatalf("reused client health check: %v", err)
+	}
+}
+
+func TestConnectCCVMWithOptionsRejectsLegacyDaemon(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := &http.Server{Handler: mux}
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+	t.Cleanup(func() {
+		_ = srv.Close()
+	})
+
+	statePath := filepath.Join(t.TempDir(), "ccvm.json")
+	if err := WriteDaemonState(statePath, DaemonState{Addr: ln.Addr().String()}); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+
+	var reused bool
+	_, err = ConnectCCVMWithOptions(CCVMLaunch{Path: "/missing/ccvm"}, t.TempDir(), statePath, ConnectOptions{
+		OnReuse: func(DaemonState) {
+			reused = true
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "start ccvm daemon") {
+		t.Fatalf("connect legacy daemon error = %v", err)
+	}
+	if reused {
+		t.Fatal("legacy daemon was reused")
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("state file after legacy rejection stat err = %v, want not exist", err)
 	}
 }
 

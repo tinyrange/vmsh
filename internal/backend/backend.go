@@ -111,7 +111,7 @@ func ConnectCCVM(launch CCVMLaunch, cacheDir, statePath string) (*client.Client,
 func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts ConnectOptions) (*client.Client, error) {
 	if state, err := ReadDaemonState(statePath); err == nil {
 		api := NewClient(state.Addr)
-		if err := api.HealthCheck(); err == nil {
+		if err := api.HealthCheck(); err == nil && apiCompatible(api) {
 			if opts.OnReuse != nil {
 				opts.OnReuse(state)
 			}
@@ -159,6 +159,14 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		return nil, fmt.Errorf("ccvm daemon started at %s but health check failed: %w", hello.Addr, err)
 	}
 	return api, nil
+}
+
+func apiCompatible(api *client.Client) bool {
+	if api == nil {
+		return false
+	}
+	_, err := api.Capabilities()
+	return err == nil
 }
 
 func CCVMLaunchName(launch CCVMLaunch) string {
