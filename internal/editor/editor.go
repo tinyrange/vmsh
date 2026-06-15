@@ -35,6 +35,9 @@ const (
 	completionMenuMaxItemWidth = 24
 	completionMenuCellPadding  = 2
 	commandCompletionAskLimit  = 100
+	pasteBurstInitialTimeout   = 2 * time.Millisecond
+	pasteBurstQuietTimeout     = 8 * time.Millisecond
+	pasteBurstMaxBytes         = 1024 * 1024
 	colorReset                 = "\x1b[0m"
 	colorYellow                = "\x1b[33m"
 )
@@ -97,12 +100,14 @@ const (
 	keyCtrlL
 	keyPageUp
 	keyPageDown
+	keyPaste
 	keyUnknown
 )
 
 type keyEvent struct {
-	key editorKey
-	r   rune
+	key  editorKey
+	r    rune
+	text string
 }
 
 func NewLineEditor(in *os.File, out io.Writer, historyPath string, completer Completer) *LineEditor {
@@ -138,7 +143,7 @@ func loadLineHistory(path string, limit int) *lineHistory {
 
 func shouldSaveHistory(line string) bool {
 	trimmed := strings.TrimSpace(line)
-	return trimmed != "" && !strings.HasPrefix(trimmed, "#")
+	return trimmed != "" && !strings.HasPrefix(trimmed, "#") && !strings.ContainsAny(line, "\r\n")
 }
 
 func (h *lineHistory) add(line string) {
@@ -167,6 +172,8 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 		return "", err
 	}
 	defer restore()
+	fmt.Fprint(e.out, "\x1b[?2004h")
+	defer fmt.Fprint(e.out, "\x1b[?2004l")
 
 	e.prompt = prompt
 	e.buf = nil
@@ -192,6 +199,24 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 			continue
 		}
 		switch ev.key {
+		case keyPaste:
+			text := normalizePastedText(ev.text)
+			if strings.Contains(text, "\n") {
+				line := e.insertPastedText(text)
+				fmt.Fprint(e.out, "\r")
+				if e.renderedCursorRow > 0 {
+					fmt.Fprintf(e.out, "\x1b[%dA", e.renderedCursorRow)
+				}
+				e.clearRenderedRows()
+				e.resetRenderedRows()
+				restore()
+				return line, nil
+			}
+			for _, r := range text {
+				e.insertRune(r)
+			}
+			historyPos = len(e.historyItems())
+			draft = string(e.buf)
 		case keyRune:
 			if e.appendRuneAndEcho(ev.r) {
 				historyPos = len(e.historyItems())
@@ -207,6 +232,18 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 				break
 			}
 			line := string(e.buf)
+			if tail, ok := e.readPasteBurstAfterEnter(); ok {
+				line += "\n" + normalizePastedText(tail)
+				e.menu = completionMenu{}
+				fmt.Fprint(e.out, "\r")
+				if e.renderedCursorRow > 0 {
+					fmt.Fprintf(e.out, "\x1b[%dA", e.renderedCursorRow)
+				}
+				e.clearRenderedRows()
+				e.resetRenderedRows()
+				restore()
+				return line, nil
+			}
 			e.menu = completionMenu{}
 			if e.cursor == len(e.buf) {
 				e.updateRenderedRows()
@@ -298,6 +335,22 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 		}
 		e.refresh()
 	}
+}
+
+func normalizePastedText(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	return strings.ReplaceAll(text, "\r", "\n")
+}
+
+func (e *LineEditor) insertPastedText(text string) string {
+	replacement := []rune(text)
+	next := make([]rune, 0, len(e.buf)+len(replacement))
+	next = append(next, e.buf[:e.cursor]...)
+	next = append(next, replacement...)
+	next = append(next, e.buf[e.cursor:]...)
+	e.buf = next
+	e.cursor += len(replacement)
+	return string(e.buf)
 }
 
 func (e *LineEditor) handleTab() {
@@ -675,6 +728,25 @@ func (e *LineEditor) decodeKey(b byte) (keyEvent, error) {
 	}
 }
 
+func (e *LineEditor) readPasteBurstAfterEnter() (string, bool) {
+	first, err := e.readByteWithTimeout(pasteBurstInitialTimeout)
+	if err != nil {
+		if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+			return "", false
+		}
+		return "", false
+	}
+	buf := []byte{first}
+	for len(buf) < pasteBurstMaxBytes {
+		b, err := e.readByteWithTimeout(pasteBurstQuietTimeout)
+		if err != nil {
+			break
+		}
+		buf = append(buf, b)
+	}
+	return string(buf), true
+}
+
 func (e *LineEditor) readRune(first byte) (keyEvent, error) {
 	if first < utf8.RuneSelf {
 		return keyEvent{key: keyRune, r: rune(first)}, nil
@@ -721,28 +793,65 @@ func (e *LineEditor) readEscape() (keyEvent, error) {
 		return keyEvent{key: keyEnd}, nil
 	case 'Z':
 		return keyEvent{key: keyBackTab}, nil
-	case '1', '3', '4', '5', '6', '7', '8':
-		term, err := e.readByteBlocking()
+	case '1', '2', '3', '4', '5', '6', '7', '8':
+		return e.readCSIWithNumericPrefix(next)
+	}
+	return keyEvent{key: keyEscape}, nil
+}
+
+func (e *LineEditor) readCSIWithNumericPrefix(first byte) (keyEvent, error) {
+	digits := []byte{first}
+	for {
+		b, err := e.readByteBlocking()
 		if err != nil {
 			return keyEvent{}, err
 		}
-		if term != '~' {
+		if b == '~' {
+			break
+		}
+		if b < '0' || b > '9' {
 			return keyEvent{key: keyEscape}, nil
 		}
-		switch next {
-		case '1', '7':
-			return keyEvent{key: keyHome}, nil
-		case '3':
-			return keyEvent{key: keyDelete}, nil
-		case '4', '8':
-			return keyEvent{key: keyEnd}, nil
-		case '5':
-			return keyEvent{key: keyPageUp}, nil
-		case '6':
-			return keyEvent{key: keyPageDown}, nil
+		digits = append(digits, b)
+		if len(digits) > 8 {
+			return keyEvent{key: keyEscape}, nil
 		}
 	}
-	return keyEvent{key: keyEscape}, nil
+	switch string(digits) {
+	case "1", "7":
+		return keyEvent{key: keyHome}, nil
+	case "3":
+		return keyEvent{key: keyDelete}, nil
+	case "4", "8":
+		return keyEvent{key: keyEnd}, nil
+	case "5":
+		return keyEvent{key: keyPageUp}, nil
+	case "6":
+		return keyEvent{key: keyPageDown}, nil
+	case "200":
+		text, err := e.readBracketedPaste()
+		if err != nil {
+			return keyEvent{}, err
+		}
+		return keyEvent{key: keyPaste, text: text}, nil
+	default:
+		return keyEvent{key: keyEscape}, nil
+	}
+}
+
+func (e *LineEditor) readBracketedPaste() (string, error) {
+	const end = "\x1b[201~"
+	var buf []byte
+	for {
+		b, err := e.readByteBlocking()
+		if err != nil {
+			return "", err
+		}
+		buf = append(buf, b)
+		if len(buf) >= len(end) && string(buf[len(buf)-len(end):]) == end {
+			return string(buf[:len(buf)-len(end)]), nil
+		}
+	}
 }
 
 func (e *LineEditor) readByteBlocking() (byte, error) {

@@ -97,6 +97,66 @@ func TestShellCommandPassingBuildsGuestRunRequests(t *testing.T) {
 	}
 }
 
+func TestEvalScriptLinesKeepsHostHeredocTogether(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	script := strings.Join([]string{
+		"@host cat > pasted.txt <<'EOF'",
+		"hello from heredoc with 'quotes'",
+		"EOF",
+		"@host cat pasted.txt",
+	}, "\n")
+
+	stdout, stderr, err := runShellUnitScript(sh, script)
+	if err != nil {
+		t.Fatalf("run heredoc script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "hello from heredoc") {
+		t.Fatalf("stdout = %q, want heredoc output\nstderr:\n%s", stdout, stderr)
+	}
+}
+
+func TestEvalScriptLinesKeepsQuotedContinuationTogether(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	script := strings.Join([]string{
+		"@host printf '%s' 'hello",
+		"from quoted paste' > quoted.txt",
+		"@host cat quoted.txt",
+	}, "\n")
+
+	stdout, stderr, err := runShellUnitScript(sh, script)
+	if err != nil {
+		t.Fatalf("run quoted continuation script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if !strings.Contains(strings.ReplaceAll(stdout, "\r\n", "\n"), "hello\nfrom quoted paste") {
+		t.Fatalf("stdout = %q, want quoted continuation output\nstderr:\n%s", stdout, stderr)
+	}
+}
+
+func TestEvalPastedLinesEchoesEachLogicalCommandWithPrompt(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	paste := strings.Join([]string{
+		"@host cat > pasted.txt <<'EOF'",
+		"hello from heredoc",
+		"EOF",
+		"@host cat pasted.txt",
+	}, "\n")
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.evalPastedLines(paste, &stdout, &stderr); err != nil {
+		t.Fatalf("eval pasted lines: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	out := strings.ReplaceAll(stdout.String(), "\r\n", "\n")
+	if strings.Count(stdout.String(), "\x1b[32m") < 2 {
+		t.Fatalf("pasted output = %q, want prompt for each logical command", stdout.String())
+	}
+	if !strings.Contains(out, "@host cat > pasted.txt <<'EOF'\nhello from heredoc\nEOF\n") {
+		t.Fatalf("pasted output = %q, want heredoc block echoed", stdout.String())
+	}
+	if !strings.Contains(out, "@host cat pasted.txt") {
+		t.Fatalf("pasted output = %q, want second command echoed", stdout.String())
+	}
+}
+
 func TestSudoWithoutCommandOpensRootSubshell(t *testing.T) {
 	api := newRecordingShellAPI("alpine")
 	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}
@@ -397,6 +457,43 @@ func TestStartIsIdempotentAfterBareVMActivation(t *testing.T) {
 	}
 	if len(api.starts) != 1 {
 		t.Fatalf("starts = %d, want only initial activation start", len(api.starts))
+	}
+}
+
+func TestExplicitVMTargetRunsExistingNamedVM(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@vm:work printf ok", &stdout, &stderr); err != nil {
+		t.Fatalf("run explicit vm target: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if len(api.runs) != 1 {
+		t.Fatalf("runs = %d, want 1", len(api.runs))
+	}
+	if api.runs[0].id != "work" || api.runs[0].req.Image != "ubuntu" {
+		t.Fatalf("run target = id %q req %+v, want work ubuntu", api.runs[0].id, api.runs[0].req)
+	}
+	if strings.Contains(api.runs[0].req.Image, "vm:work") {
+		t.Fatalf("explicit vm target was treated as image: %+v", api.runs[0].req)
+	}
+}
+
+func TestExplicitVMTargetPipelineUsesExistingNamedVM(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("printf ok | @vm:work cat", &stdout, &stderr); err != nil {
+		t.Fatalf("run explicit vm pipeline: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if len(api.runs) != 1 {
+		t.Fatalf("runs = %d, want 1", len(api.runs))
+	}
+	if api.runs[0].id != "work" || api.runs[0].req.Image != "ubuntu" {
+		t.Fatalf("pipeline target = id %q req %+v, want work ubuntu", api.runs[0].id, api.runs[0].req)
 	}
 }
 
@@ -3026,17 +3123,26 @@ func TestCopyGuestFileToSSHHost(t *testing.T) {
 }
 
 func TestCopySSHHostFileToGuest(t *testing.T) {
-	guestWrites := make(chan string, 1)
+	guestExtracts := make(chan string, 1)
 	api := newRecordingShellAPI("ubuntu")
 	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-		if req.Kind != "fs_write" {
-			t.Fatalf("exec kind = %q, want fs_write", req.Kind)
+		if req.Kind != "fs_extract" {
+			t.Fatalf("exec kind = %q, want fs_extract", req.Kind)
 		}
-		if id != "work" || req.Image != "ubuntu" || req.Path != "/tmp/to-vm.txt" {
-			t.Fatalf("write request = id %q req %+v", id, req)
+		if id != "work" || req.Image != "ubuntu" || req.Path != "/tmp/to-vm.txt" || req.Directory {
+			t.Fatalf("extract request = id %q req %+v", id, req)
 		}
-		guestWrites <- string(req.Stdin)
+		tr := tar.NewReader(bytes.NewReader(req.Stdin))
+		header, err := tr.Next()
+		if err != nil {
+			t.Fatalf("read extract header: %v", err)
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatalf("read extract data: %v", err)
+		}
+		guestExtracts <- header.Name + ":" + string(data)
 		if onEvent != nil {
 			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
 		}
@@ -3061,9 +3167,9 @@ func TestCopySSHHostFileToGuest(t *testing.T) {
 		t.Fatalf("copy ssh to guest: %v\nstderr:\n%s", err, stderr.String())
 	}
 	select {
-	case got := <-guestWrites:
-		if got != "from-ssh" {
-			t.Fatalf("guest write = %q", got)
+	case got := <-guestExtracts:
+		if !strings.HasSuffix(got, ":from-ssh") {
+			t.Fatalf("guest extract = %q", got)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("guest did not receive ssh file")
@@ -3392,6 +3498,64 @@ func TestHostDirectoryCopyDestinationSemantics(t *testing.T) {
 	}
 	if got := readTestFile(t, filepath.Join(into, "src", "nested", "file.txt")); got != "payload" {
 		t.Fatalf("copy-into nested file = %q", got)
+	}
+}
+
+func TestHostCopyPreservesMetadataAndSymlink(t *testing.T) {
+	parent := t.TempDir()
+	src := filepath.Join(parent, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatalf("make src: %v", err)
+	}
+	fileMtime := time.Unix(1700000000, 0)
+	dirMtime := time.Unix(1700000500, 0)
+	script := filepath.Join(src, "script.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	if err := os.Chmod(script, 0o755); err != nil {
+		t.Fatalf("chmod script: %v", err)
+	}
+	if err := os.Chtimes(script, fileMtime, fileMtime); err != nil {
+		t.Fatalf("chtime script: %v", err)
+	}
+	if err := os.Symlink("script.sh", filepath.Join(src, "script-link")); err != nil {
+		t.Fatalf("symlink script: %v", err)
+	}
+	if err := os.Chtimes(src, dirMtime, dirMtime); err != nil {
+		t.Fatalf("chtime src dir: %v", err)
+	}
+
+	dst := filepath.Join(parent, "dst")
+	if err := copyHostPath(src, copyTargetPath{path: dst}); err != nil {
+		t.Fatalf("copy host metadata tree: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dst, "script.sh"))
+	if err != nil {
+		t.Fatalf("stat copied script: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("copied script mode = %#o, want 0755", got)
+	}
+	if got := info.ModTime().Unix(); got != fileMtime.Unix() {
+		t.Fatalf("copied script mtime = %d, want %d", got, fileMtime.Unix())
+	}
+	linkInfo, err := os.Lstat(filepath.Join(dst, "script-link"))
+	if err != nil {
+		t.Fatalf("lstat copied symlink: %v", err)
+	}
+	if linkInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("copied link mode = %v, want symlink", linkInfo.Mode())
+	}
+	if target, err := os.Readlink(filepath.Join(dst, "script-link")); err != nil || target != "script.sh" {
+		t.Fatalf("copied symlink target = %q err=%v, want script.sh", target, err)
+	}
+	dirInfo, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("stat copied dir: %v", err)
+	}
+	if got := dirInfo.ModTime().Unix(); got != dirMtime.Unix() {
+		t.Fatalf("copied dir mtime = %d, want %d", got, dirMtime.Unix())
 	}
 }
 

@@ -154,3 +154,23 @@ func TestResetRenderedRowsClearsWrappedLineState(t *testing.T) {
 		t.Fatalf("rendered rows = cursor %d last %d, want both zero", e.renderedCursorRow, e.renderedLastRow)
 	}
 }
+
+func TestLineHistoryDoesNotSaveMultiLinePastes(t *testing.T) {
+	h := &lineHistory{limit: 10}
+
+	h.add("@host echo one\n@host echo two")
+
+	if len(h.items) != 0 {
+		t.Fatalf("history items = %#v, want no multi-line paste entry", h.items)
+	}
+}
+
+func TestLineHistorySavesSingleLineCommands(t *testing.T) {
+	h := &lineHistory{limit: 10}
+
+	h.add("@host echo one")
+
+	if got, want := h.items, []string{"@host echo one"}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("history items = %#v, want %#v", got, want)
+	}
+}

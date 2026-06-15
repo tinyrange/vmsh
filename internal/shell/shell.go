@@ -1155,7 +1155,13 @@ func (s *shellState) evalLineEditor(in *os.File, stdout, stderr io.Writer) error
 		case err != nil:
 			return err
 		}
-		if err := s.eval(line, stdout, stderr); err != nil {
+		var evalErr error
+		if strings.Contains(line, "\n") {
+			evalErr = s.evalPastedLines(line, stdout, stderr)
+		} else {
+			evalErr = s.eval(line, stdout, stderr)
+		}
+		if err := evalErr; err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
@@ -1233,28 +1239,207 @@ func (s *shellState) evalVMSHRCLines(source string, in io.Reader) error {
 }
 
 func (s *shellState) evalScriptLines(in io.Reader, stdout, stderr io.Writer) error {
+	return s.evalScriptLinesWithEcho(in, stdout, stderr, nil)
+}
+
+func (s *shellState) evalPastedLines(text string, stdout, stderr io.Writer) error {
+	return s.evalScriptLinesWithEcho(strings.NewReader(text), stdout, stderr, func(block string) error {
+		s.drawPromptStatus(stdout)
+		lines := strings.Split(block, "\n")
+		if len(lines) == 0 {
+			return nil
+		}
+		if _, err := fmt.Fprint(stdout, s.prompt()); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprint(stdout, lines[0]); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprint(stdout, "\r\n"); err != nil {
+			return err
+		}
+		for _, line := range lines[1:] {
+			if _, err := fmt.Fprint(stdout, line+"\r\n"); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (s *shellState) evalScriptLinesWithEcho(in io.Reader, stdout, stderr io.Writer, echo func(string) error) error {
 	scanner := bufio.NewScanner(in)
 	scanner.Buffer(make([]byte, 0, 4096), 1024*1024)
+	var pending []string
+	var heredocs []hereDocDelimiter
+	pendingHasHeredoc := false
 	for {
 		if !scanner.Scan() {
 			break
 		}
 		line := scanner.Text()
-		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+		if len(pending) == 0 && strings.HasPrefix(strings.TrimSpace(line), "#") {
 			continue
 		}
-		if err := s.eval(line, stdout, stderr); err != nil {
+		pending = append(pending, line)
+		if len(heredocs) == 0 {
+			heredocs = shellHereDocDelimiters(line)
+			if len(heredocs) != 0 {
+				pendingHasHeredoc = true
+				continue
+			}
+		} else if heredocs[0].matches(line) {
+			heredocs = heredocs[1:]
+			if len(heredocs) != 0 {
+				continue
+			}
+		} else {
+			continue
+		}
+		block := strings.Join(pending, "\n")
+		if !pendingHasHeredoc && shellLineNeedsContinuation(block) {
+			continue
+		}
+		if echo != nil {
+			if err := echo(block); err != nil {
+				return err
+			}
+		}
+		if err := s.eval(block, stdout, stderr); err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			s.lastCode = 1
 			return err
 		}
+		pending = nil
+		pendingHasHeredoc = false
 	}
 	if err := scanner.Err(); err != nil {
 		return err
 	}
+	if pendingHasHeredoc {
+		return fmt.Errorf("unterminated here-document %s", heredocs[0].delim)
+	}
+	if len(pending) != 0 {
+		return fmt.Errorf("incomplete shell command")
+	}
 	return nil
+}
+
+func shellLineNeedsContinuation(line string) bool {
+	inSingle := false
+	inDouble := false
+	escaped := false
+	for _, r := range line {
+		switch {
+		case escaped:
+			escaped = false
+		case r == '\\' && !inSingle:
+			escaped = true
+		case r == '\'' && !inDouble:
+			inSingle = !inSingle
+		case r == '"' && !inSingle:
+			inDouble = !inDouble
+		}
+	}
+	return escaped || inSingle || inDouble
+}
+
+type hereDocDelimiter struct {
+	delim     string
+	stripTabs bool
+}
+
+func (d hereDocDelimiter) matches(line string) bool {
+	if d.stripTabs {
+		line = strings.TrimLeft(line, "\t")
+	}
+	return line == d.delim
+}
+
+func shellHereDocDelimiters(line string) []hereDocDelimiter {
+	var out []hereDocDelimiter
+	inSingle := false
+	inDouble := false
+	escaped := false
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		switch {
+		case escaped:
+			escaped = false
+			continue
+		case c == '\\' && !inSingle:
+			escaped = true
+			continue
+		case c == '\'' && !inDouble:
+			inSingle = !inSingle
+			continue
+		case c == '"' && !inSingle:
+			inDouble = !inDouble
+			continue
+		case inSingle || inDouble:
+			continue
+		case c == '<' && i+1 < len(line) && line[i+1] == '<':
+			if i+2 < len(line) && line[i+2] == '<' {
+				continue
+			}
+			stripTabs := false
+			j := i + 2
+			if j < len(line) && line[j] == '-' {
+				stripTabs = true
+				j++
+			}
+			for j < len(line) && (line[j] == ' ' || line[j] == '\t') {
+				j++
+			}
+			delim, next := parseHereDocDelimiterToken(line, j)
+			if delim != "" {
+				out = append(out, hereDocDelimiter{delim: delim, stripTabs: stripTabs})
+			}
+			if next > i {
+				i = next - 1
+			}
+		}
+	}
+	return out
+}
+
+func parseHereDocDelimiterToken(line string, start int) (string, int) {
+	var b strings.Builder
+	quote := byte(0)
+	escaped := false
+	for i := start; i < len(line); i++ {
+		c := line[i]
+		if escaped {
+			b.WriteByte(c)
+			escaped = false
+			continue
+		}
+		if quote == 0 {
+			switch c {
+			case ' ', '\t', ';', '|', '&', '(', ')', '<', '>':
+				return b.String(), i
+			case '\\':
+				escaped = true
+			case '\'', '"':
+				quote = c
+			default:
+				b.WriteByte(c)
+			}
+			continue
+		}
+		if c == quote {
+			quote = 0
+			continue
+		}
+		if quote == '"' && c == '\\' {
+			escaped = true
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String(), len(line)
 }
 
 func shouldSaveHistory(line string) bool {
@@ -1803,7 +1988,12 @@ func (s *shellState) preparePipelineStage(base commandContext, segment string, s
 			if isControlAtTarget(at.Target) {
 				return pipelineStage{}, fmt.Errorf("@%s cannot be used in a pipeline", at.Target)
 			}
-			if sshCtx, ok := s.sshSessionContext(at.Target); ok {
+			if strings.HasPrefix(at.Target, "vm:") {
+				ctx, err = s.vmTargetCommandContext(strings.TrimPrefix(at.Target, "vm:"), at.Options)
+				if err != nil {
+					return pipelineStage{}, err
+				}
+			} else if sshCtx, ok := s.sshSessionContext(at.Target); ok {
 				if len(at.Options.OptionFields) != 0 {
 					return pipelineStage{}, fmt.Errorf("usage: @%s [cmd]", at.Target)
 				}
@@ -2161,6 +2351,23 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 	case "agent":
 		return s.runAgent(at, stdout, stderr)
 	default:
+		if strings.HasPrefix(at.Target, "vm:") {
+			ctx, err := s.vmTargetCommandContext(strings.TrimPrefix(at.Target, "vm:"), at.Options)
+			if err != nil {
+				return err
+			}
+			if at.Command == "" {
+				if at.Options.Sudo {
+					return fmt.Errorf("usage: @%s --sudo <cmd>", at.Target)
+				}
+				if err := s.prepareActivatedVMContext(&ctx, stdout, stderr); err != nil {
+					return err
+				}
+				s.activateContext(ctx)
+				return nil
+			}
+			return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
+		}
 		if ctx, ok := s.sshSessionContext(at.Target); ok {
 			if len(at.Options.OptionFields) != 0 {
 				return fmt.Errorf("usage: @%s [cmd]", at.Target)
@@ -2184,6 +2391,15 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		}
 		return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
 	}
+}
+
+func (s *shellState) vmTargetCommandContext(id string, opts commandOptions) (commandContext, error) {
+	ctx, err := s.vmCopyEndpointContext(strings.TrimSpace(id))
+	if err != nil {
+		return commandContext{}, err
+	}
+	ctx = ctx.withOptions(opts)
+	return ctx, nil
 }
 
 func (s *shellState) prepareActivatedVMContext(ctx *commandContext, stdout, stderr io.Writer) error {
@@ -2687,49 +2903,31 @@ func (s *shellState) currentSSHCWD(ctx commandContext) string {
 }
 
 func copyHostPath(src string, dst copyTargetPath) error {
-	info, err := os.Stat(src)
-	if err != nil {
-		return err
+	pr, pw := io.Pipe()
+	errCh := make(chan error, 1)
+	go func() {
+		err := writePathTar(pw, src, filepath.Base(src))
+		_ = pw.CloseWithError(err)
+		errCh <- err
+	}()
+	extractErr := extractTarToHost(pr, dst)
+	_ = pr.CloseWithError(extractErr)
+	writeErr := <-errCh
+	if extractErr != nil {
+		return extractErr
 	}
-	target := hostCopyTarget(src, dst.path, dst.directory, info)
-	if info.IsDir() {
-		return copyHostDir(src, target, info.Mode())
-	}
-	return copyHostFile(src, target, info.Mode())
+	return writeErr
 }
 
 func (s *shellState) copyLocalToGuest(src string, ctx commandContext, dst copyTargetPath, stderr io.Writer) error {
-	info, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
 	if err := s.ensureGuestCopyReady(ctx, stderr); err != nil {
 		return err
 	}
-	if info.IsDir() {
-		return s.copyLocalDirToGuest(src, ctx, dst, stderr)
-	}
-	return s.copyLocalFileToGuest(src, ctx, dst, stderr)
-}
-
-func (s *shellState) copyLocalDirToGuest(src string, ctx commandContext, dst copyTargetPath, stderr io.Writer) error {
 	var archive bytes.Buffer
 	if err := writePathTar(&archive, src, filepath.Base(src)); err != nil {
 		return err
 	}
 	return s.guestFSExtract(ctx, dst, archive.Bytes(), stderr)
-}
-
-func (s *shellState) copyLocalFileToGuest(src string, ctx commandContext, dst copyTargetPath, stderr io.Writer) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	target := dst.path
-	if dst.directory {
-		target = path.Join(target, filepath.ToSlash(filepath.Base(src)))
-	}
-	return s.guestFSWrite(ctx, target, data, stderr)
 }
 
 func (s *shellState) guestFSMkdir(ctx commandContext, dir string, stderr io.Writer) error {
@@ -2738,16 +2936,6 @@ func (s *shellState) guestFSMkdir(ctx commandContext, dir string, stderr io.Writ
 		Image: localImageName(ctx.Image, ctx.Arch),
 		Path:  dir,
 		User:  guestRunUser(ctx),
-	}, stderr)
-}
-
-func (s *shellState) guestFSWrite(ctx commandContext, target string, data []byte, stderr io.Writer) error {
-	return s.runGuestFSRequest(ctx, client.ExecRequest{
-		Kind:  "fs_write",
-		Image: localImageName(ctx.Image, ctx.Arch),
-		Path:  target,
-		User:  guestRunUser(ctx),
-		Stdin: append([]byte(nil), data...),
 	}, stderr)
 }
 
@@ -2859,22 +3047,37 @@ func (s *shellState) ensureGuestCopyReady(ctx commandContext, stderr io.Writer) 
 	if err := s.ensureImageAvailable(ctx, stderr); err != nil {
 		return err
 	}
-	return s.ensureVMRunning(ctx, stderr)
+	if err := s.ensureVMRunning(ctx, stderr); err != nil {
+		return err
+	}
+	s.closeGuestShellForControlRequest(ctx)
+	return nil
+}
+
+func (s *shellState) closeGuestShellForControlRequest(ctx commandContext) {
+	if s.guestShell == nil {
+		return
+	}
+	if !strings.HasPrefix(s.guestShell.key, backendVMID(ctx)+"\x00") {
+		return
+	}
+	s.guestShell.close()
+	s.guestShell = nil
 }
 
 func writePathTar(w io.Writer, src, rootName string) error {
-	info, err := os.Stat(src)
+	info, err := os.Lstat(src)
 	if err != nil {
 		return err
 	}
 	tw := tar.NewWriter(w)
 	defer tw.Close()
 	rootName = filepath.ToSlash(filepath.Base(rootName))
-	return filepath.WalkDir(src, func(filePath string, entry os.DirEntry, walkErr error) error {
+	return filepath.WalkDir(src, func(filePath string, _ os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		fileInfo, err := entry.Info()
+		fileInfo, err := os.Lstat(filePath)
 		if err != nil {
 			return err
 		}
@@ -2895,7 +3098,14 @@ func writePathTar(w io.Writer, src, rootName string) error {
 				name = rootName + "/" + parts[1]
 			}
 		}
-		header, err := tar.FileInfoHeader(fileInfo, "")
+		link := ""
+		if fileInfo.Mode()&os.ModeSymlink != 0 {
+			link, err = os.Readlink(filePath)
+			if err != nil {
+				return err
+			}
+		}
+		header, err := tar.FileInfoHeader(fileInfo, link)
 		if err != nil {
 			return err
 		}
@@ -2922,10 +3132,11 @@ func writePathTar(w io.Writer, src, rootName string) error {
 func extractTarToHost(r io.Reader, dst copyTargetPath) error {
 	mode := hostCopyDestMode(dst.path, dst.directory)
 	tr := tar.NewReader(r)
+	var dirs []tarDirMtime
 	for {
 		header, err := tr.Next()
 		if errors.Is(err, io.EOF) {
-			return nil
+			return restoreTarDirMtimes(dirs)
 		}
 		if err != nil {
 			return err
@@ -2937,6 +3148,18 @@ func extractTarToHost(r io.Reader, dst copyTargetPath) error {
 		switch header.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, os.FileMode(header.Mode).Perm()); err != nil {
+				return err
+			}
+			_ = os.Chmod(target, os.FileMode(header.Mode).Perm())
+			dirs = append(dirs, tarDirMtime{path: target, mtime: header.ModTime})
+		case tar.TypeSymlink:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			if err := os.Symlink(header.Linkname, target); err != nil {
 				return err
 			}
 		case tar.TypeReg, tar.TypeRegA:
@@ -2955,10 +3178,35 @@ func extractTarToHost(r io.Reader, dst copyTargetPath) error {
 			if closeErr != nil {
 				return closeErr
 			}
+			perm := os.FileMode(header.Mode).Perm()
+			if err := os.Chmod(target, perm); err != nil {
+				return err
+			}
+			if err := os.Chtimes(target, header.ModTime, header.ModTime); err != nil {
+				return err
+			}
 		default:
 			continue
 		}
 	}
+}
+
+type tarDirMtime struct {
+	path  string
+	mtime time.Time
+}
+
+func restoreTarDirMtimes(dirs []tarDirMtime) error {
+	for i := len(dirs) - 1; i >= 0; i-- {
+		dir := dirs[i]
+		if dir.mtime.IsZero() {
+			continue
+		}
+		if err := os.Chtimes(dir.path, dir.mtime, dir.mtime); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type copyDestMode int
@@ -2991,16 +3239,6 @@ func hostTarTarget(dst string, mode copyDestMode, name string) (string, error) {
 		return dst, nil
 	}
 	return filepath.Join(dst, filepath.FromSlash(parts[1])), nil
-}
-
-func hostCopyTarget(src, dst string, directoryHint bool, info os.FileInfo) string {
-	if dstInfo, err := os.Stat(dst); err == nil && dstInfo.IsDir() {
-		return filepath.Join(dst, filepath.Base(src))
-	}
-	if directoryHint || strings.HasSuffix(dst, string(filepath.Separator)) {
-		return filepath.Join(dst, filepath.Base(src))
-	}
-	return dst
 }
 
 func copyHostDir(src, dst string, mode os.FileMode) error {
@@ -3186,6 +3424,9 @@ func persistentHostCommandAllowed(line string) bool {
 }
 
 func persistentShellCommandAllowed(line string) bool {
+	if strings.ContainsAny(line, "\r\n") {
+		return false
+	}
 	fields, err := splitShellFields(line)
 	return err == nil && len(fields) > 0
 }
