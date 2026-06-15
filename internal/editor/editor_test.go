@@ -174,3 +174,142 @@ func TestLineHistorySavesSingleLineCommands(t *testing.T) {
 		t.Fatalf("history items = %#v, want %#v", got, want)
 	}
 }
+
+func TestHistorySearchFindsNewestMatchingCommand(t *testing.T) {
+	e := &LineEditor{
+		out:     ioDiscard{},
+		width:   80,
+		history: &lineHistory{items: []string{"@ssh old uptime", "@copy src dst", "@ssh new uptime"}},
+		buf:     []rune("draft"),
+		cursor:  5,
+	}
+
+	e.startHistorySearch()
+	for _, r := range "@ssh" {
+		if _, _, err := e.handleHistorySearchEvent(keyEvent{key: keyRune, r: r}); err != nil {
+			t.Fatalf("type search rune: %v", err)
+		}
+	}
+
+	if got := string(e.buf); got != "@ssh new uptime" {
+		t.Fatalf("search buffer = %q, want newest matching ssh command", got)
+	}
+	if got := string(e.search.query); got != "@ssh" {
+		t.Fatalf("search query = %q, want @ssh", got)
+	}
+}
+
+func TestHistorySearchCtrlRCyclesOlderMatches(t *testing.T) {
+	e := &LineEditor{
+		out:     ioDiscard{},
+		width:   80,
+		history: &lineHistory{items: []string{"@ssh old uptime", "@copy src dst", "@ssh new uptime"}},
+	}
+
+	e.startHistorySearch()
+	for _, r := range "@ssh" {
+		_, _, _ = e.handleHistorySearchEvent(keyEvent{key: keyRune, r: r})
+	}
+	if got := string(e.buf); got != "@ssh new uptime" {
+		t.Fatalf("first match = %q", got)
+	}
+	_, _, _ = e.handleHistorySearchEvent(keyEvent{key: keyCtrlR})
+	if got := string(e.buf); got != "@ssh old uptime" {
+		t.Fatalf("cycled match = %q, want older ssh command", got)
+	}
+	_, _, _ = e.handleHistorySearchEvent(keyEvent{key: keyCtrlR})
+	if got := string(e.buf); got != "@ssh new uptime" {
+		t.Fatalf("wrapped match = %q, want newest ssh command", got)
+	}
+}
+
+func TestHistorySearchEnterAcceptsSelectedCommand(t *testing.T) {
+	e := &LineEditor{
+		out:     ioDiscard{},
+		width:   80,
+		history: &lineHistory{items: []string{"@host echo one", "@copy src dst"}},
+	}
+
+	e.startHistorySearch()
+	for _, r := range "copy" {
+		_, _, _ = e.handleHistorySearchEvent(keyEvent{key: keyRune, r: r})
+	}
+	line, accepted, err := e.handleHistorySearchEvent(keyEvent{key: keyEnter})
+	if err != nil {
+		t.Fatalf("accept search: %v", err)
+	}
+	if !accepted || line != "@copy src dst" {
+		t.Fatalf("accepted = %t line = %q, want @copy src dst", accepted, line)
+	}
+}
+
+func TestHistorySearchCancelRestoresOriginalLine(t *testing.T) {
+	for _, key := range []editorKey{keyEscape, keyCtrlG} {
+		e := &LineEditor{
+			out:     ioDiscard{},
+			width:   80,
+			history: &lineHistory{items: []string{"@host echo one"}},
+			buf:     []rune("draft command"),
+			cursor:  5,
+		}
+		e.startHistorySearch()
+		_, _, _ = e.handleHistorySearchEvent(keyEvent{key: keyRune, r: 'e'})
+
+		if _, _, err := e.handleHistorySearchEvent(keyEvent{key: key}); err != nil {
+			t.Fatalf("cancel search with %v: %v", key, err)
+		}
+		if e.search.active {
+			t.Fatalf("search remained active after cancel with %v", key)
+		}
+		if got := string(e.buf); got != "draft command" || e.cursor != 5 {
+			t.Fatalf("restored line = %q cursor=%d, want draft command cursor=5", got, e.cursor)
+		}
+	}
+}
+
+func TestHistorySearchFailedMatchKeepsOriginalLine(t *testing.T) {
+	e := &LineEditor{
+		out:     ioDiscard{},
+		width:   80,
+		history: &lineHistory{items: []string{"@host echo one"}},
+		buf:     []rune("draft"),
+		cursor:  2,
+	}
+
+	e.startHistorySearch()
+	for _, r := range "missing" {
+		_, _, _ = e.handleHistorySearchEvent(keyEvent{key: keyRune, r: r})
+	}
+
+	if e.search.matchPos != -1 {
+		t.Fatalf("matchPos = %d, want failed match", e.search.matchPos)
+	}
+	if got := string(e.buf); got != "draft" || e.cursor != 2 {
+		t.Fatalf("failed search line = %q cursor=%d, want original", got, e.cursor)
+	}
+	if got := e.historySearchDisplay(); !strings.Contains(got, "failed reverse-i-search") {
+		t.Fatalf("search display = %q, want failed marker", got)
+	}
+}
+
+func TestDecodeHistorySearchKeys(t *testing.T) {
+	e := &LineEditor{}
+	ctrlR, err := e.decodeKey(0x12)
+	if err != nil {
+		t.Fatalf("decode Ctrl+R: %v", err)
+	}
+	if ctrlR.key != keyCtrlR {
+		t.Fatalf("Ctrl+R key = %v, want keyCtrlR", ctrlR.key)
+	}
+	ctrlG, err := e.decodeKey(0x07)
+	if err != nil {
+		t.Fatalf("decode Ctrl+G: %v", err)
+	}
+	if ctrlG.key != keyCtrlG {
+		t.Fatalf("Ctrl+G key = %v, want keyCtrlG", ctrlG.key)
+	}
+}
+
+type ioDiscard struct{}
+
+func (ioDiscard) Write(p []byte) (int, error) { return len(p), nil }

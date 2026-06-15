@@ -6740,6 +6740,7 @@ func (s *shellState) help(w io.Writer) error {
 @tmux [session]          open tmux with vmsh as the default pane command
 @forward H:G             forward host port H to guest port G
 opts: --vm id --cwd path --user user --sudo --init --no-init --kernel default|ubuntu --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
+keys: Ctrl+R reverse history search; Esc/Ctrl+G cancel search
 cd <dir>                 change the current host, VM, or SSH working directory
 exit [--force]           leave the current subshell, or vmsh at top level
 `))

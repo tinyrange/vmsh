@@ -53,6 +53,7 @@ type LineEditor struct {
 	cursor            int
 	menu              completionMenu
 	confirm           completionConfirm
+	search            historySearch
 	renderedCursorRow int
 	renderedLastRow   int
 }
@@ -79,6 +80,14 @@ type completionConfirm struct {
 	token      string
 }
 
+type historySearch struct {
+	active         bool
+	query          []rune
+	originalBuf    []rune
+	originalCursor int
+	matchPos       int
+}
+
 type editorKey int
 
 const (
@@ -97,7 +106,9 @@ const (
 	keyEscape
 	keyCtrlC
 	keyCtrlD
+	keyCtrlG
 	keyCtrlL
+	keyCtrlR
 	keyPageUp
 	keyPageDown
 	keyPaste
@@ -180,6 +191,7 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 	e.cursor = 0
 	e.menu = completionMenu{}
 	e.confirm = completionConfirm{}
+	e.search = historySearch{}
 	e.resetRenderedRows()
 	historyPos := len(e.historyItems())
 	draft := ""
@@ -192,6 +204,34 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 				return "", io.EOF
 			}
 			return "", err
+		}
+		if e.search.active {
+			line, accepted, err := e.handleHistorySearchEvent(ev)
+			if err != nil {
+				e.menu = completionMenu{}
+				e.confirm = completionConfirm{}
+				e.search = historySearch{}
+				e.buf = nil
+				e.cursor = 0
+				e.refresh()
+				fmt.Fprint(e.out, "^C\r\n")
+				e.resetRenderedRows()
+				restore()
+				return "", err
+			}
+			if accepted {
+				e.menu = completionMenu{}
+				e.confirm = completionConfirm{}
+				e.search = historySearch{}
+				e.refresh()
+				fmt.Fprint(e.out, "\r\n")
+				e.resetRenderedRows()
+				restore()
+				e.history.add(line)
+				return line, nil
+			}
+			e.refresh()
+			continue
 		}
 		if e.confirm.active {
 			e.handleCompletionConfirm(ev)
@@ -277,6 +317,8 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 		case keyCtrlL:
 			fmt.Fprint(e.out, "\x1b[H\x1b[2J")
 			e.refresh()
+		case keyCtrlR:
+			e.startHistorySearch()
 		case keyBackspace:
 			e.deleteLeft()
 			historyPos = len(e.historyItems())
@@ -396,6 +438,93 @@ func (e *LineEditor) historyMove(pos int, draft string, delta int) (int, string)
 	return pos, draft
 }
 
+func (e *LineEditor) startHistorySearch() {
+	e.menu = completionMenu{}
+	e.confirm = completionConfirm{}
+	e.search = historySearch{
+		active:         true,
+		originalBuf:    append([]rune(nil), e.buf...),
+		originalCursor: e.cursor,
+		matchPos:       len(e.historyItems()),
+	}
+	e.updateHistorySearch(false)
+}
+
+func (e *LineEditor) handleHistorySearchEvent(ev keyEvent) (string, bool, error) {
+	switch ev.key {
+	case keyCtrlC:
+		return "", false, ErrLineInterrupted
+	case keyEnter:
+		return string(e.buf), true, nil
+	case keyEscape, keyCtrlG:
+		e.cancelHistorySearch()
+	case keyCtrlR:
+		e.updateHistorySearch(true)
+	case keyRune:
+		e.search.query = append(e.search.query, ev.r)
+		e.updateHistorySearch(false)
+	case keyBackspace, keyDelete:
+		if len(e.search.query) == 0 {
+			e.bell()
+			break
+		}
+		e.search.query = e.search.query[:len(e.search.query)-1]
+		e.updateHistorySearch(false)
+	case keyCtrlL:
+		fmt.Fprint(e.out, "\x1b[H\x1b[2J")
+	default:
+		e.bell()
+	}
+	return "", false, nil
+}
+
+func (e *LineEditor) updateHistorySearch(cycle bool) {
+	items := e.historyItems()
+	if len(items) == 0 {
+		e.restoreHistorySearchOriginal()
+		e.search.matchPos = -1
+		return
+	}
+	start := len(items) - 1
+	if cycle && e.search.matchPos >= 0 {
+		start = e.search.matchPos - 1
+		if start < 0 {
+			start = len(items) - 1
+		}
+	}
+	query := string(e.search.query)
+	for checked := 0; checked < len(items); checked++ {
+		idx := start - checked
+		if idx < 0 {
+			idx += len(items)
+		}
+		if query == "" || strings.Contains(items[idx], query) {
+			e.search.matchPos = idx
+			e.buf = []rune(items[idx])
+			e.cursor = len(e.buf)
+			return
+		}
+	}
+	e.restoreHistorySearchOriginal()
+	e.search.matchPos = -1
+}
+
+func (e *LineEditor) cancelHistorySearch() {
+	e.restoreHistorySearchOriginal()
+	e.search = historySearch{}
+}
+
+func (e *LineEditor) restoreHistorySearchOriginal() {
+	e.buf = append([]rune(nil), e.search.originalBuf...)
+	e.cursor = e.search.originalCursor
+	if e.cursor < 0 {
+		e.cursor = 0
+	}
+	if e.cursor > len(e.buf) {
+		e.cursor = len(e.buf)
+	}
+}
+
 func (e *LineEditor) insertRune(r rune) {
 	e.menu.active = false
 	e.buf = append(e.buf, 0)
@@ -405,7 +534,7 @@ func (e *LineEditor) insertRune(r rune) {
 }
 
 func (e *LineEditor) canEchoAppend() bool {
-	return !e.menu.active && !e.confirm.active && e.cursor == len(e.buf)
+	return !e.menu.active && !e.confirm.active && !e.search.active && e.cursor == len(e.buf)
 }
 
 func (e *LineEditor) appendRuneAndEcho(r rune) bool {
@@ -587,6 +716,10 @@ func (e *LineEditor) completionItemWidth(items []string, token string) int {
 }
 
 func (e *LineEditor) refresh() {
+	if e.search.active {
+		e.refreshHistorySearch()
+		return
+	}
 	before := string(e.buf[:e.cursor])
 	after := string(e.buf[e.cursor:])
 	fmt.Fprint(e.out, "\r")
@@ -607,6 +740,26 @@ func (e *LineEditor) refresh() {
 	fmt.Fprint(e.out, "\x1b8")
 	e.renderedCursorRow = terminalRowForCells(visibleWidth(e.prompt)+visibleWidth(before), e.width)
 	e.renderedLastRow = e.currentRenderedLastRow()
+}
+
+func (e *LineEditor) refreshHistorySearch() {
+	display := e.historySearchDisplay()
+	fmt.Fprint(e.out, "\r")
+	if e.renderedCursorRow > 0 {
+		fmt.Fprintf(e.out, "\x1b[%dA", e.renderedCursorRow)
+	}
+	e.clearRenderedRows()
+	fmt.Fprint(e.out, display)
+	e.renderedCursorRow = terminalRowForCells(visibleWidth(display), e.width)
+	e.renderedLastRow = e.renderedCursorRow
+}
+
+func (e *LineEditor) historySearchDisplay() string {
+	prefix := "reverse-i-search"
+	if e.search.matchPos < 0 {
+		prefix = "failed reverse-i-search"
+	}
+	return fmt.Sprintf("(%s)`%s': %s", prefix, string(e.search.query), string(e.buf))
 }
 
 func (e *LineEditor) clearRenderedRows() {
@@ -631,6 +784,9 @@ func (e *LineEditor) resetRenderedRows() {
 }
 
 func (e *LineEditor) currentRenderedLastRow() int {
+	if e.search.active {
+		return terminalRowForCells(visibleWidth(e.historySearchDisplay()), e.width)
+	}
 	lastRow := terminalRowForCells(visibleWidth(e.prompt)+visibleWidth(string(e.buf)), e.width)
 	if e.menu.active && len(e.menu.items) > 0 {
 		lastRow += completionDisplayLines(len(e.menu.items), e.menuColumns())
@@ -716,8 +872,12 @@ func (e *LineEditor) decodeKey(b byte) (keyEvent, error) {
 		return keyEvent{key: keyCtrlC}, nil
 	case 0x04:
 		return keyEvent{key: keyCtrlD}, nil
+	case 0x07:
+		return keyEvent{key: keyCtrlG}, nil
 	case 0x0c:
 		return keyEvent{key: keyCtrlL}, nil
+	case 0x12:
+		return keyEvent{key: keyCtrlR}, nil
 	case 0x1b:
 		return e.readEscape()
 	default:
