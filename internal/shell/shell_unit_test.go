@@ -297,6 +297,70 @@ func TestExitUsageRejectsUnknownArguments(t *testing.T) {
 	}
 }
 
+func TestPrintPSSessionTreeShowsLiveHostManagedResources(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu", "alpine")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	api.instances["sandbox-isolated"] = client.InstanceState{ID: "sandbox-isolated", Status: "running", Image: "alpine"}
+	api.instances["old"] = client.InstanceState{ID: "old", Status: "stopped", Image: "ubuntu"}
+	sh := newUnitShell(t, api)
+	sshCtx := commandContext{Mode: modeSSH, SSHHost: "remote", CWD: "/srv"}
+	sh.context = sshCtx
+
+	var stdout bytes.Buffer
+	err := sh.printSessionTree(&stdout, []client.InstanceState{
+		api.instances["work"],
+		api.instances["sandbox-isolated"],
+		api.instances["old"],
+	}, []sshSessionState{
+		{Name: "remote", User: "alice", CWD: "/srv", Ctx: sshCtx},
+	}, []sshConnectionState{
+		{Name: "one-shot", Detail: "user=bob, host=example.com"},
+	})
+	if err != nil {
+		t.Fatalf("print session tree: %v", err)
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"host " + sh.hostCWD,
+		"|- vm work running image=ubuntu kernel=ubuntu",
+		"|- ssh remote user=alice cwd=/srv [current]",
+		"`- ssh connection one-shot (user=bob, host=example.com)",
+		"isolated vm sandbox-isolated running image=alpine",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("@ps output missing %q\noutput:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "vm old ") {
+		t.Fatalf("@ps output includes stopped VM:\n%s", out)
+	}
+}
+
+func TestPrintPSMarksCurrentVMAndHost(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu"}
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu"}
+
+	var stdout bytes.Buffer
+	if err := sh.printVMs(&stdout); err != nil {
+		t.Fatalf("print VMs: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "`- vm work running image=ubuntu [current]") {
+		t.Fatalf("@ps output did not mark current VM:\n%s", out)
+	}
+
+	sh.context = commandContext{Mode: modeHost}
+	stdout.Reset()
+	if err := sh.printVMs(&stdout); err != nil {
+		t.Fatalf("print host VMs: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "host "+sh.hostCWD+" [current]") {
+		t.Fatalf("@ps output did not mark host current:\n%s", stdout.String())
+	}
+}
+
 func hasExitResource(resources []exitResource, kind, name string) bool {
 	for _, resource := range resources {
 		if resource.Kind == kind && resource.Name == name {

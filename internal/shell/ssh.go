@@ -945,6 +945,7 @@ type sshSessionState struct {
 	Name string
 	User string
 	CWD  string
+	Ctx  commandContext
 }
 
 func (s *shellState) sshSessionStates() []sshSessionState {
@@ -955,6 +956,7 @@ func (s *shellState) sshSessionStates() []sshSessionState {
 			Name: shell.name,
 			User: shell.client.config.User,
 			CWD:  shell.cwd(),
+			Ctx:  shell.ctx,
 		})
 	}
 	sort.Slice(states, func(i, j int) bool { return states[i].Name < states[j].Name })

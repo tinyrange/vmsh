@@ -6328,13 +6328,35 @@ func (s *shellState) printVMs(w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	sshSessions := s.sshSessionStates()
-	if len(states) == 0 && len(sshSessions) == 0 {
-		_, err = fmt.Fprintln(w, "No sessions")
-		return err
+	return s.printSessionTree(w, states, s.sshSessionStates(), s.sshConnectionStates())
+}
+
+type sessionTreeNode struct {
+	label    string
+	current  bool
+	children []*sessionTreeNode
+}
+
+func (s *shellState) printSessionTree(w io.Writer, states []client.InstanceState, sshSessions []sshSessionState, sshConnections []sshConnectionState) error {
+	root := &sessionTreeNode{
+		label:   "host " + s.hostCWD,
+		current: s.context.Mode == modeHost,
 	}
+	states = append([]client.InstanceState(nil), states...)
+	sort.Slice(states, func(i, j int) bool {
+		return firstNonEmpty(strings.TrimSpace(states[i].ID), "default") < firstNonEmpty(strings.TrimSpace(states[j].ID), "default")
+	})
+	vmNodes := map[string]*sessionTreeNode{}
 	for _, state := range states {
-		parts := []string{emptyText(state.ID, "default"), emptyText(state.Status, "unknown")}
+		if !instanceStateIsLive(state) {
+			continue
+		}
+		id := firstNonEmpty(strings.TrimSpace(state.ID), "default")
+		kind := "vm"
+		if strings.HasSuffix(id, isolatedVMSuffix) {
+			kind = "isolated vm"
+		}
+		parts := []string{kind, id, emptyText(state.Status, "unknown")}
 		if state.Image != "" {
 			parts = append(parts, "image="+state.Image)
 		}
@@ -6347,19 +6369,76 @@ func (s *shellState) printVMs(w io.Writer) error {
 		if state.NetworkIPv4 != "" {
 			parts = append(parts, "addr="+state.NetworkIPv4)
 		}
-		if _, err := fmt.Fprintln(w, strings.Join(parts, " ")); err != nil {
-			return err
+		node := &sessionTreeNode{
+			label:   strings.Join(parts, " "),
+			current: s.context.Mode == modeVM && backendVMID(s.context) == id,
 		}
+		root.children = append(root.children, node)
+		vmNodes[id] = node
 	}
 	for _, session := range sshSessions {
-		parts := []string{session.Name, "ssh"}
+		parts := []string{"ssh", session.Name}
 		if session.User != "" {
 			parts = append(parts, "user="+session.User)
 		}
 		if session.CWD != "" {
 			parts = append(parts, "cwd="+session.CWD)
 		}
-		if _, err := fmt.Fprintln(w, strings.Join(parts, " ")); err != nil {
+		node := &sessionTreeNode{
+			label:   strings.Join(parts, " "),
+			current: s.context.Mode == modeSSH && contextSessionKey(s.context) == contextSessionKey(session.Ctx),
+		}
+		root.children = append(root.children, node)
+	}
+	for _, conn := range sshConnections {
+		parts := []string{"ssh connection", conn.Name}
+		if conn.Detail != "" {
+			parts = append(parts, "("+conn.Detail+")")
+		}
+		root.children = append(root.children, &sessionTreeNode{label: strings.Join(parts, " ")})
+	}
+	return printSessionTreeNode(w, root, "", true, true)
+}
+
+func instanceStateIsLive(state client.InstanceState) bool {
+	status := strings.TrimSpace(state.Status)
+	return status != "" && !strings.EqualFold(status, "stopped")
+}
+
+func contextSessionKey(ctx commandContext) string {
+	return strings.Join([]string{
+		string(ctx.Mode),
+		backendVMID(ctx),
+		localImageName(ctx.Image, ctx.Arch),
+		ctx.SSHHost,
+		contextUserKey(ctx),
+	}, "\x00")
+}
+
+func printSessionTreeNode(w io.Writer, node *sessionTreeNode, prefix string, last, root bool) error {
+	connector := ""
+	childPrefix := ""
+	if !root {
+		if last {
+			connector = "`- "
+			childPrefix = prefix + "   "
+		} else {
+			connector = "|- "
+			childPrefix = prefix + "|  "
+		}
+	}
+	label := node.label
+	if node.current {
+		label += " [current]"
+	}
+	if _, err := fmt.Fprintln(w, prefix+connector+label); err != nil {
+		return err
+	}
+	if root {
+		childPrefix = ""
+	}
+	for i, child := range node.children {
+		if err := printSessionTreeNode(w, child, childPrefix, i == len(node.children)-1, false); err != nil {
 			return err
 		}
 	}
