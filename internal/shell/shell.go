@@ -2328,7 +2328,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		ctx := s.context.withOptions(at.Options)
 		return s.ensureVMRunning(ctx, stderr)
 	case "stop":
-		return s.stopSession(at)
+		return s.stopSession(at, stdout)
 	case "restart":
 		if at.Command != "" {
 			return fmt.Errorf("usage: @restart [--vm id]")
@@ -3493,12 +3493,17 @@ func backendVMID(ctx commandContext) string {
 }
 
 func backendVMIDFor(id string, isolated bool) string {
-	id = strings.TrimSpace(id)
-	if id == "" {
-		id = "default"
-	}
+	id = normalizedVMID(id)
 	if isolated {
 		return id + isolatedVMSuffix
+	}
+	return id
+}
+
+func normalizedVMID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "default"
 	}
 	return id
 }
@@ -5440,7 +5445,36 @@ func (s *shellState) ensureVMRunning(ctx commandContext, stderr io.Writer) error
 		s.vmRunning[id] = true
 		return nil
 	}
+	if err := s.validateVMNameNamespaceAvailable(ctx); err != nil {
+		return err
+	}
 	return s.startVM(id, ctx, stderr)
+}
+
+func (s *shellState) validateVMNameNamespaceAvailable(ctx commandContext) error {
+	name := normalizedVMID(ctx.VMID)
+	otherID := backendVMIDFor(name, !ctx.Isolated)
+	state, err := s.api.InstanceStatusOf(otherID)
+	if err != nil {
+		return err
+	}
+	if !instanceStateIsLive(state) {
+		return nil
+	}
+	runningKind := "isolated"
+	requestedKind := "shared"
+	if ctx.Isolated {
+		runningKind = "shared"
+		requestedKind = "isolated"
+	}
+	return fmt.Errorf("VM name %q is already running as %s VM; stop it before starting it as %s VM", name, vmKindArticle(runningKind), vmKindArticle(requestedKind))
+}
+
+func vmKindArticle(kind string) string {
+	if kind == "isolated" {
+		return "an isolated"
+	}
+	return "a " + kind
 }
 
 func validateRunningVMContext(id string, ctx commandContext, state client.InstanceState) error {
@@ -5686,7 +5720,7 @@ func (s *shellState) stopVM(id string) error {
 	if id == "" {
 		return fmt.Errorf("vm id is required")
 	}
-	s.closeGuestSession()
+	s.closeGuestSessionForBackendID(id)
 	if err := s.api.ShutdownInstanceWithID(id); err != nil {
 		return err
 	}
@@ -5694,42 +5728,252 @@ func (s *shellState) stopVM(id string) error {
 	return nil
 }
 
-func (s *shellState) stopSession(at atLine) error {
+func (s *shellState) closeGuestSessionForBackendID(id string) {
+	if s.guestShell == nil || strings.TrimSpace(id) == "" {
+		return
+	}
+	if !strings.HasPrefix(s.guestShell.key, strings.TrimSpace(id)+"\x00") {
+		return
+	}
+	s.closeGuestSession()
+}
+
+func (s *shellState) stopSession(at atLine, stdout io.Writer) error {
 	fields, err := splitShellFields(at.Command)
 	if err != nil {
 		return err
 	}
 	if len(fields) > 1 || (at.Options.VMID != "" && len(fields) != 0) {
-		return fmt.Errorf("usage: @stop [session|--vm id]")
+		return fmt.Errorf("usage: @stop [name|vm:name|ssh:name]")
 	}
 	if len(fields) == 0 {
 		if at.Options.VMID != "" {
 			ctx := s.context.withOptions(at.Options)
-			return s.stopVM(backendVMID(ctx))
+			id := backendVMID(ctx)
+			if err := s.stopVMAndReport(id, stdout); err != nil {
+				return err
+			}
+			s.leaveStoppedVM(id)
+			return nil
 		}
 		if s.context.Mode == modeSSH {
-			if s.stopSSHSessionForContext(s.context) {
-				return nil
+			host := s.context.SSHHost
+			if key, ok := s.sshSessionKeyForContext(s.context); ok && s.closeSSHSessionKey(key) {
+				s.leaveStoppedSSHKey(key)
+				_, err := fmt.Fprintf(stdout, "Stopped SSH session %s\n", host)
+				return err
 			}
-			return fmt.Errorf("ssh session %s is not open", s.context.SSHHost)
+			return fmt.Errorf("ssh session %s is not open", host)
 		}
 		ctx := s.context.withOptions(at.Options)
-		return s.stopVM(backendVMID(ctx))
+		id := backendVMID(ctx)
+		if err := s.stopVMAndReport(id, stdout); err != nil {
+			return err
+		}
+		s.leaveStoppedContext(ctx)
+		return nil
 	}
 
 	name := fields[0]
+	if forced, vmID := parseExplicitVMStopTarget(name); forced {
+		match, err := s.resolveVMStopTarget(vmID)
+		if err != nil {
+			return err
+		}
+		if match.kind != stopTargetVM {
+			return fmt.Errorf("no running VM named %q", vmID)
+		}
+		if err := s.stopVMAndReport(match.id, stdout); err != nil {
+			return err
+		}
+		s.leaveStoppedVM(match.id)
+		return nil
+	}
 	if forced, host := parseExplicitSSHStopTarget(name); forced {
-		if s.stopSSHSession(host) {
-			return nil
+		if key, ok := s.sshSessionKeyForName(host); ok && s.closeSSHSessionKey(key) {
+			s.leaveStoppedSSHKey(key)
+			_, err := fmt.Fprintf(stdout, "Stopped SSH session %s\n", host)
+			return err
 		}
 		return fmt.Errorf("ssh session %s is not open", host)
 	}
-	if s.stopSSHSession(name) {
-		return nil
+	match, err := s.resolveStopTarget(name)
+	if err != nil {
+		return err
 	}
-	ctx := s.context.withOptions(at.Options)
-	ctx.VMID = name
-	return s.stopVM(backendVMID(ctx))
+	switch match.kind {
+	case stopTargetSSH:
+		if s.closeSSHSessionKey(match.id) {
+			s.leaveStoppedSSHKey(match.id)
+			_, err := fmt.Fprintf(stdout, "Stopped SSH session %s\n", name)
+			return err
+		}
+		return fmt.Errorf("ssh session %s is not open", name)
+	case stopTargetVM:
+		if err := s.stopVMAndReport(match.id, stdout); err != nil {
+			return err
+		}
+		s.leaveStoppedVM(match.id)
+		return nil
+	default:
+		return fmt.Errorf("no running VM or SSH session named %q", name)
+	}
+}
+
+func (s *shellState) stopVMAndReport(id string, stdout io.Writer) error {
+	if err := s.stopVM(id); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(stdout, "Stopped VM %s\n", id)
+	return err
+}
+
+type stopTargetKind int
+
+const (
+	stopTargetNone stopTargetKind = iota
+	stopTargetVM
+	stopTargetSSH
+)
+
+type stopTargetMatch struct {
+	kind stopTargetKind
+	id   string
+}
+
+func (s *shellState) resolveStopTarget(name string) (stopTargetMatch, error) {
+	name = strings.TrimSpace(name)
+	sshMatch := false
+	sshKey := ""
+	if key, ok := s.sshSessionKeyForName(name); ok {
+		sshMatch = true
+		sshKey = key
+	}
+	vmTarget, err := s.resolveVMStopTarget(name)
+	if err != nil {
+		return stopTargetMatch{}, err
+	}
+	vmMatch := vmTarget.kind == stopTargetVM
+	switch {
+	case sshMatch && vmMatch:
+		return stopTargetMatch{}, fmt.Errorf("stop target %q is ambiguous: use @stop vm:%s for the VM or @stop ssh:%s for the SSH session", name, name, name)
+	case sshMatch:
+		return stopTargetMatch{kind: stopTargetSSH, id: sshKey}, nil
+	case vmMatch:
+		return vmTarget, nil
+	default:
+		return stopTargetMatch{}, nil
+	}
+}
+
+func (s *shellState) resolveVMStopTarget(name string) (stopTargetMatch, error) {
+	name = strings.TrimSpace(name)
+	var vmMatches []string
+	sharedID := backendVMIDFor(name, false)
+	if state, err := s.api.InstanceStatusOf(sharedID); err != nil {
+		return stopTargetMatch{}, err
+	} else if instanceStateIsLive(state) {
+		vmMatches = append(vmMatches, sharedID)
+	}
+	isolatedID := backendVMIDFor(name, true)
+	if isolatedID != sharedID {
+		if state, err := s.api.InstanceStatusOf(isolatedID); err != nil {
+			return stopTargetMatch{}, err
+		} else if instanceStateIsLive(state) {
+			vmMatches = append(vmMatches, isolatedID)
+		}
+	}
+	switch {
+	case len(vmMatches) > 1:
+		return stopTargetMatch{}, fmt.Errorf("stop target %q is ambiguous because both shared and isolated VMs are running with that name; this should only happen for sessions started by older vmsh builds, use @stop --vm %s or @stop --vm %s", name, name, backendVMIDFor(name, true))
+	case len(vmMatches) == 1:
+		return stopTargetMatch{kind: stopTargetVM, id: vmMatches[0]}, nil
+	default:
+		return stopTargetMatch{}, nil
+	}
+}
+
+func (s *shellState) leaveStoppedVM(id string) {
+	id = strings.TrimSpace(id)
+	if s.context.Mode == modeVM && backendVMID(s.context) == id {
+		s.leaveStoppedContext(s.context)
+		return
+	}
+	s.contextStack = filterContextStack(s.contextStack, func(ctx commandContext) bool {
+		return !(ctx.Mode == modeVM && backendVMID(ctx) == id)
+	})
+}
+
+func (s *shellState) leaveStoppedSSHKey(key string) {
+	key = strings.TrimSpace(key)
+	if contextSSHSessionKey(s.context) == key {
+		s.leaveStoppedContext(s.context)
+		return
+	}
+	s.contextStack = filterContextStack(s.contextStack, func(ctx commandContext) bool {
+		return contextSSHSessionKey(ctx) != key
+	})
+}
+
+func (s *shellState) leaveStoppedContext(stopped commandContext) {
+	for len(s.contextStack) > 0 {
+		last := len(s.contextStack) - 1
+		parent := s.contextStack[last]
+		s.contextStack = s.contextStack[:last]
+		if contextSameSession(parent, stopped) {
+			continue
+		}
+		s.activateContext(parent)
+		return
+	}
+	s.activateContext(hostCommandContext(s.context, commandOptions{}))
+}
+
+func filterContextStack(stack []commandContext, keep func(commandContext) bool) []commandContext {
+	out := stack[:0]
+	for _, ctx := range stack {
+		if keep(ctx) {
+			out = append(out, ctx)
+		}
+	}
+	return out
+}
+
+func contextSameSession(a, b commandContext) bool {
+	if a.Mode != b.Mode {
+		return false
+	}
+	switch a.Mode {
+	case modeVM:
+		return backendVMID(a) == backendVMID(b)
+	case modeSSH:
+		return strings.TrimSpace(a.SSHHost) == strings.TrimSpace(b.SSHHost)
+	case modeHost:
+		return true
+	default:
+		return false
+	}
+}
+
+func contextSSHSessionKey(ctx commandContext) string {
+	if ctx.Mode != modeSSH {
+		return ""
+	}
+	cfg, err := resolveSSHConfig(ctx)
+	if err != nil {
+		return ""
+	}
+	return persistentSSHShellKey(cfg.cacheKey(), ctx)
+}
+
+func parseExplicitVMStopTarget(name string) (bool, string) {
+	name = strings.TrimSpace(name)
+	for _, prefix := range []string{"@vm:", "vm:"} {
+		if strings.HasPrefix(name, prefix) {
+			return true, strings.TrimSpace(strings.TrimPrefix(name, prefix))
+		}
+	}
+	return false, name
 }
 
 func (s *shellState) restartVM(id string, ctx commandContext, stderr io.Writer) error {
@@ -6486,7 +6730,7 @@ func (s *shellState) help(w io.Writer) error {
 @jobs                    list background jobs
 @status                  show vmsh and selected VM state
 @start [--vm id]         start a blank VM
-@stop [session|--vm id]  stop an SSH session or VM
+@stop [name|vm:name|ssh:name]  stop an SSH session or VM
 @restart [--vm id]       restart a VM after confirmation
 @save [--vm id] tag      save the selected VM root filesystem as a local image
 @rmi image               remove a locally cached image

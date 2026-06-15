@@ -1074,11 +1074,11 @@ func (s *shellState) closeSSHClients() {
 }
 
 func (s *shellState) stopSSHSessionForContext(ctx commandContext) bool {
-	cfg, err := resolveSSHConfig(ctx)
-	if err != nil {
+	key, ok := s.sshSessionKeyForContext(ctx)
+	if !ok {
 		return false
 	}
-	return s.closeSSHSessionKey(cfg.cacheKey())
+	return s.closeSSHSessionKey(key)
 }
 
 func (s *shellState) stopSSHSession(name string) bool {
@@ -1087,6 +1087,22 @@ func (s *shellState) stopSSHSession(name string) bool {
 		return false
 	}
 	return s.closeSSHSessionKey(key)
+}
+
+func (s *shellState) sshSessionKeyForContext(ctx commandContext) (string, bool) {
+	cfg, err := resolveSSHConfig(ctx)
+	if err != nil {
+		return "", false
+	}
+	key := persistentSSHShellKey(cfg.cacheKey(), ctx)
+	if s.hasSSHSessionKey(key) {
+		return key, true
+	}
+	clientKey := cfg.cacheKey()
+	if clientKey != key && s.hasSSHSessionKey(clientKey) {
+		return clientKey, true
+	}
+	return "", false
 }
 
 func (s *shellState) sshSessionKeyForName(name string) (string, bool) {

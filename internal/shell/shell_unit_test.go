@@ -416,6 +416,7 @@ func TestGuestPersistentShellRestartsWhenIsolationChanges(t *testing.T) {
 	}
 
 	isolatedCtx := sharedCtx
+	isolatedCtx.VMID = "sandbox"
 	isolatedCtx.Isolated = true
 	isolatedReq, err := sh.prepareGuestRunRequest(isolatedCtx, ":", true, 80, 24, io.Discard)
 	if err != nil {
@@ -449,7 +450,7 @@ func TestIsolatedContextUsesSeparateBackendVM(t *testing.T) {
 	script := strings.Join([]string{
 		"@ubuntu --vm work",
 		"true",
-		"@ubuntu --vm work --isolated",
+		"@ubuntu --vm sandbox --isolated",
 		"true",
 	}, "\n")
 
@@ -466,8 +467,8 @@ func TestIsolatedContextUsesSeparateBackendVM(t *testing.T) {
 	if api.starts[0].req.Network == nil || api.starts[0].req.Network.BlockHostAccess {
 		t.Fatalf("shared start network = %+v, want host access allowed", api.starts[0].req.Network)
 	}
-	if api.starts[1].id != "work-isolated" {
-		t.Fatalf("isolated start id = %q, want work-isolated", api.starts[1].id)
+	if api.starts[1].id != "sandbox-isolated" {
+		t.Fatalf("isolated start id = %q, want sandbox-isolated", api.starts[1].id)
 	}
 	if api.starts[1].req.Network == nil || !api.starts[1].req.Network.BlockHostAccess {
 		t.Fatalf("isolated start network = %+v, want host access blocked", api.starts[1].req.Network)
@@ -481,11 +482,46 @@ func TestIsolatedContextUsesSeparateBackendVM(t *testing.T) {
 	if api.runs[0].req.Network == nil || api.runs[0].req.Network.BlockHostAccess {
 		t.Fatalf("shared run network = %+v, want host access allowed", api.runs[0].req.Network)
 	}
-	if api.runs[1].id != "work-isolated" || len(api.runs[1].req.Shares) != 0 {
+	if api.runs[1].id != "sandbox-isolated" || len(api.runs[1].req.Shares) != 0 {
 		t.Fatalf("isolated run = id %q shares %+v", api.runs[1].id, api.runs[1].req.Shares)
 	}
 	if api.runs[1].req.Network == nil || !api.runs[1].req.Network.BlockHostAccess {
 		t.Fatalf("isolated run network = %+v, want host access blocked", api.runs[1].req.Network)
+	}
+}
+
+func TestIsolatedContextRejectsSharedNameCollision(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	sh := newUnitShell(t, api)
+	script := strings.Join([]string{
+		"@ubuntu --vm work",
+		"@ubuntu --vm work --isolated",
+	}, "\n")
+
+	stdout, stderr, err := runShellUnitScript(sh, script)
+	if err == nil || !strings.Contains(err.Error(), `VM name "work" is already running as a shared VM`) {
+		t.Fatalf("collision error = %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if len(api.starts) != 1 || api.starts[0].id != "work" {
+		t.Fatalf("starts = %+v, want only shared work", api.starts)
+	}
+}
+
+func TestSharedContextRejectsIsolatedNameCollision(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	sh := newUnitShell(t, api)
+	script := strings.Join([]string{
+		"@ubuntu --vm work --isolated",
+		"@host",
+		"@ubuntu --vm work --shared",
+	}, "\n")
+
+	stdout, stderr, err := runShellUnitScript(sh, script)
+	if err == nil || !strings.Contains(err.Error(), `VM name "work" is already running as an isolated VM`) {
+		t.Fatalf("collision error = %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if len(api.starts) != 1 || api.starts[0].id != "work-isolated" {
+		t.Fatalf("starts = %+v, want only isolated work", api.starts)
 	}
 }
 
@@ -2999,6 +3035,91 @@ func TestStopCommandStopsNamedVM(t *testing.T) {
 	if got := api.instances["work"].Status; got != "stopped" {
 		t.Fatalf("VM status = %q, want stopped", got)
 	}
+	if !strings.Contains(stdout.String(), "Stopped VM work") {
+		t.Fatalf("stdout = %q, want stopped VM message", stdout.String())
+	}
+}
+
+func TestStopCommandRequiresDisambiguation(t *testing.T) {
+	api := newRecordingShellAPI()
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running"}
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{Mode: modeVM, VMID: "sandbox", Image: "ubuntu", Isolated: true}
+	sh.sshShells = map[string]*persistentSSHShell{
+		"work": {key: "work", name: "work", ctx: commandContext{Mode: modeSSH, SSHHost: "work"}},
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := sh.eval("@stop work", &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") || !strings.Contains(err.Error(), "@stop vm:work") || !strings.Contains(err.Error(), "@stop ssh:work") {
+		t.Fatalf("ambiguous stop error = %v", err)
+	}
+	if got := api.instances["work"].Status; got != "running" {
+		t.Fatalf("ambiguous stop changed VM status = %q", got)
+	}
+}
+
+func TestStopCommandReportsLegacySharedAndIsolatedCollision(t *testing.T) {
+	api := newRecordingShellAPI()
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running"}
+	api.instances["work-isolated"] = client.InstanceState{ID: "work-isolated", Status: "running"}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	err := sh.eval("@stop work", &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "older vmsh builds") || !strings.Contains(err.Error(), "@stop --vm work-isolated") {
+		t.Fatalf("legacy isolated collision error = %v", err)
+	}
+	if err := sh.eval("@stop --vm work-isolated", &stdout, &stderr); err != nil {
+		t.Fatalf("stop isolated VM: %v", err)
+	}
+	if got := api.instances["work"].Status; got != "running" {
+		t.Fatalf("shared VM status = %q, want running", got)
+	}
+	if got := api.instances["work-isolated"].Status; got != "stopped" {
+		t.Fatalf("isolated VM status = %q, want stopped", got)
+	}
+}
+
+func TestStopCommandExplicitVMAndCurrentContext(t *testing.T) {
+	api := newRecordingShellAPI()
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running"}
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu"}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@stop --vm work", &stdout, &stderr); err != nil {
+		t.Fatalf("stop explicit VM: %v", err)
+	}
+	if got := api.instances["work"].Status; got != "stopped" {
+		t.Fatalf("VM status = %q, want stopped", got)
+	}
+	if sh.context.Mode != modeHost {
+		t.Fatalf("context after stopping current VM = %+v, want host", sh.context)
+	}
+	if !strings.Contains(stdout.String(), "Stopped VM work") {
+		t.Fatalf("stdout = %q, want stopped VM message", stdout.String())
+	}
+}
+
+func TestStopCommandExplicitVMPrefix(t *testing.T) {
+	api := newRecordingShellAPI()
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running"}
+	sh := newUnitShell(t, api)
+	sh.sshShells = map[string]*persistentSSHShell{
+		"work": {key: "work", name: "work", ctx: commandContext{Mode: modeSSH, SSHHost: "work"}},
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@stop vm:work", &stdout, &stderr); err != nil {
+		t.Fatalf("stop explicit vm prefix: %v", err)
+	}
+	if got := api.instances["work"].Status; got != "stopped" {
+		t.Fatalf("VM status = %q, want stopped", got)
+	}
+	if _, ok := sh.sshSessionKeyForName("work"); !ok {
+		t.Fatalf("explicit vm stop closed SSH session")
+	}
 }
 
 func TestSSHConnectionIsPersistentPerHost(t *testing.T) {
@@ -3090,8 +3211,15 @@ func TestSSHContextKeepsPersistentShellUntilStop(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatalf("persistent ssh shell did not receive command after @host")
 	}
-	if err := sh.eval("@stop test-ssh-a", &stdout, &stderr); err != nil {
+	stdout.Reset()
+	if err := sh.eval("@stop ssh:test-ssh-a", &stdout, &stderr); err != nil {
 		t.Fatalf("stop ssh session: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "Stopped SSH session test-ssh-a") {
+		t.Fatalf("stdout = %q, want stopped SSH message", stdout.String())
+	}
+	if sh.context.Mode != modeHost {
+		t.Fatalf("context after stopping current SSH = %+v, want host", sh.context)
 	}
 	select {
 	case <-closed:
