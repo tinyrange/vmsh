@@ -40,16 +40,18 @@ const (
 )
 
 type LineEditor struct {
-	in        *os.File
-	out       io.Writer
-	history   *lineHistory
-	completer Completer
-	width     int
-	prompt    string
-	buf       []rune
-	cursor    int
-	menu      completionMenu
-	confirm   completionConfirm
+	in                *os.File
+	out               io.Writer
+	history           *lineHistory
+	completer         Completer
+	width             int
+	prompt            string
+	buf               []rune
+	cursor            int
+	menu              completionMenu
+	confirm           completionConfirm
+	renderedCursorRow int
+	renderedLastRow   int
 }
 
 type lineHistory struct {
@@ -171,6 +173,7 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 	e.cursor = 0
 	e.menu = completionMenu{}
 	e.confirm = completionConfirm{}
+	e.resetRenderedRows()
 	historyPos := len(e.historyItems())
 	draft := ""
 	e.refresh()
@@ -190,6 +193,11 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 		}
 		switch ev.key {
 		case keyRune:
+			if e.appendRuneAndEcho(ev.r) {
+				historyPos = len(e.historyItems())
+				draft = string(e.buf)
+				continue
+			}
 			e.insertRune(ev.r)
 			historyPos = len(e.historyItems())
 			draft = string(e.buf)
@@ -200,8 +208,13 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 			}
 			line := string(e.buf)
 			e.menu = completionMenu{}
-			e.refresh()
+			if e.cursor == len(e.buf) {
+				e.updateRenderedRows()
+			} else {
+				e.refresh()
+			}
 			fmt.Fprint(e.out, "\r\n")
+			e.resetRenderedRows()
 			restore()
 			e.history.add(line)
 			return line, nil
@@ -211,6 +224,7 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 			e.cursor = 0
 			e.refresh()
 			fmt.Fprint(e.out, "^C\r\n")
+			e.resetRenderedRows()
 			restore()
 			return "", ErrLineInterrupted
 		case keyCtrlD:
@@ -218,6 +232,7 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 				e.menu = completionMenu{}
 				e.refresh()
 				fmt.Fprint(e.out, "\r\n")
+				e.resetRenderedRows()
 				restore()
 				return "", io.EOF
 			}
@@ -334,6 +349,25 @@ func (e *LineEditor) insertRune(r rune) {
 	copy(e.buf[e.cursor+1:], e.buf[e.cursor:])
 	e.buf[e.cursor] = r
 	e.cursor++
+}
+
+func (e *LineEditor) canEchoAppend() bool {
+	return !e.menu.active && !e.confirm.active && e.cursor == len(e.buf)
+}
+
+func (e *LineEditor) appendRuneAndEcho(r rune) bool {
+	if !e.canEchoAppend() {
+		return false
+	}
+	e.insertRune(r)
+	fmt.Fprint(e.out, string(r))
+	e.updateRenderedRows()
+	return true
+}
+
+func (e *LineEditor) updateRenderedRows() {
+	e.renderedCursorRow = terminalRowForCells(visibleWidth(e.prompt)+visibleWidth(string(e.buf[:e.cursor])), e.width)
+	e.renderedLastRow = e.currentRenderedLastRow()
 }
 
 func onlyTabs(buf []rune) bool {
@@ -502,7 +536,11 @@ func (e *LineEditor) completionItemWidth(items []string, token string) int {
 func (e *LineEditor) refresh() {
 	before := string(e.buf[:e.cursor])
 	after := string(e.buf[e.cursor:])
-	fmt.Fprint(e.out, "\r\x1b[J")
+	fmt.Fprint(e.out, "\r")
+	if e.renderedCursorRow > 0 {
+		fmt.Fprintf(e.out, "\x1b[%dA", e.renderedCursorRow)
+	}
+	e.clearRenderedRows()
 	fmt.Fprint(e.out, e.prompt)
 	fmt.Fprint(e.out, before)
 	fmt.Fprint(e.out, "\x1b7")
@@ -514,6 +552,40 @@ func (e *LineEditor) refresh() {
 		e.renderCompletionConfirm()
 	}
 	fmt.Fprint(e.out, "\x1b8")
+	e.renderedCursorRow = terminalRowForCells(visibleWidth(e.prompt)+visibleWidth(before), e.width)
+	e.renderedLastRow = e.currentRenderedLastRow()
+}
+
+func (e *LineEditor) clearRenderedRows() {
+	lastRow := e.renderedLastRow
+	if lastRow < e.renderedCursorRow {
+		lastRow = e.renderedCursorRow
+	}
+	for row := 0; row <= lastRow; row++ {
+		fmt.Fprint(e.out, "\x1b[2K")
+		if row < lastRow {
+			fmt.Fprint(e.out, "\x1b[1B\r")
+		}
+	}
+	if lastRow > 0 {
+		fmt.Fprintf(e.out, "\x1b[%dA\r", lastRow)
+	}
+}
+
+func (e *LineEditor) resetRenderedRows() {
+	e.renderedCursorRow = 0
+	e.renderedLastRow = 0
+}
+
+func (e *LineEditor) currentRenderedLastRow() int {
+	lastRow := terminalRowForCells(visibleWidth(e.prompt)+visibleWidth(string(e.buf)), e.width)
+	if e.menu.active && len(e.menu.items) > 0 {
+		lastRow += completionDisplayLines(len(e.menu.items), e.menuColumns())
+	}
+	if e.confirm.active {
+		lastRow++
+	}
+	return lastRow
 }
 
 func (e *LineEditor) renderMenu() {
@@ -748,6 +820,66 @@ func completionDisplayLines(items, cols int) int {
 		return 0
 	}
 	return (items + cols - 1) / cols
+}
+
+func terminalRowForCells(cells, width int) int {
+	if cells <= 0 {
+		return 0
+	}
+	if width <= 0 {
+		width = 80
+	}
+	return (cells - 1) / width
+}
+
+func visibleWidth(value string) int {
+	width := 0
+	for i := 0; i < len(value); {
+		if value[i] == 0x1b {
+			next := skipEscapeSequence(value, i)
+			if next > i {
+				i = next
+				continue
+			}
+		}
+		r, size := utf8.DecodeRuneInString(value[i:])
+		if r == utf8.RuneError && size == 0 {
+			break
+		}
+		if size <= 0 {
+			size = 1
+		}
+		width++
+		i += size
+	}
+	return width
+}
+
+func skipEscapeSequence(value string, start int) int {
+	if start+1 >= len(value) || value[start] != 0x1b {
+		return start
+	}
+	switch value[start+1] {
+	case '[':
+		for i := start + 2; i < len(value); i++ {
+			if value[i] >= 0x40 && value[i] <= 0x7e {
+				return i + 1
+			}
+		}
+		return len(value)
+	case ']':
+		for i := start + 2; i < len(value); i++ {
+			if value[i] == 0x07 {
+				return i + 1
+			}
+			if value[i] == 0x1b && i+1 < len(value) && value[i+1] == '\\' {
+				return i + 2
+			}
+		}
+		return len(value)
+	default:
+		return start + 2
+	}
 }
 
 func padRight(value string, width int) string {

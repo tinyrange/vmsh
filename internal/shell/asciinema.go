@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/tinyrange/vmsh/internal/terminal"
 )
 
 type asciinemaRecorder struct {
@@ -127,4 +129,42 @@ func terminalWriterRecorder(w io.Writer) *asciinemaRecorder {
 	default:
 		return nil
 	}
+}
+
+func terminalDisplayWriter(w io.Writer) io.Writer {
+	file, ok := terminalWriterFile(w)
+	if !ok || file == nil {
+		return w
+	}
+	if _, _, err := terminal.Size(file); err != nil {
+		return w
+	}
+	return &terminalNewlineWriter{w: w}
+}
+
+type terminalNewlineWriter struct {
+	w      io.Writer
+	lastCR bool
+}
+
+func (w *terminalNewlineWriter) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	out := make([]byte, 0, len(data)+8)
+	for _, b := range data {
+		if b == '\n' && !w.lastCR {
+			out = append(out, '\r')
+		}
+		out = append(out, b)
+		w.lastCR = b == '\r'
+		if b != '\r' {
+			w.lastCR = false
+		}
+	}
+	_, err := w.w.Write(out)
+	if err != nil {
+		return 0, err
+	}
+	return len(data), nil
 }

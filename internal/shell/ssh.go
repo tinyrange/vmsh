@@ -192,8 +192,13 @@ func (s *shellState) runSSHSession(ctx commandContext, command string, stdin io.
 	} else if tty {
 		session.Stdin = os.Stdin
 	}
-	session.Stdout = stdout
-	session.Stderr = stderr
+	if tty {
+		session.Stdout = stdout
+		session.Stderr = stderr
+	} else {
+		session.Stdout = terminalDisplayWriter(stdout)
+		session.Stderr = terminalDisplayWriter(stderr)
+	}
 
 	done := make(chan error, 1)
 	go func() {

@@ -18,6 +18,17 @@ The repository is intended to be published as `github.com/tinyrange/vmsh`.
 - Supports named VMs, memory/CPU sizing, sudo/root execution, networking
   toggles, and architecture-specific image aliases.
 
+## Demo
+
+![vmsh demo](docs/assets/demo.gif)
+
+The demo is generated from real `vmsh` commands with a local VM and local demo
+SSH server:
+
+```sh
+./tools/build.go demo
+```
+
 Example session:
 
 ```sh

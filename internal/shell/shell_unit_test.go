@@ -2306,6 +2306,17 @@ func TestAsciinemaRecorderWritesInputEvents(t *testing.T) {
 	}
 }
 
+func TestTerminalNewlineWriterConvertsBareLF(t *testing.T) {
+	var out bytes.Buffer
+	w := &terminalNewlineWriter{w: &out}
+	if n, err := w.Write([]byte("one\ntwo\r\nthree")); err != nil || n != len("one\ntwo\r\nthree") {
+		t.Fatalf("write = %d, %v", n, err)
+	}
+	if got := out.String(); got != "one\r\ntwo\r\nthree" {
+		t.Fatalf("output = %q", got)
+	}
+}
+
 func TestSSHAtCommandUsesHostSSHConfigAlias(t *testing.T) {
 	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
 		_, _ = io.WriteString(stdout, "ssh-ok\n")

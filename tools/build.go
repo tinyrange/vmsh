@@ -1,4 +1,4 @@
-///usr/bin/true; exec /usr/bin/env go run "$0" "$@"
+///usr/bin/true; DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd); ROOT=$(dirname -- "$DIR"); cd "$ROOT" && VMSH_BUILD_SCRIPT_DIR="$DIR" exec /usr/bin/env go run ./tools "$@"
 
 package main
 
@@ -42,7 +42,7 @@ func run() error {
 	cmd := "build"
 	if len(args) > 0 {
 		switch args[0] {
-		case "build", "run", "help", "-h", "--help":
+		case "build", "run", "demo", "help", "-h", "--help":
 			cmd = args[0]
 			args = args[1:]
 		}
@@ -72,6 +72,18 @@ func run() error {
 			return err
 		}
 		return runVMSH(p, args)
+	case "demo":
+		if len(args) > 0 && args[0] == "--" {
+			args = args[1:]
+		}
+		if demoWantsHelp(args) {
+			printDemoUsage(os.Stderr)
+			return nil
+		}
+		if err := build(p); err != nil {
+			return err
+		}
+		return runDemo(p, args)
 	default:
 		return fmt.Errorf("unknown command %q", cmd)
 	}
@@ -83,12 +95,15 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, `usage:
   ./tools/build.go [--build-dir DIR] [build]
   ./tools/build.go [--build-dir DIR] run [vmsh args...]
-  go run .\tools\build.go [--build-dir DIR] [build|run] [vmsh args...]
+  ./tools/build.go [--build-dir DIR] demo [demo args...]
+  go run ./tools [--build-dir DIR] [build|run|demo] [...]
 
 The default command is build. Outputs are written under build/vmsh unless
 --build-dir or VMSH_BUILD_DIR is set.
 The run command records an asciinema session to build/vmsh/session.cast unless
 vmsh args already include -record/--record.
+The demo command drives a real vmsh session through a PTY and writes a redacted
+marketing/demo cast to build/vmsh/demo.cast.
 `)
 }
 
@@ -173,6 +188,9 @@ func findRoot() (string, error) {
 		if abs, err := filepath.Abs(arg0); err == nil {
 			candidates = append(candidates, filepath.Dir(filepath.Dir(abs)))
 		}
+	}
+	if scriptDir := strings.TrimSpace(os.Getenv("VMSH_BUILD_SCRIPT_DIR")); scriptDir != "" {
+		candidates = append(candidates, filepath.Dir(scriptDir))
 	}
 
 	for _, start := range candidates {
