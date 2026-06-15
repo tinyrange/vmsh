@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"os/user"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -89,6 +88,7 @@ type shellState struct {
 	nextJobID        int
 	jobsMu           sync.Mutex
 	contextCWD       map[string]string
+	guestHomeCache   map[string]string
 	contextStack     []commandContext
 	statusSeq        atomic.Uint64
 	completion       *vmshCompleter
@@ -1616,9 +1616,9 @@ func (s *shellState) expandAliasCompletionPrefixOnce(line string) (string, bool,
 func (s *shellState) runInContext(ctx commandContext, line string, stdout, stderr io.Writer) error {
 	target, err := s.targetFor(ctx)
 	if err != nil {
-		return err
+		return contextBoundaryError(ctx, "select context", err)
 	}
-	return target.Run(line, stdout, stderr)
+	return contextBoundaryError(ctx, "run", target.Run(line, stdout, stderr))
 }
 
 func (s *shellState) runMaybeBackground(ctx commandContext, line string, stdout, stderr io.Writer) error {
@@ -2574,11 +2574,11 @@ func (s *shellState) copyPath(command string, stdout, stderr io.Writer) error {
 	if len(fields) != 2 {
 		return fmt.Errorf("usage: @copy SRC DST")
 	}
-	src, err := s.parseCopyEndpoint(fields[0])
+	src, err := s.parseCopyEndpoint(fields[0], stderr)
 	if err != nil {
 		return err
 	}
-	dst, err := s.parseCopyEndpoint(fields[1])
+	dst, err := s.parseCopyEndpoint(fields[1], stderr)
 	if err != nil {
 		return err
 	}
@@ -2626,7 +2626,7 @@ func copyStageBaseName(value string) string {
 	}
 }
 
-func (s *shellState) parseCopyEndpoint(raw string) (copyEndpoint, error) {
+func (s *shellState) parseCopyEndpoint(raw string, stderr io.Writer) (copyEndpoint, error) {
 	ctx := s.context
 	value := raw
 	if strings.HasPrefix(raw, "@") {
@@ -2677,9 +2677,13 @@ func (s *shellState) parseCopyEndpoint(raw string) (copyEndpoint, error) {
 	if err != nil {
 		return copyEndpoint{}, err
 	}
+	resolvedPath, err := target.ResolveCopyPath(value, stderr)
+	if err != nil {
+		return copyEndpoint{}, err
+	}
 	return copyEndpoint{
 		target:    target,
-		path:      target.ResolveCopyPath(value),
+		path:      resolvedPath,
 		directory: copyEndpointDirectoryHint(value),
 	}, nil
 }
@@ -2852,21 +2856,36 @@ func (s *shellState) resolveHostCopyPath(value string) string {
 	return filepath.Clean(value)
 }
 
-func (s *shellState) resolveGuestCopyPath(ctx commandContext, value string) string {
+func (s *shellState) resolveGuestCopyPath(ctx commandContext, value string, stderr io.Writer) (string, error) {
 	if value == "" {
 		value = "."
 	}
-	home := guestHomeDir(ctx)
 	if value == "~" {
-		return home
+		home, err := s.resolvedGuestHomeDir(ctx, stderr)
+		if err != nil {
+			return "", err
+		}
+		return home, nil
 	}
 	if strings.HasPrefix(value, "~/") {
-		return path.Clean(path.Join(home, value[2:]))
+		home, err := s.resolvedGuestHomeDir(ctx, stderr)
+		if err != nil {
+			return "", err
+		}
+		return path.Clean(path.Join(home, value[2:])), nil
 	}
 	if strings.HasPrefix(value, "/") {
-		return path.Clean(value)
+		return path.Clean(value), nil
 	}
-	return path.Clean(path.Join(s.currentGuestCWD(ctx), filepath.ToSlash(value)))
+	current := s.currentGuestCWD(ctx)
+	if current == "" || (ctx.CWD == "" && guestFilesystemIsolated(ctx)) {
+		home, err := s.resolvedGuestHomeDir(ctx, stderr)
+		if err != nil {
+			return "", err
+		}
+		current = home
+	}
+	return path.Clean(path.Join(current, filepath.ToSlash(value))), nil
 }
 
 func (s *shellState) resolveSSHCopyPath(ctx commandContext, value string) string {
@@ -2884,15 +2903,17 @@ func (s *shellState) currentGuestCWD(ctx commandContext) string {
 	if ctx.Mode != modeVM {
 		return ""
 	}
-	if ctx.CWD != "" {
+	if ctx.CWD != "" && (guestUsesHostShare(ctx) || !guestPathIsHostShare(ctx.CWD)) {
 		return ctx.CWD
 	}
 	if s.contextCWD != nil {
 		if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
-			return cwd
+			if guestUsesHostShare(ctx) || !guestPathIsHostShare(cwd) {
+				return cwd
+			}
 		}
 	}
-	if ctx.Isolated {
+	if guestFilesystemIsolated(ctx) {
 		return guestHomeDir(ctx)
 	}
 	_, guestCWD, err := guestHostPaths(s.hostCWD)
@@ -3992,46 +4013,122 @@ func guestShellEnv(ctx commandContext) []string {
 	}
 }
 
+func (s *shellState) resolvedGuestHomeDir(ctx commandContext, stderr io.Writer) (string, error) {
+	if home, ok := staticGuestHomeDir(ctx); ok {
+		return home, nil
+	}
+	key := contextCWDKey(ctx) + "\x00home"
+	if s.guestHomeCache != nil {
+		if home := s.guestHomeCache[key]; home != "" {
+			return home, nil
+		}
+	}
+	home, err := s.queryGuestHomeDir(ctx, stderr)
+	if err != nil {
+		return "", err
+	}
+	if s.guestHomeCache == nil {
+		s.guestHomeCache = map[string]string{}
+	}
+	s.guestHomeCache[key] = home
+	return home, nil
+}
+
+func (s *shellState) queryGuestHomeDir(ctx commandContext, stderr io.Writer) (string, error) {
+	if ctx.Image == "" {
+		return "", fmt.Errorf("no guest image selected; run @<oci-tag> or set one with @<oci-tag>")
+	}
+	if err := s.ensureImageAvailable(ctx, stderr); err != nil {
+		return "", err
+	}
+	if err := s.ensureVMRunning(ctx, stderr); err != nil {
+		return "", err
+	}
+	var out strings.Builder
+	var eventErr error
+	var exitSeen bool
+	var exitCode int
+	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+	defer stopInterrupts()
+	req := client.ExecRequest{
+		Command: []string{"sh", "-lc", "uid=\"$(id -u 2>/dev/null || printf '')\"; home=\"$(awk -F: -v u=\"$uid\" '$3 == u { print $6; exit }' /etc/passwd 2>/dev/null || true)\"; if [ -n \"$home\" ]; then printf '%s\\n' \"$home\"; elif [ -n \"$HOME\" ]; then printf '%s\\n' \"$HOME\"; else printf '/home/cc\\n'; fi"},
+		User:    guestRunUser(ctx),
+		WorkDir: "/",
+	}
+	if err := s.execStreamInContext(runCtx, backendVMID(ctx), req, nil, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "stdout", "output":
+			out.Write(execEventBytes(event))
+		case "stderr":
+			writeExecEventOutput(stderr, event)
+		case "error":
+			eventErr = fmt.Errorf("%s", firstNonEmpty(event.Error, execEventText(event)))
+		case "exit":
+			exitSeen = true
+			exitCode = event.ExitCode
+		}
+		return nil
+	}); err != nil {
+		if interrupted.Load() {
+			return "", persistentShellExit{code: 130}
+		}
+		return "", err
+	}
+	if interrupted.Load() {
+		return "", persistentShellExit{code: 130}
+	}
+	if eventErr != nil {
+		return "", eventErr
+	}
+	if exitSeen && exitCode != 0 {
+		return "", persistentShellExit{code: exitCode}
+	}
+	if !exitSeen {
+		return "", fmt.Errorf("guest home probe did not report completion")
+	}
+	home := path.Clean(strings.TrimSpace(out.String()))
+	if home == "" || !strings.HasPrefix(home, "/") {
+		return "", fmt.Errorf("guest home probe returned invalid path %q", strings.TrimSpace(out.String()))
+	}
+	return home, nil
+}
+
 func guestHomeDir(ctx commandContext) string {
+	if home, ok := staticGuestHomeDir(ctx); ok {
+		return home
+	}
+	return "/home/cc"
+}
+
+func staticGuestHomeDir(ctx commandContext) (string, bool) {
 	user := strings.TrimSpace(guestRunUser(ctx))
 	switch {
 	case user == "root" || strings.HasPrefix(user, "0:"):
-		return "/root"
+		return "/root", true
 	case user == defaultGuestUser || user == strconv.Itoa(defaultGuestUID) || strings.HasPrefix(user, strconv.Itoa(defaultGuestUID)+":"):
-		if home := defaultGuestUserHome(ctx); home != "" {
-			return home
-		}
-		return "/home/" + defaultGuestUserName(ctx)
+		return "", false
 	case user != "" && !strings.ContainsAny(user, ":0123456789"):
-		return "/home/" + user
+		return "/home/" + user, true
 	default:
-		return "/"
+		return "", false
 	}
+}
+
+func guestFilesystemIsolated(ctx commandContext) bool {
+	return ctx.Isolated || !guestSupportsHostShares(ctx)
+}
+
+func guestUsesHostShare(ctx commandContext) bool {
+	return !guestFilesystemIsolated(ctx)
+}
+
+func guestPathIsHostShare(value string) bool {
+	value = path.Clean(strings.TrimSpace(value))
+	return value == guestHostMount || strings.HasPrefix(value, guestHostMount+"/")
 }
 
 func defaultGuestUserName(ctx commandContext) string {
-	image := strings.ToLower(strings.TrimSpace(ctx.Image))
-	if image == "ubuntu" || strings.HasPrefix(image, "ubuntu:") || strings.HasSuffix(image, "/ubuntu") || strings.Contains(image, "/ubuntu:") {
-		return "ubuntu"
-	}
-	if current, err := user.Current(); err == nil && strings.TrimSpace(current.Username) != "" {
-		name := filepath.Base(filepath.ToSlash(current.Username))
-		if name != "." && name != "/" && strings.TrimSpace(name) != "" {
-			return name
-		}
-	}
 	return "cc"
-}
-
-func defaultGuestUserHome(ctx commandContext) string {
-	image := strings.ToLower(strings.TrimSpace(ctx.Image))
-	if image == "ubuntu" || strings.HasPrefix(image, "ubuntu:") || strings.HasSuffix(image, "/ubuntu") || strings.Contains(image, "/ubuntu:") {
-		return "/home/ubuntu"
-	}
-	if current, err := user.Current(); err == nil && strings.HasPrefix(current.HomeDir, "/") {
-		return path.Clean(current.HomeDir)
-	}
-	return ""
 }
 
 func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io.Writer) error {
@@ -4098,6 +4195,9 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 		return client.RunRequest{}, err
 	}
 	workDir := ctx.CWD
+	if !guestUsesHostShare(ctx) && guestPathIsHostShare(workDir) {
+		workDir = ""
+	}
 	req := client.RunRequest{
 		Image:      localImageName(ctx.Image, ctx.Arch),
 		InitSystem: ctx.InitSystem,
@@ -4109,8 +4209,14 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 		CPUs:       ctx.CPUs,
 		NestedVirt: ctx.NestedVirt,
 	}
-	if ctx.Isolated || !guestSupportsHostShares(ctx) {
-		req.WorkDir = firstNonEmpty(req.WorkDir, guestHomeDir(ctx))
+	if !guestUsesHostShare(ctx) {
+		if req.WorkDir == "" {
+			home, err := s.resolvedGuestHomeDir(ctx, stderr)
+			if err != nil {
+				return client.RunRequest{}, err
+			}
+			req.WorkDir = home
+		}
 	} else {
 		hostRoot, hostGuestCWD, err := guestHostPaths(s.hostCWD)
 		if err != nil {
@@ -6270,9 +6376,9 @@ func tmuxLaunchArgs(session, command string, insideTmux bool) []string {
 func (s *shellState) chdirContext(target string) error {
 	shellTarget, err := s.targetFor(s.context)
 	if err != nil {
-		return err
+		return contextBoundaryError(s.context, "select context", err)
 	}
-	return shellTarget.Chdir(target)
+	return contextBoundaryError(s.context, "cd", shellTarget.Chdir(target))
 }
 
 func (s *shellState) chdirHost(target string) error {
@@ -6400,18 +6506,29 @@ func (s *shellState) chdirGuestContext(ctx commandContext, target string) error 
 	s.closeGuestSession()
 	current := ctx.CWD
 	if current == "" {
-		if ctx.Isolated {
-			current = guestHomeDir(ctx)
+		if guestFilesystemIsolated(ctx) {
+			resolvedHome, err := s.resolvedGuestHomeDir(ctx, io.Discard)
+			if err != nil {
+				return err
+			}
+			current = resolvedHome
 		} else {
 			_, current, _ = guestHostPaths(s.hostCWD)
 		}
 	}
-	home := guestHomeDir(ctx)
 	if target == "" || target == "~" {
-		target = home
+		resolvedHome, err := s.resolvedGuestHomeDir(ctx, io.Discard)
+		if err != nil {
+			return err
+		}
+		target = resolvedHome
 	}
 	if strings.HasPrefix(target, "~/") {
-		target = path.Join(home, target[2:])
+		resolvedHome, err := s.resolvedGuestHomeDir(ctx, io.Discard)
+		if err != nil {
+			return err
+		}
+		target = path.Join(resolvedHome, target[2:])
 	}
 	if strings.HasPrefix(target, "~") {
 		return fmt.Errorf("guest user home expansion is only supported for ~ and ~/ paths")
@@ -6421,7 +6538,7 @@ func (s *shellState) chdirGuestContext(ctx commandContext, target string) error 
 	}
 	target = path.Clean(target)
 	if strings.HasPrefix(target, guestHostMount+"/") || target == guestHostMount {
-		if ctx.Isolated {
+		if !guestUsesHostShare(ctx) {
 			return fmt.Errorf("%s is not mounted in isolated context", guestHostMount)
 		}
 		hostPath, ok := guestHostPathToHost(s.hostCWD, target)
@@ -6767,6 +6884,37 @@ func (s *shellState) printCurrentStatusDetails(w io.Writer) error {
 	default:
 		_, err := fmt.Fprintf(w, "context: %s\n", s.context.Mode)
 		return err
+	}
+}
+
+func contextBoundaryError(ctx commandContext, op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if sessionLastCode(err) >= 0 {
+		return err
+	}
+	label := contextErrorLabel(ctx)
+	if strings.TrimSpace(op) == "" {
+		return fmt.Errorf("%s: %w", label, err)
+	}
+	return fmt.Errorf("%s: %s: %w", label, op, err)
+}
+
+func contextErrorLabel(ctx commandContext) string {
+	switch ctx.Mode {
+	case modeHost:
+		return "host"
+	case modeVM:
+		name := normalizedVMID(ctx.VMID)
+		if ctx.Isolated {
+			return "isolated vm " + name
+		}
+		return "vm " + name
+	case modeSSH:
+		return "ssh " + emptyText(strings.TrimSpace(ctx.SSHHost), "-")
+	default:
+		return string(ctx.Mode)
 	}
 }
 

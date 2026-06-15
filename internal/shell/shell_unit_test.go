@@ -373,6 +373,15 @@ func hasExitResource(resources []exitResource, kind, name string) bool {
 func TestGuestPersistentShellRestartsWhenIsolationChanges(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		if onEvent != nil {
+			if err := onEvent(client.ExecEvent{Kind: "stdout", Output: "/home/guest\n"}); err != nil {
+				return err
+			}
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
 	sh := newUnitShell(t, api)
 
 	var mu sync.Mutex
@@ -446,6 +455,15 @@ func TestGuestPersistentShellRestartsWhenIsolationChanges(t *testing.T) {
 
 func TestIsolatedContextUsesSeparateBackendVM(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
+	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		if onEvent != nil {
+			if err := onEvent(client.ExecEvent{Kind: "stdout", Output: "/home/ubuntu\n"}); err != nil {
+				return err
+			}
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
 	sh := newUnitShell(t, api)
 	script := strings.Join([]string{
 		"@ubuntu --vm work",
@@ -743,6 +761,15 @@ func TestExplicitVMTargetPipelineUsesExistingNamedVM(t *testing.T) {
 
 func TestIsolatedContextDoesNotInheritHostMappedCWD(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
+	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		if onEvent != nil {
+			if err := onEvent(client.ExecEvent{Kind: "stdout", Output: "/home/ubuntu\n"}); err != nil {
+				return err
+			}
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
 	sh := newUnitShell(t, api)
 	sh.context = commandContext{
 		Mode:    modeVM,
@@ -765,6 +792,41 @@ func TestIsolatedContextDoesNotInheritHostMappedCWD(t *testing.T) {
 	}
 	if strings.HasPrefix(req.WorkDir, guestHostMount+"/") || req.WorkDir == guestHostMount {
 		t.Fatalf("isolated workdir = %q, want non-host path", req.WorkDir)
+	}
+}
+
+func TestOpenBSDContextUsesGuestHomeInsteadOfHostShare(t *testing.T) {
+	api := newRecordingShellAPI("@openbsd")
+	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		if onEvent != nil {
+			if err := onEvent(client.ExecEvent{Kind: "stdout", Output: "/root\n"}); err != nil {
+				return err
+			}
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{
+		Mode:    modeVM,
+		VMID:    "open",
+		Image:   "@openbsd",
+		CWD:     path.Join(guestHostMount, "Users/example/project"),
+		Network: true,
+	}
+
+	req, err := sh.prepareGuestRunRequest(sh.context, "pwd", false, 0, 0, io.Discard)
+	if err != nil {
+		t.Fatalf("prepare OpenBSD run: %v", err)
+	}
+	if req.WorkDir != "/root" {
+		t.Fatalf("openbsd workdir = %q, want discovered guest home instead of host share cwd", req.WorkDir)
+	}
+	if len(req.Shares) != 0 {
+		t.Fatalf("openbsd shares = %+v, want none", req.Shares)
+	}
+	if backendVMID(sh.context) != "open" {
+		t.Fatalf("openbsd backend id = %q, want non-isolated id open", backendVMID(sh.context))
 	}
 }
 
@@ -976,6 +1038,15 @@ func TestAgentCodexProxyUsesHostAuthProxyWithoutCodexHomeMount(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	api.images["ubuntu@amd64"] = client.ImageState{Name: "ubuntu@amd64", Status: "ready"}
 	api.instances["default-isolated"] = client.InstanceState{ID: "default-isolated", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		if onEvent != nil {
+			if err := onEvent(client.ExecEvent{Kind: "stdout", Output: "/home/ubuntu\n"}); err != nil {
+				return err
+			}
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
 	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
 		if onEvent != nil {
 			if err := onEvent(client.ExecEvent{Kind: "stdout", Output: "Linux\nx86_64\n"}); err != nil {
@@ -1007,7 +1078,7 @@ func TestAgentCodexProxyUsesHostAuthProxyWithoutCodexHomeMount(t *testing.T) {
 	if len(api.servicePorts) != 1 || api.servicePorts[0].id != "default-isolated" || api.servicePorts[0].port != proxyPort {
 		t.Fatalf("service proxy port updates = %+v, want default-isolated port %d", api.servicePorts, proxyPort)
 	}
-	wantProxyHome := codexGuestProxyHomeDir(sh.context)
+	wantProxyHome := "/home/ubuntu/.vmsh/codex"
 	if !hasString(agentRun.Env, "CODEX_HOME="+wantProxyHome) {
 		t.Fatalf("agent env = %#v, want proxy CODEX_HOME", agentRun.Env)
 	}
@@ -1855,6 +1926,70 @@ func TestStatusShowsIsolatedVMContext(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("status output missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestVMRunErrorAddsContextAndPreservesCause(t *testing.T) {
+	cause := errors.New("kernel said something strange")
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
+		return cause
+	}
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu"}
+
+	var stdout, stderr bytes.Buffer
+	err := sh.eval("true", &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("run error = nil")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("run error %v does not wrap cause", err)
+	}
+	if got := err.Error(); !strings.Contains(got, "vm work: run:") || !strings.Contains(got, cause.Error()) {
+		t.Fatalf("run error = %q, want additive context and original cause", got)
+	}
+}
+
+func TestContextBoundaryDoesNotWrapExitStatus(t *testing.T) {
+	err := contextBoundaryError(commandContext{Mode: modeVM, VMID: "work"}, "run", persistentShellExit{code: 7})
+	if err == nil {
+		t.Fatalf("wrapped exit status = nil")
+	}
+	if got := err.Error(); got != "exit status 7" {
+		t.Fatalf("wrapped exit status = %q, want original exit status", got)
+	}
+	if got := sessionLastCode(err); got != 7 {
+		t.Fatalf("exit status code = %d, want 7", got)
+	}
+}
+
+func TestContextBoundaryLabelsSSHAndPreservesCause(t *testing.T) {
+	cause := errors.New("handshake failed")
+	err := contextBoundaryError(commandContext{Mode: modeSSH, SSHHost: "ws1"}, "connect", cause)
+	if err == nil {
+		t.Fatalf("ssh error = nil")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("ssh error %v does not wrap cause", err)
+	}
+	if got := err.Error(); got != "ssh ws1: connect: handshake failed" {
+		t.Fatalf("ssh error = %q, want context plus original cause", got)
+	}
+}
+
+func TestGuestCDErrorAddsContextWithoutReplacingCause(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI("ubuntu"))
+	sh.context = commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Isolated: true, CWD: "/home/ubuntu"}
+
+	var stdout, stderr bytes.Buffer
+	err := sh.eval("cd /host/tmp", &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("cd error = nil")
+	}
+	if got := err.Error(); !strings.Contains(got, "isolated vm work: cd:") || !strings.Contains(got, "/host is not mounted in isolated context") {
+		t.Fatalf("cd error = %q, want context plus original message", got)
 	}
 }
 
@@ -3666,7 +3801,7 @@ func TestCopyEndpointResolutionAllowsColonsAndQuotedPaths(t *testing.T) {
 		{raw: "@vm:work:/tmp/path:with:colons/quote'file", want: "/tmp/path:with:colons/quote'file"},
 	}
 	for _, tc := range cases {
-		ep, err := sh.parseCopyEndpoint(tc.raw)
+		ep, err := sh.parseCopyEndpoint(tc.raw, io.Discard)
 		if err != nil {
 			t.Fatalf("parse %q: %v", tc.raw, err)
 		}
@@ -4064,6 +4199,17 @@ func TestSSHCompletionUsesConfigAndRemotePath(t *testing.T) {
 
 func TestCopyEndpointResolutionAndGuestHostPathSafety(t *testing.T) {
 	api := newRecordingShellAPI("alpine", "ubuntu")
+	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		if onEvent != nil {
+			if err := onEvent(client.ExecEvent{Kind: "stdout", Output: "/guest/passwd-home\n"}); err != nil {
+				return err
+			}
+			if err := onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	sh := newUnitShell(t, api)
 	sh.context = commandContext{Mode: modeVM, VMID: "vm", Image: "alpine"}
 	_, guestCWD, err := guestHostPaths(sh.hostCWD)
@@ -4071,7 +4217,7 @@ func TestCopyEndpointResolutionAndGuestHostPathSafety(t *testing.T) {
 		t.Fatalf("guest host paths: %v", err)
 	}
 
-	guest, err := sh.parseCopyEndpoint("@:notes.txt")
+	guest, err := sh.parseCopyEndpoint("@:notes.txt", io.Discard)
 	if err != nil {
 		t.Fatalf("parse current guest endpoint: %v", err)
 	}
@@ -4079,7 +4225,15 @@ func TestCopyEndpointResolutionAndGuestHostPathSafety(t *testing.T) {
 		t.Fatalf("current guest endpoint = %+v", guest)
 	}
 
-	host, err := sh.parseCopyEndpoint("@host:relative.txt")
+	guestHome, err := sh.parseCopyEndpoint("@:~/loaded/root.txt", io.Discard)
+	if err != nil {
+		t.Fatalf("parse current guest home endpoint: %v", err)
+	}
+	if guestHome.context().Mode != modeVM || guestHome.path != "/guest/passwd-home/loaded/root.txt" {
+		t.Fatalf("current guest home endpoint = %+v", guestHome)
+	}
+
+	host, err := sh.parseCopyEndpoint("@host:relative.txt", io.Discard)
 	if err != nil {
 		t.Fatalf("parse host endpoint: %v", err)
 	}
@@ -4087,24 +4241,25 @@ func TestCopyEndpointResolutionAndGuestHostPathSafety(t *testing.T) {
 		t.Fatalf("host endpoint = %+v", host)
 	}
 
-	ubuntu, err := sh.parseCopyEndpoint("@ubuntu:~/result.txt")
+	sh.context = defaultContext("default", "", false)
+	ubuntu, err := sh.parseCopyEndpoint("@ubuntu:~/result.txt", io.Discard)
 	if err != nil {
 		t.Fatalf("parse named guest endpoint: %v", err)
 	}
-	if ubuntu.context().Image != "ubuntu" || ubuntu.path != "/home/ubuntu/result.txt" {
+	if ubuntu.context().Image != "ubuntu" || ubuntu.path != "/guest/passwd-home/result.txt" {
 		t.Fatalf("named guest endpoint = %+v", ubuntu)
 	}
 
-	image, err := sh.parseCopyEndpoint("@image:ubuntu:~/image-result.txt")
+	image, err := sh.parseCopyEndpoint("@image:ubuntu:~/image-result.txt", io.Discard)
 	if err != nil {
 		t.Fatalf("parse explicit image endpoint: %v", err)
 	}
-	if image.context().Image != "ubuntu" || image.path != "/home/ubuntu/image-result.txt" {
+	if image.context().Image != "ubuntu" || image.path != "/guest/passwd-home/image-result.txt" {
 		t.Fatalf("explicit image endpoint = %+v", image)
 	}
 
 	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
-	vm, err := sh.parseCopyEndpoint("@vm:work:/tmp/result.txt")
+	vm, err := sh.parseCopyEndpoint("@vm:work:/tmp/result.txt", io.Discard)
 	if err != nil {
 		t.Fatalf("parse explicit vm endpoint: %v", err)
 	}
@@ -4112,7 +4267,7 @@ func TestCopyEndpointResolutionAndGuestHostPathSafety(t *testing.T) {
 		t.Fatalf("explicit vm endpoint = %+v", vm)
 	}
 
-	ssh, err := sh.parseCopyEndpoint("@ssh:test-ssh-a:relative.txt")
+	ssh, err := sh.parseCopyEndpoint("@ssh:test-ssh-a:relative.txt", io.Discard)
 	if err != nil {
 		t.Fatalf("parse ssh endpoint: %v", err)
 	}
@@ -4120,15 +4275,15 @@ func TestCopyEndpointResolutionAndGuestHostPathSafety(t *testing.T) {
 		t.Fatalf("ssh endpoint = %+v context=%+v", ssh, ssh.context())
 	}
 
-	if _, err := sh.parseCopyEndpoint("@missing:notes.txt"); err == nil || !strings.Contains(err.Error(), "does not name an active SSH session") {
+	if _, err := sh.parseCopyEndpoint("@missing:notes.txt", io.Discard); err == nil || !strings.Contains(err.Error(), "does not name an active SSH session") {
 		t.Fatalf("parse unknown endpoint error = %v", err)
 	}
 	api.images["work"] = client.ImageState{Name: "work", Status: "ready"}
-	if _, err := sh.parseCopyEndpoint("@work:notes.txt"); err == nil || !strings.Contains(err.Error(), "ambiguous") || !strings.Contains(err.Error(), "@vm:work:path") || !strings.Contains(err.Error(), "@image:work:path") {
+	if _, err := sh.parseCopyEndpoint("@work:notes.txt", io.Discard); err == nil || !strings.Contains(err.Error(), "ambiguous") || !strings.Contains(err.Error(), "@vm:work:path") || !strings.Contains(err.Error(), "@image:work:path") {
 		t.Fatalf("parse ambiguous endpoint error = %v", err)
 	}
 
-	if _, err := sh.parseCopyEndpoint("@ubuntu"); err == nil || !strings.Contains(err.Error(), "must use @target:path") {
+	if _, err := sh.parseCopyEndpoint("@ubuntu", io.Discard); err == nil || !strings.Contains(err.Error(), "must use @target:path") {
 		t.Fatalf("parse malformed endpoint error = %v", err)
 	}
 	if hostPath, ok := guestHostPathToHost(sh.hostCWD, "/tmp/file"); ok || hostPath != "" {
@@ -4180,6 +4335,14 @@ func TestShellTargetsExposeLocalPathSemantics(t *testing.T) {
 	}
 	if got, ok := isolatedTarget.LocalPath(path.Join(guestHostMount, "data.txt")); ok || got != "" {
 		t.Fatalf("isolated guest local path = %q, %t; want empty, false", got, ok)
+	}
+
+	openBSDTarget, err := sh.targetFor(commandContext{Mode: modeVM, VMID: "openbsd", Image: "@openbsd"})
+	if err != nil {
+		t.Fatalf("openbsd guest target: %v", err)
+	}
+	if got, ok := openBSDTarget.LocalPath(path.Join(guestHostMount, "data.txt")); ok || got != "" {
+		t.Fatalf("openbsd guest local path = %q, %t; want empty, false", got, ok)
 	}
 }
 

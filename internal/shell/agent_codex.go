@@ -649,11 +649,15 @@ func (s *shellState) prepareCodexAgentProxyRunRequest(ctx commandContext, hostCo
 		return client.RunRequest{}, fmt.Errorf("@agent --proxy codex requires guest networking")
 	}
 	req.Network.AllowedServiceProxyPorts = appendAllowedServiceProxyPort(req.Network.AllowedServiceProxyPorts, proxyPort)
-	proxyHome := codexGuestProxyHomeDir(ctx)
+	guestHome, err := s.resolvedGuestHomeDir(ctx, stderr)
+	if err != nil {
+		return client.RunRequest{}, err
+	}
+	proxyHome := path.Join(guestHome, ".vmsh", "codex")
 	ensureGitWorkDir := ctx.Isolated
 	agentWorkDir := req.WorkDir
 	if rootAgent && ctx.Isolated {
-		agentWorkDir = firstNonEmpty(ctx.CWD, guestHomeDir(ctx))
+		agentWorkDir = firstNonEmpty(ctx.CWD, guestHome)
 	}
 	commandLine, err := codexProxyAgentCommandLine(proxyHome, release.CodexGuestBin, args, proxyPort, agentWorkDir, ensureGitWorkDir)
 	if err != nil {
