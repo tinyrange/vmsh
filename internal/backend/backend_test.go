@@ -134,6 +134,12 @@ func TestConnectCCVMWithOptionsReportsDaemonReuse(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"host":"test","vm_supported":true}`))
 	})
+	mux.HandleFunc("/watchdog/lease", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	})
+	mux.HandleFunc("/vm/start", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	})
 	srv := &http.Server{Handler: mux}
 	go func() {
 		_ = srv.Serve(ln)
@@ -201,6 +207,49 @@ func TestConnectCCVMWithOptionsRejectsLegacyDaemon(t *testing.T) {
 	}
 	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
 		t.Fatalf("state file after legacy rejection stat err = %v, want not exist", err)
+	}
+}
+
+func TestConnectCCVMWithOptionsRejectsCapabilitiesOnlyDaemon(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/capabilities", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"host":"test","vm_supported":true}`))
+	})
+	srv := &http.Server{Handler: mux}
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+	t.Cleanup(func() {
+		_ = srv.Close()
+	})
+
+	statePath := filepath.Join(t.TempDir(), "ccvm.json")
+	if err := WriteDaemonState(statePath, DaemonState{Addr: ln.Addr().String()}); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+
+	var reused bool
+	_, err = ConnectCCVMWithOptions(CCVMLaunch{Path: "/missing/ccvm"}, t.TempDir(), statePath, ConnectOptions{
+		OnReuse: func(DaemonState) {
+			reused = true
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "start ccvm daemon") {
+		t.Fatalf("connect capabilities-only daemon error = %v", err)
+	}
+	if reused {
+		t.Fatal("capabilities-only daemon was reused")
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("state file after capabilities-only rejection stat err = %v, want not exist", err)
 	}
 }
 

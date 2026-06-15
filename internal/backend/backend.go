@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -111,7 +112,7 @@ func ConnectCCVM(launch CCVMLaunch, cacheDir, statePath string) (*client.Client,
 func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts ConnectOptions) (*client.Client, error) {
 	if state, err := ReadDaemonState(statePath); err == nil {
 		api := NewClient(state.Addr)
-		if err := api.HealthCheck(); err == nil && apiCompatible(api) {
+		if err := api.HealthCheck(); err == nil && apiCompatible(state.Addr, api) {
 			if opts.OnReuse != nil {
 				opts.OnReuse(state)
 			}
@@ -161,12 +162,29 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 	return api, nil
 }
 
-func apiCompatible(api *client.Client) bool {
+func apiCompatible(addr string, api *client.Client) bool {
 	if api == nil {
 		return false
 	}
 	_, err := api.Capabilities()
-	return err == nil
+	if err != nil {
+		return false
+	}
+	for _, route := range []string{"/watchdog/lease", "/vm/start"} {
+		if !daemonRouteExists(addr, route) {
+			return false
+		}
+	}
+	return true
+}
+
+func daemonRouteExists(addr, route string) bool {
+	resp, err := http.Get("http://" + addr + route)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode != http.StatusNotFound
 }
 
 func CCVMLaunchName(launch CCVMLaunch) string {
