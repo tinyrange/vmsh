@@ -3056,6 +3056,131 @@ func TestSSHCopyStreamsTarOverConnection(t *testing.T) {
 	}
 }
 
+func TestSSHCopyPreservesDirectoryMetadataHostToSSHToHost(t *testing.T) {
+	remoteRoot := t.TempDir()
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		switch {
+		case strings.Contains(command, "tar -xf -"):
+			if err := extractTarToHost(stdin, copyTargetPath{path: remoteRoot, directory: true}); err != nil {
+				_, _ = fmt.Fprintf(stderr, "extract remote tar: %v", err)
+				return 1
+			}
+			return 0
+		case strings.Contains(command, "tar -cf -"):
+			if err := writePathTar(stdout, filepath.Join(remoteRoot, "ssh-meta"), "ssh-meta"); err != nil {
+				_, _ = fmt.Fprintf(stderr, "write remote tar: %v", err)
+				return 1
+			}
+			return 0
+		default:
+			return 0
+		}
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	src := filepath.Join(sh.hostCWD, "meta-src")
+	dst := filepath.Join(sh.hostCWD, "meta-back")
+	createMetadataCopyFixture(t, src)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.copyPath("@host:meta-src @ssh:test-ssh-a:/tmp/ssh-meta", &stdout, &stderr); err != nil {
+		t.Fatalf("copy local metadata to ssh: %v\nstderr:\n%s", err, stderr.String())
+	}
+	assertCopiedMetadataTree(t, src, filepath.Join(remoteRoot, "ssh-meta"))
+
+	if err := sh.copyPath("@ssh:test-ssh-a:/tmp/ssh-meta @host:meta-back", &stdout, &stderr); err != nil {
+		t.Fatalf("copy ssh metadata to local: %v\nstderr:\n%s", err, stderr.String())
+	}
+	assertCopiedMetadataTree(t, src, dst)
+}
+
+func TestCopySSHDirectoryMetadataToGuest(t *testing.T) {
+	remoteRoot := t.TempDir()
+	createMetadataCopyFixture(t, filepath.Join(remoteRoot, "ssh-meta"))
+	guestRoot := t.TempDir()
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		if req.Kind != "fs_extract" {
+			t.Fatalf("exec kind = %q, want fs_extract", req.Kind)
+		}
+		if id != "work" || req.Image != "ubuntu" || req.Path != "/tmp/vm-meta" || req.Directory {
+			t.Fatalf("extract request = id %q req %+v", id, req)
+		}
+		if err := extractTarToHost(bytes.NewReader(req.Stdin), copyTargetPath{path: filepath.Join(guestRoot, "vm-meta")}); err != nil {
+			t.Fatalf("extract guest tar: %v", err)
+		}
+		if onEvent != nil {
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		if !strings.Contains(command, "tar -cf -") {
+			return 0
+		}
+		if err := writePathTar(stdout, filepath.Join(remoteRoot, "ssh-meta"), "ssh-meta"); err != nil {
+			_, _ = fmt.Fprintf(stderr, "write remote tar: %v", err)
+			return 1
+		}
+		return 0
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, api)
+	var stdout, stderr bytes.Buffer
+	if err := sh.copyPath("@ssh:test-ssh-a:/tmp/ssh-meta @vm:work:/tmp/vm-meta", &stdout, &stderr); err != nil {
+		t.Fatalf("copy ssh metadata to guest: %v\nstderr:\n%s", err, stderr.String())
+	}
+	assertCopiedMetadataTree(t, filepath.Join(remoteRoot, "ssh-meta"), filepath.Join(guestRoot, "vm-meta"))
+}
+
+func TestCopyGuestDirectoryMetadataToSSH(t *testing.T) {
+	guestRoot := t.TempDir()
+	createMetadataCopyFixture(t, filepath.Join(guestRoot, "vm-meta"))
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		if req.Kind != "fs_archive" {
+			t.Fatalf("exec kind = %q, want fs_archive", req.Kind)
+		}
+		if id != "work" || req.Image != "ubuntu" || req.Path != "/tmp/vm-meta" {
+			t.Fatalf("archive request = id %q req %+v", id, req)
+		}
+		var archive bytes.Buffer
+		if err := writePathTar(&archive, filepath.Join(guestRoot, "vm-meta"), "vm-meta"); err != nil {
+			t.Fatalf("write guest archive: %v", err)
+		}
+		if onEvent != nil {
+			if err := onEvent(client.ExecEvent{Kind: "stdout", Data: archive.Bytes()}); err != nil {
+				return err
+			}
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
+	remoteRoot := t.TempDir()
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		if !strings.Contains(command, "tar -xf -") {
+			return 0
+		}
+		if err := extractTarToHost(stdin, copyTargetPath{path: remoteRoot, directory: true}); err != nil {
+			_, _ = fmt.Fprintf(stderr, "extract remote tar: %v", err)
+			return 1
+		}
+		return 0
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, api)
+	var stdout, stderr bytes.Buffer
+	if err := sh.copyPath("@vm:work:/tmp/vm-meta @ssh:test-ssh-a:/tmp/ssh-meta", &stdout, &stderr); err != nil {
+		t.Fatalf("copy guest metadata to ssh: %v\nstderr:\n%s", err, stderr.String())
+	}
+	assertCopiedMetadataTree(t, filepath.Join(guestRoot, "vm-meta"), filepath.Join(remoteRoot, "ssh-meta"))
+}
+
 func TestCopyGuestFileToSSHHost(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}

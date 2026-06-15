@@ -164,6 +164,67 @@ func TestVMIntegrationCopiesDirectoryMetadataHostToVMToHost(t *testing.T) {
 	assertCopiedMetadataTree(t, src, dst)
 }
 
+func TestVMIntegrationCopiesDirectoryMetadataThroughIsolatedVM(t *testing.T) {
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+	t.Cleanup(func() {
+		_ = env.api.ShutdownInstanceWithID("copy-iso-isolated")
+	})
+
+	src := filepath.Join(sh.hostCWD, "meta-src")
+	dst := filepath.Join(sh.hostCWD, "meta-back")
+	createMetadataCopyFixture(t, src)
+
+	script := strings.Join([]string{
+		"@" + env.image + " --vm copy-iso --isolated --memory 768 --cpus 1 --no-network",
+		"@copy @host:meta-src @:/tmp/vmsh-meta-vm",
+		"test -x /tmp/vmsh-meta-vm/script.sh",
+		"test -d /tmp/vmsh-meta-vm/empty",
+		"test -L /tmp/vmsh-meta-vm/script-link",
+		"test \"$(readlink /tmp/vmsh-meta-vm/script-link)\" = script.sh",
+		"@copy @:/tmp/vmsh-meta-vm @host:meta-back",
+	}, "\n")
+
+	stdout, stderr, err := sh.runTestScriptWithTimeout(script, 60*time.Second)
+	if err != nil {
+		t.Fatalf("run isolated metadata copy script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	assertCopiedMetadataTree(t, src, dst)
+}
+
+func TestVMIntegrationCopiesDirectoryMetadataBetweenVMs(t *testing.T) {
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+	t.Cleanup(func() {
+		_ = env.api.ShutdownInstanceWithID("copy-src")
+		_ = env.api.ShutdownInstanceWithID("copy-dst")
+	})
+
+	src := filepath.Join(sh.hostCWD, "meta-src")
+	dst := filepath.Join(sh.hostCWD, "meta-back")
+	createMetadataCopyFixture(t, src)
+
+	script := strings.Join([]string{
+		"@" + env.image + " --vm copy-src --memory 768 --cpus 1 --no-network",
+		"@" + env.image + " --vm copy-dst --memory 768 --cpus 1 --no-network",
+		"@copy @host:meta-src @vm:copy-src:/tmp/vmsh-meta-src",
+		"@copy @vm:copy-src:/tmp/vmsh-meta-src @vm:copy-dst:/tmp/vmsh-meta-dst",
+		"@vm:copy-dst test -x /tmp/vmsh-meta-dst/script.sh",
+		"@vm:copy-dst test -d /tmp/vmsh-meta-dst/empty",
+		"@vm:copy-dst test -L /tmp/vmsh-meta-dst/script-link",
+		"@vm:copy-dst test \"$(readlink /tmp/vmsh-meta-dst/script-link)\" = script.sh",
+		"@copy @vm:copy-dst:/tmp/vmsh-meta-dst @host:meta-back",
+		"@stop --vm copy-src",
+		"@stop --vm copy-dst",
+	}, "\n")
+
+	stdout, stderr, err := sh.runTestScriptWithTimeout(script, 75*time.Second)
+	if err != nil {
+		t.Fatalf("run VM-to-VM metadata copy script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	assertCopiedMetadataTree(t, src, dst)
+}
+
 func TestVMIntegrationPastedCopyDirectoryMetadataHostToVMToHost(t *testing.T) {
 	env := newVMIntegrationTestEnv(t)
 	sh := env.newShell(t)
@@ -442,7 +503,18 @@ func newVMIntegrationTestEnv(t *testing.T) *vmIntegrationTestEnv {
 	t.Helper()
 	skipUnsupportedVMIntegrationPlatform(t)
 
-	cacheDir := filepath.Join(t.TempDir(), "cache")
+	cacheBase := os.TempDir()
+	if runtime.GOOS == "darwin" {
+		cacheBase = "/tmp"
+	}
+	cacheParent, err := os.MkdirTemp(cacheBase, "vmsh-it-*")
+	if err != nil {
+		t.Fatalf("create VM integration cache dir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(cacheParent)
+	})
+	cacheDir := filepath.Join(cacheParent, "cache")
 	statePath := filepath.Join(cacheDir, "ccvm.json")
 	ccvm := buildVMIntegrationCCVM(t)
 	api, err := backend.ConnectCCVM(backend.CCVMLaunch{
