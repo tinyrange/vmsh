@@ -490,6 +490,43 @@ func TestIsolatedContextUsesSeparateBackendVM(t *testing.T) {
 	}
 }
 
+func TestBuiltInOpenBSDRunSkipsHostShare(t *testing.T) {
+	api := newRecordingShellAPI()
+	sh := newUnitShell(t, api)
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@openbsd --vm obsd --memory 768 --cpus 1 --no-network", &stdout, &stderr); err != nil {
+		t.Fatalf("enter OpenBSD context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	if err := sh.eval("uname -s", &stdout, &stderr); err != nil {
+		t.Fatalf("run OpenBSD command: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	if api.starts[0].req.Image != "@openbsd" {
+		t.Fatalf("started image = %q, want @openbsd", api.starts[0].req.Image)
+	}
+	if len(api.runs) != 1 {
+		t.Fatalf("runs = %d, want 1", len(api.runs))
+	}
+	run := api.runs[0].req
+	if run.Image != "@openbsd" {
+		t.Fatalf("run image = %q, want @openbsd", run.Image)
+	}
+	if len(run.Shares) != 0 {
+		t.Fatalf("OpenBSD run shares = %+v, want none", run.Shares)
+	}
+	if run.User != "root" {
+		t.Fatalf("OpenBSD run user = %q, want root", run.User)
+	}
+	if run.WorkDir != "/root" {
+		t.Fatalf("OpenBSD run workdir = %q, want /root", run.WorkDir)
+	}
+	if run.WorkDir == guestHostMount || strings.HasPrefix(run.WorkDir, guestHostMount+"/") {
+		t.Fatalf("OpenBSD run workdir = %q, should not use host mount", run.WorkDir)
+	}
+}
+
 func TestIsolatedContextRejectsSharedNameCollision(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	sh := newUnitShell(t, api)
@@ -1914,6 +1951,26 @@ func TestUbuntuPullUsesCloudRootFSTar(t *testing.T) {
 	}
 	if !strings.Contains(gotReq.SourceRef.Path, "cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64-root.tar.xz") {
 		t.Fatalf("source path = %q", gotReq.SourceRef.Path)
+	}
+}
+
+func TestBuiltInOpenBSDImageDoesNotPull(t *testing.T) {
+	api := newRecordingShellAPI()
+	api.pullStream = func(context.Context, string, client.PullImageRequest, func(client.ProgressEvent) error) error {
+		t.Fatal("built-in OpenBSD image attempted to pull")
+		return nil
+	}
+	sh := newUnitShell(t, api)
+	sh.confirmPull = func(source string, stderr io.Writer) (bool, error) {
+		t.Fatalf("built-in OpenBSD image prompted to pull %q", source)
+		return false, nil
+	}
+
+	if err := sh.ensureImageAvailable(commandContext{Mode: modeVM, Image: "@openbsd", Arch: "amd64"}, io.Discard); err != nil {
+		t.Fatalf("ensure built-in OpenBSD image: %v", err)
+	}
+	if got := localImageName("openbsd", "amd64"); got != "@openbsd" {
+		t.Fatalf("local OpenBSD image name = %q, want @openbsd", got)
 	}
 }
 

@@ -4102,7 +4102,7 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 		CPUs:       ctx.CPUs,
 		NestedVirt: ctx.NestedVirt,
 	}
-	if ctx.Isolated {
+	if ctx.Isolated || !guestSupportsHostShares(ctx) {
 		req.WorkDir = firstNonEmpty(req.WorkDir, guestHomeDir(ctx))
 	} else {
 		hostRoot, hostGuestCWD, err := guestHostPaths(s.hostCWD)
@@ -4134,6 +4134,10 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 		req.Network = networkConfigForContext(ctx)
 	}
 	return req, nil
+}
+
+func guestSupportsHostShares(ctx commandContext) bool {
+	return !isBuiltInGuestImage(ctx.Image)
 }
 
 func persistentGuestCommandAllowed(line string) bool {
@@ -5305,11 +5309,32 @@ func normalizeVMSHArchitecture(architecture string) string {
 }
 
 func localImageName(image, architecture string) string {
+	if isBuiltInGuestImage(image) {
+		return canonicalBuiltInGuestImage(image)
+	}
 	arch := normalizeVMSHArchitecture(architecture)
 	if arch == "" {
 		return image
 	}
 	return image + "@" + arch
+}
+
+func isBuiltInGuestImage(image string) bool {
+	switch strings.ToLower(strings.TrimSpace(image)) {
+	case "@openbsd", "openbsd":
+		return true
+	default:
+		return false
+	}
+}
+
+func canonicalBuiltInGuestImage(image string) string {
+	switch strings.ToLower(strings.TrimSpace(image)) {
+	case "@openbsd", "openbsd":
+		return "@openbsd"
+	default:
+		return strings.TrimSpace(image)
+	}
 }
 
 func pullImageRequestForContext(ctx commandContext) client.PullImageRequest {
@@ -5344,6 +5369,9 @@ func ubuntuCloudRootFSArchitecture(architecture string) string {
 
 func (s *shellState) ensureImageAvailable(ctx commandContext, stderr io.Writer) error {
 	image := localImageName(ctx.Image, ctx.Arch)
+	if isBuiltInGuestImage(image) {
+		return nil
+	}
 	req := pullImageRequestForContext(ctx)
 	requiredSource, requiredKind := requiredImageSource(req)
 	requireExactSource := requiredSource != ""
@@ -7242,6 +7270,9 @@ const (
 func guestRunUser(ctx commandContext) string {
 	if strings.TrimSpace(ctx.User) != "" {
 		return ctx.User
+	}
+	if isBuiltInGuestImage(ctx.Image) {
+		return "root"
 	}
 	return defaultGuestUser
 }
