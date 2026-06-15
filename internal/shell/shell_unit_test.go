@@ -2163,6 +2163,20 @@ func TestPersistentHostShellRunsShortCommandsAndPipelines(t *testing.T) {
 	}
 }
 
+func TestHostCommandPreludeFallsBackWhenCapturedInitIsTooLarge(t *testing.T) {
+	largePrelude := strings.Repeat("alias x=true\n", maxEmbeddedHostInitPreludeBytes/len("alias x=true\n")+2)
+	got, fallback := hostCommandPreludeFromCapture(largePrelude, nil)
+	if !fallback {
+		t.Fatal("oversized captured host init prelude was accepted")
+	}
+	if len(got) >= len(largePrelude) {
+		t.Fatalf("fallback prelude length = %d, captured length = %d", len(got), len(largePrelude))
+	}
+	if strings.Contains(got, largePrelude[:32]) {
+		t.Fatal("fallback prelude contains oversized captured content")
+	}
+}
+
 func TestPersistentHostShellCanReadForwardedInput(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("persistent host shell requires a Unix PTY")

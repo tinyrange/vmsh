@@ -39,6 +39,7 @@ const isolatedVMSuffix = "-isolated"
 const defaultGuestUser = "1000:1000"
 const defaultVMSHBootTimeoutSeconds = 60
 const defaultGuestShellReadyTimeout = 30 * time.Second
+const maxEmbeddedHostInitPreludeBytes = 64 * 1024
 const ubuntuCloudRootFSBaseURL = "https://cloud-images.ubuntu.com/releases/noble/release"
 const (
 	colorReset   = "\x1b[0m"
@@ -3826,14 +3827,16 @@ func (s *shellState) hostCommandPrelude(tty bool) string {
 	}
 	s.hostInit.once.Do(func() {
 		prelude, err := captureHostShellPrelude()
-		if err != nil || strings.TrimSpace(prelude) == "" {
-			s.hostInit.prelude = hostShellHookPrelude()
-			s.hostInit.fallback = true
-			return
-		}
-		s.hostInit.prelude = prelude
+		s.hostInit.prelude, s.hostInit.fallback = hostCommandPreludeFromCapture(prelude, err)
 	})
 	return s.hostInit.prelude
+}
+
+func hostCommandPreludeFromCapture(prelude string, err error) (string, bool) {
+	if err != nil || strings.TrimSpace(prelude) == "" || len(prelude) > maxEmbeddedHostInitPreludeBytes {
+		return hostShellHookPrelude(), true
+	}
+	return prelude, false
 }
 
 func hostShellCommand(line string, tty bool, prelude string) []string {
