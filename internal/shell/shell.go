@@ -2349,15 +2349,22 @@ func (s *shellState) copyPath(command string, stdout, stderr io.Writer) error {
 	srcHost, srcOK := src.target.LocalPath(src.path)
 	dstHost, dstOK := dst.target.LocalPath(dst.path)
 	if srcOK && dstOK {
-		return copyHostPath(srcHost, dstHost)
+		return wrapCopyPathError(fields[0], fields[1], copyHostPath(srcHost, copyTargetPath{path: dstHost, directory: dst.directory}))
 	}
 	if srcOK {
-		return dst.target.CopyFromLocal(srcHost, dst.targetPath(), stderr)
+		return wrapCopyPathError(fields[0], fields[1], dst.target.CopyFromLocal(srcHost, dst.targetPath(), stderr))
 	}
 	if dstOK {
-		return src.target.CopyToLocal(src.targetPath(), dstHost, stderr)
+		return wrapCopyPathError(fields[0], fields[1], src.target.CopyToLocal(src.targetPath(), copyTargetPath{path: dstHost, directory: dst.directory}, stderr))
 	}
-	return copyRemoteToRemote(src, dst, stderr)
+	return wrapCopyPathError(fields[0], fields[1], copyRemoteToRemote(src, dst, stderr))
+}
+
+func wrapCopyPathError(src, dst string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("copy %s -> %s: %w", src, dst, err)
 }
 
 func copyRemoteToRemote(src, dst copyEndpoint, stderr io.Writer) error {
@@ -2367,7 +2374,7 @@ func copyRemoteToRemote(src, dst copyEndpoint, stderr io.Writer) error {
 	}
 	defer os.RemoveAll(tmpRoot)
 	staged := filepath.Join(tmpRoot, copyStageBaseName(src.path))
-	if err := src.target.CopyToLocal(src.targetPath(), staged, stderr); err != nil {
+	if err := src.target.CopyToLocal(src.targetPath(), copyTargetPath{path: staged}, stderr); err != nil {
 		return err
 	}
 	return dst.target.CopyFromLocal(staged, dst.targetPath(), stderr)
@@ -2679,12 +2686,12 @@ func (s *shellState) currentSSHCWD(ctx commandContext) string {
 	return "~"
 }
 
-func copyHostPath(src, dst string) error {
+func copyHostPath(src string, dst copyTargetPath) error {
 	info, err := os.Stat(src)
 	if err != nil {
 		return err
 	}
-	target := hostCopyTarget(src, dst, info)
+	target := hostCopyTarget(src, dst.path, dst.directory, info)
 	if info.IsDir() {
 		return copyHostDir(src, target, info.Mode())
 	}
@@ -2706,58 +2713,11 @@ func (s *shellState) copyLocalToGuest(src string, ctx commandContext, dst copyTa
 }
 
 func (s *shellState) copyLocalDirToGuest(src string, ctx commandContext, dst copyTargetPath, stderr io.Writer) error {
-	targetRoot := dst.path
-	if dst.directory {
-		targetRoot = path.Join(dst.path, filepath.ToSlash(filepath.Base(src)))
-	}
-	type dirCopyOp struct {
-		hostPath string
-		target   string
-		info     os.FileInfo
-		dir      bool
-	}
-	var ops []dirCopyOp
-	if err := filepath.WalkDir(src, func(filePath string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if filePath == src {
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(src, filePath)
-		if err != nil {
-			return err
-		}
-		target := path.Join(targetRoot, filepath.ToSlash(rel))
-		if info.IsDir() {
-			ops = append(ops, dirCopyOp{target: target, dir: true})
-			return nil
-		}
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-		ops = append(ops, dirCopyOp{hostPath: filePath, target: target, info: info})
-		return nil
-	}); err != nil {
+	var archive bytes.Buffer
+	if err := writePathTar(&archive, src, filepath.Base(src)); err != nil {
 		return err
 	}
-	for _, op := range ops {
-		if op.dir {
-			if err := s.guestFSMkdir(ctx, op.target, stderr); err != nil {
-				return err
-			}
-			continue
-		}
-		fileDst := copyTargetPath{path: op.target}
-		if err := s.copyLocalFileToGuest(op.hostPath, ctx, fileDst, stderr); err != nil {
-			return err
-		}
-	}
-	return nil
+	return s.guestFSExtract(ctx, dst, archive.Bytes(), stderr)
 }
 
 func (s *shellState) copyLocalFileToGuest(src string, ctx commandContext, dst copyTargetPath, stderr io.Writer) error {
@@ -2788,6 +2748,17 @@ func (s *shellState) guestFSWrite(ctx commandContext, target string, data []byte
 		Path:  target,
 		User:  guestRunUser(ctx),
 		Stdin: append([]byte(nil), data...),
+	}, stderr)
+}
+
+func (s *shellState) guestFSExtract(ctx commandContext, dst copyTargetPath, data []byte, stderr io.Writer) error {
+	return s.runGuestFSRequest(ctx, client.ExecRequest{
+		Kind:      "fs_extract",
+		Image:     localImageName(ctx.Image, ctx.Arch),
+		Path:      dst.path,
+		Directory: dst.directory,
+		User:      guestRunUser(ctx),
+		Stdin:     append([]byte(nil), data...),
 	}, stderr)
 }
 
@@ -2829,7 +2800,7 @@ func (s *shellState) runGuestFSRequest(ctx commandContext, req client.ExecReques
 	return nil
 }
 
-func (s *shellState) copyGuestToLocal(ctx commandContext, src copyTargetPath, dst string, stderr io.Writer) error {
+func (s *shellState) copyGuestToLocal(ctx commandContext, src, dst copyTargetPath, stderr io.Writer) error {
 	if err := s.ensureGuestCopyReady(ctx, stderr); err != nil {
 		return err
 	}
@@ -2875,7 +2846,7 @@ func (s *shellState) copyGuestToLocal(ctx commandContext, src copyTargetPath, ds
 	if !exitSeen {
 		return fmt.Errorf("guest copy did not report completion")
 	}
-	return extractTarToHost(bytes.NewReader(tarData.Bytes()), dst, false)
+	return extractTarToHost(bytes.NewReader(tarData.Bytes()), dst)
 }
 
 func (s *shellState) ensureGuestCopyReady(ctx commandContext, stderr io.Writer) error {
@@ -2948,8 +2919,8 @@ func writePathTar(w io.Writer, src, rootName string) error {
 	})
 }
 
-func extractTarToHost(r io.Reader, dst string, sourceIsDir bool) error {
-	mode := hostCopyDestMode(dst, sourceIsDir)
+func extractTarToHost(r io.Reader, dst copyTargetPath) error {
+	mode := hostCopyDestMode(dst.path, dst.directory)
 	tr := tar.NewReader(r)
 	for {
 		header, err := tr.Next()
@@ -2959,7 +2930,7 @@ func extractTarToHost(r io.Reader, dst string, sourceIsDir bool) error {
 		if err != nil {
 			return err
 		}
-		target, err := hostTarTarget(dst, mode, header.Name)
+		target, err := hostTarTarget(dst.path, mode, header.Name)
 		if err != nil {
 			return err
 		}
@@ -2997,11 +2968,11 @@ const (
 	copyDestExact
 )
 
-func hostCopyDestMode(dst string, sourceIsDir bool) copyDestMode {
+func hostCopyDestMode(dst string, directoryHint bool) copyDestMode {
 	if info, err := os.Stat(dst); err == nil && info.IsDir() {
 		return copyDestIntoDir
 	}
-	if sourceIsDir || strings.HasSuffix(dst, string(filepath.Separator)) {
+	if directoryHint || strings.HasSuffix(dst, string(filepath.Separator)) {
 		return copyDestIntoDir
 	}
 	return copyDestExact
@@ -3022,11 +2993,11 @@ func hostTarTarget(dst string, mode copyDestMode, name string) (string, error) {
 	return filepath.Join(dst, filepath.FromSlash(parts[1])), nil
 }
 
-func hostCopyTarget(src, dst string, info os.FileInfo) string {
+func hostCopyTarget(src, dst string, directoryHint bool, info os.FileInfo) string {
 	if dstInfo, err := os.Stat(dst); err == nil && dstInfo.IsDir() {
 		return filepath.Join(dst, filepath.Base(src))
 	}
-	if strings.HasSuffix(dst, string(filepath.Separator)) {
+	if directoryHint || strings.HasSuffix(dst, string(filepath.Separator)) {
 		return filepath.Join(dst, filepath.Base(src))
 	}
 	return dst

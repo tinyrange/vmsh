@@ -1607,7 +1607,7 @@ func TestGuestCopyInterruptReturnsStatus130(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- sh.copyGuestToLocal(ctx, copyTargetPath{path: "/tmp/source.txt"}, filepath.Join(t.TempDir(), "source.txt"), io.Discard)
+		errCh <- sh.copyGuestToLocal(ctx, copyTargetPath{path: "/tmp/source.txt"}, copyTargetPath{path: filepath.Join(t.TempDir(), "source.txt")}, io.Discard)
 	}()
 	<-started
 	interrupts <- os.Interrupt
@@ -3070,6 +3070,63 @@ func TestCopySSHHostFileToGuest(t *testing.T) {
 	}
 }
 
+func TestCopyLocalDirectoryToGuestUsesArchive(t *testing.T) {
+	archiveEntries := make(chan []string, 1)
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		if req.Kind != "fs_extract" {
+			t.Fatalf("exec kind = %q, want fs_extract", req.Kind)
+		}
+		if id != "work" || req.Image != "ubuntu" || req.Path != "/tmp/dst" || req.Directory {
+			t.Fatalf("extract request = id %q req %+v", id, req)
+		}
+		tr := tar.NewReader(bytes.NewReader(req.Stdin))
+		var names []string
+		for {
+			header, err := tr.Next()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("read archive: %v", err)
+			}
+			names = append(names, header.Name)
+		}
+		archiveEntries <- names
+		if onEvent != nil {
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
+
+	sh := newUnitShell(t, api)
+	src := filepath.Join(sh.hostCWD, "tree")
+	if err := os.MkdirAll(filepath.Join(src, "empty"), 0o755); err != nil {
+		t.Fatalf("make empty dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(src, "nested"), 0o755); err != nil {
+		t.Fatalf("make nested dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "nested", "file.txt"), []byte("payload"), 0o644); err != nil {
+		t.Fatalf("write nested file: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.copyPath("@host:tree @vm:work:/tmp/dst", &stdout, &stderr); err != nil {
+		t.Fatalf("copy local directory to guest: %v\nstderr:\n%s", err, stderr.String())
+	}
+	select {
+	case names := <-archiveEntries:
+		want := []string{"tree", "tree/empty", "tree/nested", "tree/nested/file.txt"}
+		if !reflect.DeepEqual(names, want) {
+			t.Fatalf("archive entries = %#v, want %#v", names, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("guest extract request was not received")
+	}
+}
+
 func TestSSHCopyBetweenActiveSessions(t *testing.T) {
 	payload := "module github.com/tinyrange/vmsh\n"
 	srcSideband := newTestSSHSideband(t, "/home/test", func(line string, stdout io.Writer) (int, string) {
@@ -3258,6 +3315,19 @@ func TestCopyEndpointResolutionAndGuestHostPathSafety(t *testing.T) {
 	}
 }
 
+func TestCopyErrorsNameSourceAndDestination(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI("ubuntu"))
+	var stdout, stderr bytes.Buffer
+	err := sh.copyPath("@host:missing-file.txt @image:ubuntu:/tmp/out", &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("copy missing source succeeded")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "@host:missing-file.txt") || !strings.Contains(msg, "@image:ubuntu:/tmp/out") {
+		t.Fatalf("copy error did not name endpoints: %v", err)
+	}
+}
+
 func TestShellTargetsExposeLocalPathSemantics(t *testing.T) {
 	sh := newUnitShell(t, newRecordingShellAPI("alpine"))
 	hostTarget, err := sh.targetFor(commandContext{Mode: modeHost})
@@ -3292,6 +3362,39 @@ func TestShellTargetsExposeLocalPathSemantics(t *testing.T) {
 	}
 }
 
+func TestHostDirectoryCopyDestinationSemantics(t *testing.T) {
+	parent := t.TempDir()
+	src := filepath.Join(parent, "src")
+	if err := os.MkdirAll(filepath.Join(src, "empty"), 0o755); err != nil {
+		t.Fatalf("make empty dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(src, "nested"), 0o755); err != nil {
+		t.Fatalf("make nested dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "nested", "file.txt"), []byte("payload"), 0o644); err != nil {
+		t.Fatalf("write nested file: %v", err)
+	}
+
+	renamed := filepath.Join(parent, "renamed")
+	if err := copyHostPath(src, copyTargetPath{path: renamed}); err != nil {
+		t.Fatalf("copy host dir rename: %v", err)
+	}
+	if got := readTestFile(t, filepath.Join(renamed, "nested", "file.txt")); got != "payload" {
+		t.Fatalf("renamed nested file = %q", got)
+	}
+	if info, err := os.Stat(filepath.Join(renamed, "empty")); err != nil || !info.IsDir() {
+		t.Fatalf("renamed empty dir stat = %v info=%v", err, info)
+	}
+
+	into := filepath.Join(parent, "into")
+	if err := copyHostPath(src, copyTargetPath{path: into, directory: true}); err != nil {
+		t.Fatalf("copy host dir into: %v", err)
+	}
+	if got := readTestFile(t, filepath.Join(into, "src", "nested", "file.txt")); got != "payload" {
+		t.Fatalf("copy-into nested file = %q", got)
+	}
+}
+
 func TestExtractTarToHostRejectsTraversal(t *testing.T) {
 	parent := t.TempDir()
 	dst := filepath.Join(parent, "dst")
@@ -3311,13 +3414,64 @@ func TestExtractTarToHostRejectsTraversal(t *testing.T) {
 		t.Fatalf("close tar: %v", err)
 	}
 
-	err := extractTarToHost(bytes.NewReader(archive.Bytes()), dst, false)
+	err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: dst})
 	if err == nil || !strings.Contains(err.Error(), "unsafe tar path") {
 		t.Fatalf("extract traversal error = %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(parent, "evil.txt")); !os.IsNotExist(err) {
 		t.Fatalf("traversal file exists or stat failed unexpectedly: %v", err)
 	}
+}
+
+func TestExtractTarToHostDirectoryDestinationSemantics(t *testing.T) {
+	var archive bytes.Buffer
+	if err := writePathTar(&archive, makeTestCopyTree(t), "tree"); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+
+	parent := t.TempDir()
+	renamed := filepath.Join(parent, "renamed")
+	if err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: renamed}); err != nil {
+		t.Fatalf("extract rename: %v", err)
+	}
+	if got := readTestFile(t, filepath.Join(renamed, "nested", "file.txt")); got != "payload" {
+		t.Fatalf("renamed extract nested file = %q", got)
+	}
+	if info, err := os.Stat(filepath.Join(renamed, "empty")); err != nil || !info.IsDir() {
+		t.Fatalf("renamed extract empty dir stat = %v info=%v", err, info)
+	}
+
+	into := filepath.Join(parent, "into")
+	if err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: into, directory: true}); err != nil {
+		t.Fatalf("extract into: %v", err)
+	}
+	if got := readTestFile(t, filepath.Join(into, "tree", "nested", "file.txt")); got != "payload" {
+		t.Fatalf("copy-into extract nested file = %q", got)
+	}
+}
+
+func makeTestCopyTree(t *testing.T) string {
+	t.Helper()
+	src := filepath.Join(t.TempDir(), "tree")
+	if err := os.MkdirAll(filepath.Join(src, "empty"), 0o755); err != nil {
+		t.Fatalf("make empty dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(src, "nested"), 0o755); err != nil {
+		t.Fatalf("make nested dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "nested", "file.txt"), []byte("payload"), 0o644); err != nil {
+		t.Fatalf("write nested file: %v", err)
+	}
+	return src
+}
+
+func readTestFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(data)
 }
 
 type testSSHServer struct {

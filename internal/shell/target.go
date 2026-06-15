@@ -18,7 +18,7 @@ type shellTarget interface {
 	ResolveCopyPath(value string) string
 	LocalPath(targetPath string) (string, bool)
 	CopyFromLocal(src string, dst copyTargetPath, stderr io.Writer) error
-	CopyToLocal(src copyTargetPath, dst string, stderr io.Writer) error
+	CopyToLocal(src, dst copyTargetPath, stderr io.Writer) error
 }
 
 type copyTargetPath struct {
@@ -62,10 +62,10 @@ func (t hostShellTarget) ResolveCopyPath(value string) string {
 func (t hostShellTarget) LocalPath(targetPath string) (string, bool) { return targetPath, true }
 
 func (t hostShellTarget) CopyFromLocal(src string, dst copyTargetPath, stderr io.Writer) error {
-	return copyHostPath(src, dst.path)
+	return copyHostPath(src, dst)
 }
 
-func (t hostShellTarget) CopyToLocal(src copyTargetPath, dst string, stderr io.Writer) error {
+func (t hostShellTarget) CopyToLocal(src, dst copyTargetPath, stderr io.Writer) error {
 	return copyHostPath(src.path, dst)
 }
 
@@ -128,7 +128,7 @@ func (t guestShellTarget) CopyFromLocal(src string, dst copyTargetPath, stderr i
 	return t.shell.copyLocalToGuest(src, t.ctx, dst, stderr)
 }
 
-func (t guestShellTarget) CopyToLocal(src copyTargetPath, dst string, stderr io.Writer) error {
+func (t guestShellTarget) CopyToLocal(src, dst copyTargetPath, stderr io.Writer) error {
 	return t.shell.copyGuestToLocal(t.ctx, src, dst, stderr)
 }
 
@@ -169,7 +169,7 @@ func (t sshShellTarget) CopyFromLocal(src string, dst copyTargetPath, stderr io.
 	return t.shell.copyLocalToSSH(src, t.ctx, dst, stderr)
 }
 
-func (t sshShellTarget) CopyToLocal(src copyTargetPath, dst string, stderr io.Writer) error {
+func (t sshShellTarget) CopyToLocal(src, dst copyTargetPath, stderr io.Writer) error {
 	return t.shell.copySSHToLocal(t.ctx, src, dst, stderr)
 }
 

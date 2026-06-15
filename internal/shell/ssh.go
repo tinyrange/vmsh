@@ -1639,7 +1639,7 @@ func (s *shellState) copyLocalToSSH(src string, ctx commandContext, dst copyTarg
 	return nil
 }
 
-func (s *shellState) copySSHToLocal(ctx commandContext, src copyTargetPath, dst string, stderr io.Writer) error {
+func (s *shellState) copySSHToLocal(ctx commandContext, src, dst copyTargetPath, stderr io.Writer) error {
 	remoteDir := path.Dir(src.path)
 	base := path.Base(src.path)
 	if remoteDir == "." {
@@ -1650,7 +1650,7 @@ func (s *shellState) copySSHToLocal(ctx commandContext, src copyTargetPath, dst 
 	if err := s.runSSHCommand(ctx, command, nil, &archive, stderr, false, false); err != nil {
 		return err
 	}
-	return extractTarToHost(bytes.NewReader(archive.Bytes()), dst, false)
+	return extractTarToHost(bytes.NewReader(archive.Bytes()), dst)
 }
 
 func remoteMkdirCommand(dir string) string {
