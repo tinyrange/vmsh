@@ -1669,7 +1669,7 @@ func parseSSHBool(value string) bool {
 	}
 }
 
-func (s *shellState) copyLocalToSSH(src string, ctx commandContext, dst copyTargetPath, stderr io.Writer) error {
+func (s *shellState) copyLocalToSSH(src string, ctx commandContext, dst copyTargetPath, stderr io.Writer, progress *copyProgress) error {
 	if _, err := os.Stat(src); err != nil {
 		return err
 	}
@@ -1684,7 +1684,8 @@ func (s *shellState) copyLocalToSSH(src string, ctx commandContext, dst copyTarg
 	}
 	pr, pw := io.Pipe()
 	go func() {
-		err := writePathTar(pw, src, rootName)
+		progress.Phase("uploading")
+		err := writePathTar(copyProgressWriter{w: pw, progress: progress}, src, rootName)
 		_ = pw.CloseWithError(err)
 	}()
 	command := remoteMkdirCommand(remoteDir) + " && " + remoteCDCommand(remoteDir) + " && tar -xf -"
@@ -1695,7 +1696,7 @@ func (s *shellState) copyLocalToSSH(src string, ctx commandContext, dst copyTarg
 	return nil
 }
 
-func (s *shellState) copySSHToLocal(ctx commandContext, src, dst copyTargetPath, stderr io.Writer) error {
+func (s *shellState) copySSHToLocal(ctx commandContext, src, dst copyTargetPath, stderr io.Writer, progress *copyProgress) error {
 	remoteDir := path.Dir(src.path)
 	base := path.Base(src.path)
 	if remoteDir == "." {
@@ -1703,9 +1704,11 @@ func (s *shellState) copySSHToLocal(ctx commandContext, src, dst copyTargetPath,
 	}
 	var archive bytes.Buffer
 	command := remoteCDCommand(remoteDir) + " && tar -cf - -- " + shellQuote(base)
-	if err := s.runSSHCommand(ctx, command, nil, &archive, stderr, false, false); err != nil {
+	progress.Phase("downloading")
+	if err := s.runSSHCommand(ctx, command, nil, copyProgressWriter{w: &archive, progress: progress}, stderr, false, false); err != nil {
 		return err
 	}
+	progress.Phase("extracting")
 	return extractTarToHost(bytes.NewReader(archive.Bytes()), dst)
 }
 

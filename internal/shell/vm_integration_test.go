@@ -220,6 +220,40 @@ func TestVMIntegrationCopiesDirectoryMetadataHostToVMToHost(t *testing.T) {
 	assertCopiedMetadataTree(t, src, dst)
 }
 
+func TestVMIntegrationCopiesLargeFileHostToVM(t *testing.T) {
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+	t.Cleanup(func() {
+		_ = env.api.ShutdownInstanceWithID("copy-large")
+	})
+
+	const largeSize = 128 * 1024 * 1024
+	src := filepath.Join(sh.hostCWD, "large.bin")
+	file, err := os.Create(src)
+	if err != nil {
+		t.Fatalf("create large source: %v", err)
+	}
+	if err := file.Truncate(largeSize); err != nil {
+		_ = file.Close()
+		t.Fatalf("size large source: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close large source: %v", err)
+	}
+
+	script := strings.Join([]string{
+		"@" + env.image + " --vm copy-large --memory 768 --cpus 1 --no-network",
+		"@copy @host:large.bin @vm:copy-large:/root/large.bin",
+		fmt.Sprintf("@vm:copy-large sh -lc 'test \"$(wc -c < /root/large.bin)\" = %d'", largeSize),
+		"@stop --vm copy-large",
+	}, "\n")
+
+	stdout, stderr, err := sh.runTestScriptWithTimeout(script, 45*time.Second)
+	if err != nil {
+		t.Fatalf("run large copy script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+}
+
 func TestVMIntegrationCopiesDirectoryMetadataThroughIsolatedVM(t *testing.T) {
 	env := newVMIntegrationTestEnv(t)
 	sh := env.newShell(t)

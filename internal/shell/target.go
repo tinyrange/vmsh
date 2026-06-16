@@ -17,8 +17,8 @@ type shellTarget interface {
 	Chdir(target string) error
 	ResolveCopyPath(value string, stderr io.Writer) (string, error)
 	LocalPath(targetPath string) (string, bool)
-	CopyFromLocal(src string, dst copyTargetPath, stderr io.Writer) error
-	CopyToLocal(src, dst copyTargetPath, stderr io.Writer) error
+	CopyFromLocal(src string, dst copyTargetPath, stderr io.Writer, progress *copyProgress) error
+	CopyToLocal(src, dst copyTargetPath, stderr io.Writer, progress *copyProgress) error
 }
 
 type copyTargetPath struct {
@@ -61,12 +61,12 @@ func (t hostShellTarget) ResolveCopyPath(value string, stderr io.Writer) (string
 
 func (t hostShellTarget) LocalPath(targetPath string) (string, bool) { return targetPath, true }
 
-func (t hostShellTarget) CopyFromLocal(src string, dst copyTargetPath, stderr io.Writer) error {
-	return copyHostPath(src, dst)
+func (t hostShellTarget) CopyFromLocal(src string, dst copyTargetPath, stderr io.Writer, progress *copyProgress) error {
+	return copyHostPath(src, dst, progress)
 }
 
-func (t hostShellTarget) CopyToLocal(src, dst copyTargetPath, stderr io.Writer) error {
-	return copyHostPath(src.path, dst)
+func (t hostShellTarget) CopyToLocal(src, dst copyTargetPath, stderr io.Writer, progress *copyProgress) error {
+	return copyHostPath(src.path, dst, progress)
 }
 
 type hostPreparedCommand struct {
@@ -124,12 +124,12 @@ func (t guestShellTarget) LocalPath(targetPath string) (string, bool) {
 	return guestHostPathToHost(t.shell.hostCWD, targetPath)
 }
 
-func (t guestShellTarget) CopyFromLocal(src string, dst copyTargetPath, stderr io.Writer) error {
-	return contextBoundaryError(t.ctx, "copy from local", t.shell.copyLocalToGuest(src, t.ctx, dst, stderr))
+func (t guestShellTarget) CopyFromLocal(src string, dst copyTargetPath, stderr io.Writer, progress *copyProgress) error {
+	return contextBoundaryError(t.ctx, "copy from local", t.shell.copyLocalToGuest(src, t.ctx, dst, stderr, progress))
 }
 
-func (t guestShellTarget) CopyToLocal(src, dst copyTargetPath, stderr io.Writer) error {
-	return contextBoundaryError(t.ctx, "copy to local", t.shell.copyGuestToLocal(t.ctx, src, dst, stderr))
+func (t guestShellTarget) CopyToLocal(src, dst copyTargetPath, stderr io.Writer, progress *copyProgress) error {
+	return contextBoundaryError(t.ctx, "copy to local", t.shell.copyGuestToLocal(t.ctx, src, dst, stderr, progress))
 }
 
 type sshShellTarget struct {
@@ -165,12 +165,12 @@ func (t sshShellTarget) ResolveCopyPath(value string, stderr io.Writer) (string,
 
 func (t sshShellTarget) LocalPath(targetPath string) (string, bool) { return "", false }
 
-func (t sshShellTarget) CopyFromLocal(src string, dst copyTargetPath, stderr io.Writer) error {
-	return contextBoundaryError(t.ctx, "copy from local", t.shell.copyLocalToSSH(src, t.ctx, dst, stderr))
+func (t sshShellTarget) CopyFromLocal(src string, dst copyTargetPath, stderr io.Writer, progress *copyProgress) error {
+	return contextBoundaryError(t.ctx, "copy from local", t.shell.copyLocalToSSH(src, t.ctx, dst, stderr, progress))
 }
 
-func (t sshShellTarget) CopyToLocal(src, dst copyTargetPath, stderr io.Writer) error {
-	return contextBoundaryError(t.ctx, "copy to local", t.shell.copySSHToLocal(t.ctx, src, dst, stderr))
+func (t sshShellTarget) CopyToLocal(src, dst copyTargetPath, stderr io.Writer, progress *copyProgress) error {
+	return contextBoundaryError(t.ctx, "copy to local", t.shell.copySSHToLocal(t.ctx, src, dst, stderr, progress))
 }
 
 type sshPreparedCommand struct {

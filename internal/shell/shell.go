@@ -2583,18 +2583,20 @@ func (s *shellState) copyPath(command string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	progress := newCopyProgress(stderr, copyEndpointLabel(src), copyEndpointLabel(dst))
+	defer progress.Close()
 	srcHost, srcOK := src.target.LocalPath(src.path)
 	dstHost, dstOK := dst.target.LocalPath(dst.path)
 	if srcOK && dstOK {
-		return wrapCopyPathError(fields[0], fields[1], copyHostPath(srcHost, copyTargetPath{path: dstHost, directory: dst.directory}))
+		return wrapCopyPathError(fields[0], fields[1], copyHostPath(srcHost, copyTargetPath{path: dstHost, directory: dst.directory}, progress))
 	}
 	if srcOK {
-		return wrapCopyPathError(fields[0], fields[1], dst.target.CopyFromLocal(srcHost, dst.targetPath(), stderr))
+		return wrapCopyPathError(fields[0], fields[1], dst.target.CopyFromLocal(srcHost, dst.targetPath(), stderr, progress))
 	}
 	if dstOK {
-		return wrapCopyPathError(fields[0], fields[1], src.target.CopyToLocal(src.targetPath(), copyTargetPath{path: dstHost, directory: dst.directory}, stderr))
+		return wrapCopyPathError(fields[0], fields[1], src.target.CopyToLocal(src.targetPath(), copyTargetPath{path: dstHost, directory: dst.directory}, stderr, progress))
 	}
-	return wrapCopyPathError(fields[0], fields[1], copyRemoteToRemote(src, dst, stderr))
+	return wrapCopyPathError(fields[0], fields[1], copyRemoteToRemote(src, dst, stderr, progress))
 }
 
 func wrapCopyPathError(src, dst string, err error) error {
@@ -2604,17 +2606,137 @@ func wrapCopyPathError(src, dst string, err error) error {
 	return fmt.Errorf("copy %s -> %s: %w", src, dst, err)
 }
 
-func copyRemoteToRemote(src, dst copyEndpoint, stderr io.Writer) error {
+func copyEndpointLabel(endpoint copyEndpoint) string {
+	if endpoint.target == nil {
+		return "-"
+	}
+	ctx := endpoint.context()
+	switch ctx.Mode {
+	case modeHost:
+		return "host"
+	case modeVM:
+		return "vm:" + normalizedVMID(ctx.VMID)
+	case modeSSH:
+		return "ssh:" + emptyText(strings.TrimSpace(ctx.SSHHost), "-")
+	default:
+		return string(ctx.Mode)
+	}
+}
+
+type copyProgress struct {
+	status *terminalHoldStatus
+	src    string
+	dst    string
+
+	mu          sync.Mutex
+	phase       string
+	bytes       int64
+	lastUpdate  time.Time
+	forceUpdate bool
+}
+
+func newCopyProgress(stderr io.Writer, src, dst string) *copyProgress {
+	if file, ok := terminalWriterFile(stderr); !ok || file == nil || !terminal.IsTerminalFD(int(file.Fd())) {
+		return nil
+	}
+	p := &copyProgress{
+		status:      newTerminalHoldStatus(stderr, "Copy: preparing"),
+		src:         src,
+		dst:         dst,
+		phase:       "preparing",
+		forceUpdate: true,
+	}
+	p.updateLocked(time.Now())
+	return p
+}
+
+func (p *copyProgress) Close() {
+	if p == nil || p.status == nil {
+		return
+	}
+	p.status.Close()
+}
+
+func (p *copyProgress) Phase(phase string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.phase = strings.TrimSpace(phase)
+	p.forceUpdate = true
+	p.updateLocked(time.Now())
+	p.mu.Unlock()
+}
+
+func (p *copyProgress) ResetBytes() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.bytes = 0
+	p.forceUpdate = true
+	p.updateLocked(time.Now())
+	p.mu.Unlock()
+}
+
+func (p *copyProgress) AddBytes(n int) {
+	if p == nil || n <= 0 {
+		return
+	}
+	p.mu.Lock()
+	if p.bytes == 0 {
+		p.forceUpdate = true
+	}
+	p.bytes += int64(n)
+	p.updateLocked(time.Now())
+	p.mu.Unlock()
+}
+
+func (p *copyProgress) updateLocked(now time.Time) {
+	if p == nil || p.status == nil {
+		return
+	}
+	if !p.forceUpdate && now.Sub(p.lastUpdate) < 200*time.Millisecond {
+		return
+	}
+	p.forceUpdate = false
+	p.lastUpdate = now
+	phase := firstNonEmpty(p.phase, "copying")
+	message := "Copy  " + p.src + " -> " + p.dst + "  " + phase
+	if p.bytes > 0 {
+		message += "  " + formatByteSize(p.bytes)
+	}
+	p.status.Update(message)
+}
+
+type copyProgressWriter struct {
+	w        io.Writer
+	progress *copyProgress
+}
+
+func (w copyProgressWriter) Write(data []byte) (int, error) {
+	n, err := w.w.Write(data)
+	if n > 0 {
+		w.progress.AddBytes(n)
+	}
+	return n, err
+}
+
+func copyRemoteToRemote(src, dst copyEndpoint, stderr io.Writer, progress *copyProgress) error {
+	progress.Phase("staging via host")
 	tmpRoot, err := os.MkdirTemp("", "vmsh-copy-*")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmpRoot)
 	staged := filepath.Join(tmpRoot, copyStageBaseName(src.path))
-	if err := src.target.CopyToLocal(src.targetPath(), copyTargetPath{path: staged}, stderr); err != nil {
+	progress.Phase("downloading to staging area")
+	if err := src.target.CopyToLocal(src.targetPath(), copyTargetPath{path: staged}, stderr, progress); err != nil {
 		return err
 	}
-	return dst.target.CopyFromLocal(staged, dst.targetPath(), stderr)
+	progress.ResetBytes()
+	progress.Phase("uploading from staging area")
+	return dst.target.CopyFromLocal(staged, dst.targetPath(), stderr, progress)
 }
 
 func copyStageBaseName(value string) string {
@@ -2776,18 +2898,7 @@ func (s *shellState) knownVMCopyEndpointContext(id string) (commandContext, bool
 	if strings.TrimSpace(state.Image) == "" {
 		return commandContext{}, false, nil
 	}
-	ctx := commandContext{
-		Mode:       modeVM,
-		VMID:       firstNonEmpty(state.ID, id),
-		Image:      state.Image,
-		InitSystem: state.InitSystem,
-		Kernel:     state.Kernel,
-		MemoryMB:   state.MemoryMB,
-		CPUs:       state.CPUs,
-		NestedVirt: state.NestedVirt,
-		Network:    state.NetworkIPv4 != "",
-		Isolated:   strings.HasSuffix(firstNonEmpty(state.ID, id), "-isolated"),
-	}
+	ctx := vmContextFromState(id, state)
 	if s.contextCWD != nil {
 		if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
 			ctx.CWD = cwd
@@ -2812,9 +2923,25 @@ func (s *shellState) vmCopyEndpointContext(id string) (commandContext, error) {
 	if strings.TrimSpace(state.Image) == "" {
 		return commandContext{}, fmt.Errorf("VM %s has no image; use @<image>:path or switch to the VM first", id)
 	}
-	ctx := commandContext{
+	ctx := vmContextFromState(id, state)
+	if s.contextCWD != nil {
+		if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
+			ctx.CWD = cwd
+		}
+	}
+	return ctx, nil
+}
+
+func vmContextFromState(id string, state client.InstanceState) commandContext {
+	backendID := firstNonEmpty(strings.TrimSpace(state.ID), id)
+	isolated := strings.HasSuffix(backendID, isolatedVMSuffix)
+	vmID := backendID
+	if isolated {
+		vmID = strings.TrimSuffix(backendID, isolatedVMSuffix)
+	}
+	return commandContext{
 		Mode:       modeVM,
-		VMID:       firstNonEmpty(state.ID, id),
+		VMID:       vmID,
 		Image:      state.Image,
 		InitSystem: state.InitSystem,
 		Kernel:     state.Kernel,
@@ -2822,13 +2949,8 @@ func (s *shellState) vmCopyEndpointContext(id string) (commandContext, error) {
 		CPUs:       state.CPUs,
 		NestedVirt: state.NestedVirt,
 		Network:    state.NetworkIPv4 != "",
+		Isolated:   isolated,
 	}
-	if s.contextCWD != nil {
-		if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
-			ctx.CWD = cwd
-		}
-	}
-	return ctx, nil
 }
 
 func copyEndpointDirectoryHint(value string) bool {
@@ -2944,14 +3066,16 @@ func (s *shellState) currentSSHCWD(ctx commandContext) string {
 	return "~"
 }
 
-func copyHostPath(src string, dst copyTargetPath) error {
+func copyHostPath(src string, dst copyTargetPath, progress *copyProgress) error {
 	pr, pw := io.Pipe()
 	errCh := make(chan error, 1)
 	go func() {
-		err := writePathTar(pw, src, filepath.Base(src))
+		progress.Phase("packing")
+		err := writePathTar(copyProgressWriter{w: pw, progress: progress}, src, filepath.Base(src))
 		_ = pw.CloseWithError(err)
 		errCh <- err
 	}()
+	progress.Phase("extracting")
 	extractErr := extractTarToHost(pr, dst)
 	_ = pr.CloseWithError(extractErr)
 	writeErr := <-errCh
@@ -2961,15 +3085,204 @@ func copyHostPath(src string, dst copyTargetPath) error {
 	return writeErr
 }
 
-func (s *shellState) copyLocalToGuest(src string, ctx commandContext, dst copyTargetPath, stderr io.Writer) error {
+func (s *shellState) copyLocalToGuest(src string, ctx commandContext, dst copyTargetPath, stderr io.Writer, progress *copyProgress) error {
 	if err := s.ensureGuestCopyReady(ctx, stderr); err != nil {
 		return err
 	}
-	var archive bytes.Buffer
-	if err := writePathTar(&archive, src, filepath.Base(src)); err != nil {
+	if guestUsesHostShare(ctx) {
+		return s.copyLocalToGuestViaHostShare(src, ctx, dst, stderr, progress)
+	}
+	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+	defer stopInterrupts()
+	streamCtx, cancelStream := context.WithCancel(runCtx)
+	defer cancelStream()
+
+	inputs := make(chan client.ExecInput, 16)
+	tarErrCh := make(chan error, 1)
+	go func() {
+		defer close(inputs)
+		progress.Phase("uploading")
+		err := writePathTar(copyProgressWriter{
+			w:        execInputChannelWriter{ctx: streamCtx, inputs: inputs},
+			progress: progress,
+		}, src, filepath.Base(src))
+		tarErrCh <- err
+	}()
+
+	err := s.runGuestFSRequestInContext(runCtx, interrupted, ctx, client.ExecRequest{
+		Kind:      "fs_extract",
+		Image:     localImageName(ctx.Image, ctx.Arch),
+		Path:      dst.path,
+		Directory: dst.directory,
+		User:      guestRunUser(ctx),
+	}, inputs, stderr)
+	cancelStream()
+	tarErr := <-tarErrCh
+	if err != nil {
 		return err
 	}
-	return s.guestFSExtract(ctx, dst, archive.Bytes(), stderr)
+	return tarErr
+}
+
+func (s *shellState) copyLocalToGuestViaHostShare(src string, ctx commandContext, dst copyTargetPath, stderr io.Writer, progress *copyProgress) error {
+	if err := s.ensureGuestHostShareMounted(ctx, stderr); err != nil {
+		return err
+	}
+	stageDir, err := os.MkdirTemp(s.hostCWD, ".vmsh-copy-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stageDir)
+	archiveHostPath := filepath.Join(stageDir, "archive.tar")
+
+	progress.Phase("staging archive")
+	file, err := os.OpenFile(archiveHostPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	writeErr := writePathTar(copyProgressWriter{w: file, progress: progress}, src, filepath.Base(src))
+	closeErr := file.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	archiveGuestPath, ok := guestPathForHostPath(s.hostCWD, archiveHostPath)
+	if !ok {
+		return fmt.Errorf("stage copy archive is not visible in guest host share")
+	}
+
+	progress.Phase("extracting in guest")
+	return s.runGuestCopyExtractCommand(ctx, archiveGuestPath, filepath.Base(src), dst, stderr)
+}
+
+func (s *shellState) ensureGuestHostShareMounted(ctx commandContext, stderr io.Writer) error {
+	if !guestUsesHostShare(ctx) {
+		return nil
+	}
+	hostRoot, _, err := guestHostPaths(s.hostCWD)
+	if err != nil {
+		return err
+	}
+	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+	defer stopInterrupts()
+	var eventErr error
+	exitCode := 0
+	req := client.RunRequest{
+		Image:   localImageName(ctx.Image, ctx.Arch),
+		Command: []string{"true"},
+		WorkDir: "/",
+		User:    "root",
+		Shares: []client.ShareMount{{
+			Source:   hostRoot,
+			Mount:    guestHostMount,
+			Writable: true,
+			MapOwner: true,
+			OwnerUID: defaultGuestUID,
+			OwnerGID: defaultGuestGID,
+			Cache:    "strict",
+		}},
+	}
+	err = s.api.RunStreamInContext(runCtx, backendVMID(ctx), req, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "stderr":
+			writeExecEventOutput(stderr, event)
+		case "error":
+			eventErr = fmt.Errorf("%s", firstNonEmpty(event.Error, execEventText(event)))
+		case "exit":
+			exitCode = event.ExitCode
+		}
+		return nil
+	})
+	if interrupted.Load() {
+		return persistentShellExit{code: 130}
+	}
+	if err != nil {
+		return err
+	}
+	if eventErr != nil {
+		return eventErr
+	}
+	if exitCode != 0 {
+		return persistentShellExit{code: exitCode}
+	}
+	return nil
+}
+
+func guestPathForHostPath(hostCWD, hostPath string) (string, bool) {
+	hostRoot, _, err := guestHostPaths(hostCWD)
+	if err != nil {
+		return "", false
+	}
+	absHostPath, err := filepath.Abs(hostPath)
+	if err != nil {
+		return "", false
+	}
+	if resolved, err := filepath.EvalSymlinks(absHostPath); err == nil {
+		absHostPath = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(hostRoot); err == nil {
+		hostRoot = resolved
+	}
+	rel, err := filepath.Rel(hostRoot, absHostPath)
+	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+		return "", false
+	}
+	return path.Join(guestHostMount, filepath.ToSlash(rel)), true
+}
+
+func (s *shellState) runGuestCopyExtractCommand(ctx commandContext, archiveGuestPath, rootName string, dst copyTargetPath, stderr io.Writer) error {
+	command := strings.Join([]string{
+		"set -eu",
+		"archive=" + shellQuote(archiveGuestPath),
+		"dst=" + shellQuote(path.Clean(dst.path)),
+		"root=" + shellQuote(filepath.ToSlash(filepath.Base(rootName))),
+		"if " + boolShellTest(dst.directory) + " || [ -d \"$dst\" ]; then",
+		"  mkdir -p -- \"$dst\"",
+		"  tar -xf \"$archive\" -C \"$dst\"",
+		"else",
+		"  parent=$(dirname -- \"$dst\")",
+		"  mkdir -p -- \"$parent\"",
+		"  tmp=$(mktemp -d \"${TMPDIR:-/tmp}/vmsh-copy.XXXXXX\")",
+		"  trap 'rm -rf \"$tmp\"' EXIT HUP INT TERM",
+		"  tar -xf \"$archive\" -C \"$tmp\"",
+		"  rm -rf -- \"$dst\"",
+		"  mv -- \"$tmp/$root\" \"$dst\"",
+		"fi",
+	}, "\n")
+	return s.runGuestFSRequest(ctx, client.ExecRequest{
+		Kind:    "exec",
+		Image:   localImageName(ctx.Image, ctx.Arch),
+		Command: []string{"sh", "-lc", command},
+		WorkDir: "/",
+		User:    "root",
+	}, stderr)
+}
+
+func boolShellTest(value bool) string {
+	if value {
+		return "true"
+	}
+	return "false"
+}
+
+type execInputChannelWriter struct {
+	ctx    context.Context
+	inputs chan<- client.ExecInput
+}
+
+func (w execInputChannelWriter) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	chunk := append([]byte(nil), data...)
+	select {
+	case <-w.ctx.Done():
+		return 0, w.ctx.Err()
+	case w.inputs <- client.ExecInput{Kind: "stdin", Data: chunk}:
+		return len(data), nil
+	}
 }
 
 func (s *shellState) guestFSMkdir(ctx commandContext, dir string, stderr io.Writer) error {
@@ -2993,12 +3306,16 @@ func (s *shellState) guestFSExtract(ctx commandContext, dst copyTargetPath, data
 }
 
 func (s *shellState) runGuestFSRequest(ctx commandContext, req client.ExecRequest, stderr io.Writer) error {
+	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+	defer stopInterrupts()
+	return s.runGuestFSRequestInContext(runCtx, interrupted, ctx, req, nil, stderr)
+}
+
+func (s *shellState) runGuestFSRequestInContext(runCtx context.Context, interrupted *atomic.Bool, ctx commandContext, req client.ExecRequest, inputs <-chan client.ExecInput, stderr io.Writer) error {
 	var exitSeen bool
 	var exitCode int
 	var eventErr error
-	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
-	defer stopInterrupts()
-	if err := s.execStreamInContext(runCtx, backendVMID(ctx), req, nil, func(event client.ExecEvent) error {
+	if err := s.execStreamInContext(runCtx, backendVMID(ctx), req, inputs, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stderr":
 			writeExecEventOutput(stderr, event)
@@ -3030,7 +3347,7 @@ func (s *shellState) runGuestFSRequest(ctx commandContext, req client.ExecReques
 	return nil
 }
 
-func (s *shellState) copyGuestToLocal(ctx commandContext, src, dst copyTargetPath, stderr io.Writer) error {
+func (s *shellState) copyGuestToLocal(ctx commandContext, src, dst copyTargetPath, stderr io.Writer, progress *copyProgress) error {
 	if err := s.ensureGuestCopyReady(ctx, stderr); err != nil {
 		return err
 	}
@@ -3040,6 +3357,7 @@ func (s *shellState) copyGuestToLocal(ctx commandContext, src, dst copyTargetPat
 	var eventErr error
 	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
 	defer stopInterrupts()
+	progress.Phase("downloading")
 	if err := s.execStreamInContext(runCtx, backendVMID(ctx), client.ExecRequest{
 		Kind:  "fs_archive",
 		Image: localImageName(ctx.Image, ctx.Arch),
@@ -3048,7 +3366,9 @@ func (s *shellState) copyGuestToLocal(ctx commandContext, src, dst copyTargetPat
 	}, nil, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stdout", "output":
-			_, _ = tarData.Write(execEventBytes(event))
+			data := execEventBytes(event)
+			_, _ = tarData.Write(data)
+			progress.AddBytes(len(data))
 		case "stderr":
 			writeExecEventOutput(stderr, event)
 		case "error":
@@ -3076,6 +3396,7 @@ func (s *shellState) copyGuestToLocal(ctx commandContext, src, dst copyTargetPat
 	if !exitSeen {
 		return fmt.Errorf("guest copy did not report completion")
 	}
+	progress.Phase("extracting")
 	return extractTarToHost(bytes.NewReader(tarData.Bytes()), dst)
 }
 

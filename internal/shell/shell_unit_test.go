@@ -33,6 +33,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/creack/pty"
 	cryptossh "golang.org/x/crypto/ssh"
 	"j5.nz/cc/client"
 )
@@ -2240,7 +2241,7 @@ func TestGuestCopyInterruptReturnsStatus130(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- sh.copyGuestToLocal(ctx, copyTargetPath{path: "/tmp/source.txt"}, copyTargetPath{path: filepath.Join(t.TempDir(), "source.txt")}, io.Discard)
+		errCh <- sh.copyGuestToLocal(ctx, copyTargetPath{path: "/tmp/source.txt"}, copyTargetPath{path: filepath.Join(t.TempDir(), "source.txt")}, io.Discard, nil)
 	}()
 	<-started
 	interrupts <- os.Interrupt
@@ -3730,6 +3731,71 @@ func TestSSHCopyStreamsTarOverConnection(t *testing.T) {
 	}
 }
 
+func TestCopyProgressIsQuietForNonTerminalStderr(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	src := filepath.Join(sh.hostCWD, "local.txt")
+	if err := os.WriteFile(src, []byte("copy-data"), 0o644); err != nil {
+		t.Fatalf("write local source: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	if err := sh.copyPath("@host:local.txt @host:copied.txt", &stdout, &stderr); err != nil {
+		t.Fatalf("copy local file: %v", err)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want quiet non-terminal copy progress", stderr.String())
+	}
+	if got := readTestFile(t, filepath.Join(sh.hostCWD, "copied.txt")); got != "copy-data" {
+		t.Fatalf("copied data = %q", got)
+	}
+}
+
+func TestCopyProgressWritesTerminalStatus(t *testing.T) {
+	master, slave, err := pty.Open()
+	if err != nil {
+		t.Fatalf("open pty: %v", err)
+	}
+	defer master.Close()
+	defer slave.Close()
+
+	outputCh := make(chan string, 1)
+	go func() {
+		var out bytes.Buffer
+		buf := make([]byte, 4096)
+		for {
+			n, err := master.Read(buf)
+			if n > 0 {
+				out.Write(buf[:n])
+			}
+			if err != nil {
+				outputCh <- out.String()
+				return
+			}
+		}
+	}()
+
+	progress := newCopyProgress(slave, "host", "ssh:ws1")
+	if progress == nil {
+		t.Fatal("newCopyProgress returned nil for pty-backed stderr")
+	}
+	progress.Phase("uploading")
+	progress.AddBytes(2048)
+	time.Sleep(150 * time.Millisecond)
+	progress.Close()
+	_ = slave.Close()
+
+	var output string
+	select {
+	case output = <-outputCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out reading terminal progress output")
+	}
+	for _, want := range []string{"Copy", "host -> ssh:ws1", "uploading", "2.0 KB"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("terminal progress output missing %q in %q", want, output)
+		}
+	}
+}
+
 func TestSSHCopyPreservesDirectoryMetadataHostToSSHToHost(t *testing.T) {
 	remoteRoot := t.TempDir()
 	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
@@ -3882,15 +3948,16 @@ func TestCopySSHDirectoryMetadataToGuest(t *testing.T) {
 	createMetadataCopyFixture(t, filepath.Join(remoteRoot, "ssh-meta"))
 	guestRoot := t.TempDir()
 	api := newRecordingShellAPI("ubuntu")
-	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	api.instances["work-isolated"] = client.InstanceState{ID: "work-isolated", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 		if req.Kind != "fs_extract" {
 			t.Fatalf("exec kind = %q, want fs_extract", req.Kind)
 		}
-		if id != "work" || req.Image != "ubuntu" || req.Path != "/tmp/vm-meta" || req.Directory {
+		if id != "work-isolated" || req.Image != "ubuntu" || req.Path != "/tmp/vm-meta" || req.Directory {
 			t.Fatalf("extract request = id %q req %+v", id, req)
 		}
-		if err := extractTarToHost(bytes.NewReader(req.Stdin), copyTargetPath{path: filepath.Join(guestRoot, "vm-meta")}); err != nil {
+		archive := readExecInputArchive(t, req, inputs)
+		if err := extractTarToHost(bytes.NewReader(archive), copyTargetPath{path: filepath.Join(guestRoot, "vm-meta")}); err != nil {
 			t.Fatalf("extract guest tar: %v", err)
 		}
 		if onEvent != nil {
@@ -3912,7 +3979,7 @@ func TestCopySSHDirectoryMetadataToGuest(t *testing.T) {
 
 	sh := newUnitShell(t, api)
 	var stdout, stderr bytes.Buffer
-	if err := sh.copyPath("@ssh:test-ssh-a:/tmp/ssh-meta @vm:work:/tmp/vm-meta", &stdout, &stderr); err != nil {
+	if err := sh.copyPath("@ssh:test-ssh-a:/tmp/ssh-meta @vm:work-isolated:/tmp/vm-meta", &stdout, &stderr); err != nil {
 		t.Fatalf("copy ssh metadata to guest: %v\nstderr:\n%s", err, stderr.String())
 	}
 	assertCopiedMetadataTree(t, filepath.Join(remoteRoot, "ssh-meta"), filepath.Join(guestRoot, "vm-meta"))
@@ -4032,15 +4099,15 @@ func TestCopyGuestFileToSSHHost(t *testing.T) {
 func TestCopySSHHostFileToGuest(t *testing.T) {
 	guestExtracts := make(chan string, 1)
 	api := newRecordingShellAPI("ubuntu")
-	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	api.instances["work-isolated"] = client.InstanceState{ID: "work-isolated", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 		if req.Kind != "fs_extract" {
 			t.Fatalf("exec kind = %q, want fs_extract", req.Kind)
 		}
-		if id != "work" || req.Image != "ubuntu" || req.Path != "/tmp/to-vm.txt" || req.Directory {
+		if id != "work-isolated" || req.Image != "ubuntu" || req.Path != "/tmp/to-vm.txt" || req.Directory {
 			t.Fatalf("extract request = id %q req %+v", id, req)
 		}
-		tr := tar.NewReader(bytes.NewReader(req.Stdin))
+		tr := tar.NewReader(bytes.NewReader(readExecInputArchive(t, req, inputs)))
 		header, err := tr.Next()
 		if err != nil {
 			t.Fatalf("read extract header: %v", err)
@@ -4070,7 +4137,7 @@ func TestCopySSHHostFileToGuest(t *testing.T) {
 
 	sh := newUnitShell(t, api)
 	var stdout, stderr bytes.Buffer
-	if err := sh.copyPath("@ssh:test-ssh-a:/tmp/from-ssh.txt @vm:work:/tmp/to-vm.txt", &stdout, &stderr); err != nil {
+	if err := sh.copyPath("@ssh:test-ssh-a:/tmp/from-ssh.txt @vm:work-isolated:/tmp/to-vm.txt", &stdout, &stderr); err != nil {
 		t.Fatalf("copy ssh to guest: %v\nstderr:\n%s", err, stderr.String())
 	}
 	select {
@@ -4086,15 +4153,15 @@ func TestCopySSHHostFileToGuest(t *testing.T) {
 func TestCopyLocalDirectoryToGuestUsesArchive(t *testing.T) {
 	archiveEntries := make(chan []string, 1)
 	api := newRecordingShellAPI("ubuntu")
-	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	api.instances["work-isolated"] = client.InstanceState{ID: "work-isolated", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	api.execStream = func(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 		if req.Kind != "fs_extract" {
 			t.Fatalf("exec kind = %q, want fs_extract", req.Kind)
 		}
-		if id != "work" || req.Image != "ubuntu" || req.Path != "/tmp/dst" || req.Directory {
+		if id != "work-isolated" || req.Image != "ubuntu" || req.Path != "/tmp/dst" || req.Directory {
 			t.Fatalf("extract request = id %q req %+v", id, req)
 		}
-		tr := tar.NewReader(bytes.NewReader(req.Stdin))
+		tr := tar.NewReader(bytes.NewReader(readExecInputArchive(t, req, inputs)))
 		var names []string
 		for {
 			header, err := tr.Next()
@@ -4126,7 +4193,7 @@ func TestCopyLocalDirectoryToGuestUsesArchive(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if err := sh.copyPath("@host:tree @vm:work:/tmp/dst", &stdout, &stderr); err != nil {
+	if err := sh.copyPath("@host:tree @vm:work-isolated:/tmp/dst", &stdout, &stderr); err != nil {
 		t.Fatalf("copy local directory to guest: %v\nstderr:\n%s", err, stderr.String())
 	}
 	select {
@@ -4417,7 +4484,7 @@ func TestHostDirectoryCopyDestinationSemantics(t *testing.T) {
 	}
 
 	renamed := filepath.Join(parent, "renamed")
-	if err := copyHostPath(src, copyTargetPath{path: renamed}); err != nil {
+	if err := copyHostPath(src, copyTargetPath{path: renamed}, nil); err != nil {
 		t.Fatalf("copy host dir rename: %v", err)
 	}
 	if got := readTestFile(t, filepath.Join(renamed, "nested", "file.txt")); got != "payload" {
@@ -4428,7 +4495,7 @@ func TestHostDirectoryCopyDestinationSemantics(t *testing.T) {
 	}
 
 	into := filepath.Join(parent, "into")
-	if err := copyHostPath(src, copyTargetPath{path: into, directory: true}); err != nil {
+	if err := copyHostPath(src, copyTargetPath{path: into, directory: true}, nil); err != nil {
 		t.Fatalf("copy host dir into: %v", err)
 	}
 	if got := readTestFile(t, filepath.Join(into, "src", "nested", "file.txt")); got != "payload" {
@@ -4462,7 +4529,7 @@ func TestHostCopyPreservesMetadataAndSymlink(t *testing.T) {
 	}
 
 	dst := filepath.Join(parent, "dst")
-	if err := copyHostPath(src, copyTargetPath{path: dst}); err != nil {
+	if err := copyHostPath(src, copyTargetPath{path: dst}, nil); err != nil {
 		t.Fatalf("copy host metadata tree: %v", err)
 	}
 	info, err := os.Stat(filepath.Join(dst, "script.sh"))
@@ -4571,6 +4638,30 @@ func readTestFile(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(data)
+}
+
+func readExecInputArchive(t *testing.T, req client.ExecRequest, inputs <-chan client.ExecInput) []byte {
+	t.Helper()
+	var archive bytes.Buffer
+	if len(req.Stdin) > 0 {
+		archive.Write(req.Stdin)
+	}
+	if inputs == nil {
+		return archive.Bytes()
+	}
+	for input := range inputs {
+		switch input.Kind {
+		case "stdin":
+			if len(input.Data) > 0 {
+				archive.Write(input.Data)
+			} else {
+				archive.WriteString(input.Input)
+			}
+		case "stdin_close":
+			return archive.Bytes()
+		}
+	}
+	return archive.Bytes()
 }
 
 type testSSHServer struct {
