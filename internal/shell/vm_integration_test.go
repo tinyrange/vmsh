@@ -621,6 +621,9 @@ type vmIntegrationPTY struct {
 
 func newVMIntegrationTestEnv(t *testing.T) *vmIntegrationTestEnv {
 	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping VM integration test in short mode")
+	}
 	skipUnsupportedVMIntegrationPlatform(t)
 
 	cacheBase := os.TempDir()

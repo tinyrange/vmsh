@@ -323,10 +323,10 @@ func TestPrintPSSessionTreeShowsLiveHostManagedResources(t *testing.T) {
 	out := stdout.String()
 	for _, want := range []string{
 		"host " + sh.hostCWD,
-		"|- vm work running image=ubuntu kernel=ubuntu",
-		"|- ssh remote user=alice cwd=/srv [current]",
+		"|- work vm running from=builtin:ubuntu kernel=ubuntu",
+		"|- remote ssh from=ssh:remote user=alice cwd=/srv [current]",
 		"`- ssh connection one-shot (user=bob, host=example.com)",
-		"isolated vm sandbox-isolated running image=alpine",
+		"sandbox isolated-vm running from=library/alpine",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("@ps output missing %q\noutput:\n%s", want, out)
@@ -348,7 +348,7 @@ func TestPrintPSMarksCurrentVMAndHost(t *testing.T) {
 		t.Fatalf("print VMs: %v", err)
 	}
 	out := stdout.String()
-	if !strings.Contains(out, "`- vm work running image=ubuntu [current]") {
+	if !strings.Contains(out, "`- work vm running from=builtin:ubuntu [current]") {
 		t.Fatalf("@ps output did not mark current VM:\n%s", out)
 	}
 
@@ -369,6 +369,17 @@ func hasExitResource(resources []exitResource, kind, name string) bool {
 		}
 	}
 	return false
+}
+
+func stripANSI(value string) string {
+	replacer := strings.NewReplacer(
+		colorGreen, "",
+		colorBlue, "",
+		colorMagenta, "",
+		colorYellow, "",
+		colorReset, "",
+	)
+	return replacer.Replace(value)
 }
 
 func TestGuestPersistentShellRestartsWhenIsolationChanges(t *testing.T) {
@@ -613,6 +624,138 @@ func TestBareVMTargetStartsVMWhenActivated(t *testing.T) {
 	}
 	if len(api.runs) != 0 {
 		t.Fatalf("runs = %d, want no command run during activation", len(api.runs))
+	}
+}
+
+func TestBareImageTargetUsesImageNameAsSystemName(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ubuntu --memory 768 --cpus 1 --no-network", &stdout, &stderr); err != nil {
+		t.Fatalf("activate default ubuntu system: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if sh.context.Mode != modeVM || sh.context.Image != "ubuntu" || sh.context.VMID != "ubuntu" || sh.context.SystemName != "ubuntu" {
+		t.Fatalf("context = %+v, want ubuntu system", sh.context)
+	}
+	if len(api.starts) != 1 || api.starts[0].id != "ubuntu" {
+		t.Fatalf("starts = %+v, want ubuntu VM start", api.starts)
+	}
+}
+
+func TestNamedSystemFromImageSource(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@hello --from ubuntu --memory 768 --cpus 1 --no-network", &stdout, &stderr); err != nil {
+		t.Fatalf("activate named system: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if sh.context.Mode != modeVM || sh.context.Image != "ubuntu" || sh.context.VMID != "hello" || sh.context.SystemName != "hello" {
+		t.Fatalf("context = %+v, want hello from ubuntu", sh.context)
+	}
+	if len(api.starts) != 1 || api.starts[0].id != "hello" {
+		t.Fatalf("starts = %+v, want hello VM start", api.starts)
+	}
+}
+
+func TestNamedSystemRejectsLiveVMNameConflict(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu", "alpine")
+	api.instances["hello"] = client.InstanceState{ID: "hello", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	err := sh.eval("@hello --from alpine", &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), `system "hello" already exists from ubuntu`) {
+		t.Fatalf("conflict error = %v\nstderr:\n%s", err, stderr.String())
+	}
+	if len(api.starts) != 0 {
+		t.Fatalf("starts = %+v, want none", api.starts)
+	}
+}
+
+func TestBareTargetPrefersExistingSystemOverImageSource(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu", "alpine")
+	api.instances["alpine"] = client.InstanceState{ID: "alpine", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@alpine", &stdout, &stderr); err != nil {
+		t.Fatalf("switch to existing system named alpine: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if sh.context.Mode != modeVM || sh.context.VMID != "alpine" || sh.context.Image != "ubuntu" {
+		t.Fatalf("context = %+v, want existing ubuntu-backed system named alpine", sh.context)
+	}
+	if len(api.starts) != 0 {
+		t.Fatalf("starts = %+v, want none", api.starts)
+	}
+}
+
+func TestSSHSugarRejectsBuiltinImageName(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI("ubuntu"))
+
+	var stdout, stderr bytes.Buffer
+	err := sh.eval("@ssh ubuntu", &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), `name "ubuntu" is reserved by builtin image ubuntu`) || !strings.Contains(err.Error(), "@ubuntu2 --from ssh:ubuntu") {
+		t.Fatalf("ssh builtin conflict error = %v", err)
+	}
+}
+
+func TestNamedSSHSystemFromSourceUsesVisibleName(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	sh := newUnitShell(t, api)
+	sideband := newTestSSHSideband(t, "/home/test", func(line string, stdout io.Writer) (int, string) {
+		return 0, "/home/test"
+	})
+	server := startTestSSHServer(t, sideband.handler(t))
+	installTestSSHConfigs(t, map[string]*testSSHServer{
+		"test-ssh-a": server,
+	})
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@remote --from ssh:test-ssh-a", &stdout, &stderr); err != nil {
+		t.Fatalf("activate named ssh system: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if sh.context.Mode != modeSSH || sh.context.SSHHost != "test-ssh-a" || sh.context.SystemName != "remote" {
+		t.Fatalf("context = %+v, want remote ssh system", sh.context)
+	}
+	if _, ok := sh.sshSessionKeyForName("remote"); !ok {
+		t.Fatalf("ssh session was not addressable by visible system name")
+	}
+	stdout.Reset()
+	if err := sh.eval("@stop remote", &stdout, &stderr); err != nil {
+		t.Fatalf("stop named ssh system: %v\nstderr:\n%s", err, stderr.String())
+	}
+}
+
+func TestBareTargetSwitchesToExistingVisibleVMSystem(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["hello"] = client.InstanceState{ID: "hello", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@hello", &stdout, &stderr); err != nil {
+		t.Fatalf("switch to existing visible VM system: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if sh.context.Mode != modeVM || sh.context.VMID != "hello" || sh.context.SystemName != "hello" || sh.context.Image != "ubuntu" {
+		t.Fatalf("context = %+v, want existing hello VM", sh.context)
+	}
+	if len(api.starts) != 0 {
+		t.Fatalf("starts = %+v, want no new VM", api.starts)
+	}
+}
+
+func TestBareTargetSwitchesToExistingIsolatedVisibleVMSystem(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["scratch-isolated"] = client.InstanceState{ID: "scratch-isolated", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@scratch", &stdout, &stderr); err != nil {
+		t.Fatalf("switch to existing isolated visible VM system: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if sh.context.Mode != modeVM || sh.context.VMID != "scratch" || sh.context.SystemName != "scratch" || !sh.context.Isolated {
+		t.Fatalf("context = %+v, want isolated scratch VM", sh.context)
 	}
 }
 
@@ -1250,8 +1393,8 @@ func TestVMTargetCanRunScopedAgentCommand(t *testing.T) {
 	var agentRun client.RunRequest
 	api.runInteractive = func(id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 		agentRun = req
-		if id != "default-isolated" {
-			t.Fatalf("agent run id = %q, want default-isolated", id)
+		if id != "ubuntu-isolated" {
+			t.Fatalf("agent run id = %q, want ubuntu-isolated", id)
 		}
 		if onEvent != nil {
 			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
@@ -1271,8 +1414,8 @@ func TestVMTargetCanRunScopedAgentCommand(t *testing.T) {
 	if len(api.starts) != 1 {
 		t.Fatalf("starts = %d, want scoped VM start", len(api.starts))
 	}
-	if api.starts[0].id != "default-isolated" || api.starts[0].req.MemoryMB != 4096 {
-		t.Fatalf("start = %+v, want isolated default VM with 4g memory", api.starts[0])
+	if api.starts[0].id != "ubuntu-isolated" || api.starts[0].req.MemoryMB != 4096 {
+		t.Fatalf("start = %+v, want isolated ubuntu VM with 4g memory", api.starts[0])
 	}
 	if agentRun.User != "0:0" {
 		t.Fatalf("agent request user = %q, want numeric root for isolated sudo", agentRun.User)
@@ -1796,6 +1939,14 @@ func TestCompletionsUseCachedImagesOptionsAndHostMappedPaths(t *testing.T) {
 	if kind != completionOption || replaceLen != len("--n") || !hasString(candidates, "etwork") || !hasString(candidates, "ested") {
 		t.Fatalf("option completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
+	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@hello --from ub"), len("@hello --from ub"))
+	if kind != completionAt || replaceLen != len("ub") || !hasString(candidates, "untu") {
+		t.Fatalf("--from source completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
+	}
+	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@hello --from library/al"), len("@hello --from library/al"))
+	if kind != completionAt || replaceLen != len("library/al") || !hasString(candidates, "pine") {
+		t.Fatalf("--from library source completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
+	}
 	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@agent --pr"), len("@agent --pr"))
 	if kind != completionOption || replaceLen != len("--pr") || !hasString(candidates, "oxy") {
 		t.Fatalf("agent option completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
@@ -1812,6 +1963,11 @@ func TestCompletionsUseCachedImagesOptionsAndHostMappedPaths(t *testing.T) {
 	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@rmi al"), len("@rmi al"))
 	if kind != completionAt || replaceLen != len("al") || !reflect.DeepEqual(candidates, []string{"pine"}) {
 		t.Fatalf("@rmi completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
+	}
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@restart wo"), len("@restart wo"))
+	if kind != completionAt || replaceLen != len("wo") || !hasString(candidates, "rk") {
+		t.Fatalf("@restart target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 
 	_, guestCWD, err := guestHostPaths(sh.hostCWD)
@@ -1935,9 +2091,9 @@ func TestStatusShowsFullContextChain(t *testing.T) {
 	got := stdout.String()
 	for _, want := range []string{
 		"1. host cwd=/tmp/vmsh-host",
-		"2. vm work image=ubuntu backend=work isolated=false user=1000:1000 cwd=/srv/app status=running init=systemd kernel=ubuntu addr=10.42.0.2",
-		"3. ssh test-ssh-a user=deploy cwd=/srv/remote session=closed [current]",
-		"current: ssh test-ssh-a user=deploy cwd=/srv/remote session=closed [current]",
+		"2. work vm from=builtin:ubuntu backend=work isolated=false user=1000:1000 cwd=/srv/app status=running init=systemd kernel=ubuntu addr=10.42.0.2",
+		"3. test-ssh-a ssh from=ssh:test-ssh-a user=deploy cwd=/srv/remote session=closed [current]",
+		"current: test-ssh-a ssh from=ssh:test-ssh-a user=deploy cwd=/srv/remote session=closed [current]",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("status output missing %q:\n%s", want, got)
@@ -1958,12 +2114,24 @@ func TestStatusShowsIsolatedVMContext(t *testing.T) {
 	got := stdout.String()
 	for _, want := range []string{
 		"1. host cwd=",
-		"2. vm work image=ubuntu backend=work-isolated isolated=true user=1000:1000 cwd=/home/ubuntu status=running [current]",
-		"current: vm work image=ubuntu backend=work-isolated isolated=true user=1000:1000 cwd=/home/ubuntu status=running [current]",
+		"2. work vm from=builtin:ubuntu backend=work-isolated isolated=true user=1000:1000 cwd=/home/ubuntu status=running [current]",
+		"current: work vm from=builtin:ubuntu backend=work-isolated isolated=true user=1000:1000 cwd=/home/ubuntu status=running [current]",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("status output missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestPromptUsesVisibleSystemName(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI("ubuntu"))
+	sh.context = commandContext{Mode: modeVM, SystemName: "hello", VMID: "hello", Image: "ubuntu"}
+	if got := stripANSI(sh.prompt()); !strings.Contains(got, "vm:(hello)") || strings.Contains(got, "ubuntu:hello") {
+		t.Fatalf("VM prompt = %q, want visible system name only", got)
+	}
+	sh.context = commandContext{Mode: modeSSH, SystemName: "remote", SSHHost: "test-ssh-a"}
+	if got := stripANSI(sh.prompt()); !strings.Contains(got, "ssh:(remote)") || strings.Contains(got, "test-ssh-a") {
+		t.Fatalf("SSH prompt = %q, want visible system name only", got)
 	}
 }
 
@@ -2164,6 +2332,34 @@ func TestBuiltInFreeBSDImageDoesNotPull(t *testing.T) {
 	}
 	if got := localImageName("freebsd", "amd64"); got != "@freebsd" {
 		t.Fatalf("local FreeBSD image name = %q, want @freebsd", got)
+	}
+}
+
+func TestBuiltInBSDImagesRejectUnsupportedCCVMHost(t *testing.T) {
+	for _, tc := range []struct {
+		image string
+		name  string
+	}{
+		{image: "@openbsd", name: "OpenBSD"},
+		{image: "@freebsd", name: "FreeBSD"},
+	} {
+		t.Run(tc.image, func(t *testing.T) {
+			api := newRecordingShellAPI()
+			api.capabilities = client.CapabilitiesResponse{Host: "darwin/arm64", VMSupported: true}
+			api.pullStream = func(context.Context, string, client.PullImageRequest, func(client.ProgressEvent) error) error {
+				t.Fatalf("unsupported built-in %s image attempted to pull", tc.name)
+				return nil
+			}
+			sh := newUnitShell(t, api)
+
+			err := sh.ensureImageAvailable(commandContext{Mode: modeVM, Image: tc.image}, io.Discard)
+			if err == nil {
+				t.Fatalf("ensure %s image succeeded, want unsupported host error", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.name+" guests are currently only supported") || !strings.Contains(err.Error(), "linux/amd64") || !strings.Contains(err.Error(), "darwin/arm64") {
+				t.Fatalf("error = %v", err)
+			}
+		})
 	}
 }
 
@@ -3498,6 +3694,84 @@ func TestStopCommandExplicitVMPrefix(t *testing.T) {
 	}
 }
 
+func TestRestartCommandRestartsVisibleVMName(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu", MemoryMB: 512, CPUs: 2}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@restart work", &stdout, &stderr); err != nil {
+		t.Fatalf("restart visible VM: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if len(api.starts) != 1 || api.starts[0].id != "work" || api.starts[0].req.Image != "ubuntu" || api.starts[0].req.MemoryMB != 512 || api.starts[0].req.CPUs != 2 {
+		t.Fatalf("starts = %+v, want restarted work preserving state", api.starts)
+	}
+}
+
+func TestRestartCommandRestartsVisibleIsolatedVMName(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["scratch-isolated"] = client.InstanceState{ID: "scratch-isolated", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@restart scratch", &stdout, &stderr); err != nil {
+		t.Fatalf("restart isolated visible VM: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if len(api.starts) != 1 || api.starts[0].id != "scratch-isolated" {
+		t.Fatalf("starts = %+v, want isolated scratch restart", api.starts)
+	}
+}
+
+func TestRestartCommandRejectsSSHSession(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.sshShells = map[string]*persistentSSHShell{
+		"remote": {key: "remote", name: "remote", ctx: commandContext{Mode: modeSSH, SystemName: "remote", SSHHost: "test-ssh-a"}},
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := sh.eval("@restart remote", &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), `cannot restart SSH session "remote"`) {
+		t.Fatalf("restart ssh error = %v", err)
+	}
+}
+
+func TestRestartCommandWithoutTargetRejectsSSHContext(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.context = commandContext{Mode: modeSSH, SystemName: "remote", SSHHost: "test-ssh-a"}
+
+	var stdout, stderr bytes.Buffer
+	err := sh.eval("@restart", &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "requires a VM context") {
+		t.Fatalf("restart current ssh error = %v", err)
+	}
+}
+
+func TestContextSameSessionDistinguishesNamedSSHSystemsToSameHost(t *testing.T) {
+	a := commandContext{Mode: modeSSH, SystemName: "remote-a", SSHHost: "test-ssh-a"}
+	b := commandContext{Mode: modeSSH, SystemName: "remote-b", SSHHost: "test-ssh-a"}
+	if contextSameSession(a, b) {
+		t.Fatalf("named SSH systems to the same host should be distinct sessions")
+	}
+	if !contextSameSession(a, a) {
+		t.Fatalf("same named SSH context should match itself")
+	}
+}
+
+func TestSaveCommandAcceptsVisibleVMName(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@save work saved-work", &stdout, &stderr); err != nil {
+		t.Fatalf("save visible VM: %v\nstderr:\n%s", err, stderr.String())
+	}
+	image, ok := api.images["saved-work"]
+	if !ok || image.Source != "vm:work" {
+		t.Fatalf("saved image = %+v, ok=%t; want vm:work", image, ok)
+	}
+}
+
 func TestSSHConnectionIsPersistentPerHost(t *testing.T) {
 	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
 		_, _ = io.WriteString(stdout, "ok\n")
@@ -4366,6 +4640,7 @@ func TestCopyEndpointResolutionAndGuestHostPathSafety(t *testing.T) {
 	}
 
 	sh.context = defaultContext("default", "", false)
+	api.instances["ubuntu"] = client.InstanceState{ID: "ubuntu", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	ubuntu, err := sh.parseCopyEndpoint("@ubuntu:~/result.txt", io.Discard)
 	if err != nil {
 		t.Fatalf("parse named guest endpoint: %v", err)
@@ -4402,9 +4677,9 @@ func TestCopyEndpointResolutionAndGuestHostPathSafety(t *testing.T) {
 	if _, err := sh.parseCopyEndpoint("@missing:notes.txt", io.Discard); err == nil || !strings.Contains(err.Error(), "does not name an active SSH session") {
 		t.Fatalf("parse unknown endpoint error = %v", err)
 	}
-	api.images["work"] = client.ImageState{Name: "work", Status: "ready"}
-	if _, err := sh.parseCopyEndpoint("@work:notes.txt", io.Discard); err == nil || !strings.Contains(err.Error(), "ambiguous") || !strings.Contains(err.Error(), "@vm:work:path") || !strings.Contains(err.Error(), "@image:work:path") {
-		t.Fatalf("parse ambiguous endpoint error = %v", err)
+	api.images["cached"] = client.ImageState{Name: "cached", Status: "ready"}
+	if _, err := sh.parseCopyEndpoint("@cached:notes.txt", io.Discard); err == nil || !strings.Contains(err.Error(), `names image "cached", not a created system`) || !strings.Contains(err.Error(), "@image:cached:path") {
+		t.Fatalf("parse image-only endpoint error = %v", err)
 	}
 
 	if _, err := sh.parseCopyEndpoint("@ubuntu", io.Discard); err == nil || !strings.Contains(err.Error(), "must use @target:path") {
@@ -5007,6 +5282,7 @@ func (w *notifyWriter) String() string {
 type recordingShellAPI struct {
 	images                map[string]client.ImageState
 	instances             map[string]client.InstanceState
+	capabilities          client.CapabilitiesResponse
 	starts                []recordedStart
 	runs                  []recordedRun
 	execs                 []recordedExec
@@ -5060,7 +5336,10 @@ func newRecordingShellAPI(images ...string) *recordingShellAPI {
 func (a *recordingShellAPI) HealthCheck() error { return nil }
 
 func (a *recordingShellAPI) Capabilities() (client.CapabilitiesResponse, error) {
-	return client.CapabilitiesResponse{VMSupported: true, SupportsNestedVirt: true}, nil
+	if a.capabilities.Host == "" && !a.capabilities.VMSupported && !a.capabilities.SupportsNestedVirt {
+		return client.CapabilitiesResponse{Host: "linux/amd64", VMSupported: true, SupportsNestedVirt: true}, nil
+	}
+	return a.capabilities, nil
 }
 
 func (a *recordingShellAPI) GetImage(name string) (client.ImageState, error) {

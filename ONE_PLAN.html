@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>vmsh One Name Plan</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f8fb;
+      --fg: #17202a;
+      --muted: #5b6673;
+      --panel: #ffffff;
+      --line: #d9dee7;
+      --accent: #0f766e;
+      --warn: #9a3412;
+      --code: #eef2f7;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111418;
+        --fg: #e6e8eb;
+        --muted: #a5adb8;
+        --panel: #181d23;
+        --line: #2d3440;
+        --accent: #2dd4bf;
+        --warn: #fdba74;
+        --code: #202732;
+      }
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 16px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(1040px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 40px 0 64px;
+    }
+
+    header {
+      margin-bottom: 28px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: clamp(2rem, 4vw, 3.4rem);
+      line-height: 1.08;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 34px 0 12px;
+      font-size: 1.35rem;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 22px 0 8px;
+      font-size: 1.05rem;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0 0 14px;
+    }
+
+    code {
+      background: var(--code);
+      border-radius: 4px;
+      padding: 0.12em 0.35em;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.94em;
+    }
+
+    pre {
+      overflow-x: auto;
+      background: var(--code);
+      border: 1px solid var(--line);
+      padding: 14px;
+      margin: 12px 0 18px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92rem;
+      line-height: 1.45;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      margin: 14px 0 22px;
+    }
+
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 0.86rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    ul, ol {
+      margin: 0 0 18px 1.2rem;
+      padding: 0;
+    }
+
+    li {
+      margin: 7px 0;
+    }
+
+    .summary {
+      max-width: 820px;
+      color: var(--muted);
+      font-size: 1.08rem;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      padding: 18px;
+      margin: 18px 0;
+    }
+
+    .callout {
+      border-left: 4px solid var(--accent);
+    }
+
+    .warning {
+      border-left: 4px solid var(--warn);
+    }
+
+    .tag {
+      display: inline-block;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 1px 6px;
+      color: var(--muted);
+      font-size: 0.82rem;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>One Name Plan</h1>
+      <p class="summary">
+        vmsh should make systems easy to switch between by giving every visible target exactly one unique name.
+        VMs, SSH hosts, the host, and future image sources should all participate in the same user-facing namespace.
+      </p>
+    </header>
+
+    <section class="panel callout">
+      <h2>Core Rule</h2>
+      <p>
+        Switching should always be <code>@name</code>, where <code>name</code> is unique and tab-completable.
+        There should be no user-facing need to remember whether a target is a VM, an SSH session, a default image VM, or a named instance derived from another source.
+      </p>
+      <p>
+        The visible name namespace should reject conflicts entirely. No shadowing, no precedence rules, and no behavior that depends on the current mode.
+      </p>
+    </section>
+
+    <h2>Desired User Model</h2>
+    <pre>@ubuntu
+@alpine
+@ssh ws1
+@host
+
+@hello --from ubuntu
+@other --from ubuntu
+@ubuntu2 --from ssh:ubuntu</pre>
+
+    <p>
+      <code>@ubuntu</code> selects or creates the default Ubuntu system. <code>@hello --from ubuntu</code>
+      creates a second independent system named <code>hello</code> using Ubuntu as its source.
+      After creation, switching is just <code>@hello</code>.
+    </p>
+
+    <h2>Terminology</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Term</th>
+          <th>Meaning</th>
+          <th>Example</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>System</td>
+          <td>A user-visible target that can be selected with <code>@name</code>.</td>
+          <td><code>ubuntu</code>, <code>hello</code>, <code>ws1</code>, <code>host</code></td>
+        </tr>
+        <tr>
+          <td>Source</td>
+          <td>The thing a system is derived from or connected to.</td>
+          <td><code>builtin:ubuntu</code>, <code>library/alpine</code>, <code>ssh:ws1</code></td>
+        </tr>
+        <tr>
+          <td>Name</td>
+          <td>The globally unique handle used for switching, completion, copy endpoints, stop, restart, and status.</td>
+          <td><code>@hello</code>, <code>@copy @hello:/tmp/a @host:/tmp/a</code></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Namespace Rules</h2>
+    <ul>
+      <li>Every visible system name is globally unique.</li>
+      <li><code>host</code> is reserved for the local machine.</li>
+      <li>Builtins reserve their bare names: <code>ubuntu</code>, <code>freebsd</code>, <code>openbsd</code>.</li>
+      <li>Docker library shorthand reserves the bare name when the shorthand is used as a system or source.</li>
+      <li>Conflicts are errors at creation time, not ambiguous behavior at run time.</li>
+      <li>Typed source prefixes such as <code>ssh:</code> and <code>library/</code> disambiguate sources, not selected systems.</li>
+      <li>Creation can be explicit; switching must be boring.</li>
+      <li>There is no precedence order between VMs, SSH systems, images, and aliases. A name either resolves exactly once or it is rejected.</li>
+      <li>Unqualified names are system names first. Image names are only sources during creation, or when a builtin/default image is being created for the first time.</li>
+    </ul>
+
+    <section class="panel warning">
+      <h2>Conflict Example</h2>
+      <p>
+        If <code>ubuntu</code> is reserved by the builtin Ubuntu image, then <code>@ssh ubuntu</code>
+        should fail. The user must choose a unique visible name.
+      </p>
+      <pre>vmsh: cannot create SSH system "ubuntu": that name is reserved by builtin image ubuntu
+Use a unique name, for example: @ubuntu2 --from ssh:ubuntu</pre>
+    </section>
+
+    <h2>Creation Semantics</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Command</th>
+          <th>Meaning</th>
+          <th>Conflict Behavior</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>@ubuntu</code></td>
+          <td>Select or create the default system named <code>ubuntu</code> from builtin Ubuntu.</td>
+          <td>Allowed because the builtin reserves that name for itself.</td>
+        </tr>
+        <tr>
+          <td><code>@alpine</code></td>
+          <td>Select or create the default system named <code>alpine</code> from Docker library Alpine.</td>
+          <td>Allowed unless another system already reserved <code>alpine</code>.</td>
+        </tr>
+        <tr>
+          <td><code>@hello --from ubuntu</code></td>
+          <td>Create or select a named VM system <code>hello</code> derived from builtin Ubuntu.</td>
+          <td>Error if <code>hello</code> is already any visible name.</td>
+        </tr>
+        <tr>
+          <td><code>@other --from library/ubuntu</code></td>
+          <td>Create or select a named VM system from Docker Hub library Ubuntu, not the builtin Ubuntu alias.</td>
+          <td>Error if <code>other</code> is already taken.</td>
+        </tr>
+        <tr>
+          <td><code>@ubuntu2 --from ssh:ubuntu</code></td>
+          <td>Create or select an SSH system named <code>ubuntu2</code> connected to SSH host <code>ubuntu</code>.</td>
+          <td>Error if <code>ubuntu2</code> is already taken.</td>
+        </tr>
+        <tr>
+          <td><code>@ssh ws1</code></td>
+          <td>Sugar for creating or selecting <code>@ws1 --from ssh:ws1</code>.</td>
+          <td>Allowed only when <code>ws1</code> is free. If it conflicts, require explicit naming with <code>--from ssh:ws1</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Source Syntax</h2>
+    <p>
+      <code>--from</code> should accept typed source strings. Bare source names are permitted when they follow the default source rules.
+      The source resolver should normalize sources before saving durable state, so a moving tag never becomes the only record of what was booted.
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th>Source</th>
+          <th>Type</th>
+          <th>Notes</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>ubuntu</code></td>
+          <td><span class="tag">builtin image</span></td>
+          <td>Reserved bare name. Current special Ubuntu source.</td>
+        </tr>
+        <tr>
+          <td><code>freebsd</code></td>
+          <td><span class="tag">builtin image</span></td>
+          <td>Reserved bare name.</td>
+        </tr>
+        <tr>
+          <td><code>openbsd</code></td>
+          <td><span class="tag">builtin image</span></td>
+          <td>Reserved bare name.</td>
+        </tr>
+        <tr>
+          <td><code>alpine</code></td>
+          <td><span class="tag">library image</span></td>
+          <td>Shorthand for Docker library image <code>library/alpine</code>.</td>
+        </tr>
+        <tr>
+          <td><code>library/ubuntu</code></td>
+          <td><span class="tag">library image</span></td>
+          <td>Explicit Docker library image, useful when a bare name is reserved by a builtin.</td>
+        </tr>
+        <tr>
+          <td><code>ubuntu:latest</code></td>
+          <td><span class="tag">image tag</span></td>
+          <td>Accepted as a requested source, but saved records should resolve it to the exact immutable image digest.</td>
+        </tr>
+        <tr>
+          <td><code>ssh:ws1</code></td>
+          <td><span class="tag">ssh</span></td>
+          <td>SSH source using the user's SSH config for <code>ws1</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Copy Endpoints</h2>
+    <p>
+      Copy endpoints should use the same unique visible names. The day-to-day syntax should not require
+      <code>vm:</code> or <code>ssh:</code> prefixes for already-created systems.
+    </p>
+    <pre>@copy @host:/tmp/a @hello:/tmp/a
+@copy @hello:/tmp/a @ubuntu:/tmp/a
+@copy @ubuntu2:/tmp/a @host:/tmp/a</pre>
+    <p>
+      Typed prefixes still matter for sources at creation time. Once a system exists, its visible name is the endpoint.
+    </p>
+
+    <h2>Internal Shape</h2>
+    <p>
+      vmsh still needs backend IDs, instance IDs, and source metadata internally, but users should mostly see systems.
+    </p>
+    <pre>System {
+  Name      string // "hello"
+  Kind      string // "host", "vm", "ssh"
+  Source    string // "builtin:ubuntu", "library/alpine", "ssh:ws1"
+  Isolated  bool
+  BackendID string // hidden implementation detail
+}</pre>
+    <p>
+      The invariant is that <code>Name</code> is globally unique. <code>Source</code> can repeat:
+      <code>hello</code> and <code>other</code> may both be derived from <code>builtin:ubuntu</code>.
+    </p>
+    <p>
+      Source metadata should be canonical for durable state. If a system starts from a tag such as
+      <code>ubuntu:latest</code>, saved images and durable records should store the resolved immutable image identity
+      or digest, not only the moving tag. Human-facing diagnostics can still show the friendly source that was requested.
+    </p>
+
+    <h2>Command Behavior</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Operation</th>
+          <th>Proposed Form</th>
+          <th>Notes</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Switch</td>
+          <td><code>@hello</code></td>
+          <td>Selects the unique system named <code>hello</code>.</td>
+        </tr>
+        <tr>
+          <td>Create named system</td>
+          <td><code>@hello --from ubuntu</code></td>
+          <td>Creates a VM system if <code>hello</code> is not taken.</td>
+        </tr>
+        <tr>
+          <td>Create SSH system</td>
+          <td><code>@laptop --from ssh:work-laptop</code></td>
+          <td>Avoids conflicts between SSH host aliases and image names.</td>
+        </tr>
+        <tr>
+          <td>SSH sugar</td>
+          <td><code>@ssh ws1</code></td>
+          <td>Equivalent to creating or selecting <code>@ws1 --from ssh:ws1</code> only when <code>ws1</code> is free.</td>
+        </tr>
+        <tr>
+          <td>Stop</td>
+          <td><code>@stop hello</code></td>
+          <td>Targets the unique visible system name.</td>
+        </tr>
+        <tr>
+          <td>Restart</td>
+          <td><code>@restart hello</code></td>
+          <td>Restarts the same source/config, not a different image.</td>
+        </tr>
+        <tr>
+          <td>Status tree</td>
+          <td><code>@ps</code></td>
+          <td>Shows <code>hello from ubuntu</code>, <code>ubuntu2 from ssh:ubuntu</code>, and active nesting.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Isolated Systems</h2>
+    <p>
+      Isolation remains useful, but it should be an attribute of a named system rather than a separate visible namespace.
+    </p>
+    <pre>@scratch --from ubuntu --isolated
+@scratch</pre>
+    <p>
+      Since names are globally unique, there should not be both a shared <code>scratch</code> and an isolated <code>scratch</code>.
+      If a user wants both, they should choose two names:
+    </p>
+    <pre>@dev --from ubuntu
+@dev-iso --from ubuntu --isolated</pre>
+
+    <h2>Resolved Decisions</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Question</th>
+          <th>Decision</th>
+          <th>Reason</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Should <code>@ssh ws1</code> remain?</td>
+          <td>Yes, as sugar for <code>@ws1 --from ssh:ws1</code> when <code>ws1</code> is available.</td>
+          <td>It preserves the familiar flow while keeping the global name invariant. Conflicts must error.</td>
+        </tr>
+        <tr>
+          <td>What does “record Docker library systems” mean?</td>
+          <td>Once shorthand such as <code>@alpine</code> creates a system, <code>alpine</code> is reserved by that system until it is stopped/removed.</td>
+          <td>The name must stay stable for switching, completion, copy endpoints, and status. Durable VM state should make the record durable too.</td>
+        </tr>
+        <tr>
+          <td>How should future configured source conflicts report?</td>
+          <td>Prefer a direct owner-and-fix diagnostic.</td>
+          <td>Errors should say who owns the name and show a valid <code>--from</code> form.</td>
+        </tr>
+        <tr>
+          <td>How should saved images record source identity?</td>
+          <td>Normalize entirely. Save immutable resolved image identity, such as the exact digest behind <code>ubuntu:latest</code>.</td>
+          <td>Saved images should be reproducible and should not silently change if an upstream tag moves.</td>
+        </tr>
+        <tr>
+          <td>Can isolated and non-isolated systems share a visible name?</td>
+          <td>No. Isolation is a system attribute, not a separate namespace.</td>
+          <td><code>@dev</code> and <code>@dev --isolated</code> should not silently refer to different machines. Use <code>@dev</code> and <code>@dev-iso</code>.</td>
+        </tr>
+        <tr>
+          <td>Should legacy selectors remain?</td>
+          <td>Yes, temporarily, but only as compatibility aliases.</td>
+          <td><code>@vm:name</code>, <code>@ssh:name</code>, and <code>--vm</code> can keep old scripts working while docs, prompts, completion, and errors teach the one-name model.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Cleanup Opportunities</h2>
+    <ul>
+      <li>Hide <code>--vm</code> from normal docs and completion once <code>@name --from source</code> covers common workflows.</li>
+      <li>Retire <code>@vm:name</code> as primary syntax; keep it temporarily as a compatibility alias.</li>
+      <li>Stop exposing backend IDs such as <code>name-isolated</code> in prompts and ordinary errors.</li>
+      <li>Make <code>@ps</code> show <code>name from source</code> instead of forcing users to parse VM IDs and image fields.</li>
+      <li>Make copy endpoint parsing prefer <code>@name:path</code>; reserve typed prefixes for compatibility and source creation.</li>
+      <li>Replace shared/isolated collision handling with one rule: one visible name, one system.</li>
+      <li>Make <code>@stop</code>, <code>@restart</code>, and <code>@save</code> take visible system names.</li>
+      <li>Move source normalization into one resolver so builtin, Docker library, SSH, and future sources use the same conflict checks.</li>
+      <li>Keep source identity and visible name separate in durable records so renames and saved images do not rewrite what the system was created from.</li>
+      <li>Make tab completion list only valid visible targets in switch position, and list source strings only after <code>--from</code>.</li>
+      <li>Prefer additive migration: introduce the system registry and compatibility aliases before removing old spelling.</li>
+    </ul>
+
+    <h2>Error Cases To Avoid</h2>
+    <p>
+      The dangerous behavior is silent guessing. The resolver should reject any command where a name could plausibly mean
+      more than one visible system or source.
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th>Case</th>
+          <th>Desired Behavior</th>
+          <th>Example Diagnostic</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>@ssh ubuntu</code> when <code>ubuntu</code> is builtin</td>
+          <td>Error and force a unique name.</td>
+          <td><code>vmsh: name "ubuntu" is reserved by builtin image ubuntu. Use @ubuntu2 --from ssh:ubuntu</code></td>
+        </tr>
+        <tr>
+          <td><code>@ubuntu --from alpine</code></td>
+          <td>Error because <code>ubuntu</code> is reserved by builtin Ubuntu.</td>
+          <td><code>vmsh: name "ubuntu" is reserved by builtin image ubuntu</code></td>
+        </tr>
+        <tr>
+          <td><code>@hello --from alpine</code> after <code>hello</code> exists from Ubuntu</td>
+          <td>Error; do not retarget the existing system.</td>
+          <td><code>vmsh: system "hello" already exists from builtin:ubuntu. Run @hello to switch to it or choose another name</code></td>
+        </tr>
+        <tr>
+          <td><code>@copy @ubuntu:/x ...</code> when <code>ubuntu</code> is not exactly resolvable</td>
+          <td>Error before copying.</td>
+          <td><code>vmsh: copy endpoint "ubuntu" is ambiguous or not created; create a named system first</code></td>
+        </tr>
+        <tr>
+          <td>Bare Docker library name conflicts with a configured source</td>
+          <td>Error and require a typed source.</td>
+          <td><code>vmsh: name "redis" conflicts with configured source redis. Use @redis2 --from library/redis</code></td>
+        </tr>
+        <tr>
+          <td><code>@ssh ws1</code> after <code>@ws1 --from ubuntu</code></td>
+          <td>Error; do not replace or retarget the existing VM.</td>
+          <td><code>vmsh: system "ws1" already exists from builtin:ubuntu. Use @ws1 to switch to it or choose @ws1-ssh --from ssh:ws1</code></td>
+        </tr>
+        <tr>
+          <td><code>@hello --from ubuntu:latest</code> saved as an image</td>
+          <td>Save the resolved digest, not the moving tag alone.</td>
+          <td><code>source: docker://ubuntu@sha256:...</code></td>
+        </tr>
+        <tr>
+          <td>Completion after <code>@</code></td>
+          <td>Offer visible systems and unambiguous creatable defaults, not every possible source spelling.</td>
+          <td><code>ubuntu</code>, <code>host</code>, <code>ws1</code>; source-only forms appear after <code>--from</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Migration Plan</h2>
+    <ol>
+      <li>Add a system registry with globally unique visible names.</li>
+      <li>Represent current host, VM, and SSH contexts as systems internally.</li>
+      <li>Add <code>@name --from source</code> creation while keeping current commands working.</li>
+      <li>Make tab completion list visible system names and valid source names.</li>
+      <li>Teach copy endpoints to prefer <code>@name:path</code> and keep <code>@vm:</code>/<code>@ssh:</code> as compatibility aliases for a while.</li>
+      <li>Update <code>@ps</code>, <code>@stop</code>, <code>@restart</code>, and prompt display to use system names.</li>
+      <li>Deprecate <code>--vm</code> once the new model covers all common workflows.</li>
+    </ol>
+  </main>
+</body>
+</html>

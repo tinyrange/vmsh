@@ -392,6 +392,13 @@ func setOpenSSHStyleEnv(session *ssh.Session) {
 }
 
 func persistentSSHShellKey(clientKey string, ctx commandContext) string {
+	name := strings.TrimSpace(ctx.SystemName)
+	if name == "" {
+		name = strings.TrimSpace(ctx.SSHHost)
+	}
+	if name != "" {
+		return clientKey + "\x00system:" + name
+	}
 	return clientKey
 }
 
@@ -1110,22 +1117,24 @@ func (s *shellState) sshSessionKeyForName(name string) (string, bool) {
 	if name == "" {
 		return "", false
 	}
-	if cfg, err := resolveSSHConfig(commandContext{Mode: modeSSH, SSHHost: name}); err == nil {
-		key := cfg.cacheKey()
-		if s.hasSSHSessionKey(key) {
-			return key, true
-		}
-	}
 	s.sshMu.Lock()
-	defer s.sshMu.Unlock()
 	for key, shell := range s.sshShells {
 		if shell.name == name || shell.ctx.SSHHost == name {
+			s.sshMu.Unlock()
 			return key, true
 		}
 	}
 	for key, client := range s.sshClients {
 		cfg := client.config
 		if cfg.Alias == name || cfg.HostName == name || sshSessionDisplayName(commandContext{Mode: modeSSH, SSHHost: cfg.Alias}, cfg) == name {
+			s.sshMu.Unlock()
+			return key, true
+		}
+	}
+	s.sshMu.Unlock()
+	if cfg, err := resolveSSHConfig(commandContext{Mode: modeSSH, SSHHost: name}); err == nil {
+		key := cfg.cacheKey()
+		if s.hasSSHSessionKey(key) {
 			return key, true
 		}
 	}
@@ -1171,6 +1180,9 @@ func parseExplicitSSHStopTarget(name string) (bool, string) {
 }
 
 func sshSessionDisplayName(ctx commandContext, cfg resolvedSSHConfig) string {
+	if strings.TrimSpace(ctx.SystemName) != "" {
+		return strings.TrimSpace(ctx.SystemName)
+	}
 	if strings.TrimSpace(ctx.SSHHost) != "" {
 		return strings.TrimSpace(ctx.SSHHost)
 	}

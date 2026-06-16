@@ -205,11 +205,15 @@ func (c *vmshCompleter) CompleteWithKind(line []rune, pos int) ([]string, int, c
 		candidates = suffixCompletions(sshHostAliases(), token)
 		return candidates, len([]rune(typedToken)), completionAt
 	}
+	if c.shouldCompleteFromSource(prefix, tokenStart) {
+		candidates = suffixCompletions(c.sourceNames(token), token)
+		return candidates, len([]rune(typedToken)), completionAt
+	}
 	if c.shouldCompleteRMIImage(prefix, tokenStart) {
 		candidates = suffixCompletions(c.cachedImageNames(), token)
 		return candidates, len([]rune(typedToken)), completionAt
 	}
-	if c.shouldCompleteStopTarget(prefix, tokenStart) {
+	if c.shouldCompleteSessionTarget(prefix, tokenStart) {
 		candidates = suffixCompletions(c.stopTargetNames(), token)
 		return candidates, len([]rune(typedToken)), completionAt
 	}
@@ -324,12 +328,51 @@ func (c *vmshCompleter) atTargetWords() []string {
 		for _, name := range c.shell.sshSessionNames() {
 			words = append(words, "@"+name)
 		}
+		for _, name := range c.shell.liveVMSystemNames() {
+			words = append(words, "@"+name)
+		}
 	}
 	for _, image := range c.cachedImageNames() {
 		words = append(words, "@"+image)
 	}
 	sort.Strings(words)
 	return uniqueStrings(words)
+}
+
+func (c *vmshCompleter) sourceNames(token string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	for _, name := range []string{"ubuntu", "freebsd", "openbsd"} {
+		add(name)
+	}
+	for _, image := range c.cachedImageNames() {
+		add(image)
+		if !strings.Contains(image, "/") {
+			add("library/" + image)
+		}
+	}
+	if strings.HasPrefix(token, "ssh:") {
+		prefix := strings.TrimPrefix(token, "ssh:")
+		for _, host := range sshHostAliases() {
+			if strings.HasPrefix(host, prefix) {
+				add("ssh:" + host)
+			}
+		}
+	} else {
+		for _, host := range sshHostAliases() {
+			add("ssh:" + host)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (c *vmshCompleter) cachedImageNames() []string {
@@ -358,6 +401,7 @@ func (c *vmshCompleter) cachedImageNames() []string {
 func vmshOptionWords(prefix string) []string {
 	words := []string{
 		"--vm",
+		"--from",
 		"--cwd",
 		"--user",
 		"--sudo",
@@ -444,12 +488,23 @@ func (c *vmshCompleter) shouldCompleteSSHHost(prefix string, tokenStart int) boo
 	return len(words) == 1 && words[0] == "@ssh"
 }
 
-func (c *vmshCompleter) shouldCompleteStopTarget(prefix string, tokenStart int) bool {
+func (c *vmshCompleter) shouldCompleteFromSource(prefix string, tokenStart int) bool {
 	if !strings.HasPrefix(prefix, "@") {
 		return false
 	}
 	words := completedShellWords(prefix[:tokenStart])
-	return len(words) == 1 && words[0] == "@stop"
+	if len(words) == 0 {
+		return false
+	}
+	return words[len(words)-1] == "--from"
+}
+
+func (c *vmshCompleter) shouldCompleteSessionTarget(prefix string, tokenStart int) bool {
+	if !strings.HasPrefix(prefix, "@") {
+		return false
+	}
+	words := completedShellWords(prefix[:tokenStart])
+	return len(words) == 1 && (words[0] == "@stop" || words[0] == "@restart")
 }
 
 func (c *vmshCompleter) stopTargetNames() []string {
@@ -469,12 +524,8 @@ func (c *vmshCompleter) stopTargetNames() []string {
 	for _, name := range c.shell.sshSessionNames() {
 		add(name)
 	}
-	if c.shell.api != nil {
-		if states, err := c.shell.api.InstanceStatuses(); err == nil {
-			for _, state := range states {
-				add(state.ID)
-			}
-		}
+	for _, name := range c.shell.liveVMSystemNames() {
+		add(name)
 	}
 	sort.Strings(names)
 	return names
@@ -922,6 +973,7 @@ func uniqueStrings(items []string) []string {
 
 type commandContext struct {
 	Mode       shellMode `json:"mode"`
+	SystemName string    `json:"system,omitempty"`
 	Image      string    `json:"image,omitempty"`
 	SSHHost    string    `json:"ssh_host,omitempty"`
 	Arch       string    `json:"arch,omitempty"`
@@ -945,6 +997,7 @@ type atLine struct {
 
 type commandOptions struct {
 	VMID         string
+	From         string
 	CWD          string
 	User         string
 	Arch         string
@@ -2285,6 +2338,9 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
+		if err := s.validateSSHSystemName(host); err != nil {
+			return err
+		}
 		ctx := sshCommandContext(s.context, at.Options, host)
 		if command == "" {
 			session, err := s.sshPersistentShell(ctx, stdout, stderr)
@@ -2334,12 +2390,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 	case "stop":
 		return s.stopSession(at, stdout)
 	case "restart":
-		if at.Command != "" {
-			return fmt.Errorf("usage: @restart [--vm id]")
-		}
-		ctx := s.context.withOptions(at.Options)
-		id := backendVMID(ctx)
-		return s.restartVM(id, ctx, stderr)
+		return s.restartSession(at, stderr)
 	case "save":
 		return s.saveVM(at, stdout)
 	case "rmi":
@@ -2372,6 +2423,34 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 	case "agent":
 		return s.runAgent(at, stdout, stderr)
 	default:
+		if at.Options.From != "" {
+			ctx, err := s.systemCommandContext(at.Target, at.Options)
+			if err != nil {
+				return err
+			}
+			if at.Command == "" {
+				if ctx.Mode == modeSSH {
+					session, err := s.sshPersistentShell(ctx, stdout, stderr)
+					if err != nil {
+						return err
+					}
+					if cwd := session.cwd(); cwd != "" {
+						ctx.CWD = cwd
+					}
+					s.activateContext(ctx)
+					return nil
+				}
+				if at.Options.Sudo {
+					return fmt.Errorf("usage: @%s --sudo <cmd>", at.Target)
+				}
+				if err := s.prepareActivatedVMContext(&ctx, stdout, stderr); err != nil {
+					return err
+				}
+				s.activateContext(ctx)
+				return nil
+			}
+			return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
+		}
 		if strings.HasPrefix(at.Target, "vm:") {
 			ctx, err := s.vmTargetCommandContext(strings.TrimPrefix(at.Target, "vm:"), at.Options)
 			if err != nil {
@@ -2399,7 +2478,26 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			}
 			return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
 		}
+		if ctx, ok, err := s.knownVMCopyEndpointContext(at.Target); err != nil {
+			return err
+		} else if ok {
+			ctx = ctx.withOptions(at.Options)
+			if at.Command == "" {
+				if at.Options.Sudo {
+					return fmt.Errorf("usage: @%s --sudo <cmd>", at.Target)
+				}
+				if err := s.prepareActivatedVMContext(&ctx, stdout, stderr); err != nil {
+					return err
+				}
+				s.activateContext(ctx)
+				return nil
+			}
+			return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
+		}
 		ctx := vmCommandContext(s.context, at.Options, at.Target)
+		if err := s.validateDefaultImageSystemName(ctx); err != nil {
+			return err
+		}
 		if at.Command == "" {
 			if at.Options.Sudo {
 				return fmt.Errorf("usage: @%s --sudo <cmd>", at.Target)
@@ -2836,16 +2934,12 @@ func (s *shellState) resolveImplicitCopyEndpointTarget(name, raw string) (comman
 			ctx:      vmCtx,
 		})
 	}
-	if imageCtx, ok := s.knownImageCopyEndpointContext(name); ok {
-		matches = append(matches, copyEndpointTargetMatch{
-			kind:     "image",
-			explicit: fmt.Sprintf("@image:%s:path", name),
-			ctx:      imageCtx,
-		})
-	}
 	switch len(matches) {
 	case 0:
-		return commandContext{}, fmt.Errorf("copy endpoint %q does not name an active SSH session, known VM, or known image; use @:path, @host:path, @vm:name:path, @ssh:host:path, or @image:name:path", raw)
+		if _, ok := s.knownImageCopyEndpointContext(name); ok {
+			return commandContext{}, fmt.Errorf("copy endpoint %q names image %q, not a created system; create @%s first or use @image:%s:path", raw, name, name, name)
+		}
+		return commandContext{}, fmt.Errorf("copy endpoint %q does not name an active SSH session or known VM; use @:path, @host:path, @name:path, @vm:name:path, @ssh:host:path, or @image:name:path", raw)
 	case 1:
 		return matches[0].ctx, nil
 	default:
@@ -2880,25 +2974,28 @@ func (s *shellState) knownVMCopyEndpointContext(id string) (commandContext, bool
 	if id == "" {
 		return commandContext{}, false, nil
 	}
-	if s.context.Mode == modeVM && backendVMID(s.context) == backendVMIDFor(id, false) && s.context.Image != "" {
+	if s.context.Mode == modeVM && visibleContextName(s.context) == id && s.context.Image != "" {
 		return s.context, true, nil
 	}
 	for _, ctx := range s.contextStack {
-		if ctx.Mode == modeVM && backendVMID(ctx) == backendVMIDFor(id, false) && ctx.Image != "" {
+		if ctx.Mode == modeVM && visibleContextName(ctx) == id && ctx.Image != "" {
 			return ctx, true, nil
 		}
 	}
 	if s.api == nil {
 		return commandContext{}, false, nil
 	}
-	state, err := s.api.InstanceStatusOf(id)
+	match, err := s.resolveVMStopTarget(id)
 	if err != nil {
 		return commandContext{}, false, err
 	}
-	if strings.TrimSpace(state.Image) == "" {
+	if match.kind != stopTargetVM {
 		return commandContext{}, false, nil
 	}
-	ctx := vmContextFromState(id, state)
+	ctx, err := s.vmContextForBackendID(match.id)
+	if err != nil {
+		return commandContext{}, false, err
+	}
 	if s.contextCWD != nil {
 		if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
 			ctx.CWD = cwd
@@ -2908,22 +3005,25 @@ func (s *shellState) knownVMCopyEndpointContext(id string) (commandContext, bool
 }
 
 func (s *shellState) vmCopyEndpointContext(id string) (commandContext, error) {
-	if s.context.Mode == modeVM && backendVMID(s.context) == backendVMIDFor(id, false) {
+	if s.context.Mode == modeVM && visibleContextName(s.context) == id {
 		return s.context, nil
 	}
 	for _, ctx := range s.contextStack {
-		if ctx.Mode == modeVM && backendVMID(ctx) == backendVMIDFor(id, false) {
+		if ctx.Mode == modeVM && visibleContextName(ctx) == id {
 			return ctx, nil
 		}
 	}
-	state, err := s.api.InstanceStatusOf(id)
+	match, err := s.resolveVMStopTarget(id)
 	if err != nil {
 		return commandContext{}, err
 	}
-	if strings.TrimSpace(state.Image) == "" {
+	if match.kind != stopTargetVM {
 		return commandContext{}, fmt.Errorf("VM %s has no image; use @<image>:path or switch to the VM first", id)
 	}
-	ctx := vmContextFromState(id, state)
+	ctx, err := s.vmContextForBackendID(match.id)
+	if err != nil {
+		return commandContext{}, err
+	}
 	if s.contextCWD != nil {
 		if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
 			ctx.CWD = cwd
@@ -2941,6 +3041,7 @@ func vmContextFromState(id string, state client.InstanceState) commandContext {
 	}
 	return commandContext{
 		Mode:       modeVM,
+		SystemName: vmID,
 		VMID:       vmID,
 		Image:      state.Image,
 		InitSystem: state.InitSystem,
@@ -5845,6 +5946,9 @@ func ubuntuCloudRootFSArchitecture(architecture string) string {
 func (s *shellState) ensureImageAvailable(ctx commandContext, stderr io.Writer) error {
 	image := localImageName(ctx.Image, ctx.Arch)
 	if isBuiltInGuestImage(image) {
+		if err := s.ensureBuiltInGuestSupported(ctx); err != nil {
+			return err
+		}
 		return nil
 	}
 	req := pullImageRequestForContext(ctx)
@@ -5906,6 +6010,40 @@ func (s *shellState) ensureImageAvailable(ctx commandContext, stderr io.Writer) 
 	}
 	s.imageCache[image] = true
 	return nil
+}
+
+func (s *shellState) ensureBuiltInGuestSupported(ctx commandContext) error {
+	image := canonicalBuiltInGuestImage(ctx.Image)
+	switch image {
+	case "@freebsd", "@openbsd":
+	default:
+		return nil
+	}
+	host := runtime.GOOS + "/" + runtime.GOARCH
+	if s.api != nil {
+		caps, err := s.api.Capabilities()
+		if err != nil {
+			return fmt.Errorf("%s guest support requires ccvm on linux/amd64; could not determine ccvm host platform: %w", builtInGuestDisplayName(image), err)
+		}
+		if strings.TrimSpace(caps.Host) != "" {
+			host = strings.TrimSpace(caps.Host)
+		}
+	}
+	if host == "linux/amd64" {
+		return nil
+	}
+	return fmt.Errorf("%s guests are currently only supported when ccvm is running on linux/amd64; current ccvm host is %s", builtInGuestDisplayName(image), host)
+}
+
+func builtInGuestDisplayName(image string) string {
+	switch canonicalBuiltInGuestImage(image) {
+	case "@freebsd":
+		return "FreeBSD"
+	case "@openbsd":
+		return "OpenBSD"
+	default:
+		return strings.TrimPrefix(strings.TrimSpace(image), "@")
+	}
 }
 
 func requiredImageSource(req client.PullImageRequest) (source, kind string) {
@@ -6005,14 +6143,19 @@ func vmKindArticle(kind string) string {
 }
 
 func validateRunningVMContext(id string, ctx commandContext, state client.InstanceState) error {
+	wantImage := strings.TrimSpace(ctx.Image)
+	gotImage := strings.TrimSpace(state.Image)
 	wantInit := strings.TrimSpace(ctx.InitSystem)
 	gotInit := strings.TrimSpace(state.InitSystem)
 	wantKernel := strings.TrimSpace(ctx.Kernel)
 	gotKernel := strings.TrimSpace(state.Kernel)
+	displayID := firstNonEmpty(state.ID, id)
+	if gotImage != "" && wantImage != "" && gotImage != wantImage {
+		return fmt.Errorf("VM %q is already running from %s, not %s; run @%s to switch to it or choose another name", displayID, sourceTextForImage(gotImage), sourceTextForImage(wantImage), visibleVMNameFromBackendID(displayID))
+	}
 	if kernelStateEqual(wantKernel, gotKernel) && wantInit == gotInit {
 		return nil
 	}
-	displayID := firstNonEmpty(state.ID, id)
 	if !kernelStateEqual(wantKernel, gotKernel) {
 		if kernelStateIsDefault(wantKernel) {
 			return fmt.Errorf("VM %q is already running with kernel %q; run @restart or @stop before using --kernel default", displayID, gotKernel)
@@ -6359,6 +6502,84 @@ func (s *shellState) stopVMAndReport(id string, stdout io.Writer) error {
 	return err
 }
 
+func (s *shellState) restartSession(at atLine, stderr io.Writer) error {
+	fields, err := splitShellFields(at.Command)
+	if err != nil {
+		return err
+	}
+	if len(fields) > 1 || (at.Options.VMID != "" && len(fields) != 0) {
+		return fmt.Errorf("usage: @restart [name|vm:name|--vm id]")
+	}
+	if len(fields) == 0 {
+		ctx := s.context.withOptions(at.Options)
+		if ctx.Mode != modeVM {
+			return fmt.Errorf("@restart without a target requires a VM context; use @restart name")
+		}
+		id := backendVMID(ctx)
+		return s.restartVM(id, ctx, stderr)
+	}
+	name := fields[0]
+	if forced, vmID := parseExplicitVMStopTarget(name); forced {
+		match, err := s.resolveVMStopTarget(vmID)
+		if err != nil {
+			return err
+		}
+		if match.kind != stopTargetVM {
+			return fmt.Errorf("no running VM named %q", vmID)
+		}
+		ctx, err := s.vmContextForBackendID(match.id)
+		if err != nil {
+			return err
+		}
+		return s.restartVM(match.id, ctx.withOptions(at.Options), stderr)
+	}
+	if forced, host := parseExplicitSSHStopTarget(name); forced {
+		if _, ok := s.sshSessionKeyForName(host); ok {
+			return fmt.Errorf("cannot restart SSH session %q; use @stop %s then reconnect", host, name)
+		}
+		return fmt.Errorf("ssh session %s is not open", host)
+	}
+	match, err := s.resolveStopTarget(name)
+	if err != nil {
+		return err
+	}
+	switch match.kind {
+	case stopTargetSSH:
+		return fmt.Errorf("cannot restart SSH session %q; use @stop %s then reconnect", name, name)
+	case stopTargetVM:
+		ctx, err := s.vmContextForBackendID(match.id)
+		if err != nil {
+			return err
+		}
+		return s.restartVM(match.id, ctx.withOptions(at.Options), stderr)
+	default:
+		return fmt.Errorf("no running VM named %q", name)
+	}
+}
+
+func (s *shellState) vmContextForBackendID(id string) (commandContext, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return commandContext{}, fmt.Errorf("vm id is required")
+	}
+	if s.context.Mode == modeVM && backendVMID(s.context) == id {
+		return s.context, nil
+	}
+	for _, ctx := range s.contextStack {
+		if ctx.Mode == modeVM && backendVMID(ctx) == id {
+			return ctx, nil
+		}
+	}
+	state, err := s.api.InstanceStatusOf(id)
+	if err != nil {
+		return commandContext{}, err
+	}
+	if strings.TrimSpace(state.Image) == "" {
+		return commandContext{}, fmt.Errorf("VM %s has no image; switch to the VM first", id)
+	}
+	return vmContextFromState(id, state), nil
+}
+
 type stopTargetKind int
 
 const (
@@ -6478,7 +6699,7 @@ func contextSameSession(a, b commandContext) bool {
 	case modeVM:
 		return backendVMID(a) == backendVMID(b)
 	case modeSSH:
-		return strings.TrimSpace(a.SSHHost) == strings.TrimSpace(b.SSHHost)
+		return contextSSHSessionKey(a) == contextSSHSessionKey(b)
 	case modeHost:
 		return true
 	default:
@@ -6564,15 +6785,32 @@ func (s *shellState) saveVM(at atLine, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if len(fields) != 1 || hasSaveOnlyUnsupportedOptions(at.Options) {
-		return fmt.Errorf("usage: @save [--vm id] tag")
+	if len(fields) < 1 || len(fields) > 2 || hasSaveOnlyUnsupportedOptions(at.Options) || (at.Options.VMID != "" && len(fields) == 2) {
+		return fmt.Errorf("usage: @save [name|--vm id] tag")
 	}
-	name := strings.TrimSpace(fields[0])
+	var ctx commandContext
+	var id string
+	name := strings.TrimSpace(fields[len(fields)-1])
 	if name == "" || strings.HasPrefix(name, "-") {
-		return fmt.Errorf("usage: @save [--vm id] tag")
+		return fmt.Errorf("usage: @save [name|--vm id] tag")
 	}
-	ctx := s.context.withOptions(at.Options)
-	id := backendVMID(ctx)
+	if len(fields) == 2 {
+		match, err := s.resolveVMStopTarget(fields[0])
+		if err != nil {
+			return err
+		}
+		if match.kind != stopTargetVM {
+			return fmt.Errorf("no running VM named %q", fields[0])
+		}
+		ctx, err = s.vmContextForBackendID(match.id)
+		if err != nil {
+			return err
+		}
+		id = match.id
+	} else {
+		ctx = s.context.withOptions(at.Options)
+		id = backendVMID(ctx)
+	}
 	if strings.TrimSpace(id) == "" {
 		return fmt.Errorf("vm id is required")
 	}
@@ -6912,15 +7150,11 @@ func (s *shellState) prompt() string {
 	base := colorGreen + "➜" + colorReset + "  "
 	cwd := s.promptCWDColor(promptCWD) + leaf + colorReset + " "
 	if s.context.Mode == modeSSH {
-		target := "(" + s.context.SSHHost + ")"
+		target := "(" + visibleContextName(s.context) + ")"
 		return base + colorMagenta + "ssh:" + colorReset + colorYellow + target + colorReset + " " + cwd
 	}
 	if s.context.Mode == modeVM {
-		target := "(" + contextImageText(s.context)
-		if s.context.VMID != "" && s.context.VMID != "default" {
-			target += ":" + s.context.VMID
-		}
-		target += ")"
+		target := "(" + visibleContextName(s.context) + ")"
 		label := "vm:"
 		if s.context.Isolated {
 			label = "vm isolated:"
@@ -7115,9 +7349,9 @@ func (s *shellState) contextStatusLine(ctx commandContext, current bool) (string
 			return "", err
 		}
 		parts = []string{
+			emptyText(visibleContextName(ctx), "default"),
 			"vm",
-			emptyText(normalizedVMID(ctx.VMID), "default"),
-			"image=" + emptyText(contextImageText(ctx), "-"),
+			"from=" + emptyText(contextSourceText(ctx), "-"),
 			"backend=" + emptyText(id, "-"),
 			"isolated=" + strconv.FormatBool(ctx.Isolated),
 			"user=" + emptyText(guestRunUser(ctx), "-"),
@@ -7139,8 +7373,9 @@ func (s *shellState) contextStatusLine(ctx commandContext, current bool) (string
 			session = "open"
 		}
 		parts = []string{
+			emptyText(visibleContextName(ctx), "-"),
 			"ssh",
-			emptyText(ctx.SSHHost, "-"),
+			"from=" + emptyText(contextSourceText(ctx), "-"),
 			"user=" + emptyText(s.sshStatusUser(ctx), "-"),
 			"cwd=" + emptyText(s.currentSSHCWD(ctx), "-"),
 			"session=" + session,
@@ -7236,16 +7471,62 @@ func contextErrorLabel(ctx commandContext) string {
 	case modeHost:
 		return "host"
 	case modeVM:
-		name := normalizedVMID(ctx.VMID)
+		name := visibleContextName(ctx)
 		if ctx.Isolated {
 			return "isolated vm " + name
 		}
 		return "vm " + name
 	case modeSSH:
-		return "ssh " + emptyText(strings.TrimSpace(ctx.SSHHost), "-")
+		return "ssh " + emptyText(visibleContextName(ctx), "-")
 	default:
 		return string(ctx.Mode)
 	}
+}
+
+func visibleContextName(ctx commandContext) string {
+	if strings.TrimSpace(ctx.SystemName) != "" {
+		return strings.TrimSpace(ctx.SystemName)
+	}
+	switch ctx.Mode {
+	case modeHost:
+		return "host"
+	case modeVM:
+		return normalizedVMID(ctx.VMID)
+	case modeSSH:
+		return strings.TrimSpace(ctx.SSHHost)
+	default:
+		return ""
+	}
+}
+
+func contextSourceText(ctx commandContext) string {
+	switch ctx.Mode {
+	case modeHost:
+		return "host"
+	case modeVM:
+		return sourceTextForImage(ctx.Image)
+	case modeSSH:
+		return "ssh:" + emptyText(strings.TrimSpace(ctx.SSHHost), "-")
+	default:
+		return string(ctx.Mode)
+	}
+}
+
+func sourceTextForImage(image string) string {
+	image = strings.TrimSpace(image)
+	if image == "" {
+		return "vm"
+	}
+	if isReservedImageSystemName(image) {
+		return "builtin:" + image
+	}
+	if isBuiltInGuestImage(image) {
+		return "builtin:" + strings.TrimPrefix(canonicalBuiltInGuestImage(image), "@")
+	}
+	if strings.Contains(image, "/") {
+		return image
+	}
+	return "library/" + image
 }
 
 func (s *shellState) printVMs(w io.Writer) error {
@@ -7254,6 +7535,31 @@ func (s *shellState) printVMs(w io.Writer) error {
 		return err
 	}
 	return s.printSessionTree(w, states, s.sshSessionStates(), s.sshConnectionStates())
+}
+
+func (s *shellState) liveVMSystemNames() []string {
+	if s == nil || s.api == nil {
+		return nil
+	}
+	states, err := s.api.InstanceStatuses()
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var names []string
+	for _, state := range states {
+		if !instanceStateIsLive(state) {
+			continue
+		}
+		name := visibleVMNameFromBackendID(firstNonEmpty(strings.TrimSpace(state.ID), "default"))
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 type sessionTreeNode struct {
@@ -7277,13 +7583,14 @@ func (s *shellState) printSessionTree(w io.Writer, states []client.InstanceState
 			continue
 		}
 		id := firstNonEmpty(strings.TrimSpace(state.ID), "default")
+		name := visibleVMNameFromBackendID(id)
 		kind := "vm"
 		if strings.HasSuffix(id, isolatedVMSuffix) {
-			kind = "isolated vm"
+			kind = "isolated-vm"
 		}
-		parts := []string{kind, id, emptyText(state.Status, "unknown")}
+		parts := []string{name, kind, emptyText(state.Status, "unknown")}
 		if state.Image != "" {
-			parts = append(parts, "image="+state.Image)
+			parts = append(parts, "from="+sourceTextForImage(state.Image))
 		}
 		if state.InitSystem != "" {
 			parts = append(parts, "init="+state.InitSystem)
@@ -7302,7 +7609,11 @@ func (s *shellState) printSessionTree(w io.Writer, states []client.InstanceState
 		vmNodes[id] = node
 	}
 	for _, session := range sshSessions {
-		parts := []string{"ssh", session.Name}
+		source := contextSourceText(session.Ctx)
+		parts := []string{session.Name, "ssh"}
+		if source != "" {
+			parts = append(parts, "from="+source)
+		}
 		if session.User != "" {
 			parts = append(parts, "user="+session.User)
 		}
@@ -7333,11 +7644,20 @@ func instanceStateIsLive(state client.InstanceState) bool {
 func contextSessionKey(ctx commandContext) string {
 	return strings.Join([]string{
 		string(ctx.Mode),
+		visibleContextName(ctx),
 		backendVMID(ctx),
 		localImageName(ctx.Image, ctx.Arch),
 		ctx.SSHHost,
 		contextUserKey(ctx),
 	}, "\x00")
+}
+
+func visibleVMNameFromBackendID(id string) string {
+	id = strings.TrimSpace(id)
+	if strings.HasSuffix(id, isolatedVMSuffix) {
+		return strings.TrimSuffix(id, isolatedVMSuffix)
+	}
+	return id
 }
 
 func printSessionTreeNode(w io.Writer, node *sessionTreeNode, prefix string, last, root bool) error {
@@ -7400,9 +7720,10 @@ func (s *shellState) printJobs(w io.Writer) error {
 
 func (s *shellState) help(w io.Writer) error {
 	_, err := fmt.Fprintln(w, strings.TrimSpace(`
-@<oci-tag> [opts] [cmd]  run cmd in an OCI image, or make it current if cmd is omitted
+@<image> [opts] [cmd]    select/create the default system for an image, or run cmd in it
+@<name> --from SOURCE    create/select a named system from image, library/image, or ssh:host
 @host [cmd]              run cmd on the host, or make host current if cmd is omitted
-@ssh HOST [cmd]          run cmd through host ssh config, or make SSH host current
+@ssh HOST [cmd]          sugar for @HOST --from ssh:HOST when HOST is available
 @ [opts] [cmd]           update or use the current context
 @sudo [cmd]              open a root VM subshell, or run cmd as root in the current VM
 @alias [name=value]      list aliases, or set one (example: @alias clear=@host clear)
@@ -7412,15 +7733,15 @@ func (s *shellState) help(w io.Writer) error {
 @status                  show vmsh and selected VM state
 @start [--vm id]         start a blank VM
 @stop [name|vm:name|ssh:name]  stop an SSH session or VM
-@restart [--vm id]       restart a VM after confirmation
-@save [--vm id] tag      save the selected VM root filesystem as a local image
+@restart [name|vm:name|--vm id]  restart a VM after confirmation
+@save [name|--vm id] tag save a VM root filesystem as a local image
 @rmi image               remove a locally cached image
-@copy SRC DST            copy paths between @:path, @host:path, @vm:id:path, @ssh:host:path, @image:name:path, and active @session:path
+@copy SRC DST            copy between @:path, @host:path, @name:path, @vm:id:path, @ssh:host:path, and @image:name:path
 @agent codex [args]      run Codex inside the current VM with host ~/.codex mounted
 @agent --proxy codex     run Codex through a host auth proxy without mounting ~/.codex
 @tmux [session]          open tmux with vmsh as the default pane command
 @forward H:G             forward host port H to guest port G
-opts: --vm id --cwd path --user user --sudo --init --no-init --kernel default|ubuntu --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
+opts: --from source --vm id --cwd path --user user --sudo --init --no-init --kernel default|ubuntu --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
 keys: Ctrl+R reverse history search; Esc/Ctrl+G cancel search
 cd <dir>                 change the current host, VM, or SSH working directory
 exit [--force]           leave the current subshell, or vmsh at top level
@@ -7506,6 +7827,12 @@ func parseCommandOptions(tokens []shellToken, start int, target string) (command
 				return opts, i, err
 			}
 			opts.VMID = v
+		case "--from":
+			v, err := readValue()
+			if err != nil {
+				return opts, i, err
+			}
+			opts.From = v
 		case "--cwd":
 			v, err := readValue()
 			if err != nil {
@@ -7685,6 +8012,7 @@ func (c commandContext) withOptions(opts commandOptions) commandContext {
 func hostCommandContext(base commandContext, opts commandOptions) commandContext {
 	ctx := base.withOptions(opts)
 	ctx.Mode = modeHost
+	ctx.SystemName = "host"
 	ctx.SSHHost = ""
 	ctx.CWD = ""
 	return ctx
@@ -7694,12 +8022,17 @@ func vmCommandContext(base commandContext, opts commandOptions, image string) co
 	if isBuiltInGuestImage(image) {
 		image = canonicalBuiltInGuestImage(image)
 	}
+	systemName := defaultSystemNameForImage(image)
 	previousKey := ""
 	if base.Mode == modeVM {
 		previousKey = contextCWDKey(base)
 	}
 	ctx := base.withOptions(opts)
 	ctx.Mode = modeVM
+	if opts.VMID == "" {
+		ctx.VMID = systemName
+	}
+	ctx.SystemName = normalizedVMID(ctx.VMID)
 	ctx.Image = image
 	ctx.SSHHost = ""
 	if opts.InitSystem == nil {
@@ -7712,6 +8045,182 @@ func vmCommandContext(base commandContext, opts commandOptions, image string) co
 		ctx.CWD = ""
 	}
 	return ctx
+}
+
+func (s *shellState) systemCommandContext(name string, opts commandOptions) (commandContext, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || strings.HasPrefix(name, "-") || strings.Contains(name, ":") {
+		return commandContext{}, fmt.Errorf("system name %q is invalid", name)
+	}
+	source, err := parseSystemSource(opts.From)
+	if err != nil {
+		return commandContext{}, err
+	}
+	if err := s.validateNewSystemName(name, source); err != nil {
+		return commandContext{}, err
+	}
+	switch source.Kind {
+	case systemSourceSSH:
+		ctx := sshCommandContext(s.context, opts, source.Value)
+		ctx.SystemName = name
+		return ctx, nil
+	case systemSourceImage:
+		vmOpts := opts
+		vmOpts.VMID = name
+		ctx := vmCommandContext(s.context, vmOpts, source.Value)
+		ctx.SystemName = name
+		return ctx, nil
+	default:
+		return commandContext{}, fmt.Errorf("unsupported source %q", opts.From)
+	}
+}
+
+type systemSourceKind string
+
+const (
+	systemSourceImage systemSourceKind = "image"
+	systemSourceSSH   systemSourceKind = "ssh"
+)
+
+type systemSource struct {
+	Kind  systemSourceKind
+	Value string
+}
+
+func parseSystemSource(raw string) (systemSource, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return systemSource{}, fmt.Errorf("--from requires a source")
+	}
+	switch {
+	case strings.HasPrefix(raw, "ssh:"):
+		host := strings.TrimSpace(strings.TrimPrefix(raw, "ssh:"))
+		if host == "" {
+			return systemSource{}, fmt.Errorf("--from ssh: source requires a host")
+		}
+		return systemSource{Kind: systemSourceSSH, Value: host}, nil
+	case strings.HasPrefix(raw, "image:"):
+		image := strings.TrimSpace(strings.TrimPrefix(raw, "image:"))
+		if image == "" {
+			return systemSource{}, fmt.Errorf("--from image: source requires an image")
+		}
+		return systemSource{Kind: systemSourceImage, Value: canonicalImageSource(image)}, nil
+	default:
+		return systemSource{Kind: systemSourceImage, Value: canonicalImageSource(raw)}, nil
+	}
+}
+
+func canonicalImageSource(image string) string {
+	image = strings.TrimSpace(image)
+	if isBuiltInGuestImage(image) {
+		return canonicalBuiltInGuestImage(image)
+	}
+	return image
+}
+
+func defaultSystemNameForImage(image string) string {
+	image = strings.TrimPrefix(strings.TrimSpace(image), "@")
+	if image == "" {
+		return "default"
+	}
+	if strings.HasPrefix(image, "library/") {
+		image = strings.TrimPrefix(image, "library/")
+	}
+	image = strings.TrimSuffix(image, ":latest")
+	base := path.Base(strings.Split(image, ":")[0])
+	base = strings.TrimSpace(base)
+	if base == "" || base == "." || base == "/" {
+		return normalizedVMID(image)
+	}
+	return base
+}
+
+func (s *shellState) validateDefaultImageSystemName(ctx commandContext) error {
+	name := visibleContextName(ctx)
+	if name == "" {
+		return nil
+	}
+	if err := s.validateNameNotOwnedBySSH(name); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *shellState) validateSSHSystemName(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	if isReservedImageSystemName(name) {
+		return fmt.Errorf("name %q is reserved by builtin image %s; use a unique name, for example: @%s2 --from ssh:%s", name, name, name, name)
+	}
+	if err := s.validateNameNotOwnedByVM(name); err != nil {
+		return fmt.Errorf("cannot create SSH system %q: %w; use a unique name, for example: @%s2 --from ssh:%s", name, err, name, name)
+	}
+	return nil
+}
+
+func (s *shellState) validateNewSystemName(name string, source systemSource) error {
+	if name == "host" {
+		return fmt.Errorf("name %q is reserved by the host", name)
+	}
+	if isReservedImageSystemName(name) {
+		if source.Kind == systemSourceImage && defaultSystemNameForImage(source.Value) == name {
+			return fmt.Errorf("name %q is reserved by builtin image %s; use @%s to switch to it", name, name, name)
+		}
+		return fmt.Errorf("name %q is reserved by builtin image %s", name, name)
+	}
+	if err := s.validateNameNotOwnedByVM(name); err != nil {
+		return err
+	}
+	if err := s.validateNameNotOwnedBySSH(name); err != nil {
+		return err
+	}
+	return nil
+}
+
+func isReservedImageSystemName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "ubuntu", "freebsd", "openbsd":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *shellState) validateNameNotOwnedByVM(name string) error {
+	name = normalizedVMID(name)
+	if s.context.Mode == modeVM && visibleContextName(s.context) == name {
+		return fmt.Errorf("system %q already exists from %s", name, contextSourceText(s.context))
+	}
+	for _, ctx := range s.contextStack {
+		if ctx.Mode == modeVM && visibleContextName(ctx) == name {
+			return fmt.Errorf("system %q already exists from %s", name, contextSourceText(ctx))
+		}
+	}
+	if s.api == nil {
+		return nil
+	}
+	for _, id := range []string{backendVMIDFor(name, false), backendVMIDFor(name, true)} {
+		state, err := s.api.InstanceStatusOf(id)
+		if err != nil {
+			return err
+		}
+		if instanceStateIsLive(state) {
+			return fmt.Errorf("system %q already exists from %s", name, firstNonEmpty(state.Image, "vm"))
+		}
+	}
+	return nil
+}
+
+func (s *shellState) validateNameNotOwnedBySSH(name string) error {
+	if s == nil {
+		return nil
+	}
+	if _, ok := s.sshSessionKeyForName(name); ok {
+		return fmt.Errorf("system %q already exists from ssh:%s", name, name)
+	}
+	return nil
 }
 
 func defaultInitSystemForImage(image string) string {
@@ -7772,6 +8281,7 @@ func sshCommandContext(base commandContext, opts commandOptions, host string) co
 	ctx := base.withOptions(opts)
 	sameHost := base.Mode == modeSSH && base.SSHHost == host
 	ctx.Mode = modeSSH
+	ctx.SystemName = strings.TrimSpace(host)
 	ctx.SSHHost = host
 	ctx.Image = ""
 	ctx.VMID = ""
