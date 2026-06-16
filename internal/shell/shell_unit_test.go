@@ -431,7 +431,7 @@ func TestGuestPersistentShellRestartsWhenIsolationChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare shared run: %v", err)
 	}
-	shared, err := sh.guestPersistentShell(sharedCtx, sharedReq)
+	shared, err := sh.guestPersistentShell(sharedCtx, sharedReq, nil, nil)
 	if err != nil {
 		t.Fatalf("start shared shell: %v", err)
 	}
@@ -443,7 +443,7 @@ func TestGuestPersistentShellRestartsWhenIsolationChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare isolated run: %v", err)
 	}
-	isolated, err := sh.guestPersistentShell(isolatedCtx, isolatedReq)
+	isolated, err := sh.guestPersistentShell(isolatedCtx, isolatedReq, nil, nil)
 	if err != nil {
 		t.Fatalf("start isolated shell: %v", err)
 	}
@@ -2203,7 +2203,7 @@ func TestHostCommandInterruptIsNotFatal(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("host interrupt test uses POSIX shell commands")
 	}
-	session, err := startPersistentHostShell(t.TempDir(), nil, 80, 24, "")
+	session, err := startPersistentHostShell(t.TempDir(), nil, 80, 24, "", nil, nil)
 	if err != nil {
 		t.Fatalf("start persistent host shell: %v", err)
 	}
@@ -2721,6 +2721,35 @@ func TestPersistentHostShellRunsShortCommandsAndPipelines(t *testing.T) {
 	}
 }
 
+func TestPersistentHostShellStartupPromptIsVisibleAndInteractive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("persistent host shell requires a Unix PTY")
+	}
+	t.Setenv("SHELL", "/bin/sh")
+	home := t.TempDir()
+	env := []string{
+		"HOME=" + home,
+		"PATH=" + os.Getenv("PATH"),
+		"ENV=/dev/null",
+	}
+	var output bytes.Buffer
+	prelude := "printf 'startup prompt? '; read answer; printf 'startup answer=%s\\n' \"$answer\"; "
+	session, err := startPersistentHostShell(t.TempDir(), env, 80, 24, prelude, &output, func(session *persistentHostShell) (func(), error) {
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			_, _ = session.tty.Write([]byte("yes\n"))
+		}()
+		return func() {}, nil
+	})
+	if err != nil {
+		t.Fatalf("start persistent host shell with startup prompt: %v\nstartup output:\n%s", err, output.String())
+	}
+	t.Cleanup(session.close)
+	if got := output.String(); !strings.Contains(got, "startup prompt?") || !strings.Contains(got, "startup answer=yes") {
+		t.Fatalf("startup output = %q, want prompt and forwarded answer", got)
+	}
+}
+
 func TestHostCommandPreludeFallsBackWhenCapturedInitIsTooLarge(t *testing.T) {
 	largePrelude := strings.Repeat("alias x=true\n", maxEmbeddedHostInitPreludeBytes/len("alias x=true\n")+2)
 	got, fallback := hostCommandPreludeFromCapture(largePrelude, nil)
@@ -2740,7 +2769,7 @@ func TestPersistentHostShellCanReadForwardedInput(t *testing.T) {
 		t.Skip("persistent host shell requires a Unix PTY")
 	}
 	dir := t.TempDir()
-	session, err := startPersistentHostShell(dir, nil, 80, 24, "")
+	session, err := startPersistentHostShell(dir, nil, 80, 24, "", nil, nil)
 	if err != nil {
 		t.Fatalf("start persistent host shell: %v", err)
 	}
@@ -2769,7 +2798,7 @@ func TestPersistentHostShellStreamsPartialOutputBeforeCompletion(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("persistent host shell requires a Unix PTY")
 	}
-	session, err := startPersistentHostShell(t.TempDir(), nil, 80, 24, "")
+	session, err := startPersistentHostShell(t.TempDir(), nil, 80, 24, "", nil, nil)
 	if err != nil {
 		t.Fatalf("start persistent host shell: %v", err)
 	}

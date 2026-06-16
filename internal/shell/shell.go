@@ -95,6 +95,7 @@ type shellState struct {
 	completion       *vmshCompleter
 	tmuxExec         func([]string) error
 	interruptSignals <-chan os.Signal
+	evaluatingPaste  bool
 }
 
 type imagePullContextAPI interface {
@@ -1189,7 +1190,7 @@ func (s *shellState) warmHostShell(stdout, stderr io.Writer) {
 		return
 	}
 	env := hostCommandEnv(s.env, terminalEnv(cols, rows))
-	_, _ = s.hostPersistentShell(env, cols, rows, stderr)
+	_, _ = s.hostPersistentShell(env, cols, rows, stdout, stderr, false)
 }
 
 func (s *shellState) evalLineEditor(in *os.File, stdout, stderr io.Writer) error {
@@ -1304,6 +1305,11 @@ func (s *shellState) evalScriptLines(in io.Reader, stdout, stderr io.Writer) err
 }
 
 func (s *shellState) evalPastedLines(text string, stdout, stderr io.Writer) error {
+	previous := s.evaluatingPaste
+	s.evaluatingPaste = true
+	defer func() {
+		s.evaluatingPaste = previous
+	}()
 	return s.evalScriptLinesWithEcho(strings.NewReader(text), stdout, stderr, func(block string) error {
 		s.drawPromptStatus(stdout)
 		lines := strings.Split(block, "\n")
@@ -2543,7 +2549,7 @@ func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 		env = mergedEnv(os.Environ(), shellEnv(s.env))
 	}
 	if persistentHostCommandAllowed(line) {
-		session, err := s.hostPersistentShell(env, cols, rows, stderr)
+		session, err := s.hostPersistentShell(env, cols, rows, stdout, stderr, true)
 		if err == nil {
 			var interrupted *atomic.Bool
 			err = session.run(line, stdout, stderr, func() (func(), error) {
@@ -3786,7 +3792,7 @@ func (s *shellState) enterSudoSubshell(ctx commandContext, stdout, stderr io.Wri
 		if err != nil {
 			return err
 		}
-		session, err := s.guestPersistentShell(ctx, req)
+		session, err := s.guestPersistentShell(ctx, req, stdout, stderr)
 		if err != nil {
 			return err
 		}
@@ -3991,11 +3997,17 @@ func persistentShellCommandAllowed(line string) bool {
 	return err == nil && len(fields) > 0
 }
 
-func (s *shellState) hostPersistentShell(env []string, cols, rows int, stderr io.Writer) (*persistentHostShell, error) {
+func (s *shellState) hostPersistentShell(env []string, cols, rows int, stdout, stderr io.Writer, forwardStartupInput bool) (*persistentHostShell, error) {
 	if s.hostShell != nil {
 		return s.hostShell, nil
 	}
-	session, err := startPersistentHostShell(s.hostCWD, env, cols, rows, s.hostCommandPrelude(true))
+	session, err := startPersistentHostShell(s.hostCWD, env, cols, rows, s.hostCommandPrelude(true), stdout, func(session *persistentHostShell) (func(), error) {
+		if stdout == nil || !forwardStartupInput || s.evaluatingPaste {
+			return func() {}, nil
+		}
+		stop, _, err := s.startHostPTYForwarding(true, session, stdout, stderr)
+		return stop, err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -4003,7 +4015,7 @@ func (s *shellState) hostPersistentShell(env []string, cols, rows int, stderr io
 	return session, nil
 }
 
-func startPersistentHostShell(cwd string, env []string, cols, rows int, prelude string) (*persistentHostShell, error) {
+func startPersistentHostShell(cwd string, env []string, cols, rows int, prelude string, startupOutput io.Writer, startForwarding func(*persistentHostShell) (func(), error)) (*persistentHostShell, error) {
 	script := prelude + persistentHostShellScript()
 	cmd := exec.Command(hostShell(), "-ic", script)
 	cmd.Dir = cwd
@@ -4044,6 +4056,22 @@ func startPersistentHostShell(cwd string, env []string, cols, rows int, prelude 
 		session.done <- cmd.Wait()
 	}()
 	go session.forwardPTYOutput()
+	stopForwarding := func() {}
+	if startupOutput != nil {
+		session.setOutput(startupOutput)
+		defer session.setOutput(nil)
+	}
+	if startForwarding != nil {
+		stop, err := startForwarding(session)
+		if err != nil {
+			session.close()
+			return nil, err
+		}
+		if stop != nil {
+			stopForwarding = stop
+		}
+	}
+	defer stopForwarding()
 	if err := session.waitReady(); err != nil {
 		session.close()
 		return nil, err
@@ -4066,7 +4094,7 @@ func persistentHostShellScript() string {
 		"}",
 		"__vmsh_run() {",
 		"  stty echo 2>/dev/null || true",
-		"  command eval \"$1\"",
+		"  eval \"$1\"",
 		"  __vmsh_status=$?",
 		"  stty -echo 2>/dev/null || true",
 		"  __vmsh_report done \"$__vmsh_status\"",
@@ -4561,7 +4589,7 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 		return err
 	}
 	if tty && persistentGuestCommandAllowed(line) {
-		session, err := s.guestPersistentShell(ctx, req)
+		session, err := s.guestPersistentShell(ctx, req, stdout, stderr)
 		if err != nil {
 			s.lastCode = 1
 			return err
@@ -4680,7 +4708,7 @@ func persistentGuestCommandAllowed(line string) bool {
 	return persistentShellCommandAllowed(line)
 }
 
-func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequest) (*persistentGuestShell, error) {
+func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequest, stdout, stderr io.Writer) (*persistentGuestShell, error) {
 	key := guestPersistentShellKey(ctx, req)
 	if s.guestShell != nil && s.guestShell.key == key {
 		return s.guestShell, nil
@@ -4716,7 +4744,19 @@ func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequ
 		close(events)
 		done <- err
 	}()
-	if err := session.waitReady(); err != nil {
+	stopForwarding := func() {}
+	if stdout != nil {
+		stop, err := s.startGuestInputForwarding(req.TTY, !s.evaluatingPaste, inputs, stdout, stderr)
+		if err != nil {
+			session.close()
+			return nil, err
+		}
+		if stop != nil {
+			stopForwarding = stop
+		}
+	}
+	defer stopForwarding()
+	if err := session.waitReady(stdout, stderr); err != nil {
 		session.close()
 		return nil, err
 	}
@@ -4762,7 +4802,7 @@ func guestPersistentCommand() []string {
 		"}",
 		"__vmsh_run() {",
 		"  stty echo 2>/dev/null || true",
-		"  command eval \"$1\"",
+		"  eval \"$1\"",
 		"  __vmsh_status=$?",
 		"  stty -echo 2>/dev/null || true",
 		"  __vmsh_report done \"$__vmsh_status\"",
@@ -4772,7 +4812,7 @@ func guestPersistentCommand() []string {
 	}, "\n")}
 }
 
-func (p *persistentGuestShell) waitReady() error {
+func (p *persistentGuestShell) waitReady(stdout, stderr io.Writer) error {
 	timer := time.NewTimer(defaultGuestShellReadyTimeout)
 	defer timer.Stop()
 	var startup strings.Builder
@@ -4799,8 +4839,14 @@ func (p *persistentGuestShell) waitReady() error {
 			case "stdout", "output":
 				text := execEventText(event)
 				appendPersistentStartupOutput(&startup, text)
+				if stdout != nil {
+					writeTTYExecEventOutput(stdout, event)
+				}
 			case "stderr":
 				appendPersistentStartupOutput(&startup, execEventText(event))
+				if stderr != nil {
+					writeTTYExecEventOutput(stderr, event)
+				}
 			case "exit":
 				if msg := persistentStartupMessage(startup.String()); msg != "" {
 					return fmt.Errorf("persistent guest shell exited before ready: %s", msg)

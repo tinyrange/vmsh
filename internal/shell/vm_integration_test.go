@@ -402,6 +402,9 @@ func TestVMIntegrationInteractivePasteCopiesDirectoryMetadataHostToVMToHost(t *t
 	}, "\n") + "\n"
 	session.write(paste)
 	session.expectOccurrences("VM_COPY_PASTE_DONE", 2, 60*time.Second)
+	waitForPath(t, filepath.Join(dst, "script.sh"), 60*time.Second, func() string {
+		return session.snapshot()
+	})
 
 	assertCopiedMetadataTree(t, src, dst)
 }
@@ -1078,6 +1081,24 @@ func assertCopiedMetadataTree(t *testing.T, src, dst string) {
 	}
 	if info, err := os.Stat(filepath.Join(dst, "empty")); err != nil || !info.IsDir() {
 		t.Fatalf("copied empty dir info = %v err=%v, want directory", info, err)
+	}
+}
+
+func waitForPath(t *testing.T, path string, timeout time.Duration, debug func() string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			msg := ""
+			if debug != nil {
+				msg = "\noutput:\n" + debug()
+			}
+			t.Fatalf("timed out waiting for %s%s", path, msg)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
