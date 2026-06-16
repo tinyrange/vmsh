@@ -524,7 +524,7 @@ func sshPersistentShellSidebandScript(ctx commandContext, controlPath string) st
 		"}",
 		"__vmsh_run() {",
 		"  stty echo 2>/dev/null || true",
-		"  eval \"$1\" 2>&1",
+		"  command eval \"$1\" 2>&1",
 		"  __vmsh_status=$?",
 		"  stty -echo 2>/dev/null || true",
 		"  __vmsh_report done \"$__vmsh_status\"",
