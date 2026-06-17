@@ -2394,7 +2394,7 @@ func TestBuiltInNetBSDImageDoesNotPull(t *testing.T) {
 	}
 }
 
-func TestBuiltInOpenBSDAndFreeBSDImagesAllowSupportedCCVMHosts(t *testing.T) {
+func TestBuiltInBSDImagesAllowSupportedCCVMHosts(t *testing.T) {
 	for _, tc := range []struct {
 		image string
 		host  string
@@ -2405,6 +2405,9 @@ func TestBuiltInOpenBSDAndFreeBSDImagesAllowSupportedCCVMHosts(t *testing.T) {
 		{image: "@freebsd", host: "linux/amd64"},
 		{image: "@freebsd", host: "linux/arm64"},
 		{image: "@freebsd", host: "darwin/arm64"},
+		{image: "@netbsd", host: "linux/amd64"},
+		{image: "@netbsd", host: "linux/arm64"},
+		{image: "@netbsd", host: "darwin/arm64"},
 	} {
 		t.Run(tc.image+"_"+tc.host, func(t *testing.T) {
 			api := newRecordingShellAPI()
@@ -2431,7 +2434,7 @@ func TestBuiltInBSDImagesRejectUnsupportedCCVMHost(t *testing.T) {
 	}{
 		{image: "@openbsd", name: "OpenBSD", host: "windows/amd64", want: "linux/amd64, linux/arm64, or darwin/arm64"},
 		{image: "@freebsd", name: "FreeBSD", host: "windows/amd64", want: "linux/amd64, linux/arm64, or darwin/arm64"},
-		{image: "@netbsd", name: "NetBSD", host: "darwin/arm64", want: "linux/amd64"},
+		{image: "@netbsd", name: "NetBSD", host: "windows/amd64", want: "linux/amd64, linux/arm64, or darwin/arm64"},
 	} {
 		t.Run(tc.image, func(t *testing.T) {
 			api := newRecordingShellAPI()
