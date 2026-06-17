@@ -629,6 +629,9 @@ func newVMIntegrationTestEnv(t *testing.T) *vmIntegrationTestEnv {
 		t.Skip("skipping VM integration test in short mode")
 	}
 	skipUnsupportedVMIntegrationPlatform(t)
+	bootTimeout := vmIntegrationTimeoutSeconds()
+	t.Setenv("CCX3_VM_BOOT_TIMEOUT", bootTimeout)
+	t.Setenv("VMSH_VM_BOOT_TIMEOUT", bootTimeout)
 
 	cacheBase := os.TempDir()
 	if runtime.GOOS == "darwin" {
@@ -648,8 +651,8 @@ func newVMIntegrationTestEnv(t *testing.T) *vmIntegrationTestEnv {
 		Path: ccvm,
 		Env: []string{
 			"CCX3_OCI_SHARED_CACHE_DIR=" + filepath.Join(cacheDir, "oci-shared"),
-			"CCX3_VM_BOOT_TIMEOUT=" + vmIntegrationTimeoutSeconds(),
-			"VMSH_VM_BOOT_TIMEOUT=" + vmIntegrationTimeoutSeconds(),
+			"CCX3_VM_BOOT_TIMEOUT=" + bootTimeout,
+			"VMSH_VM_BOOT_TIMEOUT=" + bootTimeout,
 		},
 	}, cacheDir, statePath)
 	if err != nil {
