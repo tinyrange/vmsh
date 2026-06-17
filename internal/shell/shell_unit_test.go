@@ -536,6 +536,9 @@ func TestBuiltInOpenBSDRunSkipsHostShare(t *testing.T) {
 	if api.starts[0].req.Image != "@openbsd" {
 		t.Fatalf("started image = %q, want @openbsd", api.starts[0].req.Image)
 	}
+	if api.starts[0].req.NestedVirt {
+		t.Fatalf("OpenBSD start nested virt = true, want false by default")
+	}
 	if len(api.runs) != 1 {
 		t.Fatalf("runs = %d, want 1", len(api.runs))
 	}
@@ -2392,18 +2395,48 @@ func TestBuiltInNetBSDImageDoesNotPull(t *testing.T) {
 	}
 }
 
+func TestBuiltInOpenBSDAndFreeBSDImagesAllowSupportedCCVMHosts(t *testing.T) {
+	for _, tc := range []struct {
+		image string
+		host  string
+	}{
+		{image: "@openbsd", host: "linux/amd64"},
+		{image: "@openbsd", host: "linux/arm64"},
+		{image: "@openbsd", host: "darwin/arm64"},
+		{image: "@freebsd", host: "linux/amd64"},
+		{image: "@freebsd", host: "linux/arm64"},
+		{image: "@freebsd", host: "darwin/arm64"},
+	} {
+		t.Run(tc.image+"_"+tc.host, func(t *testing.T) {
+			api := newRecordingShellAPI()
+			api.capabilities = client.CapabilitiesResponse{Host: tc.host, VMSupported: true}
+			api.pullStream = func(context.Context, string, client.PullImageRequest, func(client.ProgressEvent) error) error {
+				t.Fatalf("built-in %s image attempted to pull", tc.image)
+				return nil
+			}
+			sh := newUnitShell(t, api)
+
+			if err := sh.ensureImageAvailable(commandContext{Mode: modeVM, Image: tc.image}, io.Discard); err != nil {
+				t.Fatalf("ensure %s image on %s: %v", tc.image, tc.host, err)
+			}
+		})
+	}
+}
+
 func TestBuiltInBSDImagesRejectUnsupportedCCVMHost(t *testing.T) {
 	for _, tc := range []struct {
 		image string
 		name  string
+		host  string
+		want  string
 	}{
-		{image: "@openbsd", name: "OpenBSD"},
-		{image: "@freebsd", name: "FreeBSD"},
-		{image: "@netbsd", name: "NetBSD"},
+		{image: "@openbsd", name: "OpenBSD", host: "windows/amd64", want: "linux/amd64, linux/arm64, or darwin/arm64"},
+		{image: "@freebsd", name: "FreeBSD", host: "windows/amd64", want: "linux/amd64, linux/arm64, or darwin/arm64"},
+		{image: "@netbsd", name: "NetBSD", host: "darwin/arm64", want: "linux/amd64"},
 	} {
 		t.Run(tc.image, func(t *testing.T) {
 			api := newRecordingShellAPI()
-			api.capabilities = client.CapabilitiesResponse{Host: "darwin/arm64", VMSupported: true}
+			api.capabilities = client.CapabilitiesResponse{Host: tc.host, VMSupported: true}
 			api.pullStream = func(context.Context, string, client.PullImageRequest, func(client.ProgressEvent) error) error {
 				t.Fatalf("unsupported built-in %s image attempted to pull", tc.name)
 				return nil
@@ -2414,7 +2447,7 @@ func TestBuiltInBSDImagesRejectUnsupportedCCVMHost(t *testing.T) {
 			if err == nil {
 				t.Fatalf("ensure %s image succeeded, want unsupported host error", tc.name)
 			}
-			if !strings.Contains(err.Error(), tc.name+" guests are currently only supported") || !strings.Contains(err.Error(), "linux/amd64") || !strings.Contains(err.Error(), "darwin/arm64") {
+			if !strings.Contains(err.Error(), tc.name+" guests are currently only supported") || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), tc.host) {
 				t.Fatalf("error = %v", err)
 			}
 		})

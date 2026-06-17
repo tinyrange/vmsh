@@ -6073,16 +6073,38 @@ func (s *shellState) ensureBuiltInGuestSupported(ctx commandContext) error {
 	if s.api != nil {
 		caps, err := s.api.Capabilities()
 		if err != nil {
-			return fmt.Errorf("%s guest support requires ccvm on linux/amd64; could not determine ccvm host platform: %w", builtInGuestDisplayName(image), err)
+			return fmt.Errorf("%s guest support requires ccvm on %s; could not determine ccvm host platform: %w", builtInGuestDisplayName(image), supportedBuiltInGuestHostsText(image), err)
 		}
 		if strings.TrimSpace(caps.Host) != "" {
 			host = strings.TrimSpace(caps.Host)
 		}
 	}
-	if host == "linux/amd64" {
+	if builtInGuestHostSupported(image, host) {
 		return nil
 	}
-	return fmt.Errorf("%s guests are currently only supported when ccvm is running on linux/amd64; current ccvm host is %s", builtInGuestDisplayName(image), host)
+	return fmt.Errorf("%s guests are currently only supported when ccvm is running on %s; current ccvm host is %s", builtInGuestDisplayName(image), supportedBuiltInGuestHostsText(image), host)
+}
+
+func builtInGuestHostSupported(image, host string) bool {
+	switch canonicalBuiltInGuestImage(image) {
+	case "@openbsd", "@freebsd":
+		return host == "linux/amd64" || host == "linux/arm64" || host == "darwin/arm64"
+	case "@netbsd":
+		return host == "linux/amd64"
+	default:
+		return true
+	}
+}
+
+func supportedBuiltInGuestHostsText(image string) string {
+	switch canonicalBuiltInGuestImage(image) {
+	case "@openbsd", "@freebsd":
+		return "linux/amd64, linux/arm64, or darwin/arm64"
+	case "@netbsd":
+		return "linux/amd64"
+	default:
+		return "a supported host"
+	}
 }
 
 func builtInGuestDisplayName(image string) string {
@@ -8086,6 +8108,9 @@ func vmCommandContext(base commandContext, opts commandOptions, image string) co
 	}
 	ctx.SystemName = normalizedVMID(ctx.VMID)
 	ctx.Image = image
+	if opts.NestedVirt == nil && isBuiltInGuestImage(image) {
+		ctx.NestedVirt = false
+	}
 	ctx.SSHHost = ""
 	if opts.InitSystem == nil {
 		ctx.InitSystem = defaultInitSystemForImage(image)
