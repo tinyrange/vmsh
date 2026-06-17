@@ -351,7 +351,7 @@ func (c *vmshCompleter) sourceNames(token string) []string {
 		seen[name] = true
 		out = append(out, name)
 	}
-	for _, name := range []string{"ubuntu", "freebsd", "openbsd"} {
+	for _, name := range []string{"ubuntu", "freebsd", "openbsd", "netbsd"} {
 		add(name)
 	}
 	for _, image := range c.cachedImageNames() {
@@ -5943,6 +5943,8 @@ func isBuiltInGuestImage(image string) bool {
 		return true
 	case "@freebsd", "freebsd":
 		return true
+	case "@netbsd", "netbsd":
+		return true
 	default:
 		return false
 	}
@@ -5954,6 +5956,8 @@ func canonicalBuiltInGuestImage(image string) string {
 		return "@openbsd"
 	case "@freebsd", "freebsd":
 		return "@freebsd"
+	case "@netbsd", "netbsd":
+		return "@netbsd"
 	default:
 		return strings.TrimSpace(image)
 	}
@@ -6061,7 +6065,7 @@ func (s *shellState) ensureImageAvailable(ctx commandContext, stderr io.Writer) 
 func (s *shellState) ensureBuiltInGuestSupported(ctx commandContext) error {
 	image := canonicalBuiltInGuestImage(ctx.Image)
 	switch image {
-	case "@freebsd", "@openbsd":
+	case "@freebsd", "@openbsd", "@netbsd":
 	default:
 		return nil
 	}
@@ -6087,6 +6091,8 @@ func builtInGuestDisplayName(image string) string {
 		return "FreeBSD"
 	case "@openbsd":
 		return "OpenBSD"
+	case "@netbsd":
+		return "NetBSD"
 	default:
 		return strings.TrimPrefix(strings.TrimSpace(image), "@")
 	}
@@ -6276,7 +6282,7 @@ func vmshBootTimeoutSeconds(image string) float64 {
 	}
 	if raw == "" {
 		switch canonicalBuiltInGuestImage(image) {
-		case "@freebsd", "@openbsd":
+		case "@freebsd", "@openbsd", "@netbsd":
 			return defaultBuiltInBSDBootTimeoutSeconds
 		}
 		return defaultVMSHBootTimeoutSeconds
@@ -8227,7 +8233,7 @@ func (s *shellState) validateNewSystemName(name string, source systemSource) err
 
 func isReservedImageSystemName(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "ubuntu", "freebsd", "openbsd":
+	case "ubuntu", "freebsd", "openbsd", "netbsd":
 		return true
 	default:
 		return false

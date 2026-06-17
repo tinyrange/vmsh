@@ -867,6 +867,43 @@ func TestBuiltInFreeBSDRunSkipsHostShare(t *testing.T) {
 	}
 }
 
+func TestBuiltInNetBSDRunSkipsHostShare(t *testing.T) {
+	api := newRecordingShellAPI()
+	sh := newUnitShell(t, api)
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@netbsd --vm nbsd --memory 1024 --cpus 1 --no-network", &stdout, &stderr); err != nil {
+		t.Fatalf("enter NetBSD context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	if err := sh.eval("uname -s", &stdout, &stderr); err != nil {
+		t.Fatalf("run NetBSD command: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	if api.starts[0].req.Image != "@netbsd" {
+		t.Fatalf("started image = %q, want @netbsd", api.starts[0].req.Image)
+	}
+	if len(api.runs) != 1 {
+		t.Fatalf("runs = %d, want 1", len(api.runs))
+	}
+	run := api.runs[0].req
+	if run.Image != "@netbsd" {
+		t.Fatalf("run image = %q, want @netbsd", run.Image)
+	}
+	if len(run.Shares) != 0 {
+		t.Fatalf("NetBSD run shares = %+v, want none", run.Shares)
+	}
+	if run.User != "root" {
+		t.Fatalf("NetBSD run user = %q, want root", run.User)
+	}
+	if run.WorkDir != "/root" {
+		t.Fatalf("NetBSD run workdir = %q, want /root", run.WorkDir)
+	}
+	if run.WorkDir == guestHostMount || strings.HasPrefix(run.WorkDir, guestHostMount+"/") {
+		t.Fatalf("NetBSD run workdir = %q, should not use host mount", run.WorkDir)
+	}
+}
+
 func TestBareVMOptionsStartVMWhenActivated(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	sh := newUnitShell(t, api)
@@ -2335,6 +2372,26 @@ func TestBuiltInFreeBSDImageDoesNotPull(t *testing.T) {
 	}
 }
 
+func TestBuiltInNetBSDImageDoesNotPull(t *testing.T) {
+	api := newRecordingShellAPI()
+	api.pullStream = func(context.Context, string, client.PullImageRequest, func(client.ProgressEvent) error) error {
+		t.Fatal("built-in NetBSD image attempted to pull")
+		return nil
+	}
+	sh := newUnitShell(t, api)
+	sh.confirmPull = func(source string, stderr io.Writer) (bool, error) {
+		t.Fatalf("built-in NetBSD image prompted to pull %q", source)
+		return false, nil
+	}
+
+	if err := sh.ensureImageAvailable(commandContext{Mode: modeVM, Image: "@netbsd", Arch: "amd64"}, io.Discard); err != nil {
+		t.Fatalf("ensure built-in NetBSD image: %v", err)
+	}
+	if got := localImageName("netbsd", "amd64"); got != "@netbsd" {
+		t.Fatalf("local NetBSD image name = %q, want @netbsd", got)
+	}
+}
+
 func TestBuiltInBSDImagesRejectUnsupportedCCVMHost(t *testing.T) {
 	for _, tc := range []struct {
 		image string
@@ -2342,6 +2399,7 @@ func TestBuiltInBSDImagesRejectUnsupportedCCVMHost(t *testing.T) {
 	}{
 		{image: "@openbsd", name: "OpenBSD"},
 		{image: "@freebsd", name: "FreeBSD"},
+		{image: "@netbsd", name: "NetBSD"},
 	} {
 		t.Run(tc.image, func(t *testing.T) {
 			api := newRecordingShellAPI()
