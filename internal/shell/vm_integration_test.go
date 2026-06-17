@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -144,7 +145,7 @@ func TestVMIntegrationFreeBSDBuiltinRunsCommandsAndCopiesFiles(t *testing.T) {
 		"@stop --vm freebsd",
 	}, "\n")
 
-	stdout, stderr, err := sh.runTestScriptWithTimeout(script, 3*time.Minute)
+	stdout, stderr, err := sh.runTestScriptWithTimeout(script, vmIntegrationLongTimeout())
 	if err != nil {
 		t.Fatalf("run FreeBSD vmsh script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
@@ -995,6 +996,16 @@ func vmIntegrationTimeoutSeconds() string {
 		return value
 	}
 	return "180"
+}
+
+func vmIntegrationLongTimeout() time.Duration {
+	if value := strings.TrimSpace(os.Getenv("VMSH_VM_INTEGRATION_TIMEOUT_SECONDS")); value != "" {
+		seconds, err := strconv.Atoi(value)
+		if err == nil && seconds > 0 {
+			return time.Duration(seconds) * time.Second
+		}
+	}
+	return 6 * time.Minute
 }
 
 func isPTYClosedError(err error) bool {

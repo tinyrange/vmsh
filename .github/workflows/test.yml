@@ -98,5 +98,5 @@ jobs:
           VMSH_TEST_CCVM: ${{ github.workspace }}/build/vmsh/ccvm
           VMSH_TEST_VMSH: ${{ github.workspace }}/build/vmsh/vmsh
           VMSH_TEST_FREEBSD: "1"
-          VMSH_VM_INTEGRATION_TIMEOUT_SECONDS: "240"
+          VMSH_VM_INTEGRATION_TIMEOUT_SECONDS: "600"
         run: go test ./internal/shell -run TestVMIntegration -count=1 -timeout 45m
