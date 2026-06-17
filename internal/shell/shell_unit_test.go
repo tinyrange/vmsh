@@ -29,7 +29,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -2681,7 +2680,7 @@ func TestStreamSSHPTYStdinForwardsDelayedInputBytes(t *testing.T) {
 	}
 	defer inR.Close()
 	defer inW.Close()
-	if err := syscall.SetNonblock(int(inR.Fd()), true); err != nil {
+	if err := setNonblockForTest(inR); err != nil {
 		t.Fatalf("set nonblock: %v", err)
 	}
 	outR, outW, err := os.Pipe()
