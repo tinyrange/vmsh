@@ -4071,17 +4071,30 @@ func TestSSHCopyStreamsTarOverConnection(t *testing.T) {
 		switch {
 		case strings.Contains(command, "tar -xf -"):
 			tr := tar.NewReader(stdin)
-			header, err := tr.Next()
-			if err != nil {
-				_, _ = fmt.Fprintf(stderr, "read tar: %v", err)
+			var got string
+			for {
+				header, err := tr.Next()
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				if err != nil {
+					_, _ = fmt.Fprintf(stderr, "read tar: %v", err)
+					return 1
+				}
+				data, err := io.ReadAll(tr)
+				if err != nil {
+					_, _ = fmt.Fprintf(stderr, "read file: %v", err)
+					return 1
+				}
+				if header.Typeflag == tar.TypeReg || header.Typeflag == tar.TypeRegA {
+					got = header.Name + ":" + string(data)
+				}
+			}
+			if got == "" {
+				_, _ = fmt.Fprint(stderr, "read tar: no regular file entries")
 				return 1
 			}
-			data, err := io.ReadAll(tr)
-			if err != nil {
-				_, _ = fmt.Fprintf(stderr, "read file: %v", err)
-				return 1
-			}
-			received <- header.Name + ":" + string(data)
+			received <- got
 			return 0
 		case strings.Contains(command, "tar -cf -"):
 			tw := tar.NewWriter(stdout)
