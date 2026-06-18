@@ -4070,28 +4070,9 @@ func TestSSHCopyStreamsTarOverConnection(t *testing.T) {
 	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
 		switch {
 		case strings.Contains(command, "tar -xf -"):
-			tr := tar.NewReader(stdin)
-			var got string
-			for {
-				header, err := tr.Next()
-				if errors.Is(err, io.EOF) {
-					break
-				}
-				if err != nil {
-					_, _ = fmt.Fprintf(stderr, "read tar: %v", err)
-					return 1
-				}
-				data, err := io.ReadAll(tr)
-				if err != nil {
-					_, _ = fmt.Fprintf(stderr, "read file: %v", err)
-					return 1
-				}
-				if header.Typeflag == tar.TypeReg || header.Typeflag == tar.TypeRegA {
-					got = header.Name + ":" + string(data)
-				}
-			}
-			if got == "" {
-				_, _ = fmt.Fprint(stderr, "read tar: no regular file entries")
+			got, err := readSingleRegularTarPayload(stdin)
+			if err != nil {
+				_, _ = fmt.Fprintf(stderr, "read tar: %v", err)
 				return 1
 			}
 			received <- got
@@ -4138,6 +4119,31 @@ func TestSSHCopyStreamsTarOverConnection(t *testing.T) {
 	if string(data) != "from-ssh" {
 		t.Fatalf("copied local data = %q", string(data))
 	}
+}
+
+func readSingleRegularTarPayload(r io.Reader) (string, error) {
+	tr := tar.NewReader(r)
+	var got string
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			return "", fmt.Errorf("read %s: %w", header.Name, err)
+		}
+		if header.Typeflag == tar.TypeReg || header.Typeflag == tar.TypeRegA {
+			got = header.Name + ":" + string(data)
+		}
+	}
+	if got == "" {
+		return "", fmt.Errorf("no regular file entries")
+	}
+	return got, nil
 }
 
 func TestCopyProgressIsQuietForNonTerminalStderr(t *testing.T) {
@@ -4644,18 +4650,12 @@ func TestSSHCopyBetweenActiveSessions(t *testing.T) {
 		case strings.Contains(command, "mkfifo") || strings.Contains(command, "__vmsh_control_path"):
 			return dstSideband.handler(t)(command, stdin, stdout, stderr)
 		case strings.Contains(command, "tar -xf -"):
-			tr := tar.NewReader(stdin)
-			header, err := tr.Next()
+			got, err := readSingleRegularTarPayload(stdin)
 			if err != nil {
 				_, _ = fmt.Fprintf(stderr, "read tar: %v", err)
 				return 1
 			}
-			data, err := io.ReadAll(tr)
-			if err != nil {
-				_, _ = fmt.Fprintf(stderr, "read file: %v", err)
-				return 1
-			}
-			received <- header.Name + ":" + string(data)
+			received <- got
 			return 0
 		default:
 			return 0
