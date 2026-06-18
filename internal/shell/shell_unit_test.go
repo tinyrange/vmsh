@@ -4101,7 +4101,7 @@ func TestSSHCopyStreamsTarOverConnection(t *testing.T) {
 	}
 	select {
 	case got := <-received:
-		if got != "remote.txt:to-ssh" {
+		if got != "local.txt:to-ssh" {
 			t.Fatalf("remote tar payload = %q", got)
 		}
 	case <-time.After(2 * time.Second):
@@ -4118,6 +4118,51 @@ func TestSSHCopyStreamsTarOverConnection(t *testing.T) {
 	}
 	if string(data) != "from-ssh" {
 		t.Fatalf("copied local data = %q", string(data))
+	}
+}
+
+func TestSSHCopyUploadUsesConflictSafeExtractCommand(t *testing.T) {
+	commands := make(chan string, 1)
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		if strings.Contains(command, "tar -xf -") {
+			commands <- command
+			if _, err := io.Copy(io.Discard, stdin); err != nil {
+				_, _ = fmt.Fprintf(stderr, "drain tar: %v", err)
+				return 1
+			}
+		}
+		return 0
+	})
+	server.installConfig(t, "test-ssh-conflict")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	src := filepath.Join(sh.hostCWD, "local.txt")
+	if err := os.WriteFile(src, []byte("to-ssh"), 0o644); err != nil {
+		t.Fatalf("write local source: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	if err := sh.copyPath("@host:local.txt @ssh:test-ssh-conflict:/tmp/remote.txt", &stdout, &stderr); err != nil {
+		t.Fatalf("copy local to ssh: %v\nstderr:\n%s", err, stderr.String())
+	}
+
+	var command string
+	select {
+	case command = <-commands:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("remote extract command was not received")
+	}
+	for _, want := range []string{
+		"if false || [ -d \"$dst\" ]; then",
+		"cannot overwrite non-directory with directory",
+		"cannot overwrite directory with non-directory",
+		"rm -f -- \"$dst\"",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("remote extract command missing %q in:\n%s", want, command)
+		}
+	}
+	if strings.Contains(command, "rm -rf -- \"$dst\"") {
+		t.Fatalf("remote extract command recursively removes dst:\n%s", command)
 	}
 }
 
@@ -4216,7 +4261,7 @@ func TestSSHCopyPreservesDirectoryMetadataHostToSSHToHost(t *testing.T) {
 	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
 		switch {
 		case strings.Contains(command, "tar -xf -"):
-			if err := extractTarToHost(stdin, copyTargetPath{path: remoteRoot, directory: true}); err != nil {
+			if err := extractTarToHost(stdin, copyTargetPath{path: filepath.Join(remoteRoot, "ssh-meta")}); err != nil {
 				_, _ = fmt.Fprintf(stderr, "extract remote tar: %v", err)
 				return 1
 			}
@@ -4255,7 +4300,7 @@ func TestCopyPreservesWeirdFilenamesHostAndSSH(t *testing.T) {
 	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
 		switch {
 		case strings.Contains(command, "tar -xf -"):
-			if err := extractTarToHost(stdin, copyTargetPath{path: remoteRoot, directory: true}); err != nil {
+			if err := extractTarToHost(stdin, copyTargetPath{path: filepath.Join(remoteRoot, "weird-src")}); err != nil {
 				_, _ = fmt.Fprintf(stderr, "extract remote tar: %v", err)
 				return 1
 			}
@@ -4429,7 +4474,7 @@ func TestCopyGuestDirectoryMetadataToSSH(t *testing.T) {
 		if !strings.Contains(command, "tar -xf -") {
 			return 0
 		}
-		if err := extractTarToHost(stdin, copyTargetPath{path: remoteRoot, directory: true}); err != nil {
+		if err := extractTarToHost(stdin, copyTargetPath{path: filepath.Join(remoteRoot, "ssh-meta")}); err != nil {
 			_, _ = fmt.Fprintf(stderr, "extract remote tar: %v", err)
 			return 1
 		}
@@ -4503,7 +4548,7 @@ func TestCopyGuestFileToSSHHost(t *testing.T) {
 	}
 	select {
 	case got := <-received:
-		if got != "to-ssh.txt:from-vm" {
+		if got != "from-vm.txt:from-vm" {
 			t.Fatalf("ssh received = %q", got)
 		}
 	case <-time.After(2 * time.Second):
@@ -5026,6 +5071,124 @@ func TestExtractTarToHostDirectoryDestinationSemantics(t *testing.T) {
 	}
 }
 
+func TestExtractTarToHostConflictSemantics(t *testing.T) {
+	t.Run("file over file overwrites", func(t *testing.T) {
+		var archive bytes.Buffer
+		if err := writeSingleFileTar(&archive, "src.txt", "new"); err != nil {
+			t.Fatalf("write archive: %v", err)
+		}
+		dst := filepath.Join(t.TempDir(), "dst.txt")
+		if err := os.WriteFile(dst, []byte("old"), 0o644); err != nil {
+			t.Fatalf("write dst: %v", err)
+		}
+
+		if err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: dst}); err != nil {
+			t.Fatalf("extract file over file: %v", err)
+		}
+		if got := readTestFile(t, dst); got != "new" {
+			t.Fatalf("dst content = %q, want new", got)
+		}
+	})
+
+	t.Run("file into directory copies under source name", func(t *testing.T) {
+		var archive bytes.Buffer
+		if err := writeSingleFileTar(&archive, "src.txt", "payload"); err != nil {
+			t.Fatalf("write archive: %v", err)
+		}
+		dst := t.TempDir()
+
+		if err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: dst}); err != nil {
+			t.Fatalf("extract file into directory: %v", err)
+		}
+		if got := readTestFile(t, filepath.Join(dst, "src.txt")); got != "payload" {
+			t.Fatalf("copied file content = %q, want payload", got)
+		}
+	})
+
+	t.Run("directory over file fails", func(t *testing.T) {
+		var archive bytes.Buffer
+		if err := writePathTar(&archive, makeTestCopyTree(t), "tree"); err != nil {
+			t.Fatalf("write archive: %v", err)
+		}
+		dst := filepath.Join(t.TempDir(), "dst")
+		if err := os.WriteFile(dst, []byte("keep"), 0o644); err != nil {
+			t.Fatalf("write dst: %v", err)
+		}
+
+		err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: dst})
+		if err == nil || !strings.Contains(err.Error(), "cannot overwrite non-directory with directory") {
+			t.Fatalf("extract directory over file error = %v", err)
+		}
+		if got := readTestFile(t, dst); got != "keep" {
+			t.Fatalf("dst content = %q, want keep", got)
+		}
+	})
+
+	t.Run("directory into directory merges under source name", func(t *testing.T) {
+		var archive bytes.Buffer
+		if err := writePathTar(&archive, makeTestCopyTree(t), "tree"); err != nil {
+			t.Fatalf("write archive: %v", err)
+		}
+		dst := filepath.Join(t.TempDir(), "dst")
+		if err := os.MkdirAll(filepath.Join(dst, "tree", "nested"), 0o755); err != nil {
+			t.Fatalf("make dst nested: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dst, "tree", "nested", "old.txt"), []byte("old"), 0o644); err != nil {
+			t.Fatalf("write old file: %v", err)
+		}
+
+		if err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: dst}); err != nil {
+			t.Fatalf("extract directory into directory: %v", err)
+		}
+		if got := readTestFile(t, filepath.Join(dst, "tree", "nested", "file.txt")); got != "payload" {
+			t.Fatalf("new nested file = %q, want payload", got)
+		}
+		if got := readTestFile(t, filepath.Join(dst, "tree", "nested", "old.txt")); got != "old" {
+			t.Fatalf("old nested file = %q, want old", got)
+		}
+	})
+
+	t.Run("non-directory over directory fails when forced exact", func(t *testing.T) {
+		var archive bytes.Buffer
+		if err := writeSingleFileTar(&archive, "src.txt", "payload"); err != nil {
+			t.Fatalf("write archive: %v", err)
+		}
+		dst := filepath.Join(t.TempDir(), "dst")
+		if err := os.Mkdir(dst, 0o755); err != nil {
+			t.Fatalf("make dst dir: %v", err)
+		}
+
+		err := extractTarToHostExact(bytes.NewReader(archive.Bytes()), dst)
+		if err == nil || !strings.Contains(err.Error(), "cannot overwrite directory with non-directory") {
+			t.Fatalf("extract file over directory error = %v", err)
+		}
+		if info, err := os.Stat(dst); err != nil || !info.IsDir() {
+			t.Fatalf("dst dir stat = %v info=%v", err, info)
+		}
+	})
+}
+
+func extractTarToHostExact(r io.Reader, dst string) error {
+	tr := tar.NewReader(r)
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		target, err := hostTarTarget(dst, copyDestExact, header.Name)
+		if err != nil {
+			return err
+		}
+		incomingDir := header.Typeflag == tar.TypeDir
+		if err := ensureHostTarTargetCompatible(target, incomingDir); err != nil {
+			return err
+		}
+	}
+}
+
 func makeTestCopyTree(t *testing.T) string {
 	t.Helper()
 	src := filepath.Join(t.TempDir(), "tree")
@@ -5039,6 +5202,17 @@ func makeTestCopyTree(t *testing.T) string {
 		t.Fatalf("write nested file: %v", err)
 	}
 	return src
+}
+
+func writeSingleFileTar(w io.Writer, name, content string) error {
+	tw := tar.NewWriter(w)
+	if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(content))}); err != nil {
+		return err
+	}
+	if _, err := tw.Write([]byte(content)); err != nil {
+		return err
+	}
+	return tw.Close()
 }
 
 func readTestFile(t *testing.T, path string) string {

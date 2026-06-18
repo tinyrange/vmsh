@@ -156,6 +156,12 @@ Copy endpoints use explicit context prefixes so accidental names fail early:
 @copy @image:alpine:/tmp/out @host:./out     # image context by name
 ```
 
+`@copy` follows normal copy semantics across host, VM, isolated VM, and SSH
+endpoints: files overwrite files, existing directory destinations receive the
+source by name and merge with existing contents, and directory/non-directory
+type conflicts fail instead of replacing the destination. Copy errors include
+both source and destination endpoints.
+
 Supported options:
 
 ```sh

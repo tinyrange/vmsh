@@ -3354,8 +3354,17 @@ func (s *shellState) runGuestCopyExtractCommand(ctx commandContext, archiveGuest
 		"  tmp=$(mktemp -d \"${TMPDIR:-/tmp}/vmsh-copy.XXXXXX\")",
 		"  trap 'rm -rf \"$tmp\"' EXIT HUP INT TERM",
 		"  tar -xf \"$archive\" -C \"$tmp\"",
-		"  rm -rf -- \"$dst\"",
-		"  mv -- \"$tmp/$root\" \"$dst\"",
+		"  src=\"$tmp/$root\"",
+		"  if [ -d \"$src\" ] && [ -e \"$dst\" ] && [ ! -d \"$dst\" ]; then",
+		"    echo \"copy conflict at $dst: cannot overwrite non-directory with directory\" >&2",
+		"    exit 1",
+		"  fi",
+		"  if [ ! -d \"$src\" ] && [ -d \"$dst\" ]; then",
+		"    echo \"copy conflict at $dst: cannot overwrite directory with non-directory\" >&2",
+		"    exit 1",
+		"  fi",
+		"  rm -f -- \"$dst\"",
+		"  mv -- \"$src\" \"$dst\"",
 		"fi",
 	}, "\n")
 	return s.runGuestFSRequest(ctx, client.ExecRequest{
@@ -3617,12 +3626,18 @@ func extractTarToHost(r io.Reader, dst copyTargetPath) error {
 		}
 		switch header.Typeflag {
 		case tar.TypeDir:
+			if err := ensureHostTarTargetCompatible(target, true); err != nil {
+				return err
+			}
 			if err := os.MkdirAll(target, os.FileMode(header.Mode).Perm()); err != nil {
 				return err
 			}
 			_ = os.Chmod(target, os.FileMode(header.Mode).Perm())
 			dirs = append(dirs, tarDirMtime{path: target, mtime: header.ModTime})
 		case tar.TypeSymlink:
+			if err := ensureHostTarTargetCompatible(target, false); err != nil {
+				return err
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
@@ -3633,6 +3648,9 @@ func extractTarToHost(r io.Reader, dst copyTargetPath) error {
 				return err
 			}
 		case tar.TypeReg, tar.TypeRegA:
+			if err := ensureHostTarTargetCompatible(target, false); err != nil {
+				return err
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
@@ -3658,6 +3676,25 @@ func extractTarToHost(r io.Reader, dst copyTargetPath) error {
 		default:
 			continue
 		}
+	}
+}
+
+func ensureHostTarTargetCompatible(target string, incomingDir bool) error {
+	info, err := os.Lstat(target)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	existingDir := info.IsDir()
+	switch {
+	case incomingDir && !existingDir:
+		return fmt.Errorf("copy conflict at %s: cannot overwrite non-directory with directory", target)
+	case !incomingDir && existingDir:
+		return fmt.Errorf("copy conflict at %s: cannot overwrite directory with non-directory", target)
+	default:
+		return nil
 	}
 }
 
@@ -7807,6 +7844,7 @@ func (s *shellState) help(w io.Writer) error {
 @save [name|--vm id] tag save a VM root filesystem as a local image
 @rmi image               remove a locally cached image
 @copy SRC DST            copy between @:path, @host:path, @name:path, @vm:id:path, @ssh:host:path, and @image:name:path
+                         files overwrite files; existing directory destinations merge; directory/non-directory conflicts fail
 @agent codex [args]      run Codex inside the current VM with host ~/.codex mounted
 @agent --proxy codex     run Codex through a host auth proxy without mounting ~/.codex
 @tmux [session]          open tmux with vmsh as the default pane command

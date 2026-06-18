@@ -1685,22 +1685,43 @@ func (s *shellState) copyLocalToSSH(src string, ctx commandContext, dst copyTarg
 	if _, err := os.Stat(src); err != nil {
 		return err
 	}
-	remoteDir := dst.path
 	rootName := filepath.Base(src)
-	if !dst.directory {
-		remoteDir = path.Dir(dst.path)
-		rootName = path.Base(dst.path)
-	}
-	if remoteDir == "." {
-		remoteDir = s.currentSSHCWD(ctx)
-	}
 	pr, pw := io.Pipe()
 	go func() {
 		progress.Phase("uploading")
 		err := writePathTar(copyProgressWriter{w: pw, progress: progress}, src, rootName)
 		_ = pw.CloseWithError(err)
 	}()
-	command := remoteMkdirCommand(remoteDir) + " && " + remoteCDCommand(remoteDir) + " && tar -xf -"
+	dstPath := dst.path
+	if dstPath == "." {
+		dstPath = s.currentSSHCWD(ctx)
+	}
+	command := strings.Join([]string{
+		"set -eu",
+		"dst=" + shellQuote(dstPath),
+		"root=" + shellQuote(filepath.ToSlash(rootName)),
+		"if " + boolShellTest(dst.directory) + " || [ -d \"$dst\" ]; then",
+		"  mkdir -p -- \"$dst\"",
+		"  tar -xf - -C \"$dst\"",
+		"else",
+		"  parent=$(dirname -- \"$dst\")",
+		"  mkdir -p -- \"$parent\"",
+		"  tmp=$(mktemp -d \"${TMPDIR:-/tmp}/vmsh-copy.XXXXXX\")",
+		"  trap 'rm -rf \"$tmp\"' EXIT HUP INT TERM",
+		"  tar -xf - -C \"$tmp\"",
+		"  src=\"$tmp/$root\"",
+		"  if [ -d \"$src\" ] && [ -e \"$dst\" ] && [ ! -d \"$dst\" ]; then",
+		"    echo \"copy conflict at $dst: cannot overwrite non-directory with directory\" >&2",
+		"    exit 1",
+		"  fi",
+		"  if [ ! -d \"$src\" ] && [ -d \"$dst\" ]; then",
+		"    echo \"copy conflict at $dst: cannot overwrite directory with non-directory\" >&2",
+		"    exit 1",
+		"  fi",
+		"  rm -f -- \"$dst\"",
+		"  mv -- \"$src\" \"$dst\"",
+		"fi",
+	}, "\n")
 	err := s.runSSHCommand(ctx, command, pr, io.Discard, stderr, false, false)
 	if err != nil {
 		return err
