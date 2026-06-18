@@ -4738,7 +4738,10 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 }
 
 func guestSupportsHostShares(ctx commandContext) bool {
-	return !isBuiltInGuestImage(ctx.Image)
+	if !isBuiltInGuestImage(ctx.Image) {
+		return true
+	}
+	return runtime.GOOS == "linux" && runtime.GOARCH == "amd64"
 }
 
 func persistentGuestCommandAllowed(line string) bool {

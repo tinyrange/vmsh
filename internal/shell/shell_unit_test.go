@@ -519,7 +519,7 @@ func TestIsolatedContextUsesSeparateBackendVM(t *testing.T) {
 	}
 }
 
-func TestBuiltInOpenBSDRunSkipsHostShare(t *testing.T) {
+func TestBuiltInOpenBSDRunHostShareBehavior(t *testing.T) {
 	api := newRecordingShellAPI()
 	sh := newUnitShell(t, api)
 	var stdout, stderr bytes.Buffer
@@ -545,17 +545,9 @@ func TestBuiltInOpenBSDRunSkipsHostShare(t *testing.T) {
 	if run.Image != "@openbsd" {
 		t.Fatalf("run image = %q, want @openbsd", run.Image)
 	}
-	if len(run.Shares) != 0 {
-		t.Fatalf("OpenBSD run shares = %+v, want none", run.Shares)
-	}
+	assertBuiltinBSDHostShareBehavior(t, commandContext{Image: "@openbsd"}, run)
 	if run.User != "root" {
 		t.Fatalf("OpenBSD run user = %q, want root", run.User)
-	}
-	if run.WorkDir != "/root" {
-		t.Fatalf("OpenBSD run workdir = %q, want /root", run.WorkDir)
-	}
-	if run.WorkDir == guestHostMount || strings.HasPrefix(run.WorkDir, guestHostMount+"/") {
-		t.Fatalf("OpenBSD run workdir = %q, should not use host mount", run.WorkDir)
 	}
 }
 
@@ -832,7 +824,7 @@ func TestUbuntuNoInitRefusesRunningSystemdVM(t *testing.T) {
 	}
 }
 
-func TestBuiltInFreeBSDRunSkipsHostShare(t *testing.T) {
+func TestBuiltInFreeBSDRunHostShareBehavior(t *testing.T) {
 	api := newRecordingShellAPI()
 	sh := newUnitShell(t, api)
 	var stdout, stderr bytes.Buffer
@@ -855,21 +847,13 @@ func TestBuiltInFreeBSDRunSkipsHostShare(t *testing.T) {
 	if run.Image != "@freebsd" {
 		t.Fatalf("run image = %q, want @freebsd", run.Image)
 	}
-	if len(run.Shares) != 0 {
-		t.Fatalf("FreeBSD run shares = %+v, want none", run.Shares)
-	}
+	assertBuiltinBSDHostShareBehavior(t, commandContext{Image: "@freebsd"}, run)
 	if run.User != "root" {
 		t.Fatalf("FreeBSD run user = %q, want root", run.User)
 	}
-	if run.WorkDir != "/root" {
-		t.Fatalf("FreeBSD run workdir = %q, want /root", run.WorkDir)
-	}
-	if run.WorkDir == guestHostMount || strings.HasPrefix(run.WorkDir, guestHostMount+"/") {
-		t.Fatalf("FreeBSD run workdir = %q, should not use host mount", run.WorkDir)
-	}
 }
 
-func TestBuiltInNetBSDRunSkipsHostShare(t *testing.T) {
+func TestBuiltInNetBSDRunHostShareBehavior(t *testing.T) {
 	api := newRecordingShellAPI()
 	sh := newUnitShell(t, api)
 	var stdout, stderr bytes.Buffer
@@ -892,17 +876,28 @@ func TestBuiltInNetBSDRunSkipsHostShare(t *testing.T) {
 	if run.Image != "@netbsd" {
 		t.Fatalf("run image = %q, want @netbsd", run.Image)
 	}
-	if len(run.Shares) != 0 {
-		t.Fatalf("NetBSD run shares = %+v, want none", run.Shares)
-	}
+	assertBuiltinBSDHostShareBehavior(t, commandContext{Image: "@netbsd"}, run)
 	if run.User != "root" {
 		t.Fatalf("NetBSD run user = %q, want root", run.User)
 	}
-	if run.WorkDir != "/root" {
-		t.Fatalf("NetBSD run workdir = %q, want /root", run.WorkDir)
+}
+
+func assertBuiltinBSDHostShareBehavior(t *testing.T, ctx commandContext, run client.RunRequest) {
+	t.Helper()
+	if guestSupportsHostShares(ctx) {
+		if len(run.Shares) != 1 || run.Shares[0].Mount != guestHostMount || !run.Shares[0].Writable {
+			t.Fatalf("%s run shares = %+v, want writable host share", ctx.Image, run.Shares)
+		}
+		if run.WorkDir != guestHostMount && !strings.HasPrefix(run.WorkDir, guestHostMount+"/") {
+			t.Fatalf("%s run workdir = %q, want host share path", ctx.Image, run.WorkDir)
+		}
+		return
 	}
-	if run.WorkDir == guestHostMount || strings.HasPrefix(run.WorkDir, guestHostMount+"/") {
-		t.Fatalf("NetBSD run workdir = %q, should not use host mount", run.WorkDir)
+	if len(run.Shares) != 0 {
+		t.Fatalf("%s run shares = %+v, want none", ctx.Image, run.Shares)
+	}
+	if run.WorkDir != "/root" {
+		t.Fatalf("%s run workdir = %q, want /root", ctx.Image, run.WorkDir)
 	}
 }
 
@@ -1039,11 +1034,20 @@ func TestOpenBSDContextUsesGuestHomeInsteadOfHostShare(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare OpenBSD run: %v", err)
 	}
-	if req.WorkDir != "/root" {
-		t.Fatalf("openbsd workdir = %q, want discovered guest home instead of host share cwd", req.WorkDir)
-	}
-	if len(req.Shares) != 0 {
-		t.Fatalf("openbsd shares = %+v, want none", req.Shares)
+	if guestSupportsHostShares(sh.context) {
+		if req.WorkDir != path.Join(guestHostMount, "Users/example/project") {
+			t.Fatalf("openbsd workdir = %q, want host share cwd", req.WorkDir)
+		}
+		if len(req.Shares) != 1 || req.Shares[0].Mount != guestHostMount {
+			t.Fatalf("openbsd shares = %+v, want host share", req.Shares)
+		}
+	} else {
+		if req.WorkDir != "/root" {
+			t.Fatalf("openbsd workdir = %q, want discovered guest home instead of host share cwd", req.WorkDir)
+		}
+		if len(req.Shares) != 0 {
+			t.Fatalf("openbsd shares = %+v, want none", req.Shares)
+		}
 	}
 	if backendVMID(sh.context) != "open" {
 		t.Fatalf("openbsd backend id = %q, want non-isolated id open", backendVMID(sh.context))
@@ -4920,7 +4924,13 @@ func TestShellTargetsExposeLocalPathSemantics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openbsd guest target: %v", err)
 	}
-	if got, ok := openBSDTarget.LocalPath(path.Join(guestHostMount, "data.txt")); ok || got != "" {
+	openBSDPath := path.Join(guestHostMount, "data.txt")
+	if guestSupportsHostShares(openBSDTarget.Context()) {
+		wantOpenBSDHostPath := string(filepath.Separator) + "data.txt"
+		if got, ok := openBSDTarget.LocalPath(openBSDPath); !ok || got != wantOpenBSDHostPath {
+			t.Fatalf("openbsd guest local path = %q, %t; want %q, true", got, ok, wantOpenBSDHostPath)
+		}
+	} else if got, ok := openBSDTarget.LocalPath(openBSDPath); ok || got != "" {
 		t.Fatalf("openbsd guest local path = %q, %t; want empty, false", got, ok)
 	}
 }
