@@ -153,7 +153,7 @@ func TestVMIntegrationFreeBSDBuiltinRunsCommandsAndCopiesFiles(t *testing.T) {
 	requireContains(t, stdout, "context: vm")
 	requireContains(t, stdout, "image: @freebsd")
 	requireContains(t, stdout, "vm: freebsd")
-	requireContains(t, stdout, "/root")
+	requireContains(t, stdout, "/host"+sh.hostCWD)
 	requireContains(t, stdout, "root-workdir")
 	requireContains(t, stdout, "from-host")
 	requireContains(t, stdout, "direct:from-host")

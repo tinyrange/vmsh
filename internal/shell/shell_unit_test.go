@@ -903,15 +903,18 @@ func assertBuiltinBSDHostShareBehavior(t *testing.T, ctx commandContext, run cli
 
 func TestBuiltInBSDTargetsSwitchFromActiveGuestContext(t *testing.T) {
 	for _, tc := range []struct {
+		base  string
 		line  string
 		image string
 		vmid  string
 	}{
-		{line: "@openbsd", image: "@openbsd", vmid: "openbsd"},
-		{line: "@freebsd", image: "@freebsd", vmid: "freebsd"},
-		{line: "@netbsd", image: "@netbsd", vmid: "netbsd"},
+		{base: "@alpine", line: "@openbsd", image: "@openbsd", vmid: "openbsd"},
+		{base: "@alpine", line: "@freebsd", image: "@freebsd", vmid: "freebsd"},
+		{base: "@alpine", line: "@netbsd", image: "@netbsd", vmid: "netbsd"},
+		{base: "@freebsd", line: "@openbsd", image: "@openbsd", vmid: "openbsd"},
+		{base: "@freebsd", line: "@netbsd", image: "@netbsd", vmid: "netbsd"},
 	} {
-		t.Run(tc.image, func(t *testing.T) {
+		t.Run(tc.base+"_to_"+tc.image, func(t *testing.T) {
 			api := newRecordingShellAPI("alpine")
 			api.pullStream = func(context.Context, string, client.PullImageRequest, func(client.ProgressEvent) error) error {
 				t.Fatalf("built-in target %s attempted to pull image", tc.image)
@@ -919,8 +922,8 @@ func TestBuiltInBSDTargetsSwitchFromActiveGuestContext(t *testing.T) {
 			}
 			sh := newUnitShell(t, api)
 			var stdout, stderr bytes.Buffer
-			if err := sh.eval("@alpine --memory 768 --cpus 1 --no-network", &stdout, &stderr); err != nil {
-				t.Fatalf("enter Alpine context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+			if err := sh.eval(tc.base+" --memory 768 --cpus 1 --no-network", &stdout, &stderr); err != nil {
+				t.Fatalf("enter %s context: %v\nstdout:\n%s\nstderr:\n%s", tc.base, err, stdout.String(), stderr.String())
 			}
 			if err := sh.eval(tc.line, &stdout, &stderr); err != nil {
 				t.Fatalf("switch to %s context: %v\nstdout:\n%s\nstderr:\n%s", tc.image, err, stdout.String(), stderr.String())
@@ -929,7 +932,7 @@ func TestBuiltInBSDTargetsSwitchFromActiveGuestContext(t *testing.T) {
 				t.Fatalf("context = %+v, want %s VM %s", sh.context, tc.image, tc.vmid)
 			}
 			if len(api.starts) != 2 {
-				t.Fatalf("starts = %+v, want alpine and %s", api.starts, tc.image)
+				t.Fatalf("starts = %+v, want %s and %s", api.starts, tc.base, tc.image)
 			}
 			if got := api.starts[1].req.Image; got != tc.image {
 				t.Fatalf("second start image = %q, want %q", got, tc.image)

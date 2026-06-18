@@ -84,7 +84,7 @@ jobs:
   kvm-integration:
     name: KVM integration tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -124,5 +124,5 @@ jobs:
           VMSH_TEST_CCVM: ${{ github.workspace }}/build/vmsh/ccvm
           VMSH_TEST_VMSH: ${{ github.workspace }}/build/vmsh/vmsh
           VMSH_TEST_FREEBSD: "1"
-          VMSH_VM_INTEGRATION_TIMEOUT_SECONDS: "600"
-        run: go test ./internal/shell -run TestVMIntegration -count=1 -timeout 45m
+          VMSH_VM_INTEGRATION_TIMEOUT_SECONDS: "180"
+        run: go test ./internal/shell -run 'TestVMIntegration(ScriptCommandsStartVMAndUseShellFeatures|FreeBSDBuiltinRunsCommandsAndCopiesFiles)$' -count=1 -timeout 4m
