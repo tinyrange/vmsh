@@ -135,6 +135,45 @@ func TestNormalizeDemoCastTimeline(t *testing.T) {
 	}
 }
 
+func TestNormalizeDemoCastTimelineCompressesBootSpinner(t *testing.T) {
+	input := `{"version":2,"width":80,"height":24}` + "\n" +
+		`[10,"o","\r\u001b[2K- Boot: starting VM"]` + "\n" +
+		`[11,"o","\r\u001b[2K\\ Boot: starting VM"]` + "\n" +
+		`[12,"o","\r\u001b[2K| Boot: starting VM"]` + "\n" +
+		`[13,"o","\r\u001b[2K/ Boot: starting VM"]` + "\n" +
+		`[14,"o","\r\u001b[2K- Boot: starting VM"]` + "\n" +
+		`[15,"o","\r\u001b[2K\\ Boot: starting VM"]` + "\n" +
+		`[16,"o","\r\u001b[2K| Boot: starting VM"]` + "\n" +
+		`[97,"o","Boot: ready freebsd"]` + "\n" +
+		`[98,"o","FreeBSD"]` + "\n"
+	got := normalizeDemoCastTimeline(input)
+	if strings.Contains(got, `[6,"o","\r\u001b[2K| Boot: starting VM"]`) {
+		t.Fatalf("long spinner event was not dropped: %s", got)
+	}
+	var readyTime, freeBSDTime float64
+	for _, line := range strings.Split(got, "\n") {
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "{") {
+			continue
+		}
+		event, err := parseDemoCastEvent(line)
+		if err != nil {
+			t.Fatalf("parse event %q: %v", line, err)
+		}
+		switch event.Data {
+		case "Boot: ready freebsd":
+			readyTime = event.Time
+		case "FreeBSD":
+			freeBSDTime = event.Time
+		}
+	}
+	if readyTime < 1.19 || readyTime > 1.21 {
+		t.Fatalf("boot ready event was not compressed near spinner start: time=%v cast=%s", readyTime, got)
+	}
+	if freeBSDTime < 2.19 || freeBSDTime > 2.21 {
+		t.Fatalf("events after compressed spinner did not keep relative timing: time=%v cast=%s", freeBSDTime, got)
+	}
+}
+
 func TestParseSSHExecPayload(t *testing.T) {
 	payload := make([]byte, 4+len("hostname"))
 	binary.BigEndian.PutUint32(payload[:4], uint32(len("hostname")))

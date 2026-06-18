@@ -901,6 +901,43 @@ func assertBuiltinBSDHostShareBehavior(t *testing.T, ctx commandContext, run cli
 	}
 }
 
+func TestBuiltInBSDTargetsSwitchFromActiveGuestContext(t *testing.T) {
+	for _, tc := range []struct {
+		line  string
+		image string
+		vmid  string
+	}{
+		{line: "@openbsd", image: "@openbsd", vmid: "openbsd"},
+		{line: "@freebsd", image: "@freebsd", vmid: "freebsd"},
+		{line: "@netbsd", image: "@netbsd", vmid: "netbsd"},
+	} {
+		t.Run(tc.image, func(t *testing.T) {
+			api := newRecordingShellAPI("alpine")
+			api.pullStream = func(context.Context, string, client.PullImageRequest, func(client.ProgressEvent) error) error {
+				t.Fatalf("built-in target %s attempted to pull image", tc.image)
+				return nil
+			}
+			sh := newUnitShell(t, api)
+			var stdout, stderr bytes.Buffer
+			if err := sh.eval("@alpine --memory 768 --cpus 1 --no-network", &stdout, &stderr); err != nil {
+				t.Fatalf("enter Alpine context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+			}
+			if err := sh.eval(tc.line, &stdout, &stderr); err != nil {
+				t.Fatalf("switch to %s context: %v\nstdout:\n%s\nstderr:\n%s", tc.image, err, stdout.String(), stderr.String())
+			}
+			if sh.context.Mode != modeVM || sh.context.Image != tc.image || sh.context.VMID != tc.vmid {
+				t.Fatalf("context = %+v, want %s VM %s", sh.context, tc.image, tc.vmid)
+			}
+			if len(api.starts) != 2 {
+				t.Fatalf("starts = %+v, want alpine and %s", api.starts, tc.image)
+			}
+			if got := api.starts[1].req.Image; got != tc.image {
+				t.Fatalf("second start image = %q, want %q", got, tc.image)
+			}
+		})
+	}
+}
+
 func TestBareVMOptionsStartVMWhenActivated(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	sh := newUnitShell(t, api)
@@ -4145,7 +4182,7 @@ func TestSSHCopyUploadUsesConflictSafeExtractCommand(t *testing.T) {
 		t.Fatalf("write local source: %v", err)
 	}
 	var stdout, stderr bytes.Buffer
-	if err := sh.copyPath("@host:local.txt @ssh:test-ssh-conflict:/tmp/remote.txt", &stdout, &stderr); err != nil {
+	if err := sh.copyPath("@host:local.txt @ssh:test-ssh-conflict:~/remote.txt", &stdout, &stderr); err != nil {
 		t.Fatalf("copy local to ssh: %v\nstderr:\n%s", err, stderr.String())
 	}
 
@@ -4156,6 +4193,8 @@ func TestSSHCopyUploadUsesConflictSafeExtractCommand(t *testing.T) {
 		t.Fatalf("remote extract command was not received")
 	}
 	for _, want := range []string{
+		"case \"$dst\" in",
+		"\"~/\"*) dst=\"$HOME/${dst#~/}\" ;;",
 		"if false || [ -d \"$dst\" ]; then",
 		"cannot overwrite non-directory with directory",
 		"cannot overwrite directory with non-directory",

@@ -45,7 +45,8 @@ type API interface {
 }
 
 type DaemonState struct {
-	Addr string `json:"addr"`
+	Addr      string `json:"addr"`
+	LaunchKey string `json:"launch_key,omitempty"`
 }
 
 type CCVMLaunch struct {
@@ -110,9 +111,10 @@ func ConnectCCVM(launch CCVMLaunch, cacheDir, statePath string) (*client.Client,
 }
 
 func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts ConnectOptions) (*client.Client, error) {
+	launchKey := DaemonLaunchKey(launch)
 	if state, err := ReadDaemonState(statePath); err == nil {
 		api := NewClient(state.Addr)
-		if err := api.HealthCheck(); err == nil && apiCompatible(state.Addr, api) {
+		if state.LaunchKey == launchKey && api.HealthCheck() == nil && apiCompatible(state.Addr, api) {
 			if opts.OnReuse != nil {
 				opts.OnReuse(state)
 			}
@@ -147,7 +149,7 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		_ = proc.Wait()
 		return nil, err
 	}
-	if err := WriteDaemonState(statePath, DaemonState{Addr: hello.Addr}); err != nil {
+	if err := WriteDaemonState(statePath, DaemonState{Addr: hello.Addr, LaunchKey: launchKey}); err != nil {
 		_ = proc.Process.Kill()
 		_ = proc.Wait()
 		return nil, fmt.Errorf("write daemon state %s for %s: %w", statePath, hello.Addr, err)
@@ -192,6 +194,23 @@ func CCVMLaunchName(launch CCVMLaunch) string {
 		return launch.Path
 	}
 	return launch.Path + " " + strings.Join(launch.Args, " ")
+}
+
+func DaemonLaunchKey(launch CCVMLaunch) string {
+	path := launch.Path
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	parts := []string{"path=" + path}
+	if info, err := os.Stat(launch.Path); err == nil {
+		parts = append(parts,
+			"size="+strconv.FormatInt(info.Size(), 10),
+			"mtime="+strconv.FormatInt(info.ModTime().UnixNano(), 10),
+		)
+	}
+	parts = append(parts, "args="+strings.Join(launch.Args, "\x1f"))
+	parts = append(parts, "env="+strings.Join(launch.Env, "\x1f"))
+	return strings.Join(parts, "\x00")
 }
 
 func ValidateServerHello(hello client.ServerHello, cacheDir string) error {

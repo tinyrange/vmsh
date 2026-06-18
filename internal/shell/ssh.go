@@ -1699,6 +1699,10 @@ func (s *shellState) copyLocalToSSH(src string, ctx commandContext, dst copyTarg
 	command := strings.Join([]string{
 		"set -eu",
 		"dst=" + shellQuote(dstPath),
+		"case \"$dst\" in",
+		"  \"~\") dst=\"$HOME\" ;;",
+		"  \"~/\"*) dst=\"$HOME/${dst#~/}\" ;;",
+		"esac",
 		"root=" + shellQuote(filepath.ToSlash(rootName)),
 		"if " + boolShellTest(dst.directory) + " || [ -d \"$dst\" ]; then",
 		"  mkdir -p -- \"$dst\"",

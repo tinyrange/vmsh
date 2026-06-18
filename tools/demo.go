@@ -73,9 +73,6 @@ func runDemo(p paths, args []string) error {
 	if err := writeDemoSSHConfig(workRoot, sshSrv.Addr()); err != nil {
 		return err
 	}
-	if err := prepareDemoImage(p, opts); err != nil {
-		return err
-	}
 
 	logf("demo: recording raw session to %s", opts.raw)
 	if err := driveDemoSession(p, opts, workRoot, hostWork); err != nil {
@@ -92,50 +89,6 @@ func runDemo(p paths, args []string) error {
 	if !opts.noGIF {
 		if err := renderDemoGIF(opts.out, opts.gif); err != nil {
 			logf("demo: skipped gif render: %v", err)
-		}
-	}
-	return nil
-}
-
-func prepareDemoImage(p paths, opts demoOptions) error {
-	if strings.TrimSpace(opts.vmImage) == "" {
-		return nil
-	}
-	logf("demo: preparing VM image %s", opts.vmImage)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, p.vmsh, "-ccvm", p.ccvm)
-	cmd.Dir = p.root
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-	ptyFile, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 18, Cols: 110})
-	if err != nil {
-		return err
-	}
-	driver := newDemoPTYDriver(ptyFile, false)
-	defer driver.Close()
-	if err := driver.WaitForAfter("vmsh", 0, 20*time.Second); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return fmt.Errorf("prepare VM image: %w", err)
-	}
-	start := driver.Len()
-	if err := driver.TypeLine(fmt.Sprintf("@%s --vm demo-prep --memory %s --network", opts.vmImage, opts.vmMemory)); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return fmt.Errorf("prepare VM image: %w", err)
-	}
-	if err := driver.WaitForAfterHandlingPrompts("vmsh", start, 2*time.Minute); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return fmt.Errorf("prepare VM image: %w", err)
-	}
-	_ = driver.TypeLine("@stop --vm demo-prep")
-	_ = driver.WaitForAfter("vmsh", driver.Len(), 30*time.Second)
-	_ = driver.TypeLine("exit")
-	if err := cmd.Wait(); err != nil {
-		var exitErr *exec.ExitError
-		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 0 {
-			return fmt.Errorf("prepare VM image: %w", err)
 		}
 	}
 	return nil
@@ -160,7 +113,7 @@ func parseDemoArgs(p paths, args []string) (demoOptions, error) {
 		out:      filepath.Join(p.build, "demo.cast"),
 		raw:      filepath.Join(p.build, "demo.raw.cast"),
 		gif:      filepath.Join(p.build, "demo.gif"),
-		timeout:  5 * time.Minute,
+		timeout:  8 * time.Minute,
 		vmImage:  "alpine",
 		vmMemory: "768m",
 	}
@@ -272,7 +225,7 @@ Options:
   --live              mirror the driven vmsh session to this terminal
   --vm-image IMAGE    VM image to use for the demo (default alpine)
   --memory SIZE       VM memory size for the demo VM (default 768m)
-  --timeout DURATION  whole demo timeout (default 5m)
+  --timeout DURATION  whole demo timeout (default 8m)
 `)
 }
 
@@ -287,11 +240,19 @@ func resolveDemoPath(root, value string) string {
 	return filepath.Join(root, value)
 }
 
+func defaultDemoCacheDir() string {
+	dir, err := os.UserCacheDir()
+	if err != nil || strings.TrimSpace(dir) == "" {
+		return filepath.Join(os.TempDir(), "ccx3")
+	}
+	return filepath.Join(dir, "ccx3")
+}
+
 func driveDemoSession(p paths, opts demoOptions, workRoot, hostWork string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), opts.timeout)
 	defer cancel()
 
-	args := []string{"-ccvm", p.ccvm, "-record", opts.raw}
+	args := []string{"-ccvm", p.ccvm, "-cache-dir", defaultDemoCacheDir(), "-record", opts.raw}
 	cmd := exec.CommandContext(ctx, p.vmsh, args...)
 	cmd.Dir = p.root
 	cmd.Env = append(os.Environ(),
@@ -338,19 +299,23 @@ func driveDemoSession(p paths, opts demoOptions, workRoot, hostWork string) erro
 		expect  string
 		timeout time.Duration
 	}{
-		{fmt.Sprintf("@%s --vm demo --memory %s --network", opts.vmImage, opts.vmMemory), "vm:", 2 * time.Minute},
-		{"cat /etc/os-release | sed -n '1,4p'", "ID=", 15 * time.Second},
-		{demoInstallJSONCommand(opts.vmImage), "jq-", 90 * time.Second},
-		{"sh -lc 'echo hello-from-vm > /tmp/v && cat /tmp/v'", "hello-from-vm", 10 * time.Second},
-		{"@host mkdir -p " + hostWork + " && echo host ready", "host ready", 10 * time.Second},
-		{"@host sh -c 'echo hello-from-host>" + hostWork + "/h'", "vmsh", 10 * time.Second},
-		{"@copy @host:" + hostWork + "/h @ssh:demo-ssh:~/h", "vmsh", 20 * time.Second},
-		{"@ssh demo-ssh hostname && cat h", "hello-from-host", 20 * time.Second},
-		{"@ssh demo-ssh sh -lc 'echo hello-from-ssh > s && cat s'", "hello-from-ssh", 20 * time.Second},
-		{"@copy @ssh:demo-ssh:~/s @host:" + hostWork + "/s", "vmsh", 20 * time.Second},
-		{"@host cat " + hostWork + "/s", "hello-from-ssh", 10 * time.Second},
-		{"@ps", "running", 10 * time.Second},
-		{"@stop --vm demo", "vmsh", 30 * time.Second},
+		{fmt.Sprintf("@demo --from %s --memory %s", opts.vmImage, opts.vmMemory), "vm:", 2 * time.Minute},
+		{"sh -lc 'printf \"guest: \"; uname -srm'", "Linux", 30 * time.Second},
+		{"@host sh -lc 'mkdir -p " + shellSingleQuote(hostWork) + " && printf \"hello-from-host\\n\" > " + shellSingleQuote(filepath.Join(hostWork, "note.txt")) + "'", "vmsh", 20 * time.Second},
+		{"@copy @host:" + hostWork + "/note.txt @:/tmp/note.txt", "vmsh", 20 * time.Second},
+		{"sh -lc 'printf \"vm saw: \"; cat /tmp/note.txt'", "hello-from-host", 30 * time.Second},
+		{"sh -c 'printf \"hello-from-vm\\n\" > /tmp/reply.txt'", "vmsh", 20 * time.Second},
+		{"@copy @:/tmp/reply.txt @host:" + hostWork + "/reply.txt", "vmsh", 20 * time.Second},
+		{"@host sh -c 'printf \"host saw: \"; cat " + hostWork + "/reply.txt'", "hello-from-vm", 20 * time.Second},
+		{"@ssh demo-ssh sh -lc 'printf \"ssh: \"; hostname; printf \"hello-from-ssh\\n\" > ssh.txt'", "ssh:", 20 * time.Second},
+		{"@copy @ssh:demo-ssh:ssh.txt @host:" + hostWork + "/ssh.txt", "vmsh", 20 * time.Second},
+		{"@host sh -c 'printf \"host copied: \"; cat " + hostWork + "/ssh.txt'", "hello-from-ssh", 20 * time.Second},
+		{"@ps", "running", 20 * time.Second},
+		{"@stop ssh:demo-ssh", "vmsh", 20 * time.Second},
+		{"@stop demo", "vmsh", 30 * time.Second},
+		{"@demo-freebsd --from freebsd --memory 1024 --cpus 1", "vm:", 3 * time.Minute},
+		{"sh -lc 'printf \"one more guest: \"; uname -srm'", "FreeBSD", 30 * time.Second},
+		{"@stop demo-freebsd", "vmsh", 30 * time.Second},
 	}
 	for _, item := range commands {
 		if err := send(item.line, item.expect, item.timeout); err != nil {
@@ -374,14 +339,6 @@ func driveDemoSession(p paths, opts demoOptions, workRoot, hostWork string) erro
 		return waitErr
 	}
 	return nil
-}
-
-func demoInstallJSONCommand(image string) string {
-	image = strings.ToLower(strings.TrimSpace(image))
-	if strings.HasPrefix(image, "ubuntu") || strings.HasPrefix(image, "debian") {
-		return "@sudo apt-get update && @sudo apt-get install -y jq && jq -V"
-	}
-	return "@sudo apk add jq && jq -V"
 }
 
 type demoPTYDriver struct {
@@ -770,6 +727,11 @@ func normalizeDemoCastTimeline(text string) string {
 	var firstEvent *float64
 	var out []string
 	var pending *demoCastEvent
+	var timeShift float64
+	var spinnerAnchorRaw float64
+	var spinnerAnchorOut float64
+	var spinnerEvents int
+	inBootSpinner := false
 	flushPending := func() {
 		if pending == nil {
 			return
@@ -798,6 +760,34 @@ func normalizeDemoCastTimeline(text string) string {
 		if event.Time < 0 {
 			event.Time = 0
 		}
+		if isDemoBootSpinnerEvent(event) {
+			if !inBootSpinner {
+				inBootSpinner = true
+				spinnerEvents = 0
+				spinnerAnchorRaw = event.Time
+				spinnerAnchorOut = event.Time - timeShift
+			}
+			spinnerEvents++
+			if spinnerEvents > 6 {
+				continue
+			}
+			event.Time -= timeShift
+		} else {
+			if inBootSpinner {
+				rawDuration := event.Time - spinnerAnchorRaw
+				displayDuration := rawDuration
+				if displayDuration > 1.2 {
+					displayDuration = 1.2
+				}
+				timeShift = event.Time - (spinnerAnchorOut + displayDuration)
+				inBootSpinner = false
+				spinnerEvents = 0
+			}
+			event.Time -= timeShift
+		}
+		if event.Time < 0 {
+			event.Time = 0
+		}
 		if pending != nil && pending.canMerge(event) {
 			pending.Data += event.Data
 			continue
@@ -807,6 +797,10 @@ func normalizeDemoCastTimeline(text string) string {
 	}
 	flushPending()
 	return strings.Join(out, "")
+}
+
+func isDemoBootSpinnerEvent(event demoCastEvent) bool {
+	return event.Kind == "o" && strings.Contains(event.Data, "Boot: starting VM")
 }
 
 type demoCastEvent struct {
