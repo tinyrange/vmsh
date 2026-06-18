@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BSD OCI Artifact Plan</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --text: #202124;
+      --muted: #5f6368;
+      --border: #d9dce1;
+      --bg: #ffffff;
+      --panel: #f7f8fa;
+      --accent: #0b6f6a;
+      --code: #eef3f2;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(980px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 48px 0 72px;
+    }
+
+    header {
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 32px;
+      padding-bottom: 24px;
+    }
+
+    h1, h2, h3 {
+      line-height: 1.2;
+      margin: 0;
+    }
+
+    h1 {
+      font-size: 2.2rem;
+      font-weight: 720;
+    }
+
+    h2 {
+      border-top: 1px solid var(--border);
+      font-size: 1.35rem;
+      margin-top: 34px;
+      padding-top: 28px;
+    }
+
+    h3 {
+      font-size: 1.05rem;
+      margin-top: 22px;
+    }
+
+    p {
+      margin: 12px 0;
+    }
+
+    ul, ol {
+      margin: 12px 0 0;
+      padding-left: 24px;
+    }
+
+    li {
+      margin: 7px 0;
+    }
+
+    code {
+      background: var(--code);
+      border-radius: 4px;
+      padding: 0.12rem 0.28rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    pre {
+      background: #17201f;
+      border-radius: 8px;
+      color: #f4fbfa;
+      overflow-x: auto;
+      padding: 16px;
+    }
+
+    pre code {
+      background: transparent;
+      color: inherit;
+      padding: 0;
+    }
+
+    .summary {
+      color: var(--muted);
+      font-size: 1.05rem;
+      margin-top: 12px;
+      max-width: 780px;
+    }
+
+    .decision {
+      background: var(--panel);
+      border-left: 4px solid var(--accent);
+      margin: 22px 0;
+      padding: 14px 18px;
+    }
+
+    .grid {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      margin-top: 16px;
+    }
+
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+    }
+
+    .card h3 {
+      margin-top: 0;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>BSD OCI Artifact Plan</h1>
+      <p class="summary">
+        Move built-in OpenBSD, FreeBSD, and NetBSD distribution inputs from
+        ad hoc mirror downloads to versioned OCI artifacts published to GHCR,
+        while continuing to build and overlay the vmsh guest init binary locally.
+      </p>
+    </header>
+
+    <section>
+      <h2>Goal</h2>
+      <p>
+        Publish BSD root filesystem and kernel inputs as content-addressed OCI
+        artifacts under:
+      </p>
+      <ul>
+        <li><code>ghcr.io/tinyrange/cc-openbsd:&lt;version&gt;</code></li>
+        <li><code>ghcr.io/tinyrange/cc-freebsd:&lt;version&gt;</code></li>
+        <li><code>ghcr.io/tinyrange/cc-netbsd:&lt;version&gt;</code></li>
+      </ul>
+      <p>
+        The vmsh runtime should pull these artifacts, verify the metadata, load
+        the kernel bytes, read the rootfs tree, apply the existing runtime
+        overlays, and build the bootable BSD filesystem image exactly as it does
+        today.
+      </p>
+
+      <div class="decision">
+        <strong>Key decision:</strong> OCI provides the pristine BSD rootfs and
+        kernel. vmsh still builds and embeds the current guest init binary
+        locally, then overlays init, network config, device nodes, fstab, hosts,
+        resolver config, and any other runtime-specific files.
+      </div>
+    </section>
+
+    <section>
+      <h2>Why Change</h2>
+      <div class="grid">
+        <article class="card">
+          <h3>Reliability</h3>
+          <p>
+            BSD mirror structure, availability, and latency become less visible
+            to users. GHCR gives us a single distribution path and a cacheable
+            registry API.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Reproducibility</h3>
+          <p>
+            Artifacts become digest-addressed. A tag can point at a tested
+            manifest, while callers may pin exact digests for deterministic
+            boot inputs.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Simpler Runtime</h3>
+          <p>
+            The runtime no longer needs per-BSD mirror URL construction,
+            decompression, and release-set fetching as the default path.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section>
+      <h2>Artifact Shape</h2>
+      <p>
+        Use a normal OCI manifest or image manifest rather than placing a
+        single opaque archive inside an image. The rootfs and kernel should be
+        separately identifiable.
+      </p>
+
+      <h3>Recommended Layers</h3>
+      <ul>
+        <li>
+          Root filesystem layer:
+          <code>application/vnd.oci.image.layer.v1.tar+gzip</code>
+        </li>
+        <li>
+          Kernel layer or blob:
+          <code>application/vnd.tinyrange.bsd.kernel.v1</code>
+        </li>
+        <li>
+          Optional metadata layer:
+          <code>application/vnd.tinyrange.bsd.metadata.v1+json</code>
+        </li>
+      </ul>
+
+      <h3>Recommended Annotations</h3>
+      <pre><code>{
+  "org.opencontainers.image.source": "https://github.com/tinyrange/vmsh",
+  "org.opencontainers.image.version": "7.9",
+  "io.tinyrange.bsd.family": "openbsd",
+  "io.tinyrange.bsd.version": "7.9",
+  "io.tinyrange.bsd.guest_arch": "amd64",
+  "io.tinyrange.bsd.kernel.media_type": "application/vnd.tinyrange.bsd.kernel.v1",
+  "io.tinyrange.bsd.rootfs.format": "tar+gzip",
+  "io.tinyrange.bsd.source.mirror": "https://mirror.example.invalid/pub/OpenBSD",
+  "io.tinyrange.bsd.source.checksums": "SHA256"
+}</code></pre>
+
+      <p>
+        The annotations should make it possible to reject the artifact early if
+        the family, version, architecture, or kernel media type does not match
+        what the selected built-in guest profile expects.
+      </p>
+    </section>
+
+    <section>
+      <h2>Runtime Integration</h2>
+      <p>
+        Keep the current managed BSD boundary: callers ask for a
+        <code>rootartifact.Artifact</code> containing kernel bytes, a root block
+        backend, an <code>imagefs.Directory</code>, metadata, and cleanup.
+      </p>
+
+      <ol>
+        <li>
+          Add an OCI-backed BSD artifact provider behind the existing
+          <code>BSDDefinition.BuildArtifact</code> hook.
+        </li>
+        <li>
+          Pull <code>ghcr.io/tinyrange/cc-&lt;bsd&gt;:&lt;version&gt;</code>
+          into the existing OCI store or a small adjacent artifact cache.
+        </li>
+        <li>
+          Resolve the rootfs layer as an <code>imagefs.Directory</code>.
+        </li>
+        <li>
+          Resolve the kernel layer into raw kernel bytes.
+        </li>
+        <li>
+          Build the guest init binary locally for the active guest architecture.
+        </li>
+        <li>
+          Apply the existing per-BSD overlays for init, fstab, network, hosts,
+          resolver config, device nodes, and runtime defaults.
+        </li>
+        <li>
+          Build the FFS/UFS root block image and boot with the existing KVM,
+          HVF, or WHP managed BSD path.
+        </li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>Local Utility</h2>
+      <p>
+        The initial implementation lives at <code>cc/cmd/bsdoci</code>. It
+        downloads or reads BSD release inputs, normalizes the rootfs to a gzip
+        OCI layer, extracts the raw kernel as a separate custom layer, writes an
+        OCI image layout, and can push the manifest and blobs to an OCI registry.
+      </p>
+
+      <h3>Build an OCI layout from upstream sources</h3>
+      <pre><code>cd cc
+go run ./cmd/bsdoci \
+  --family openbsd \
+  --version 7.9 \
+  --arch amd64 \
+  --cache-dir ../.cache/bsdoci \
+  --out ../build/bsdoci/openbsd-7.9-amd64</code></pre>
+
+      <h3>Push to a local registry</h3>
+      <pre><code>cd cc
+go run ./cmd/bsdoci \
+  --family openbsd \
+  --version 7.9 \
+  --arch amd64 \
+  --cache-dir ../.cache/bsdoci \
+  --push localhost:5000/tinyrange/cc-openbsd:7.9 \
+  --plain-http</code></pre>
+
+      <h3>Dry-run a GHCR push</h3>
+      <pre><code>cd cc
+go run ./cmd/bsdoci \
+  --family openbsd \
+  --version 7.9 \
+  --arch amd64 \
+  --cache-dir ../.cache/bsdoci \
+  --push ghcr.io/tinyrange/cc-openbsd:7.9 \
+  --dry-run</code></pre>
+
+      <p>
+        For fast local testing, pass <code>--source-dir</code> with files named
+        like the upstream artifacts, such as <code>bsd</code> and
+        <code>base79.tgz</code> for OpenBSD 7.9.
+      </p>
+    </section>
+
+    <section>
+      <h2>Guest Init Policy</h2>
+      <p>
+        Do not publish vmsh's live guest init binary inside these OCI artifacts
+        as the runtime contract. The init binary is coupled to the vmsh host
+        code and guest-agent protocol, so baking it into published BSD images
+        would create version skew.
+      </p>
+      <p>
+        The OCI artifact should contain only the upstream-derived BSD rootfs and
+        kernel inputs. vmsh should continue to compile the correct
+        <code>cc-openbsd-init</code>, <code>cc-freebsd-init</code>, or
+        <code>cc-netbsd-init</code> binary at runtime or from its local cache,
+        then overlay that binary into the root filesystem.
+      </p>
+    </section>
+
+    <section>
+      <h2>Tagging</h2>
+      <p>
+        Start with stable version tags and digest pinning support.
+      </p>
+      <ul>
+        <li><code>ghcr.io/tinyrange/cc-openbsd:7.9</code></li>
+        <li><code>ghcr.io/tinyrange/cc-freebsd:15.1</code></li>
+        <li><code>ghcr.io/tinyrange/cc-netbsd:10.1</code></li>
+      </ul>
+      <p>
+        If a version needs republishing, prefer a new build metadata tag such as
+        <code>7.9-r2</code> and update the default mapping intentionally. Users
+        who need exact reproducibility should be able to pin by digest.
+      </p>
+    </section>
+
+    <section>
+      <h2>Multi-Arch</h2>
+      <p>
+        BSD guest architecture is not always the same concept as OCI platform
+        architecture. The manifest should be explicit about guest architecture.
+      </p>
+      <ul>
+        <li>OpenBSD amd64 for Linux amd64 hosts.</li>
+        <li>OpenBSD arm64 for Linux arm64 and Darwin arm64 hosts.</li>
+        <li>FreeBSD amd64 and arm64 where supported.</li>
+        <li>NetBSD amd64 and <code>evbarm-aarch64</code> where supported.</li>
+      </ul>
+      <p>
+        OCI platform fields can still be used for registry selection, but vmsh
+        should verify <code>io.tinyrange.bsd.guest_arch</code> before booting.
+      </p>
+    </section>
+
+    <section>
+      <h2>Fallback And Rollout</h2>
+      <ol>
+        <li>
+          Build and publish OCI artifacts in CI from the same upstream release
+          inputs currently downloaded at runtime.
+        </li>
+        <li>
+          Add an OCI artifact provider and keep the current mirror provider as
+          fallback.
+        </li>
+        <li>
+          Switch built-in BSD defaults to GHCR artifacts.
+        </li>
+        <li>
+          Emit clear progress messages: pulling artifact, reading kernel,
+          building local init, applying overlay, building root block.
+        </li>
+        <li>
+          Once stable, make mirror fallback opt-in or keep it as a recovery path
+          for development builds.
+        </li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>Risks To Check</h2>
+      <ul>
+        <li>
+          Confirm redistribution expectations for OpenBSD, FreeBSD, and NetBSD
+          release artifacts.
+        </li>
+        <li>
+          Confirm GHCR public pull behavior and size limits for the largest BSD
+          rootfs layers.
+        </li>
+        <li>
+          Verify the OCI store preserves file metadata needed by BSD rootfs
+          builds: uid, gid, modes, symlinks, hardlinks, and device-node intent.
+        </li>
+        <li>
+          Decide whether custom kernel media types should be accepted by the
+          existing OCI pull code or handled by a dedicated artifact reader.
+        </li>
+        <li>
+          Add digest verification and source checksum recording so the build
+          pipeline is auditable.
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Definition Of Done</h2>
+      <ul>
+        <li>
+          <code>@openbsd</code>, <code>@freebsd</code>, and
+          <code>@netbsd</code> boot from GHCR-backed artifacts by default.
+        </li>
+        <li>
+          The runtime still builds and overlays the current local guest init
+          binary.
+        </li>
+        <li>
+          Digest-pinned artifacts boot successfully.
+        </li>
+        <li>
+          Mirror download remains available during rollout.
+        </li>
+        <li>
+          CI validates each published artifact by booting it and running a basic
+          guest command through the managed control channel.
+        </li>
+      </ul>
+      <p class="muted">
+        This plan intentionally keeps boot, network, and guest-agent behavior in
+        the existing managed BSD runtime. The distribution mechanism changes;
+        the runtime contract stays stable.
+      </p>
+    </section>
+  </main>
+</body>
+</html>
