@@ -2063,6 +2063,9 @@ func (s *shellState) runPipeline(base commandContext, segments []string, stdout,
 		return lastErr
 	}
 	for _, err := range errs[:len(errs)-1] {
+		if isClosedPipeError(err) {
+			continue
+		}
 		if sessionLastCode(err) == 130 {
 			s.lastCode = 130
 			return nil
@@ -5201,6 +5204,7 @@ func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, s
 	req.TTY = false
 	req.Cols = 0
 	req.Rows = 0
+	pipelineStdin := isPipelineReader(stdin)
 	runStream := func(req client.RunRequest) error {
 		exitCode := 0
 		runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
@@ -5274,8 +5278,12 @@ func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, s
 		}
 		return nil
 	})
+	if pipelineStdin && isClosedPipeError(err) {
+		err = nil
+	}
 	closeDone()
-	if inErr := <-inputErr; err == nil && inErr != nil {
+	closePipelineReader(stdin)
+	if inErr := <-inputErr; err == nil && inErr != nil && !(pipelineStdin && isClosedPipeError(inErr)) {
 		err = inErr
 	}
 	if interrupted.Load() {
@@ -5288,6 +5296,21 @@ func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, s
 		return persistentShellExit{code: exitCode}
 	}
 	return nil
+}
+
+func isPipelineReader(r io.Reader) bool {
+	_, ok := r.(*io.PipeReader)
+	return ok
+}
+
+func isClosedPipeError(err error) bool {
+	return errors.Is(err, io.ErrClosedPipe) || (err != nil && err.Error() == io.ErrClosedPipe.Error())
+}
+
+func closePipelineReader(r io.Reader) {
+	if pipe, ok := r.(*io.PipeReader); ok {
+		_ = pipe.Close()
+	}
 }
 
 func streamReaderToGuestInput(r io.Reader, out chan<- client.ExecInput, done <-chan struct{}) error {
