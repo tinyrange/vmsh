@@ -1678,7 +1678,50 @@ func (s *shellState) runInContext(ctx commandContext, line string, stdout, stder
 	if err != nil {
 		return contextBoundaryError(ctx, "select context", err)
 	}
-	return contextBoundaryError(ctx, "run", target.Run(line, stdout, stderr))
+	err = contextBoundaryError(ctx, "run", target.Run(line, stdout, stderr))
+	if err != nil {
+		return err
+	}
+	s.reportRemoteCommandFailure(ctx, line, stderr)
+	return nil
+}
+
+func (s *shellState) reportRemoteCommandFailure(ctx commandContext, line string, stderr io.Writer) {
+	if stderr == nil || s.lastCode == 0 || ctx.Mode == modeHost {
+		return
+	}
+	fmt.Fprintln(stderr, remoteCommandFailureDiagnostic(ctx, line, s.lastCode))
+}
+
+func remoteCommandFailureDiagnostic(ctx commandContext, line string, code int) string {
+	label := contextErrorLabel(ctx)
+	parts := []string{fmt.Sprintf("%s: command exited with status %d", label, code)}
+	if cwd := strings.TrimSpace(contextFailureCWD(ctx)); cwd != "" {
+		parts = append(parts, "cwd="+cwd)
+	}
+	switch code {
+	case 126:
+		parts = append(parts, "check executable permissions in this context")
+	case 127:
+		parts = append(parts, "command not found in this context")
+	}
+	line = strings.TrimSpace(line)
+	if line != "" {
+		parts = append(parts, "command="+shellQuote(line))
+		if ctx.Mode != modeHost {
+			parts = append(parts, "use @host "+line+" to run it on the local host")
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+func contextFailureCWD(ctx commandContext) string {
+	switch ctx.Mode {
+	case modeVM, modeSSH:
+		return ctx.CWD
+	default:
+		return ""
+	}
 }
 
 func (s *shellState) runMaybeBackground(ctx commandContext, line string, stdout, stderr io.Writer) error {
