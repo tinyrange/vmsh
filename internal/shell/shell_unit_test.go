@@ -840,6 +840,7 @@ func TestBuiltInFreeBSDRunHostShareBehavior(t *testing.T) {
 	if api.starts[0].req.Image != "@freebsd" {
 		t.Fatalf("started image = %q, want @freebsd", api.starts[0].req.Image)
 	}
+	assertBuiltinBSDStartHostShareBehavior(t, commandContext{Image: "@freebsd"}, api.starts[0].req)
 	if len(api.runs) != 1 {
 		t.Fatalf("runs = %d, want 1", len(api.runs))
 	}
@@ -869,6 +870,7 @@ func TestBuiltInNetBSDRunHostShareBehavior(t *testing.T) {
 	if api.starts[0].req.Image != "@netbsd" {
 		t.Fatalf("started image = %q, want @netbsd", api.starts[0].req.Image)
 	}
+	assertBuiltinBSDStartHostShareBehavior(t, commandContext{Image: "@netbsd"}, api.starts[0].req)
 	if len(api.runs) != 1 {
 		t.Fatalf("runs = %d, want 1", len(api.runs))
 	}
@@ -879,6 +881,19 @@ func TestBuiltInNetBSDRunHostShareBehavior(t *testing.T) {
 	assertBuiltinBSDHostShareBehavior(t, commandContext{Image: "@netbsd"}, run)
 	if run.User != "root" {
 		t.Fatalf("NetBSD run user = %q, want root", run.User)
+	}
+}
+
+func assertBuiltinBSDStartHostShareBehavior(t *testing.T, ctx commandContext, req client.StartInstanceRequest) {
+	t.Helper()
+	if guestSupportsHostShares(ctx) {
+		if len(req.Shares) != 1 || req.Shares[0].Mount != guestHostMount || !req.Shares[0].Writable {
+			t.Fatalf("%s start shares = %+v, want writable host share", ctx.Image, req.Shares)
+		}
+		return
+	}
+	if len(req.Shares) != 0 {
+		t.Fatalf("%s start shares = %+v, want none", ctx.Image, req.Shares)
 	}
 }
 
@@ -898,6 +913,31 @@ func assertBuiltinBSDHostShareBehavior(t *testing.T, ctx commandContext, run cli
 	}
 	if run.WorkDir != "/root" {
 		t.Fatalf("%s run workdir = %q, want /root", ctx.Image, run.WorkDir)
+	}
+}
+
+func TestGuestSupportsHostSharesForBuiltInBSDHostMatrix(t *testing.T) {
+	ctx := commandContext{Image: "@freebsd"}
+	tests := []struct {
+		goos   string
+		goarch string
+		want   bool
+	}{
+		{goos: "linux", goarch: "amd64", want: true},
+		{goos: "linux", goarch: "arm64", want: true},
+		{goos: "darwin", goarch: "arm64", want: true},
+		{goos: "darwin", goarch: "amd64", want: false},
+		{goos: "windows", goarch: "amd64", want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.goos+"/"+tc.goarch, func(t *testing.T) {
+			if got := guestSupportsHostSharesOn(tc.goos, tc.goarch, ctx); got != tc.want {
+				t.Fatalf("guestSupportsHostSharesOn(%q, %q, @freebsd) = %t, want %t", tc.goos, tc.goarch, got, tc.want)
+			}
+		})
+	}
+	if !guestSupportsHostSharesOn("windows", "amd64", commandContext{Image: "alpine"}) {
+		t.Fatalf("non-built-in images should keep host share support")
 	}
 }
 
