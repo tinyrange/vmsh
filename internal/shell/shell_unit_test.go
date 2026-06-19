@@ -3348,6 +3348,123 @@ func TestMixedPipelineDownstreamGuestEarlyExitClosesUpstream(t *testing.T) {
 	}
 }
 
+func TestMixedPipelinePreservesBinaryDataThroughGuestStages(t *testing.T) {
+	payload := byteCleanPipelineSample()
+	api := newRecordingShellAPI("alpine")
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}
+	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
+		if onEvent == nil {
+			return nil
+		}
+		if err := onEvent(client.ExecEvent{Kind: "stdout", Data: payload[:7]}); err != nil {
+			return err
+		}
+		if err := onEvent(client.ExecEvent{Kind: "stdout", Data: payload[7:]}); err != nil {
+			return err
+		}
+		return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+	}
+	api.runInteractive = func(id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		data, closeEvents := drainExecInputStream(inputs)
+		if closeEvents != 0 {
+			return fmt.Errorf("pipeline input sent explicit stdin_close events = %d", closeEvents)
+		}
+		if !bytes.Equal(data, payload) {
+			return fmt.Errorf("guest stdin sha256=%s, want %s", sha256Hex(data), sha256Hex(payload))
+		}
+		if onEvent != nil {
+			if err := onEvent(client.ExecEvent{Kind: "stdout", Data: data}); err != nil {
+				return err
+			}
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval(`@alpine emit-binary | @alpine cat`, &stdout, &stderr); err != nil {
+		t.Fatalf("run guest binary pipeline: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if !bytes.Equal(stdout.Bytes(), payload) {
+		t.Fatalf("stdout sha256=%s, want %s\nstdout=%q\nwant=%q", sha256Hex(stdout.Bytes()), sha256Hex(payload), stdout.Bytes(), payload)
+	}
+}
+
+func TestMixedPipelinePreservesBinaryDataThroughSSHStage(t *testing.T) {
+	payload := byteCleanPipelineSample()
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		if _, err := io.Copy(stdout, stdin); err != nil {
+			_, _ = fmt.Fprintf(stderr, "copy stdin: %v", err)
+			return 1
+		}
+		return 0
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	if err := os.WriteFile(filepath.Join(sh.hostCWD, "payload.bin"), payload, 0o600); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval(`@host cat payload.bin | @ssh test-ssh-a cat | @host cat`, &stdout, &stderr); err != nil {
+		t.Fatalf("run ssh binary pipeline: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if !bytes.Equal(stdout.Bytes(), payload) {
+		t.Fatalf("stdout sha256=%s, want %s\nstdout=%q\nwant=%q", sha256Hex(stdout.Bytes()), sha256Hex(payload), stdout.Bytes(), payload)
+	}
+}
+
+func TestMixedPipelinePreservesBinaryDataFromSSHOutput(t *testing.T) {
+	payload := byteCleanPipelineSample()
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		_, _ = stdout.Write(payload)
+		return 0
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval(`@ssh test-ssh-a emit-binary | @host cat`, &stdout, &stderr); err != nil {
+		t.Fatalf("run ssh output binary pipeline: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if !bytes.Equal(stdout.Bytes(), payload) {
+		t.Fatalf("stdout sha256=%s, want %s\nstdout=%q\nwant=%q", sha256Hex(stdout.Bytes()), sha256Hex(payload), stdout.Bytes(), payload)
+	}
+}
+
+func TestMixedPipelinePreservesBinaryDataGuestToSSHToHost(t *testing.T) {
+	payload := byteCleanPipelineSample()
+	api := newRecordingShellAPI("alpine")
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}
+	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
+		if onEvent == nil {
+			return nil
+		}
+		if err := onEvent(client.ExecEvent{Kind: "stdout", Data: payload}); err != nil {
+			return err
+		}
+		return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+	}
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		if _, err := io.Copy(stdout, stdin); err != nil {
+			_, _ = fmt.Fprintf(stderr, "copy stdin: %v", err)
+			return 1
+		}
+		return 0
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, api)
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval(`@alpine emit-binary | @ssh test-ssh-a cat | @host cat`, &stdout, &stderr); err != nil {
+		t.Fatalf("run guest-to-ssh binary pipeline: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if !bytes.Equal(stdout.Bytes(), payload) {
+		t.Fatalf("stdout sha256=%s, want %s\nstdout=%q\nwant=%q", sha256Hex(stdout.Bytes()), sha256Hex(payload), stdout.Bytes(), payload)
+	}
+}
+
 func TestGuestPipelineStreamsLargeInputInChunks(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("large pipeline test uses POSIX host commands")
@@ -6058,6 +6175,17 @@ func fakeCodexPackageArchive(t *testing.T) []byte {
 func sha256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+func byteCleanPipelineSample() []byte {
+	return []byte{
+		0x00, 0x01, 0x02, 0x7f, 0x80, 0xff,
+		'A', '\n', 'B', '\r', '\n',
+		0x1b, '[', '3', '1', 'm',
+		'_', '_', 'V', 'M', 'S', 'H', '_', 'R', 'E', 'A', 'D', 'Y', '_', '_',
+		'\n',
+		0xc3, 0x28,
+	}
 }
 
 func drainExecInputStream(inputs <-chan client.ExecInput) ([]byte, int) {
