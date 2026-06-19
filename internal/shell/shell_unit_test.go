@@ -3288,6 +3288,66 @@ func TestGuestPipelineStreamsStdinForGuestStages(t *testing.T) {
 	}
 }
 
+func TestGuestPipelineInputStopsWhenGuestExitsBeforeReading(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	api.runInteractive = func(id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		if onEvent != nil {
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
+	sh := newUnitShell(t, api)
+	stdin, upstream := io.Pipe()
+	defer upstream.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- sh.streamGuestRunWithInput("default", client.RunRequest{}, stdin, io.Discard, io.Discard)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("guest run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("guest run did not return after guest exited without reading stdin")
+	}
+	if _, err := upstream.Write([]byte("late input")); err == nil {
+		t.Fatalf("pipeline writer succeeded after guest stdin reader was closed")
+	}
+}
+
+func TestMixedPipelineDownstreamGuestEarlyExitClosesUpstream(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mixed pipeline test uses POSIX host commands")
+	}
+	api := newRecordingShellAPI("alpine")
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}
+	api.runInteractive = func(id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		if onEvent != nil {
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
+	sh := newUnitShell(t, api)
+
+	done := make(chan error, 1)
+	var stdout, stderr bytes.Buffer
+	go func() {
+		done <- sh.eval(`yes | @alpine true`, &stdout, &stderr)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run early-close pipeline: %v\nstderr:\n%s", err, stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("early-close pipeline did not return")
+	}
+}
+
 func TestGuestPipelineStreamsLargeInputInChunks(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("large pipeline test uses POSIX host commands")
