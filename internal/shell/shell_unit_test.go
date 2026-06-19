@@ -2268,6 +2268,67 @@ func TestContextBoundaryLabelsSSHAndPreservesCause(t *testing.T) {
 	}
 }
 
+func TestRemoteCommandFailureDiagnosticNamesVMContext(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
+		if err := onEvent(client.ExecEvent{Kind: "stderr", Output: "missing-tool: not found\n"}); err != nil {
+			return err
+		}
+		return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 127})
+	}
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", CWD: "/missing"}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("missing-tool --flag", &stdout, &stderr); err != nil {
+		t.Fatalf("run missing VM command: %v", err)
+	}
+	got := stderr.String()
+	for _, want := range []string{
+		"missing-tool: not found",
+		"vm work: command exited with status 127",
+		"cwd=/missing",
+		"command not found in this context",
+		"use @host missing-tool --flag",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stderr = %q, want %q", got, want)
+		}
+	}
+	if sh.lastCode != 127 {
+		t.Fatalf("lastCode = %d, want 127", sh.lastCode)
+	}
+}
+
+func TestRemoteCommandFailureDiagnosticNamesSSHContext(t *testing.T) {
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		_, _ = io.WriteString(stderr, "missing-tool: not found\n")
+		return 127
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ssh test-ssh-a missing-tool", &stdout, &stderr); err != nil {
+		t.Fatalf("run missing SSH command: %v", err)
+	}
+	got := stderr.String()
+	for _, want := range []string{
+		"missing-tool: not found",
+		"ssh test-ssh-a: command exited with status 127",
+		"command not found in this context",
+		"use @host missing-tool",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stderr = %q, want %q", got, want)
+		}
+	}
+	if sh.lastCode != 127 {
+		t.Fatalf("lastCode = %d, want 127", sh.lastCode)
+	}
+}
+
 func TestGuestCDErrorAddsContextWithoutReplacingCause(t *testing.T) {
 	sh := newUnitShell(t, newRecordingShellAPI("ubuntu"))
 	sh.context = commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Isolated: true, CWD: "/home/ubuntu"}
