@@ -98,6 +98,9 @@ func TestShellCommandPassingBuildsGuestRunRequests(t *testing.T) {
 }
 
 func TestEvalScriptLinesKeepsHostHeredocTogether(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host heredoc fixture uses Unix shell syntax")
+	}
 	sh := newUnitShell(t, newRecordingShellAPI())
 	script := strings.Join([]string{
 		"@host cat > pasted.txt <<'EOF'",
@@ -116,6 +119,9 @@ func TestEvalScriptLinesKeepsHostHeredocTogether(t *testing.T) {
 }
 
 func TestEvalScriptLinesKeepsQuotedContinuationTogether(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host quoted-continuation fixture uses Unix shell syntax")
+	}
 	sh := newUnitShell(t, newRecordingShellAPI())
 	script := strings.Join([]string{
 		"@host printf '%s' 'hello",
@@ -461,6 +467,114 @@ func TestGuestPersistentShellRestartsWhenIsolationChanges(t *testing.T) {
 	}
 	if len(starts[1].Shares) != 0 {
 		t.Fatalf("isolated shell shares = %+v, want none", starts[1].Shares)
+	}
+}
+
+func TestGuestPersistentShellRestartsEndedCachedSession(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	sh := newUnitShell(t, api)
+	ctx := commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu", Network: true}
+	req := client.RunRequest{Image: "ubuntu", WorkDir: "/host/project", TTY: true}
+	var starts atomic.Int32
+	api.runInteractive = func(id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		starts.Add(1)
+		if onEvent != nil {
+			if err := onEvent(client.ExecEvent{Kind: "control", Output: "ready\t0\t" + req.WorkDir + "\n"}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	first, err := sh.guestPersistentShell(ctx, req, nil, nil)
+	if err != nil {
+		t.Fatalf("start first shell: %v", err)
+	}
+	deadline := time.After(2 * time.Second)
+	for !first.ended.Load() {
+		select {
+		case <-deadline:
+			t.Fatal("first persistent shell did not end")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	second, err := sh.guestPersistentShell(ctx, req, nil, nil)
+	if err != nil {
+		t.Fatalf("start second shell: %v", err)
+	}
+	if second == first {
+		t.Fatal("reused ended persistent guest shell")
+	}
+	if got := starts.Load(); got != 2 {
+		t.Fatalf("persistent shell starts = %d, want 2", got)
+	}
+}
+
+func TestPersistentShellPreludesPrefixEvalArgument(t *testing.T) {
+	guestCommand := strings.Join(guestPersistentCommand(), "\n")
+	if !strings.Contains(guestCommand, "eval \" $1\"") {
+		t.Fatalf("guest persistent command missing eval argument prefix:\n%s", guestCommand)
+	}
+	sshScript := sshPersistentShellSidebandScript(commandContext{}, "/tmp/vmsh-control")
+	if !strings.Contains(sshScript, "command eval \" $1\"") {
+		t.Fatalf("ssh persistent script missing eval argument prefix:\n%s", sshScript)
+	}
+}
+
+func TestPersistentShellCommandAllowedRejectsLeadingDashCommand(t *testing.T) {
+	if persistentShellCommandAllowed("-la") {
+		t.Fatal("leading-dash command should not use persistent shell")
+	}
+	if !persistentShellCommandAllowed("ls -la") {
+		t.Fatal("ordinary command with leading-dash argument should use persistent shell")
+	}
+}
+
+func TestPersistentGuestShellStartsForwardingBeforeCommand(t *testing.T) {
+	inputs := make(chan client.ExecInput, 1)
+	events := make(chan client.ExecEvent, 1)
+	session := &persistentGuestShell{
+		inputs: inputs,
+		events: events,
+		done:   make(chan error, 1),
+	}
+	started := make(chan struct{})
+	stop := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- session.run("cat", io.Discard, io.Discard, func() (func(), error) {
+			close(started)
+			return func() { close(stop) }, nil
+		})
+	}()
+	select {
+	case <-started:
+	case input := <-inputs:
+		t.Fatalf("sent command before stdin forwarding started: %+v", input)
+	case <-time.After(2 * time.Second):
+		t.Fatal("stdin forwarding did not start")
+	}
+	select {
+	case input := <-inputs:
+		if got := string(input.Data); !strings.Contains(got, "__vmsh_run") || !strings.Contains(got, "cat") {
+			t.Fatalf("persistent shell command input = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("persistent shell command was not sent")
+	}
+	events <- client.ExecEvent{Kind: "control", Output: "done\t0\t/home/cc\n"}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("run persistent command: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("persistent command did not finish")
+	}
+	select {
+	case <-stop:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stdin forwarding stop was not called")
 	}
 }
 
@@ -1862,7 +1976,7 @@ func TestPrepareCodexAgentHomeSeedsOnlySafeCodexData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read standalone symlink: %v", err)
 	}
-	if link != codexGuestStandaloneMount {
+	if filepath.ToSlash(link) != codexGuestStandaloneMount {
 		t.Fatalf("standalone symlink = %q, want %q", link, codexGuestStandaloneMount)
 	}
 }
@@ -2446,12 +2560,15 @@ func TestBuiltInBSDImagesAllowSupportedCCVMHosts(t *testing.T) {
 		{image: "@openbsd", host: "linux/amd64"},
 		{image: "@openbsd", host: "linux/arm64"},
 		{image: "@openbsd", host: "darwin/arm64"},
+		{image: "@openbsd", host: "windows/amd64"},
 		{image: "@freebsd", host: "linux/amd64"},
 		{image: "@freebsd", host: "linux/arm64"},
 		{image: "@freebsd", host: "darwin/arm64"},
+		{image: "@freebsd", host: "windows/amd64"},
 		{image: "@netbsd", host: "linux/amd64"},
 		{image: "@netbsd", host: "linux/arm64"},
 		{image: "@netbsd", host: "darwin/arm64"},
+		{image: "@netbsd", host: "windows/amd64"},
 	} {
 		t.Run(tc.image+"_"+tc.host, func(t *testing.T) {
 			api := newRecordingShellAPI()
@@ -2476,9 +2593,9 @@ func TestBuiltInBSDImagesRejectUnsupportedCCVMHost(t *testing.T) {
 		host  string
 		want  string
 	}{
-		{image: "@openbsd", name: "OpenBSD", host: "windows/amd64", want: "linux/amd64, linux/arm64, or darwin/arm64"},
-		{image: "@freebsd", name: "FreeBSD", host: "windows/amd64", want: "linux/amd64, linux/arm64, or darwin/arm64"},
-		{image: "@netbsd", name: "NetBSD", host: "windows/amd64", want: "linux/amd64, linux/arm64, or darwin/arm64"},
+		{image: "@openbsd", name: "OpenBSD", host: "windows/arm64", want: "linux/amd64, linux/arm64, darwin/arm64, or windows/amd64"},
+		{image: "@freebsd", name: "FreeBSD", host: "windows/arm64", want: "linux/amd64, linux/arm64, darwin/arm64, or windows/amd64"},
+		{image: "@netbsd", name: "NetBSD", host: "windows/arm64", want: "linux/amd64, linux/arm64, darwin/arm64, or windows/amd64"},
 	} {
 		t.Run(tc.image, func(t *testing.T) {
 			api := newRecordingShellAPI()
@@ -4258,7 +4375,7 @@ func TestCopyProgressIsQuietForNonTerminalStderr(t *testing.T) {
 func TestCopyProgressWritesTerminalStatus(t *testing.T) {
 	master, slave, err := pty.Open()
 	if err != nil {
-		t.Fatalf("open pty: %v", err)
+		t.Skipf("open pty: %v", err)
 	}
 	defer master.Close()
 	defer slave.Close()
@@ -4429,6 +4546,15 @@ func TestCopyEndpointResolutionAllowsColonsAndQuotedPaths(t *testing.T) {
 		{raw: "@ssh:test-ssh-a:/tmp/path:with:colons/two words.txt", want: "/tmp/path:with:colons/two words.txt"},
 		{raw: "@vm:work:/tmp/path:with:colons/quote'file", want: "/tmp/path:with:colons/quote'file"},
 	}
+	if runtime.GOOS == "windows" {
+		cases = append(cases, struct {
+			raw  string
+			want string
+		}{
+			raw:  `@host:C:\Users\vmsh\AppData\Local\Temp\meta-src`,
+			want: `C:\Users\vmsh\AppData\Local\Temp\meta-src`,
+		})
+	}
 	for _, tc := range cases {
 		ep, err := sh.parseCopyEndpoint(tc.raw, io.Discard)
 		if err != nil {
@@ -4567,22 +4693,21 @@ func TestCopyGuestFileToSSHHost(t *testing.T) {
 		return nil
 	}
 	received := make(chan string, 1)
+	commands := make(chan string, 1)
 	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		select {
+		case commands <- command:
+		default:
+		}
 		if !strings.Contains(command, "tar -xf -") {
 			return 0
 		}
-		tr := tar.NewReader(stdin)
-		header, err := tr.Next()
+		got, err := readSingleRegularTarPayload(stdin)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "read tar: %v", err)
 			return 1
 		}
-		data, err := io.ReadAll(tr)
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "read file: %v", err)
-			return 1
-		}
-		received <- header.Name + ":" + string(data)
+		received <- got
 		return 0
 	})
 	server.installConfig(t, "test-ssh-a")
@@ -4590,7 +4715,12 @@ func TestCopyGuestFileToSSHHost(t *testing.T) {
 	sh := newUnitShell(t, api)
 	var stdout, stderr bytes.Buffer
 	if err := sh.copyPath("@vm:work:/tmp/from-vm.txt @ssh:test-ssh-a:/tmp/to-ssh.txt", &stdout, &stderr); err != nil {
-		t.Fatalf("copy guest to ssh: %v\nstderr:\n%s", err, stderr.String())
+		var command string
+		select {
+		case command = <-commands:
+		default:
+		}
+		t.Fatalf("copy guest to ssh: %v\ncommand:\n%s\nstderr:\n%s", err, command, stderr.String())
 	}
 	select {
 	case got := <-received:
@@ -5043,7 +5173,8 @@ func TestHostCopyPreservesMetadataAndSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat copied script: %v", err)
 	}
-	if got := info.Mode().Perm(); got != 0o755 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o755 {
+		got := info.Mode().Perm()
 		t.Fatalf("copied script mode = %#o, want 0755", got)
 	}
 	if got := info.ModTime().Unix(); got != fileMtime.Unix() {

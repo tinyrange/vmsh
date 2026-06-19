@@ -144,6 +144,7 @@ type persistentHostShell struct {
 type persistentGuestShell struct {
 	mu        sync.Mutex
 	closeOnce sync.Once
+	ended     atomic.Bool
 	key       string
 	inputs    chan client.ExecInput
 	events    chan client.ExecEvent
@@ -1204,10 +1205,19 @@ func (s *shellState) evalLineEditor(in *os.File, stdout, stderr io.Writer) error
 	}()
 
 	lineEditor := editor.NewLineEditor(in, stdout, s.history, s.completion)
+	readLine := lineEditor.ReadLine
+	if runtime.GOOS == "windows" {
+		restoreInput, err := terminal.MakeRaw(in)
+		if err != nil {
+			return err
+		}
+		defer restoreInput()
+		readLine = lineEditor.ReadLinePrepared
+	}
 	for {
 		drainInterruptSignals(s.interruptSignals)
 		s.drawPromptStatus(stdout)
-		line, err := lineEditor.ReadLine(s.prompt())
+		line, err := readLine(s.prompt())
 		s.statusSeq.Add(1)
 		switch {
 		case errors.Is(err, editor.ErrLineInterrupted):
@@ -4031,7 +4041,7 @@ func persistentShellCommandAllowed(line string) bool {
 		return false
 	}
 	fields, err := splitShellFields(line)
-	return err == nil && len(fields) > 0
+	return err == nil && len(fields) > 0 && !strings.HasPrefix(fields[0], "-")
 }
 
 func (s *shellState) hostPersistentShell(env []string, cols, rows int, stdout, stderr io.Writer, forwardStartupInput bool) (*persistentHostShell, error) {
@@ -4131,7 +4141,7 @@ func persistentHostShellScript() string {
 		"}",
 		"__vmsh_run() {",
 		"  stty echo 2>/dev/null || true",
-		"  eval \"$1\"",
+		"  eval \" $1\"",
 		"  __vmsh_status=$?",
 		"  stty -echo 2>/dev/null || true",
 		"  __vmsh_report done \"$__vmsh_status\"",
@@ -4652,8 +4662,10 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 				}
 			})
 		})
-		if interrupted.Load() && persistentGuestShellEnded(err) {
+		if persistentGuestShellEnded(err) && s.guestShell == session {
 			s.guestShell = nil
+		}
+		if interrupted.Load() && persistentGuestShellEnded(err) {
 			err = persistentShellExit{code: 130}
 		}
 		s.lastCode = sessionLastCode(err)
@@ -4751,7 +4763,10 @@ func persistentGuestCommandAllowed(line string) bool {
 func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequest, stdout, stderr io.Writer) (*persistentGuestShell, error) {
 	key := guestPersistentShellKey(ctx, req)
 	if s.guestShell != nil && s.guestShell.key == key {
-		return s.guestShell, nil
+		if !s.guestShell.ended.Load() {
+			return s.guestShell, nil
+		}
+		s.guestShell = nil
 	}
 	if s.guestShell != nil {
 		s.guestShell.close()
@@ -4781,21 +4796,10 @@ func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequ
 			events <- event
 			return nil
 		})
+		session.ended.Store(true)
 		close(events)
 		done <- err
 	}()
-	stopForwarding := func() {}
-	if stdout != nil {
-		stop, err := s.startGuestInputForwarding(req.TTY, !s.evaluatingPaste, inputs, stdout, stderr)
-		if err != nil {
-			session.close()
-			return nil, err
-		}
-		if stop != nil {
-			stopForwarding = stop
-		}
-	}
-	defer stopForwarding()
 	if err := session.waitReady(stdout, stderr); err != nil {
 		session.close()
 		return nil, err
@@ -4842,7 +4846,7 @@ func guestPersistentCommand() []string {
 		"}",
 		"__vmsh_run() {",
 		"  stty echo 2>/dev/null || true",
-		"  eval \"$1\"",
+		"  eval \" $1\"",
 		"  __vmsh_status=$?",
 		"  stty -echo 2>/dev/null || true",
 		"  __vmsh_report done \"$__vmsh_status\"",
@@ -4958,7 +4962,6 @@ func parsePersistentReady(text string) (string, bool) {
 func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer, startForwarding func() (func(), error)) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.inputs <- client.ExecInput{Kind: "stdin", Data: []byte("__vmsh_run " + shellQuote(line) + "\n")}
 	stopForwarding := func() {}
 	if startForwarding != nil {
 		stop, err := startForwarding()
@@ -4970,6 +4973,7 @@ func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer, startF
 		}
 	}
 	defer stopForwarding()
+	p.inputs <- client.ExecInput{Kind: "stdin", Data: []byte("__vmsh_run " + shellQuote(line) + "\n")}
 	for event := range p.events {
 		switch event.Kind {
 		case "control":
@@ -5335,6 +5339,11 @@ func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan st
 		}
 		n, err := readPTYInput(file, buf[:], done, inputCancel)
 		if n > 0 {
+			select {
+			case <-done:
+				return
+			default:
+			}
 			if recorder != nil {
 				recorder.recordInput(buf[:n])
 			}
@@ -5479,6 +5488,11 @@ func streamHostPTYStdin(in *os.File, out *os.File, done <-chan struct{}, inputCa
 		}
 		n, err := readPTYInput(in, buf[:], done, inputCancel)
 		if n > 0 {
+			select {
+			case <-done:
+				return
+			default:
+			}
 			if recorder != nil {
 				recorder.recordInput(buf[:n])
 			}
@@ -6128,7 +6142,7 @@ func (s *shellState) ensureBuiltInGuestSupported(ctx commandContext) error {
 func builtInGuestHostSupported(image, host string) bool {
 	switch canonicalBuiltInGuestImage(image) {
 	case "@openbsd", "@freebsd", "@netbsd":
-		return host == "linux/amd64" || host == "linux/arm64" || host == "darwin/arm64"
+		return host == "linux/amd64" || host == "linux/arm64" || host == "darwin/arm64" || host == "windows/amd64"
 	default:
 		return true
 	}
@@ -6137,7 +6151,7 @@ func builtInGuestHostSupported(image, host string) bool {
 func supportedBuiltInGuestHostsText(image string) string {
 	switch canonicalBuiltInGuestImage(image) {
 	case "@openbsd", "@freebsd", "@netbsd":
-		return "linux/amd64, linux/arm64, or darwin/arm64"
+		return "linux/amd64, linux/arm64, darwin/arm64, or windows/amd64"
 	default:
 		return "a supported host"
 	}
@@ -8512,6 +8526,11 @@ func lexShellTokens(input string) ([]shellToken, error) {
 			haveField = true
 			escaped = false
 		case r == '\\' && !inSingle:
+			if preserveWindowsPathBackslash(b.String()) {
+				b.WriteRune(r)
+				haveField = true
+				continue
+			}
 			if !haveField {
 				fieldStart = i
 			}
@@ -8553,6 +8572,18 @@ func lexShellTokens(input string) ([]shellToken, error) {
 		tokens = append(tokens, shellToken{Value: b.String(), Start: fieldStart, End: len(input)})
 	}
 	return tokens, nil
+}
+
+func preserveWindowsPathBackslash(field string) bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	field = strings.TrimPrefix(field, "@host:")
+	if len(field) < 2 || field[1] != ':' {
+		return false
+	}
+	drive := field[0]
+	return (drive >= 'A' && drive <= 'Z') || (drive >= 'a' && drive <= 'z')
 }
 
 func hostShell() string {

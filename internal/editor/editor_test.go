@@ -2,8 +2,11 @@ package editor
 
 import (
 	"bytes"
+	"os"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLineEditorTabKeepsOpenCompletionSelectionStable(t *testing.T) {
@@ -172,6 +175,61 @@ func TestLineHistorySavesSingleLineCommands(t *testing.T) {
 
 	if got, want := h.items, []string{"@host echo one"}; len(got) != len(want) || got[0] != want[0] {
 		t.Fatalf("history items = %#v, want %#v", got, want)
+	}
+}
+
+func TestReadPasteBurstAfterEnterDoesNotBlockOnWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows console reads cannot be timed out by polling for EAGAIN")
+	}
+	in, out, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	defer out.Close()
+	e := &LineEditor{in: in}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if text, ok := e.readPasteBurstAfterEnter(); ok || text != "" {
+			t.Errorf("paste burst = %q, %v; want empty false", text, ok)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(250 * time.Millisecond):
+		_ = out.Close()
+		t.Fatal("readPasteBurstAfterEnter blocked")
+	}
+}
+
+func TestReadLinePreparedPreservesBufferedPromptInputOnWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows raw-mode prompt handoff regression")
+	}
+	in, out, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	defer out.Close()
+	var terminal bytes.Buffer
+	e := NewLineEditor(in, &terminal, "", nil)
+
+	input := "ls\n@freebsd\nass\n"
+	if _, err := out.Write([]byte(input)); err != nil {
+		t.Fatalf("write editor input: %v", err)
+	}
+
+	for _, want := range []string{"ls", "@freebsd", "ass"} {
+		got, err := e.ReadLinePrepared("> ")
+		if err != nil {
+			t.Fatalf("ReadLinePrepared(%q): %v", want, err)
+		}
+		if got != want {
+			t.Fatalf("ReadLinePrepared returned %q, want %q; terminal output:\n%q", got, want, terminal.String())
+		}
 	}
 }
 

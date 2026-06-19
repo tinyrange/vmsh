@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -182,7 +183,25 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer restore()
+	rawActive := true
+	restoreRaw := func() {
+		if rawActive {
+			restore()
+			rawActive = false
+		}
+	}
+	defer restoreRaw()
+	return e.readLine(prompt, restoreRaw)
+}
+
+func (e *LineEditor) ReadLinePrepared(prompt string) (string, error) {
+	return e.readLine(prompt, func() {})
+}
+
+func (e *LineEditor) readLine(prompt string, restore func()) (string, error) {
+	if restore == nil {
+		restore = func() {}
+	}
 	fmt.Fprint(e.out, "\x1b[?2004h")
 	defer fmt.Fprint(e.out, "\x1b[?2004l")
 
@@ -889,6 +908,9 @@ func (e *LineEditor) decodeKey(b byte) (keyEvent, error) {
 }
 
 func (e *LineEditor) readPasteBurstAfterEnter() (string, bool) {
+	if runtime.GOOS == "windows" {
+		return "", false
+	}
 	first, err := e.readByteWithTimeout(pasteBurstInitialTimeout)
 	if err != nil {
 		if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
