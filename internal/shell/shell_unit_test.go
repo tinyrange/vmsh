@@ -3279,6 +3279,193 @@ func TestMixedPipelineStreamsHostInputToGuestAndGuestOutputToHost(t *testing.T) 
 	}
 }
 
+func TestMixedPipelineUsesLastStageStatusAndReportsHiddenFailures(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mixed pipeline test uses POSIX host commands")
+	}
+	api := newRecordingShellAPI("alpine")
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}
+	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
+		if onEvent != nil {
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 7})
+		}
+		return nil
+	}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval(`@alpine false | @host cat >/dev/null`, &stdout, &stderr); err != nil {
+		t.Fatalf("run guest-to-host failure pipeline: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if sh.lastCode != 0 {
+		t.Fatalf("pipeline last code = %d, want last stage status 0", sh.lastCode)
+	}
+	want := "vmsh: pipeline stage 1 (vm alpine) exited with status 7: false"
+	if !strings.Contains(stderr.String(), want) {
+		t.Fatalf("pipeline stderr = %q, want diagnostic containing %q", stderr.String(), want)
+	}
+}
+
+func TestMixedPipelineReportsFailingMiddleVMStage(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mixed pipeline test uses POSIX host commands")
+	}
+	api := newRecordingShellAPI("alpine")
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}
+	api.runInteractive = func(id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		_, _ = drainExecInputStream(inputs)
+		if onEvent != nil {
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 9})
+		}
+		return nil
+	}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval(`@host printf data | @alpine false | @host cat >/dev/null`, &stdout, &stderr); err != nil {
+		t.Fatalf("run middle VM failure pipeline: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if sh.lastCode != 0 {
+		t.Fatalf("pipeline last code = %d, want final stage status 0", sh.lastCode)
+	}
+	want := "vmsh: pipeline stage 2 (vm alpine) exited with status 9: false"
+	if !strings.Contains(stderr.String(), want) {
+		t.Fatalf("pipeline stderr = %q, want diagnostic containing %q", stderr.String(), want)
+	}
+}
+
+func TestMixedPipelineReportsMissingSSHCommandWithSSHContext(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mixed pipeline test uses POSIX host commands")
+	}
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		if strings.Contains(command, "missing-tool") {
+			_, _ = io.WriteString(stderr, "missing-tool: not found\n")
+			return 127
+		}
+		_, _ = io.Copy(stdout, stdin)
+		return 0
+	})
+	server.installConfig(t, "test-ssh-a")
+	sh := newUnitShell(t, newRecordingShellAPI())
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval(`@host printf data | @ssh test-ssh-a missing-tool | @host cat >/dev/null`, &stdout, &stderr); err != nil {
+		t.Fatalf("run SSH missing command pipeline: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if sh.lastCode != 0 {
+		t.Fatalf("pipeline last code = %d, want final stage status 0", sh.lastCode)
+	}
+	want := "vmsh: pipeline stage 2 (ssh test-ssh-a) exited with status 127: missing-tool"
+	if !strings.Contains(stderr.String(), want) {
+		t.Fatalf("pipeline stderr = %q, want diagnostic containing %q", stderr.String(), want)
+	}
+}
+
+func TestMixedPipelineNonFinalStatus130DoesNotInterruptPipeline(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mixed pipeline test uses POSIX host commands")
+	}
+	api := newRecordingShellAPI("alpine")
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}
+	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
+		if onEvent != nil {
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 130})
+		}
+		return nil
+	}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval(`@alpine interrupted-command | @host cat >/dev/null`, &stdout, &stderr); err != nil {
+		t.Fatalf("run non-final status 130 pipeline: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if sh.lastCode != 0 {
+		t.Fatalf("pipeline last code = %d, want final stage status 0", sh.lastCode)
+	}
+	want := "vmsh: pipeline stage 1 (vm alpine) exited with status 130: interrupted-command"
+	if !strings.Contains(stderr.String(), want) {
+		t.Fatalf("pipeline stderr = %q, want diagnostic containing %q", stderr.String(), want)
+	}
+}
+
+func TestMixedPipelineUsesLastStageFailureWithoutExtraDiagnostic(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mixed pipeline test uses POSIX host commands")
+	}
+	api := newRecordingShellAPI("alpine")
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}
+	api.runInteractive = func(id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		_, _ = drainExecInputStream(inputs)
+		if onEvent != nil {
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 5})
+		}
+		return nil
+	}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval(`@host printf data | @alpine false`, &stdout, &stderr); err != nil {
+		t.Fatalf("run host-to-guest failure pipeline: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if sh.lastCode != 5 {
+		t.Fatalf("pipeline last code = %d, want final stage status 5", sh.lastCode)
+	}
+	if strings.Contains(stderr.String(), "pipeline stage") {
+		t.Fatalf("pipeline stderr = %q, want no extra diagnostic for final stage status", stderr.String())
+	}
+}
+
+func TestMixedPipelineInterruptCancelsAllStages(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mixed pipeline test uses POSIX host commands")
+	}
+	api := newRecordingShellAPI("alpine")
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	var once sync.Once
+	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
+		once.Do(func() { close(started) })
+		<-ctx.Done()
+		close(cancelled)
+		return ctx.Err()
+	}
+	sh := newUnitShell(t, api)
+	interrupts := make(chan os.Signal, 1)
+	sh.interruptSignals = interrupts
+
+	done := make(chan error, 1)
+	var stdout, stderr bytes.Buffer
+	go func() {
+		done <- sh.eval(`@alpine sleep 30 | @host cat >/dev/null`, &stdout, &stderr)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("pipeline guest stage did not start")
+	}
+	interrupts <- os.Interrupt
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("pipeline interrupt did not cancel guest stage")
+	}
+	select {
+	case err := <-done:
+		if err != nil || sh.lastCode != 130 {
+			t.Fatalf("interrupted pipeline code = %d, err = %v\nstderr:\n%s", sh.lastCode, err, stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("interrupted pipeline did not return")
+	}
+	sh.jobsMu.Lock()
+	defer sh.jobsMu.Unlock()
+	if len(sh.jobs) != 0 {
+		t.Fatalf("foreground pipeline registered background jobs: %+v", sh.jobs)
+	}
+}
+
 func TestGuestPipelineStreamsStdinForGuestStages(t *testing.T) {
 	api := newRecordingShellAPI("alpine")
 	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}
