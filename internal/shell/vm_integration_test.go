@@ -1040,6 +1040,7 @@ func requireContains(t *testing.T, text, want string) {
 
 func createMetadataCopyFixture(t *testing.T, src string) {
 	t.Helper()
+	requireHostSymlinkSupport(t)
 	fileMtime := time.Date(2024, 1, 2, 3, 4, 5, 0, time.Local)
 	mustWriteTestFile(t, filepath.Join(src, "script.sh"), "#!/bin/sh\necho hi\n")
 	mustWriteTestFile(t, filepath.Join(src, "nested", "file.txt"), "nested\n")

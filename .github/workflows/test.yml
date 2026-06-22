@@ -49,17 +49,7 @@ jobs:
             cc/go.sum
 
       - name: Run tests
-        if: runner.os != 'Windows'
         run: go test -short ./... -count=1 -timeout 20m
-
-      - name: Run Windows tests
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          packages="$(go list ./... | grep -v 'github.com/tinyrange/vmsh/internal/shell$')"
-          go test -short ${packages} -count=1 -timeout 20m
-          go test -run '^$' ./internal/shell -count=1
 
   build:
     name: Build vmsh payload

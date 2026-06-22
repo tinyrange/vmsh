@@ -98,6 +98,9 @@ func TestShellCommandPassingBuildsGuestRunRequests(t *testing.T) {
 }
 
 func TestEvalScriptLinesKeepsHostHeredocTogether(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host heredoc script uses POSIX shell syntax")
+	}
 	sh := newUnitShell(t, newRecordingShellAPI())
 	script := strings.Join([]string{
 		"@host cat > pasted.txt <<'EOF'",
@@ -116,6 +119,9 @@ func TestEvalScriptLinesKeepsHostHeredocTogether(t *testing.T) {
 }
 
 func TestEvalScriptLinesKeepsQuotedContinuationTogether(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host quoted continuation script uses POSIX shell syntax")
+	}
 	sh := newUnitShell(t, newRecordingShellAPI())
 	script := strings.Join([]string{
 		"@host printf '%s' 'hello",
@@ -1243,6 +1249,7 @@ func TestAliasExpandPrintsInspectableCommandWithoutRunning(t *testing.T) {
 }
 
 func TestAgentCodexUsesGuestReleaseWithoutChangingGlobalCurrent(t *testing.T) {
+	requireHostSymlinkSupport(t)
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
 	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), []byte(`{"token":"host"}`), 0o600); err != nil {
@@ -1850,6 +1857,7 @@ func TestAgentCodexNoInstallReportsMissingGuestTarget(t *testing.T) {
 }
 
 func TestAgentCodexSudoRunsAsRoot(t *testing.T) {
+	requireHostSymlinkSupport(t)
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
 	linuxRelease := makeFakeCodexRelease(t, codexHome, "9.8.7", "x86_64-unknown-linux-musl")
@@ -1898,6 +1906,7 @@ func TestAgentCodexSudoRunsAsRoot(t *testing.T) {
 }
 
 func TestPrepareCodexAgentHomeSeedsOnlySafeCodexData(t *testing.T) {
+	requireHostSymlinkSupport(t)
 	codexHome := t.TempDir()
 	for name, data := range map[string]string{
 		"auth.json":           `{"token":"host"}`,
@@ -3653,6 +3662,9 @@ func TestMixedPipelinePreservesBinaryDataThroughGuestStages(t *testing.T) {
 }
 
 func TestMixedPipelinePreservesBinaryDataThroughSSHStage(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mixed pipeline test uses POSIX host commands")
+	}
 	payload := byteCleanPipelineSample()
 	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
 		if _, err := io.Copy(stdout, stdin); err != nil {
@@ -3677,6 +3689,9 @@ func TestMixedPipelinePreservesBinaryDataThroughSSHStage(t *testing.T) {
 }
 
 func TestMixedPipelinePreservesBinaryDataFromSSHOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mixed pipeline test uses POSIX host commands")
+	}
 	payload := byteCleanPipelineSample()
 	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
 		_, _ = stdout.Write(payload)
@@ -3695,6 +3710,9 @@ func TestMixedPipelinePreservesBinaryDataFromSSHOutput(t *testing.T) {
 }
 
 func TestMixedPipelinePreservesBinaryDataGuestToSSHToHost(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mixed pipeline test uses POSIX host commands")
+	}
 	payload := byteCleanPipelineSample()
 	api := newRecordingShellAPI("alpine")
 	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}
@@ -4834,6 +4852,9 @@ func TestCopyProgressIsQuietForNonTerminalStderr(t *testing.T) {
 }
 
 func TestCopyProgressWritesTerminalStatus(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("pty-backed terminal progress test requires a Unix PTY")
+	}
 	master, slave, err := pty.Open()
 	if err != nil {
 		t.Fatalf("open pty: %v", err)
@@ -5593,6 +5614,7 @@ func TestHostDirectoryCopyDestinationSemantics(t *testing.T) {
 }
 
 func TestHostCopyPreservesMetadataAndSymlink(t *testing.T) {
+	requireHostSymlinkSupport(t)
 	parent := t.TempDir()
 	src := filepath.Join(parent, "src")
 	if err := os.MkdirAll(src, 0o755); err != nil {
@@ -6190,6 +6212,22 @@ func runShellUnitScript(sh *shellState, script string) (string, string, error) {
 	var stdout, stderr bytes.Buffer
 	err := sh.evalScriptLines(strings.NewReader(script), &stdout, &stderr)
 	return stdout.String(), stderr.String(), err
+}
+
+func requireHostSymlinkSupport(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "link")
+	if err := os.WriteFile(target, []byte("target"), 0o644); err != nil {
+		t.Fatalf("write symlink probe target: %v", err)
+	}
+	if err := os.Symlink("target", link); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("host symlink creation is unavailable: %v", err)
+		}
+		t.Fatalf("create symlink probe: %v", err)
+	}
 }
 
 type notifyWriter struct {
