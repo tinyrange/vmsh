@@ -4656,6 +4656,10 @@ func guestUsesHostShare(ctx commandContext) bool {
 	return !guestFilesystemIsolated(ctx)
 }
 
+func startMountsHostShare(ctx commandContext) bool {
+	return guestUsesHostShare(ctx) && isBuiltInGuestImage(ctx.Image)
+}
+
 func guestPathIsHostShare(value string) bool {
 	value = path.Clean(strings.TrimSpace(value))
 	return value == guestHostMount || strings.HasPrefix(value, guestHostMount+"/")
@@ -4757,15 +4761,7 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 			return client.RunRequest{}, err
 		}
 		req.WorkDir = firstNonEmpty(req.WorkDir, hostGuestCWD)
-		req.Shares = []client.ShareMount{{
-			Source:   hostRoot,
-			Mount:    guestHostMount,
-			Writable: true,
-			MapOwner: true,
-			OwnerUID: defaultGuestUID,
-			OwnerGID: defaultGuestGID,
-			Cache:    "strict",
-		}}
+		req.Shares = []client.ShareMount{hostShareMount(hostRoot)}
 	}
 	if tty {
 		req.TTY = true
@@ -4783,11 +4779,32 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 	return req, nil
 }
 
+func hostShareMount(hostRoot string) client.ShareMount {
+	return client.ShareMount{
+		Source:   hostRoot,
+		Mount:    guestHostMount,
+		Writable: true,
+		MapOwner: true,
+		OwnerUID: defaultGuestUID,
+		OwnerGID: defaultGuestGID,
+		Cache:    "strict",
+	}
+}
+
 func guestSupportsHostShares(ctx commandContext) bool {
+	return guestSupportsHostSharesOn(runtime.GOOS, runtime.GOARCH, ctx)
+}
+
+func guestSupportsHostSharesOn(goos, goarch string, ctx commandContext) bool {
 	if !isBuiltInGuestImage(ctx.Image) {
 		return true
 	}
-	return runtime.GOOS == "linux" && runtime.GOARCH == "amd64"
+	switch goos + "/" + goarch {
+	case "linux/amd64", "linux/arm64", "darwin/arm64":
+		return true
+	default:
+		return false
+	}
 }
 
 func persistentGuestCommandAllowed(line string) bool {
@@ -6366,6 +6383,13 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 		CPUs:           ctx.CPUs,
 		NestedVirt:     ctx.NestedVirt,
 		TimeoutSeconds: vmshBootTimeoutSeconds(ctx.Image),
+	}
+	if startMountsHostShare(ctx) {
+		hostRoot, _, err := guestHostPaths(s.hostCWD)
+		if err != nil {
+			return err
+		}
+		req.Shares = []client.ShareMount{hostShareMount(hostRoot)}
 	}
 	if ctx.Network {
 		req.Network = networkConfigForContext(ctx)
