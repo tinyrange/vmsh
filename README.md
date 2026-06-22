@@ -149,6 +149,12 @@ Common forms:
 @stop --vm work                 # stop a named VM
 ```
 
+Pipelines can mix host, VM, and SSH stages. `vmsh` follows normal POSIX shell
+status semantics: the pipeline status is the final command's status. When an
+earlier mixed-context stage exits non-zero, `vmsh` also prints a diagnostic that
+names the stage number, context, exit status, and command so the final stage does
+not hide the failure.
+
 Copy endpoints use explicit context prefixes so accidental names fail early:
 
 ```sh

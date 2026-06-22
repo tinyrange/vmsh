@@ -115,17 +115,35 @@ func (s *shellState) runSSHWithInput(ctx commandContext, line string, stdin io.R
 	return s.runSSHCommand(ctx, line, stdin, stdout, stderr, false, false)
 }
 
+func (s *shellState) runSSHWithInputContext(runCtx context.Context, ctx commandContext, line string, stdin io.Reader, stdout, stderr io.Writer) error {
+	return s.runSSHCommandWithSizeContext(runCtx, ctx, line, stdin, stdout, stderr, false, 0, 0, false)
+}
+
 func (s *shellState) runSSHCommand(ctx commandContext, line string, stdin io.Reader, stdout, stderr io.Writer, tty, setLastCode bool) error {
 	return s.runSSHCommandWithSize(ctx, line, stdin, stdout, stderr, tty, 0, 0, setLastCode)
 }
 
 func (s *shellState) runSSHCommandWithSize(ctx commandContext, line string, stdin io.Reader, stdout, stderr io.Writer, tty bool, cols, rows int, setLastCode bool) error {
+	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+	defer stopInterrupts()
+	err := s.runSSHCommandWithSizeContext(runCtx, ctx, line, stdin, stdout, stderr, tty, cols, rows, setLastCode)
+	if interrupted.Load() && err != nil && sessionLastCode(err) < 0 {
+		err = persistentShellExit{code: 130}
+	}
+	return err
+}
+
+func (s *shellState) runSSHCommandWithSizeContext(runCtx context.Context, ctx commandContext, line string, stdin io.Reader, stdout, stderr io.Writer, tty bool, cols, rows int, setLastCode bool) error {
 	if ctx.CWD == "" {
 		ctx.CWD = s.currentSSHCWD(ctx)
 	}
 	script := sshRemoteCommandScript(ctx, line)
-	err := s.runSSHSession(ctx, "sh -lc "+shellQuote(script), stdin, stdout, stderr, tty, cols, rows)
+	err := s.runSSHSessionContext(runCtx, ctx, "sh -lc "+shellQuote(script), stdin, stdout, stderr, tty, cols, rows)
 	code := sshSessionExitCode(err)
+	if runCtx.Err() != nil {
+		code = 130
+		err = persistentShellExit{code: 130}
+	}
 	if setLastCode {
 		s.lastCode = code
 		if err != nil && code < 0 {
@@ -144,25 +162,29 @@ func (s *shellState) runSSHCommandWithSize(ctx commandContext, line string, stdi
 
 func (s *shellState) runSSHSession(ctx commandContext, command string, stdin io.Reader, stdout, stderr io.Writer, tty bool, cols, rows int) error {
 	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
-	client, err := s.sshClientForContext(runCtx, ctx)
-	if interrupted.Load() {
-		stopInterrupts()
+	defer stopInterrupts()
+	err := s.runSSHSessionContext(runCtx, ctx, command, stdin, stdout, stderr, tty, cols, rows)
+	if interrupted.Load() && err != nil && sessionLastCode(err) < 0 {
 		return persistentShellExit{code: 130}
 	}
-	stopInterrupts()
+	return err
+}
+
+func (s *shellState) runSSHSessionContext(runCtx context.Context, ctx commandContext, command string, stdin io.Reader, stdout, stderr io.Writer, tty bool, cols, rows int) error {
+	client, err := s.sshClientForContext(runCtx, ctx)
+	if runCtx.Err() != nil {
+		return persistentShellExit{code: 130}
+	}
 	if err != nil {
 		return err
 	}
 	session, err := client.client.NewSession()
 	if err != nil {
 		s.dropSSHClient(client.key)
-		runCtx, stopInterrupts, interrupted = s.interruptibleCommandContext()
 		client, err = s.sshClientForContext(runCtx, ctx)
-		if interrupted.Load() {
-			stopInterrupts()
+		if runCtx.Err() != nil {
 			return persistentShellExit{code: 130}
 		}
-		stopInterrupts()
 		if err != nil {
 			return err
 		}
@@ -204,20 +226,17 @@ func (s *shellState) runSSHSession(ctx commandContext, command string, stdin io.
 	go func() {
 		done <- session.Run(command)
 	}()
-	interrupts := newCommandInterruptEscalator(command, stderr, func() {
-		_ = session.Signal(ssh.SIGINT)
-	}, func() {
-		_ = session.Close()
-	})
-	stopRunInterrupts, runInterrupted := s.startInterruptWatcher(interrupts.Interrupt)
-	defer stopRunInterrupts()
 	for {
 		select {
 		case err := <-done:
-			if runInterrupted.Load() {
+			if runCtx.Err() != nil {
 				return persistentShellExit{code: 130}
 			}
 			return err
+		case <-runCtx.Done():
+			_ = session.Signal(ssh.SIGINT)
+			_ = session.Close()
+			return persistentShellExit{code: 130}
 		}
 	}
 }
