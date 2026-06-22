@@ -59,7 +59,7 @@ Options followed by a command apply to that command:
 @ --cpus 2 pytest -q
 ```
 
-The host root is mounted writable into guest commands at `/host`, and the guest workdir defaults to the mirrored host cwd, such as `/host/Users/alice/project`. In host mode, `cd` changes the host directory. In VM mode, `cd /tmp` changes the guest workdir, while `cd /host/...` moves the host directory and returns guest commands to the mirrored host path.
+The host root is mounted writable into guest commands at `/host`, and the guest workdir defaults to the mirrored host cwd, such as `/host/Users/alice/project`. Linux guests use the fastest available host-share backend, while built-in BSD guests use vmsh/cc's NFS host-share path on supported hosts. In host mode, `cd` changes the host directory. In VM mode, `cd /tmp` changes the guest workdir, while `cd /host/...` moves the host directory and returns guest commands to the mirrored host path.
 
 `export NAME=value` is tracked by `vmsh` and applied to later host and guest commands.
 
@@ -68,6 +68,15 @@ Background commands can be started with a trailing `&` and inspected with `@jobs
 ```sh
 sleep 10 &
 @jobs
+```
+
+Aliases can include vmsh context prefixes and pipelines. Use `@alias expand`
+to inspect the exact expanded line without running it:
+
+```sh
+@alias deploy=@ssh prod make deploy
+@alias logs=@vm:app journalctl -f
+@alias expand deploy && logs | @host cat
 ```
 
 ## Builtins
@@ -83,6 +92,9 @@ These attention words are reserved:
 @start [--vm id]
 @stop [--vm id]
 @forward <host-port:guest-port>
+@copy SRC DST
+@alias [name=value]
+@alias expand line
 ```
 
 `@host` with no command switches the current context to the host. `@host <command>` runs a one-shot host command.
