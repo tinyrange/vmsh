@@ -2186,6 +2186,13 @@ func (s *shellState) evalAlias(command string, stdout io.Writer) error {
 	if command == "" {
 		return s.printAliases(stdout)
 	}
+	if expanded, ok, err := s.expandAliasPreview(command); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(stdout, expanded)
+		return err
+	}
 	fields, err := splitShellFields(command)
 	if err != nil {
 		return err
@@ -2196,7 +2203,7 @@ func (s *shellState) evalAlias(command string, stdout io.Writer) error {
 	}
 	name, value, ok := parseAliasAssignment(command)
 	if !ok {
-		return fmt.Errorf("usage: @alias [name=value] | @alias -d name")
+		return fmt.Errorf("usage: @alias [name=value] | @alias -d name | @alias expand <line>")
 	}
 	if !isAliasName(name) {
 		return fmt.Errorf("alias: invalid name %q", name)
@@ -2211,6 +2218,25 @@ func (s *shellState) evalAlias(command string, stdout io.Writer) error {
 	}
 	s.aliases[name] = value
 	return nil
+}
+
+func (s *shellState) expandAliasPreview(command string) (string, bool, error) {
+	tokens, err := lexShellTokens(command)
+	if err != nil {
+		return "", false, err
+	}
+	if len(tokens) == 0 || tokens[0].Value != "expand" {
+		return "", false, nil
+	}
+	line := strings.TrimSpace(command[tokens[0].End:])
+	if line == "" {
+		return "", true, fmt.Errorf("usage: @alias expand <line>")
+	}
+	expanded, err := s.expandAliasLine(line)
+	if err != nil {
+		return "", true, err
+	}
+	return expanded, true, nil
 }
 
 func (s *shellState) printAliases(w io.Writer) error {
@@ -2418,7 +2444,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		return s.printJobs(stdout)
 	case "alias":
 		if len(at.Options.OptionFields) != 0 {
-			return fmt.Errorf("usage: @alias [name=value] | @alias -d name")
+			return fmt.Errorf("usage: @alias [name=value] | @alias -d name | @alias expand <line>")
 		}
 		return s.evalAlias(at.Command, stdout)
 	case "status", "where":
@@ -7928,6 +7954,7 @@ func (s *shellState) help(w io.Writer) error {
 @sudo [cmd]              open a root VM subshell, or run cmd as root in the current VM
 @alias [name=value]      list aliases, or set one (example: @alias clear=@host clear)
 @alias -d name           delete an alias
+@alias expand line       print alias-expanded line without running it
 @ps                      list VMs and SSH sessions
 @jobs                    list background jobs
 @status                  show vmsh and selected VM state

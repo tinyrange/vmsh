@@ -1208,6 +1208,40 @@ func TestSudoAliasExpandsAcrossVMShCommandLists(t *testing.T) {
 	}
 }
 
+func TestAliasExpandPrintsInspectableCommandWithoutRunning(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "alpine", Network: true}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@alias deploy=@ssh prod make deploy", &stdout, &stderr); err != nil {
+		t.Fatalf("set deploy alias: %v", err)
+	}
+	if err := sh.eval("@alias logs=@vm:app journalctl -f", &stdout, &stderr); err != nil {
+		t.Fatalf("set logs alias: %v", err)
+	}
+	stdout.Reset()
+	if err := sh.eval("@alias expand deploy && logs | @host cat", &stdout, &stderr); err != nil {
+		t.Fatalf("expand alias: %v\nstderr:\n%s", err, stderr.String())
+	}
+	got := strings.TrimSpace(stdout.String())
+	want := "@ssh prod make deploy&& @vm:app journalctl -f| @host cat"
+	if got != want {
+		t.Fatalf("expanded alias = %q, want %q", got, want)
+	}
+	if len(api.runs) != 0 {
+		t.Fatalf("alias expansion executed VM runs: %+v", api.runs)
+	}
+
+	if err := sh.eval("@alias loop=loop", &stdout, &stderr); err != nil {
+		t.Fatalf("set loop alias: %v", err)
+	}
+	if err := sh.eval("@alias expand loop", &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "alias expansion exceeded") {
+		t.Fatalf("recursive alias expand err = %v, want expansion depth error", err)
+	}
+}
+
 func TestAgentCodexUsesGuestReleaseWithoutChangingGlobalCurrent(t *testing.T) {
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
@@ -3505,6 +3539,85 @@ func TestMixedPipelinePreservesBinaryDataGuestToSSHToHost(t *testing.T) {
 	}
 }
 
+func TestMixedPipelineStreamsHostToGuestToSSH(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mixed pipeline test uses POSIX host commands")
+	}
+	api := newRecordingShellAPI("alpine")
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}
+	api.runInteractive = func(id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		data, closeEvents := drainExecInputStream(inputs)
+		if closeEvents != 0 {
+			return fmt.Errorf("pipeline input sent explicit stdin_close events = %d", closeEvents)
+		}
+		if onEvent != nil {
+			if err := onEvent(client.ExecEvent{Kind: "stdout", Data: append([]byte("guest:"), data...)}); err != nil {
+				return err
+			}
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		_, _ = io.WriteString(stdout, "ssh:")
+		if _, err := io.Copy(stdout, stdin); err != nil {
+			_, _ = fmt.Fprintf(stderr, "copy stdin: %v", err)
+			return 1
+		}
+		return 0
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, api)
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval(`printf data | @alpine cat | @ssh test-ssh-a cat`, &stdout, &stderr); err != nil {
+		t.Fatalf("run host-to-guest-to-ssh pipeline: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if stdout.String() != "ssh:guest:data" {
+		t.Fatalf("pipeline stdout = %q, want ssh:guest:data", stdout.String())
+	}
+}
+
+func TestMixedPipelineStreamsFourHeterogeneousStagesInOrder(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mixed pipeline test uses POSIX host commands")
+	}
+	api := newRecordingShellAPI("alpine")
+	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}
+	api.runInteractive = func(id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+		data, closeEvents := drainExecInputStream(inputs)
+		if closeEvents != 0 {
+			return fmt.Errorf("pipeline input sent explicit stdin_close events = %d", closeEvents)
+		}
+		if onEvent != nil {
+			if err := onEvent(client.ExecEvent{Kind: "stdout", Data: append(data, []byte(":guest")...)}); err != nil {
+				return err
+			}
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		}
+		return nil
+	}
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		data, err := io.ReadAll(stdin)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "read stdin: %v", err)
+			return 1
+		}
+		_, _ = stdout.Write(append(data, []byte(":ssh")...))
+		return 0
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, api)
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval(`printf host | @alpine cat | @ssh test-ssh-a cat | @host cat`, &stdout, &stderr); err != nil {
+		t.Fatalf("run four-stage mixed pipeline: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if stdout.String() != "host:guest:ssh" {
+		t.Fatalf("pipeline stdout = %q, want host:guest:ssh", stdout.String())
+	}
+}
+
 func TestGuestPipelineStreamsLargeInputInChunks(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("large pipeline test uses POSIX host commands")
@@ -4858,6 +4971,10 @@ func TestCopyGuestFileToSSHHost(t *testing.T) {
 		data, err := io.ReadAll(tr)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "read file: %v", err)
+			return 1
+		}
+		if _, err := io.Copy(io.Discard, stdin); err != nil {
+			_, _ = fmt.Fprintf(stderr, "drain tar: %v", err)
 			return 1
 		}
 		received <- header.Name + ":" + string(data)

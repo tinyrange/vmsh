@@ -142,6 +142,8 @@ Common forms:
 @host pwd                       # run one command on the host
 @ --vm work --memory 4g         # update the current VM context
 @ --sudo whoami                 # run as root in the current VM
+@alias ll=@host ls -la          # create an alias
+@alias expand ll /tmp           # preview the expanded command
 @jobs                           # list background jobs
 @status                         # show selected context and VM status
 @stop --vm work                 # stop a named VM
@@ -160,7 +162,10 @@ Copy endpoints use explicit context prefixes so accidental names fail early:
 endpoints: files overwrite files, existing directory destinations receive the
 source by name and merge with existing contents, and directory/non-directory
 type conflicts fail instead of replacing the destination. Copy errors include
-both source and destination endpoints.
+both source and destination endpoints. Interactive copies show lightweight
+progress on the terminal; non-interactive copies stay quiet for scripts. Remote
+to remote copies stream through a temporary host staging directory and remove it
+when the transfer finishes or fails.
 
 Supported options:
 
