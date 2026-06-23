@@ -3279,6 +3279,70 @@ func TestMixedPipelineStreamsHostInputToGuestAndGuestOutputToHost(t *testing.T) 
 	}
 }
 
+func TestMixedHostPipelineStagesShareProcessGroup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host process group test uses POSIX shell commands")
+	}
+	sh := newUnitShell(t, newRecordingShellAPI())
+
+	var stdout, stderr bytes.Buffer
+	err := sh.eval(`@host sh -c 'ps -o pgid= -p $$; sleep 1' | @host sh -c 'read first; second=$(ps -o pgid= -p $$); printf "%s:%s" "$first" "$second"'`, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run host process group pipeline: %v\nstderr:\n%s", err, stderr.String())
+	}
+	parts := strings.Split(strings.TrimSpace(stdout.String()), ":")
+	if len(parts) != 2 {
+		t.Fatalf("process group output = %q, want first:second", stdout.String())
+	}
+	if strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[0]) != strings.TrimSpace(parts[1]) {
+		t.Fatalf("pipeline process groups = %q, want matching pgids", stdout.String())
+	}
+}
+
+func TestMixedPipelineTerminalProgramsRunAsByteStreamStages(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mixed pipeline test uses POSIX host commands")
+	}
+	for _, command := range []string{"vim", "less", "git commit"} {
+		t.Run(command, func(t *testing.T) {
+			api := newRecordingShellAPI("alpine")
+			api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}
+			var sawRun bool
+			api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
+				sawRun = true
+				if req.TTY {
+					t.Fatalf("pipeline stage %q requested a TTY: %+v", command, req)
+				}
+				if onEvent == nil {
+					return nil
+				}
+				if err := onEvent(client.ExecEvent{Kind: "stderr", Output: "not a terminal\n"}); err != nil {
+					return err
+				}
+				return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 1})
+			}
+			sh := newUnitShell(t, api)
+
+			var stdout, stderr bytes.Buffer
+			if err := sh.eval("@alpine "+command+" | @host cat >/dev/null", &stdout, &stderr); err != nil {
+				t.Fatalf("run terminal-looking command in pipeline: %v\nstderr:\n%s", err, stderr.String())
+			}
+			if !sawRun {
+				t.Fatalf("pipeline stage %q was blocked before execution", command)
+			}
+			if sh.lastCode != 0 {
+				t.Fatalf("pipeline status = %d, want final stage status 0", sh.lastCode)
+			}
+			if !strings.Contains(stderr.String(), "not a terminal") {
+				t.Fatalf("pipeline stderr = %q, want command terminal failure", stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "pipeline stage 1 (vm alpine) exited with status 1") {
+				t.Fatalf("pipeline stderr = %q, want stage diagnostic", stderr.String())
+			}
+		})
+	}
+}
+
 func TestMixedPipelineUsesLastStageStatusAndReportsHiddenFailures(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("mixed pipeline test uses POSIX host commands")
