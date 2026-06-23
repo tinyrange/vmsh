@@ -1715,8 +1715,6 @@ func remoteCommandFailureDiagnostic(ctx commandContext, line string, code int) s
 	switch code {
 	case 126:
 		parts = append(parts, "check executable permissions in this context")
-	case 127:
-		parts = append(parts, "command not found in this context")
 	}
 	line = strings.TrimSpace(line)
 	if line != "" {

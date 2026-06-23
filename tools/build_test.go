@@ -104,20 +104,20 @@ func TestRedactDemoCast(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read redacted cast: %v", err)
 	}
-	text := string(data)
-	for _, sensitive := range []string{p.root, "127.0.0.1:49152"} {
-		if strings.Contains(text, sensitive) {
-			t.Fatalf("redacted cast still contains %q: %s", sensitive, text)
-		}
+	lines := splitCastLines(string(data))
+	if len(lines) != 2 {
+		t.Fatalf("redacted cast lines = %q, want header and one event", lines)
 	}
-	if !strings.Contains(text, "/work/vmsh") || !strings.Contains(text, "/tmp/d123/h") || !strings.Contains(text, "127.0.0.1:2222") {
-		t.Fatalf("redacted cast missing replacements: %s", text)
+	event, err := parseDemoCastEvent(lines[1])
+	if err != nil {
+		t.Fatalf("parse redacted event: %v", err)
 	}
-	if strings.Contains(text, "[0.1,") {
-		t.Fatalf("redacted cast was not timeline-normalized: %s", text)
+	if event.Time != 0 {
+		t.Fatalf("redacted event time = %v, want 0", event.Time)
 	}
-	if !strings.Contains(text, "[0,") {
-		t.Fatalf("redacted cast missing zero-based first event: %s", text)
+	wantData := "/work/vmsh /tmp/d123/h 127.0.0.1:2222"
+	if event.Data != wantData {
+		t.Fatalf("redacted event data = %q, want %q", event.Data, wantData)
 	}
 }
 
@@ -127,11 +127,13 @@ func TestNormalizeDemoCastTimeline(t *testing.T) {
 		`[0.26,"o","rst"]` + "\n" +
 		`[1.0,"o","second"]` + "\n"
 	got := normalizeDemoCastTimeline(input)
-	if !strings.Contains(got, `[0,"o","first"]`) {
-		t.Fatalf("nearby output events were not shifted and merged: %s", got)
+	events := parseDemoCastEventsForTest(t, got)
+	want := []demoCastEvent{
+		{Time: 0, Kind: "o", Data: "first"},
+		{Time: 0.75, Kind: "o", Data: "second"},
 	}
-	if !strings.Contains(got, `[0.75,"o","second"]`) {
-		t.Fatalf("later event was not shifted by first timestamp: %s", got)
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %+v, want %+v\ncast:\n%s", events, want, got)
 	}
 }
 
@@ -147,17 +149,10 @@ func TestNormalizeDemoCastTimelineCompressesBootSpinner(t *testing.T) {
 		`[97,"o","Boot: ready freebsd"]` + "\n" +
 		`[98,"o","FreeBSD"]` + "\n"
 	got := normalizeDemoCastTimeline(input)
-	if strings.Contains(got, `[6,"o","\r\u001b[2K| Boot: starting VM"]`) {
-		t.Fatalf("long spinner event was not dropped: %s", got)
-	}
 	var readyTime, freeBSDTime float64
-	for _, line := range strings.Split(got, "\n") {
-		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "{") {
-			continue
-		}
-		event, err := parseDemoCastEvent(line)
-		if err != nil {
-			t.Fatalf("parse event %q: %v", line, err)
+	for _, event := range parseDemoCastEventsForTest(t, got) {
+		if event.Time == 6 && event.Data == "\r\x1b[2K| Boot: starting VM" {
+			t.Fatalf("long spinner event was not dropped: %s", got)
 		}
 		switch event.Data {
 		case "Boot: ready freebsd":
@@ -188,4 +183,30 @@ func TestParseSSHExecPayload(t *testing.T) {
 	if _, err := parseSSHExecPayload([]byte{0, 0, 0, 9, 'h'}); err == nil {
 		t.Fatalf("truncated payload succeeded")
 	}
+}
+
+func splitCastLines(text string) []string {
+	var lines []string
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func parseDemoCastEventsForTest(t *testing.T, text string) []demoCastEvent {
+	t.Helper()
+	var events []demoCastEvent
+	for _, line := range splitCastLines(text) {
+		if len(line) > 0 && line[0] == '{' {
+			continue
+		}
+		event, err := parseDemoCastEvent(line)
+		if err != nil {
+			t.Fatalf("parse event %q: %v", line, err)
+		}
+		events = append(events, event)
+	}
+	return events
 }
