@@ -38,6 +38,7 @@ const isolatedVMSuffix = "-isolated"
 const defaultGuestUser = "1000:1000"
 const defaultVMSHBootTimeoutSeconds = 60
 const defaultBuiltInBSDBootTimeoutSeconds = 180
+const vmshCustomKernelFilePrefix = "file:"
 const defaultGuestShellReadyTimeout = 30 * time.Second
 const maxEmbeddedHostInitPreludeBytes = 64 * 1024
 const maxBackgroundJobLogBytes = 1024 * 1024
@@ -997,6 +998,7 @@ type commandContext struct {
 	CPUs       int       `json:"cpus,omitempty"`
 	Network    bool      `json:"network,omitempty"`
 	NestedVirt bool      `json:"nested_virtualization,omitempty"`
+	Debug      bool      `json:"debug,omitempty"`
 	Isolated   bool      `json:"isolated,omitempty"`
 	ParentKey  string    `json:"parent_key,omitempty"`
 	ParentText string    `json:"parent_text,omitempty"`
@@ -1022,6 +1024,7 @@ type commandOptions struct {
 	CPUs         int
 	Network      *bool
 	NestedVirt   *bool
+	Debug        bool
 	Isolated     *bool
 	OptionFields []string
 }
@@ -5019,6 +5022,11 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 	if strings.TrimSpace(ctx.Kernel) == "" {
 		ctx.Kernel = defaultKernelForImage(ctx.Image)
 	}
+	kernel, err := s.resolveStartKernel(ctx)
+	if err != nil {
+		return client.RunRequest{}, err
+	}
+	ctx.Kernel = kernel
 	if err := s.ensureImageAvailable(ctx, stderr); err != nil {
 		return client.RunRequest{}, err
 	}
@@ -6584,6 +6592,11 @@ func (s *shellState) ensureVMRunning(ctx commandContext, stderr io.Writer) error
 	if strings.TrimSpace(ctx.Kernel) == "" {
 		ctx.Kernel = defaultKernelForImage(ctx.Image)
 	}
+	kernel, kernelErr := s.resolveStartKernel(ctx)
+	if kernelErr != nil {
+		return kernelErr
+	}
+	ctx.Kernel = kernel
 	id := backendVMID(ctx)
 	if s.vmRunning != nil && s.vmRunning[id] && strings.TrimSpace(ctx.InitSystem) == "" && strings.TrimSpace(ctx.Kernel) == "" {
 		return nil
@@ -6674,6 +6687,11 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 	if strings.TrimSpace(ctx.Kernel) == "" {
 		ctx.Kernel = defaultKernelForImage(ctx.Image)
 	}
+	kernel, kernelErr := s.resolveStartKernel(ctx)
+	if kernelErr != nil {
+		return kernelErr
+	}
+	ctx.Kernel = kernel
 	req := client.StartInstanceRequest{
 		Image:          localImageName(ctx.Image, ctx.Arch),
 		InitSystem:     ctx.InitSystem,
@@ -6681,6 +6699,7 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 		MemoryMB:       ctx.MemoryMB,
 		CPUs:           ctx.CPUs,
 		NestedVirt:     ctx.NestedVirt,
+		Dmesg:          ctx.Debug,
 		TimeoutSeconds: vmshBootTimeoutSeconds(ctx.Image),
 	}
 	if startMountsHostShare(ctx) {
@@ -6693,7 +6712,7 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 	if ctx.Network {
 		req.Network = networkConfigForContext(ctx)
 	}
-	boot := newBootStatus(stderr)
+	boot := newBootStatus(stderr, ctx.Debug)
 	defer boot.Close()
 	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
 	defer stopInterrupts()
@@ -6743,15 +6762,22 @@ func vmshBootTimeoutSeconds(image string) float64 {
 
 type bootStatus struct {
 	*terminalHoldStatus
+	debug bool
 }
 
-func newBootStatus(w io.Writer) *bootStatus {
-	return &bootStatus{terminalHoldStatus: newTerminalHoldStatus(w, "Boot: starting VM")}
+func newBootStatus(w io.Writer, debug bool) *bootStatus {
+	return &bootStatus{
+		terminalHoldStatus: newTerminalHoldStatus(w, "Boot: starting VM"),
+		debug:              debug,
+	}
 }
 
 func (b *bootStatus) Update(event client.BootEvent) {
 	if event.Kind == "serial" {
-		if !b.tty && event.Data != "" {
+		if b.debug && b.tty {
+			b.Close()
+		}
+		if (b.debug || !b.tty) && event.Data != "" {
 			fmt.Fprint(b.w, event.Data)
 		}
 		return
@@ -8397,7 +8423,7 @@ func (s *shellState) help(w io.Writer) error {
 @agent --proxy codex     run Codex through a host auth proxy without mounting ~/.codex
 @tmux [session]          open tmux with vmsh as the default pane command
 @forward H:G             forward host port H to guest port G
-opts: --from source --vm id --cwd path --user user --sudo --init --no-init --kernel default|ubuntu --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
+opts: --from source --vm id --cwd path --user user --sudo --init --no-init --kernel default|ubuntu --debug --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
 keys: Ctrl+R reverse history search; Esc/Ctrl+G cancel search
 cd <dir>                 change the current host, VM, or SSH working directory
 exit [--force]           leave the current subshell, or vmsh at top level
@@ -8595,6 +8621,11 @@ func parseCommandOptions(tokens []shellToken, start int, target string) (command
 				return opts, i, err
 			}
 			opts.Kernel = &kernel
+		case "--debug":
+			if hasInlineValue {
+				return opts, i, fmt.Errorf("--debug does not take a value")
+			}
+			opts.Debug = true
 		case "--proxy":
 			if target != "agent" {
 				return opts, i, fmt.Errorf("unknown vmsh option %q", name)
@@ -8712,6 +8743,9 @@ func (c commandContext) withOptions(opts commandOptions) commandContext {
 	}
 	if opts.NestedVirt != nil {
 		c.NestedVirt = *opts.NestedVirt
+	}
+	if opts.Debug {
+		c.Debug = true
 	}
 	if opts.Isolated != nil {
 		c.Isolated = *opts.Isolated
@@ -8958,15 +8992,73 @@ func defaultKernelForImage(image string) string {
 }
 
 func normalizeVMSHKernel(value string) (string, error) {
-	value = strings.ToLower(strings.TrimSpace(value))
-	switch value {
+	value = strings.TrimSpace(value)
+	switch strings.ToLower(value) {
 	case "", "default", "alpine":
 		return "default", nil
 	case "ubuntu":
 		return "ubuntu", nil
 	default:
-		return "", fmt.Errorf("invalid --kernel value %q; expected default or ubuntu", value)
+		return value, nil
 	}
+}
+
+func (s *shellState) resolveStartKernel(ctx commandContext) (string, error) {
+	kernel := strings.TrimSpace(ctx.Kernel)
+	if kernel == "" {
+		kernel = defaultKernelForImage(ctx.Image)
+	}
+	if isNamedVMSHKernel(kernel) || strings.HasPrefix(kernel, vmshCustomKernelFilePrefix) {
+		return kernel, nil
+	}
+	hostPath, err := s.resolveKernelHostPath(ctx, kernel)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(hostPath)
+	if err != nil {
+		return "", fmt.Errorf("stat kernel %s: %w", hostPath, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("kernel %s is a directory", hostPath)
+	}
+	return vmshCustomKernelFilePrefix + hostPath, nil
+}
+
+func isNamedVMSHKernel(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "default", "alpine", "ubuntu":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *shellState) resolveKernelHostPath(ctx commandContext, value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("kernel path is required")
+	}
+	if path.IsAbs(value) {
+		guestPath := path.Clean(value)
+		if hostPath, ok := guestHostPathToHost(s.hostCWD, guestPath); ok {
+			return hostPath, nil
+		}
+		if filepath.IsAbs(value) {
+			return filepath.Clean(value), nil
+		}
+		return "", fmt.Errorf("kernel path %s is not available on the host; place it under %s or use a host path", value, guestHostMount)
+	}
+	if ctx.CWD != "" {
+		guestPath := path.Clean(path.Join(ctx.CWD, filepath.ToSlash(value)))
+		if hostPath, ok := guestHostPathToHost(s.hostCWD, guestPath); ok {
+			return hostPath, nil
+		}
+	}
+	if s.hostCWD == "" {
+		return filepath.Abs(value)
+	}
+	return filepath.Abs(filepath.Join(s.hostCWD, value))
 }
 
 func kernelStateIsDefault(value string) bool {

@@ -811,6 +811,116 @@ func TestUbuntuKernelCanUseDefault(t *testing.T) {
 	}
 }
 
+func TestVMKernelPathResolvesRelativeToHostCWD(t *testing.T) {
+	dir := t.TempDir()
+	kernelPath := filepath.Join(dir, "vmlinuz-test")
+	if err := os.WriteFile(kernelPath, []byte("kernel"), 0o600); err != nil {
+		t.Fatalf("write kernel: %v", err)
+	}
+	api := newRecordingShellAPI("ubuntu")
+	sh := newUnitShell(t, api)
+	sh.hostCWD = dir
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ubuntu --kernel vmlinuz-test --vm work", &stdout, &stderr); err != nil {
+		t.Fatalf("activate VM with custom kernel: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	want := vmshCustomKernelFilePrefix + kernelPath
+	if api.starts[0].req.Kernel != want {
+		t.Fatalf("start kernel = %q, want %q", api.starts[0].req.Kernel, want)
+	}
+}
+
+func TestVMKernelPathResolvesRelativeToGuestHostShareCWD(t *testing.T) {
+	dir := t.TempDir()
+	kernelPath := filepath.Join(dir, "kernels", "vmlinuz-test")
+	if err := os.MkdirAll(filepath.Dir(kernelPath), 0o755); err != nil {
+		t.Fatalf("mkdir kernel dir: %v", err)
+	}
+	if err := os.WriteFile(kernelPath, []byte("kernel"), 0o600); err != nil {
+		t.Fatalf("write kernel: %v", err)
+	}
+	api := newRecordingShellAPI("ubuntu")
+	sh := newUnitShell(t, api)
+	sh.hostCWD = dir
+	_, guestCWD, err := guestHostPaths(dir)
+	if err != nil {
+		t.Fatalf("guest host paths: %v", err)
+	}
+	sh.context = commandContext{
+		Mode:       modeVM,
+		SystemName: "ubuntu",
+		Image:      "ubuntu",
+		VMID:       "ubuntu",
+		CWD:        path.Join(guestCWD, "kernels"),
+		Kernel:     "ubuntu",
+		Network:    true,
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ --kernel vmlinuz-test --vm work", &stdout, &stderr); err != nil {
+		t.Fatalf("activate VM with guest-relative custom kernel: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	want := vmshCustomKernelFilePrefix + kernelPath
+	if api.starts[0].req.Kernel != want {
+		t.Fatalf("start kernel = %q, want %q", api.starts[0].req.Kernel, want)
+	}
+}
+
+func TestVMDebugEnablesBootDmesgAndSerialOutput(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.startStream = func(ctx context.Context, id string, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
+		api.starts = append(api.starts, recordedStart{id: id, req: req})
+		state := client.InstanceState{ID: id, Status: "running", Image: req.Image, Kernel: req.Kernel}
+		api.instances[id] = state
+		if onEvent != nil {
+			if req.Dmesg {
+				if err := onEvent(client.BootEvent{Kind: "serial", Data: "debug-serial\n"}); err != nil {
+					return client.InstanceState{}, err
+				}
+			}
+			if err := onEvent(client.BootEvent{Kind: "ready", State: state}); err != nil {
+				return client.InstanceState{}, err
+			}
+		}
+		return state, nil
+	}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ubuntu --debug --vm work", &stdout, &stderr); err != nil {
+		t.Fatalf("activate debug VM context: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	if !api.starts[0].req.Dmesg {
+		t.Fatalf("start Dmesg = false, want true")
+	}
+	if !sh.context.Debug {
+		t.Fatalf("context Debug = false, want true")
+	}
+	if got := stderr.String(); !strings.Contains(got, "debug-serial\n") {
+		t.Fatalf("stderr = %q, want debug serial output", got)
+	}
+}
+
+func TestVMDebugRejectsValue(t *testing.T) {
+	_, err := parseAtLine("@ubuntu --debug=true")
+	if err == nil {
+		t.Fatalf("parse @ubuntu --debug=true succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "--debug does not take a value") {
+		t.Fatalf("error = %v, want --debug value error", err)
+	}
+}
+
 func TestUbuntuInitRefusesRunningUntrackedVM(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
