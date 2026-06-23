@@ -51,6 +51,8 @@ const (
 	colorYellow  = "\x1b[33m"
 )
 
+var userCacheDir = os.UserCacheDir
+
 type shellMode string
 
 const (
@@ -1047,7 +1049,7 @@ func Run(args []string) error {
 		return fmt.Errorf("usage: vmsh [flags]")
 	}
 
-	rootCache, err := resolveCacheDir(*cacheDir)
+	rootCache, err := resolveCacheDir(*cacheDir, defaultDaemonIdentity())
 	if err != nil {
 		return err
 	}
@@ -9315,15 +9317,19 @@ func formatBootEvent(event client.BootEvent) string {
 	return ""
 }
 
-func resolveCacheDir(arg string) (string, error) {
+func resolveCacheDir(arg, identity string) (string, error) {
 	if arg != "" {
 		return arg, os.MkdirAll(arg, 0o755)
 	}
-	userCacheDir, err := os.UserCacheDir()
+	cacheRoot, err := userCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve user cache dir: %w", err)
 	}
-	dir := filepath.Join(userCacheDir, "ccx3")
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		identity = "ccdev"
+	}
+	dir := filepath.Join(cacheRoot, identity)
 	return dir, os.MkdirAll(dir, 0o755)
 }
 
