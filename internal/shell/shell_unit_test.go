@@ -336,6 +336,28 @@ func TestPrintPSSessionTreeShowsLiveHostManagedResources(t *testing.T) {
 	}
 }
 
+func TestPrintPSSessionTreeNestsRelativeSSH(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	parentCtx := commandContext{Mode: modeSSH, SSHHost: "test-ssh-a", SystemName: "a"}
+	childCtx := sshCommandContext(parentCtx, commandOptions{}, "test-ssh-b")
+
+	var stdout bytes.Buffer
+	err := sh.printSessionTree(&stdout, nil, []sshSessionState{
+		{Name: "a", User: "alice", CWD: "/srv", Ctx: parentCtx},
+		{Name: "test-ssh-b", User: "bob", CWD: "/opt", Ctx: childCtx},
+	}, nil)
+	if err != nil {
+		t.Fatalf("print session tree: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "`- a ssh from=ssh:test-ssh-a user=alice cwd=/srv") {
+		t.Fatalf("@ps output missing parent SSH:\n%s", out)
+	}
+	if !strings.Contains(out, "   `- test-ssh-b ssh from=ssh:test-ssh-b origin=ssh:a user=bob cwd=/opt") {
+		t.Fatalf("@ps output missing nested SSH child:\n%s", out)
+	}
+}
+
 func TestPrintPSMarksCurrentVMAndHost(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu"}
@@ -2280,6 +2302,176 @@ func TestStatusShowsIsolatedVMContext(t *testing.T) {
 	}
 }
 
+func TestContextSwitchingPreservesSeparateEnvironment(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu"}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("export VMSH_SCOPE=host", &stdout, &stderr); err != nil {
+		t.Fatalf("export host env: %v", err)
+	}
+	hostCtx := sh.context
+	vmCtx := commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu"}
+	sh.activateContext(vmCtx)
+	if _, ok := sh.env["VMSH_SCOPE"]; ok {
+		t.Fatalf("VM env inherited host export: %#v", sh.env)
+	}
+	if err := sh.eval("export VMSH_SCOPE=vm", &stdout, &stderr); err != nil {
+		t.Fatalf("export vm env: %v", err)
+	}
+	sh.activateContext(hostCtx)
+	if got := sh.env["VMSH_SCOPE"]; got != "host" {
+		t.Fatalf("host env = %q, want host", got)
+	}
+	sh.activateContext(vmCtx)
+	if got := sh.env["VMSH_SCOPE"]; got != "vm" {
+		t.Fatalf("vm env = %q, want vm", got)
+	}
+
+	stdout.Reset()
+	if err := sh.eval("@status", &stdout, &stderr); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "env=1") {
+		t.Fatalf("status output missing env count:\n%s", stdout.String())
+	}
+}
+
+func TestJobsShowContextAndMarkLostWhenParentStops(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu"}
+	sh := newUnitShell(t, api)
+	ctx := commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu"}
+	sh.jobs = append(sh.jobs, shellJob{
+		ID:          1,
+		Context:     ctx,
+		ContextKey:  contextSessionKey(ctx),
+		ContextText: jobContextText(ctx),
+		Command:     "sleep 30",
+		Started:     time.Unix(1, 0),
+		Control:     jobControlText(ctx),
+	})
+
+	var stdout bytes.Buffer
+	if err := sh.printJobs(&stdout); err != nil {
+		t.Fatalf("print jobs: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, `[1] running context=vm:work cmd="sleep 30"`) || !strings.Contains(out, "logs=@jobs logs 1") || !strings.Contains(out, "stop parent context") {
+		t.Fatalf("@jobs output missing context/control:\n%s", out)
+	}
+
+	stdout.Reset()
+	if err := sh.stopVMAndReport("work", &stdout); err != nil {
+		t.Fatalf("stop VM: %v", err)
+	}
+	stdout.Reset()
+	if err := sh.printJobs(&stdout); err != nil {
+		t.Fatalf("print jobs after stop: %v", err)
+	}
+	out = stdout.String()
+	if !strings.Contains(out, `[1] lost context=vm:work cmd="sleep 30"`) || !strings.Contains(out, `error="parent VM stopped"`) {
+		t.Fatalf("@jobs output missing lost parent status:\n%s", out)
+	}
+}
+
+func TestJobsLogsPrintsCapturedOutput(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.jobs = append(sh.jobs, shellJob{
+		ID:      1,
+		Context: commandContext{Mode: modeHost},
+		Command: "python3 -m http.server .",
+		Log:     []byte("Serving HTTP on 0.0.0.0 port 8000\n"),
+	})
+
+	var stdout bytes.Buffer
+	if err := sh.controlJob("logs 1", &stdout); err != nil {
+		t.Fatalf("jobs logs: %v", err)
+	}
+	if got := stdout.String(); got != "Serving HTTP on 0.0.0.0 port 8000\n" {
+		t.Fatalf("logs output = %q", got)
+	}
+}
+
+func TestJobsLogsReportsEmptyAndDroppedOutput(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.jobs = append(sh.jobs,
+		shellJob{ID: 1, Context: commandContext{Mode: modeHost}, Command: "quiet"},
+		shellJob{ID: 2, Context: commandContext{Mode: modeHost}, Command: "noisy", Log: []byte("tail\n"), LogDropped: true},
+	)
+
+	var stdout bytes.Buffer
+	if err := sh.controlJob("logs 1", &stdout); err != nil {
+		t.Fatalf("empty logs: %v", err)
+	}
+	if got := stdout.String(); got != "[1] no log output captured\n" {
+		t.Fatalf("empty logs output = %q", got)
+	}
+	stdout.Reset()
+	if err := sh.controlJob("logs 2", &stdout); err != nil {
+		t.Fatalf("dropped logs: %v", err)
+	}
+	if got := stdout.String(); got != "[older log output dropped]\ntail\n" {
+		t.Fatalf("dropped logs output = %q", got)
+	}
+}
+
+func TestBackgroundJobStartMessageShowsLogsCommand(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.startBackgroundJob(commandContext{Mode: modeHost}, ":", &stdout, &stderr); err != nil {
+		t.Fatalf("start background job: %v", err)
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "[1] running context=host :") || !strings.Contains(got, "logs: @jobs logs 1") {
+		t.Fatalf("start message = %q, want running context and logs hint", got)
+	}
+}
+
+func TestSSHFromCurrentVMRunsSSHInsideCurrentContext(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", CWD: "/srv"}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ssh --from current vm-only-host printf ok", &stdout, &stderr); err != nil {
+		t.Fatalf("relative ssh from VM: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if len(api.runs) != 1 {
+		t.Fatalf("VM runs = %+v, want one relative ssh command", api.runs)
+	}
+	got := strings.Join(api.runs[0].req.Command, " ")
+	if !strings.Contains(got, "ssh -- 'vm-only-host' printf ok") {
+		t.Fatalf("VM command = %q, want ssh CLI inside VM", got)
+	}
+}
+
+func TestSSHWithoutFromStaysHostRootedInsideVM(t *testing.T) {
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		_, _ = io.WriteString(stdout, "ok\n")
+		return 0
+	})
+	server.installConfig(t, "test-ssh-a")
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", CWD: "/srv"}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ssh test-ssh-a printf ok", &stdout, &stderr); err != nil {
+		t.Fatalf("host-rooted ssh from VM context: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if len(api.runs) != 0 {
+		t.Fatalf("VM runs = %+v, want plain @ssh to stay host-rooted", api.runs)
+	}
+	if commands := server.commands(); len(commands) != 1 || !strings.Contains(commands[0], "printf ok") {
+		t.Fatalf("ssh commands = %q, want host-side ssh command", commands)
+	}
+}
+
 func TestPromptUsesVisibleSystemName(t *testing.T) {
 	sh := newUnitShell(t, newRecordingShellAPI("ubuntu"))
 	sh.context = commandContext{Mode: modeVM, SystemName: "hello", VMID: "hello", Image: "ubuntu"}
@@ -2364,11 +2556,13 @@ func TestRemoteCommandFailureDiagnosticNamesVMContext(t *testing.T) {
 		"vm work: command exited with status 127",
 		"cwd=/missing",
 		"command not found in this context",
-		"use @host missing-tool --flag",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stderr = %q, want %q", got, want)
 		}
+	}
+	if strings.Contains(got, "use @host") {
+		t.Fatalf("stderr = %q, should not suggest @host for remote command failure", got)
 	}
 	if sh.lastCode != 127 {
 		t.Fatalf("lastCode = %d, want 127", sh.lastCode)
@@ -2392,11 +2586,13 @@ func TestRemoteCommandFailureDiagnosticNamesSSHContext(t *testing.T) {
 		"missing-tool: not found",
 		"ssh test-ssh-a: command exited with status 127",
 		"command not found in this context",
-		"use @host missing-tool",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stderr = %q, want %q", got, want)
 		}
+	}
+	if strings.Contains(got, "use @host") {
+		t.Fatalf("stderr = %q, should not suggest @host for remote command failure", got)
 	}
 	if sh.lastCode != 127 {
 		t.Fatalf("lastCode = %d, want 127", sh.lastCode)
@@ -6236,6 +6432,7 @@ func newUnitShell(t *testing.T, api *recordingShellAPI) *shellState {
 		imageCache: map[string]bool{},
 		vmRunning:  map[string]bool{},
 		contextCWD: map[string]string{},
+		contextEnv: map[string]map[string]string{},
 		promptOut:  io.Discard,
 		env:        map[string]string{},
 		aliases:    map[string]string{},
