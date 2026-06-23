@@ -47,7 +47,7 @@ func TestVMIntegrationScriptCommandsStartVMAndUseShellFeatures(t *testing.T) {
 
 	mustWriteTestFile(t, filepath.Join(sh.hostCWD, "host-input.txt"), "from-host-copy\n")
 	script := strings.Join([]string{
-		"@" + env.image + " --vm script --memory 768 --cpus 1 --no-network",
+		"@script --from " + env.image + " --memory 768 --cpus 1 --no-network",
 		"printf 'guest-start:%s:%s\\n' \"$(uname -s)\" \"$(id -u)\"",
 		"export VMSH_REALVM_EXPORT=from-vmsh",
 		"printf 'guest-env:%s\\n' \"$VMSH_REALVM_EXPORT\"",
@@ -61,14 +61,14 @@ func TestVMIntegrationScriptCommandsStartVMAndUseShellFeatures(t *testing.T) {
 		"@host echo host-ok",
 		"@alias sayhost=@host echo alias-host-ok",
 		"sayhost",
-		"@" + env.image + " --vm script --no-network printf 'direct:%s\\n' \"$(cat /tmp/vmsh-script.txt)\"",
+		"@script --no-network printf 'direct:%s\\n' \"$(cat /tmp/vmsh-script.txt)\"",
 		"printf 'alpha\\nbeta\\n' | grep beta",
 		"@sudo sh -lc 'echo sudo:$(id -u)'",
 		"@sudo",
 		"printf 'sudo-shell:%s\\n' \"$(id -u)\"",
 		"exit",
 		"printf 'after-sudo-shell:%s\\n' \"$(id -u)\"",
-		"@stop --vm script",
+		"@stop script",
 	}, "\n")
 
 	stdout, stderr, err := sh.runTestScript(script)
@@ -123,7 +123,7 @@ func TestVMIntegrationFreeBSDBuiltinRunsCommandsAndCopiesFiles(t *testing.T) {
 
 	mustWriteTestFile(t, filepath.Join(sh.hostCWD, "host-input.txt"), "from-host\n")
 	script := strings.Join([]string{
-		"@freebsd --vm freebsd --memory 1024 --cpus 1",
+		"@freebsd --memory 1024 --cpus 1",
 		"printf 'guest:%s:%s\\n' \"$(uname -s)\" \"$(id -u)\"",
 		"pwd",
 		"printf 'root-workdir\\n' > root-workdir.txt",
@@ -133,7 +133,7 @@ func TestVMIntegrationFreeBSDBuiltinRunsCommandsAndCopiesFiles(t *testing.T) {
 		"printf freebsd-output > /tmp/vmsh-freebsd-output.txt",
 		"@copy @:/tmp/vmsh-freebsd-output.txt @host:guest-output.txt",
 		"@vm:freebsd printf 'direct:%s\\n' \"$(cat /tmp/vmsh-freebsd-input.txt)\"",
-		"@stop --vm freebsd",
+		"@stop freebsd",
 	}, "\n")
 
 	stdout, stderr, err := sh.runTestScriptWithTimeout(script, vmIntegrationLongTimeout())
@@ -193,13 +193,13 @@ func TestVMIntegrationCopiesDirectoryMetadataHostToVMToHost(t *testing.T) {
 	}
 
 	script := strings.Join([]string{
-		"@" + env.image + " --vm copy-meta --memory 768 --cpus 1 --no-network",
+		"@copy-meta --from " + env.image + " --memory 768 --cpus 1 --no-network",
 		"@copy @host:meta-src @vm:copy-meta:/tmp/vmsh-meta-vm",
 		"@vm:copy-meta test -x /tmp/vmsh-meta-vm/script.sh",
 		"@vm:copy-meta test -L /tmp/vmsh-meta-vm/script-link",
 		"@vm:copy-meta test \"$(readlink /tmp/vmsh-meta-vm/script-link)\" = script.sh",
 		"@copy @vm:copy-meta:/tmp/vmsh-meta-vm @host:meta-back",
-		"@stop --vm copy-meta",
+		"@stop copy-meta",
 	}, "\n")
 
 	stdout, stderr, err := sh.runTestScriptWithTimeout(script, 45*time.Second)
@@ -231,10 +231,10 @@ func TestVMIntegrationCopiesLargeFileHostToVM(t *testing.T) {
 	}
 
 	script := strings.Join([]string{
-		"@" + env.image + " --vm copy-large --memory 768 --cpus 1 --no-network",
+		"@copy-large --from " + env.image + " --memory 768 --cpus 1 --no-network",
 		"@copy @host:large.bin @vm:copy-large:/root/large.bin",
 		fmt.Sprintf("@vm:copy-large sh -lc 'test \"$(wc -c < /root/large.bin)\" = %d'", largeSize),
-		"@stop --vm copy-large",
+		"@stop copy-large",
 	}, "\n")
 
 	stdout, stderr, err := sh.runTestScriptWithTimeout(script, 45*time.Second)
@@ -255,7 +255,7 @@ func TestVMIntegrationCopiesDirectoryMetadataThroughIsolatedVM(t *testing.T) {
 	createMetadataCopyFixture(t, src)
 
 	script := strings.Join([]string{
-		"@" + env.image + " --vm copy-iso --isolated --memory 768 --cpus 1 --no-network",
+		"@copy-iso --from " + env.image + " --isolated --memory 768 --cpus 1 --no-network",
 		"@copy @host:meta-src @:/tmp/vmsh-meta-vm",
 		"test -x /tmp/vmsh-meta-vm/script.sh",
 		"test -d /tmp/vmsh-meta-vm/empty",
@@ -284,8 +284,8 @@ func TestVMIntegrationCopiesDirectoryMetadataBetweenVMs(t *testing.T) {
 	createMetadataCopyFixture(t, src)
 
 	script := strings.Join([]string{
-		"@" + env.image + " --vm copy-src --memory 768 --cpus 1 --no-network",
-		"@" + env.image + " --vm copy-dst --memory 768 --cpus 1 --no-network",
+		"@copy-src --from " + env.image + " --memory 768 --cpus 1 --no-network",
+		"@copy-dst --from " + env.image + " --memory 768 --cpus 1 --no-network",
 		"@copy @host:meta-src @vm:copy-src:/tmp/vmsh-meta-src",
 		"@copy @vm:copy-src:/tmp/vmsh-meta-src @vm:copy-dst:/tmp/vmsh-meta-dst",
 		"@vm:copy-dst test -x /tmp/vmsh-meta-dst/script.sh",
@@ -293,8 +293,8 @@ func TestVMIntegrationCopiesDirectoryMetadataBetweenVMs(t *testing.T) {
 		"@vm:copy-dst test -L /tmp/vmsh-meta-dst/script-link",
 		"@vm:copy-dst test \"$(readlink /tmp/vmsh-meta-dst/script-link)\" = script.sh",
 		"@copy @vm:copy-dst:/tmp/vmsh-meta-dst @host:meta-back",
-		"@stop --vm copy-src",
-		"@stop --vm copy-dst",
+		"@stop copy-src",
+		"@stop copy-dst",
 	}, "\n")
 
 	stdout, stderr, err := sh.runTestScriptWithTimeout(script, 75*time.Second)
@@ -318,10 +318,10 @@ func TestVMIntegrationCopiesWeirdFilenamesThroughVMAndIsolatedVM(t *testing.T) {
 	names := createWeirdNameCopyFixture(t, src)
 
 	script := strings.Join([]string{
-		"@" + env.image + " --vm copy-weird --memory 768 --cpus 1 --no-network",
+		"@copy-weird --from " + env.image + " --memory 768 --cpus 1 --no-network",
 		"@copy @host:weird-src @vm:copy-weird:/tmp/weird-vm",
 		"@copy @vm:copy-weird:/tmp/weird-vm @host:vm-back",
-		"@" + env.image + " --vm copy-weird-iso --isolated --memory 768 --cpus 1 --no-network",
+		"@copy-weird-iso --from " + env.image + " --isolated --memory 768 --cpus 1 --no-network",
 		"@copy @host:weird-src @:/tmp/weird-iso",
 		"@copy @:/tmp/weird-iso @host:iso-back",
 	}, "\n")
@@ -347,13 +347,13 @@ func TestVMIntegrationPastedCopyDirectoryMetadataHostToVMToHost(t *testing.T) {
 	createMetadataCopyFixture(t, src)
 
 	paste := strings.Join([]string{
-		"@" + env.image + " --vm copy-paste --memory 768 --cpus 1 --no-network",
+		"@copy-paste --from " + env.image + " --memory 768 --cpus 1 --no-network",
 		"@copy @host:" + src + " @vm:copy-paste:/tmp/vmsh-meta-vm",
 		"@vm:copy-paste test -x /tmp/vmsh-meta-vm/script.sh",
 		"@vm:copy-paste test -L /tmp/vmsh-meta-vm/script-link",
 		"@vm:copy-paste test \"$(readlink /tmp/vmsh-meta-vm/script-link)\" = script.sh",
 		"@copy @vm:copy-paste:/tmp/vmsh-meta-vm @host:" + dst,
-		"@stop --vm copy-paste",
+		"@stop copy-paste",
 	}, "\n")
 
 	stdout, stderr, err := sh.runPastedLinesWithTimeout(paste, 45*time.Second)
@@ -380,13 +380,13 @@ func TestVMIntegrationInteractivePasteCopiesDirectoryMetadataHostToVMToHost(t *t
 	session.expect("vmsh", 10*time.Second)
 
 	paste := strings.Join([]string{
-		"@" + env.image + " --vm copy-pty-paste --memory 768 --cpus 1 --no-network",
+		"@copy-pty-paste --from " + env.image + " --memory 768 --cpus 1 --no-network",
 		"@copy @host:meta-src @vm:copy-pty-paste:/tmp/vmsh-meta-vm",
 		"@vm:copy-pty-paste test -x /tmp/vmsh-meta-vm/script.sh",
 		"@vm:copy-pty-paste test -L /tmp/vmsh-meta-vm/script-link",
 		"@vm:copy-pty-paste test \"$(readlink /tmp/vmsh-meta-vm/script-link)\" = script.sh",
 		"@copy @vm:copy-pty-paste:/tmp/vmsh-meta-vm @host:meta-back",
-		"@stop --vm copy-pty-paste",
+		"@stop copy-pty-paste",
 		"@host echo VM_COPY_PASTE_DONE",
 	}, "\n") + "\n"
 	session.write(paste)
@@ -404,14 +404,14 @@ func TestVMIntegrationManagesVMAndImages(t *testing.T) {
 
 	savedImage := "vmsh-integration-saved"
 	script := strings.Join([]string{
-		"@" + env.image + " --vm manage --memory 768 --cpus 1 --no-network",
-		"@start --vm manage",
+		"@manage --from " + env.image + " --memory 768 --cpus 1 --no-network",
+		"@start",
 		"printf warm-root > /tmp/vmsh-manage.txt",
-		"@restart --vm manage",
+		"@restart manage",
 		"if test -e /tmp/vmsh-manage.txt; then printf 'restart-kept\\n'; else printf 'restart-cleared\\n'; fi",
-		"@save --vm manage " + savedImage,
+		"@save manage " + savedImage,
 		"@rmi " + savedImage,
-		"@stop --vm manage",
+		"@stop manage",
 	}, "\n")
 
 	stdout, stderr, err := sh.runTestScript(script)
@@ -436,16 +436,16 @@ func TestVMIntegrationSavesLoadedVMFilesystemFiles(t *testing.T) {
 	mustWriteTestFile(t, filepath.Join(sh.hostCWD, "seed", "root.txt"), "loaded-root\n")
 	mustWriteTestFile(t, filepath.Join(sh.hostCWD, "seed", "nested", "child.txt"), "loaded-child\n")
 	script := strings.Join([]string{
-		"@" + env.image + " --vm save-load --memory 768 --cpus 1 --no-network",
+		"@save-load --from " + env.image + " --memory 768 --cpus 1 --no-network",
 		"@copy @host:seed/root.txt @:~/loaded/root.txt",
 		"@copy @host:seed/nested/child.txt @:~/loaded/nested/child.txt",
 		"printf 'before-save:%s:%s\\n' \"$(cat ~/loaded/root.txt)\" \"$(cat ~/loaded/nested/child.txt)\"",
-		"@save --vm save-load " + savedImage,
-		"@stop --vm save-load",
-		"@" + savedImage + " --vm saved-load --memory 768 --cpus 1 --no-network",
+		"@save save-load " + savedImage,
+		"@stop save-load",
+		"@saved-load --from " + savedImage + " --memory 768 --cpus 1 --no-network",
 		"printf 'after-save:%s:%s\\n' \"$(cat ~/loaded/root.txt)\" \"$(cat ~/loaded/nested/child.txt)\"",
 		"@rmi " + savedImage,
-		"@stop --vm saved-load",
+		"@stop saved-load",
 	}, "\n")
 
 	stdout, stderr, err := sh.runTestScript(script)
@@ -471,7 +471,7 @@ func TestVMIntegrationSavesAfterPersistentTTYGuestShell(t *testing.T) {
 		_ = env.api.DeleteImage(savedImage)
 	})
 
-	stdout, stderr, err := sh.runTestScript("@" + env.image + " --vm tty-save --memory 768 --cpus 1 --no-network\n")
+	stdout, stderr, err := sh.runTestScript("@tty-save --from " + env.image + " --memory 768 --cpus 1 --no-network\n")
 	if err != nil {
 		t.Fatalf("select VM context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
@@ -482,12 +482,12 @@ func TestVMIntegrationSavesAfterPersistentTTYGuestShell(t *testing.T) {
 	}
 
 	script := strings.Join([]string{
-		"@save --vm tty-save " + savedImage,
-		"@stop --vm tty-save",
-		"@" + savedImage + " --vm tty-saved --memory 768 --cpus 1 --no-network",
+		"@save tty-save " + savedImage,
+		"@stop tty-save",
+		"@tty-saved --from " + savedImage + " --memory 768 --cpus 1 --no-network",
 		"printf 'saved-tty:%s\\n' \"$(cat ~/saved/value.txt)\"",
 		"@rmi " + savedImage,
-		"@stop --vm tty-saved",
+		"@stop tty-saved",
 	}, "\n")
 	stdout, stderr, err = sh.runTestScript(script)
 	if err != nil {
@@ -503,7 +503,7 @@ func TestVMIntegrationPersistentTTYGuestShellState(t *testing.T) {
 	env := newVMIntegrationTestEnv(t)
 	sh := env.newShell(t)
 
-	stdout, stderr, err := sh.runTestScript("@" + env.image + " --vm tty --memory 768 --cpus 1 --no-network\n")
+	stdout, stderr, err := sh.runTestScript("@tty --from " + env.image + " --memory 768 --cpus 1 --no-network\n")
 	if err != nil {
 		t.Fatalf("select VM context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
@@ -546,7 +546,7 @@ func TestVMIntegrationPersistentTTYSudoSubshell(t *testing.T) {
 	env := newVMIntegrationTestEnv(t)
 	sh := env.newShell(t)
 
-	stdout, stderr, err := sh.runTestScript("@" + env.image + " --vm sudo-tty --memory 768 --cpus 1 --no-network\n")
+	stdout, stderr, err := sh.runTestScript("@sudo-tty --from " + env.image + " --memory 768 --cpus 1 --no-network\n")
 	if err != nil {
 		t.Fatalf("select VM context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}

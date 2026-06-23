@@ -24,9 +24,9 @@ python --version
 
 @node:22 npm test
 
-@alpine --vm scratch --memory 2g --cpus 4 sh -lc 'cat /etc/os-release'
+@scratch --from alpine --memory 2g --cpus 4 sh -lc 'cat /etc/os-release'
 
-@ --vm work --memory-mb 4096
+@work --from ubuntu --memory-mb 4096
 make -j4
 ```
 
@@ -47,10 +47,10 @@ Commands after a target are one-shot:
 @alpine uname -a
 ```
 
-Bare options update the current context:
+Named systems can be created from an image source:
 
 ```sh
-@ --vm work --cpus 8 --memory 12g
+@work --from ubuntu --cpus 8 --memory 12g
 ```
 
 Options followed by a command apply to that command:
@@ -89,8 +89,8 @@ These attention words are reserved:
 @jobs
 @ps
 @status
-@start [--vm id]
-@stop [--vm id]
+@start
+@stop [name|vm:name|ssh:name]
 @forward <host-port:guest-port>
 @copy SRC DST
 @alias [name=value]
@@ -104,7 +104,7 @@ These attention words are reserved:
 `vmsh` options are parsed before the command:
 
 ```sh
---vm <id>
+--from <source>
 --cwd <guest-path>
 --user <user>
 --sudo
