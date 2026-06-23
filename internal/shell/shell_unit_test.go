@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -2271,8 +2272,8 @@ func TestStatusShowsFullContextChain(t *testing.T) {
 	for _, want := range []string{
 		"1. host cwd=/tmp/vmsh-host",
 		"2. work vm from=builtin:ubuntu backend=work isolated=false user=1000:1000 cwd=/srv/app status=running init=systemd kernel=ubuntu addr=10.42.0.2",
-		"3. test-ssh-a ssh from=ssh:test-ssh-a user=deploy cwd=/srv/remote session=closed [current]",
-		"current: test-ssh-a ssh from=ssh:test-ssh-a user=deploy cwd=/srv/remote session=closed [current]",
+		"3. test-ssh-a ssh from=ssh:test-ssh-a user=deploy cwd=/srv/remote session=closed route=deploy@test-ssh-a",
+		"current: test-ssh-a ssh from=ssh:test-ssh-a user=deploy cwd=/srv/remote session=closed route=deploy@test-ssh-a",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("status output missing %q:\n%s", want, got)
@@ -2469,6 +2470,111 @@ func TestSSHWithoutFromStaysHostRootedInsideVM(t *testing.T) {
 	}
 	if commands := server.commands(); len(commands) != 1 || !strings.Contains(commands[0], "printf ok") {
 		t.Fatalf("ssh commands = %q, want host-side ssh command", commands)
+	}
+}
+
+func TestSSHRouteTextShowsProxyJumpChain(t *testing.T) {
+	config := strings.Join([]string{
+		"Host jump",
+		"  HostName jump.example",
+		"  User jumpuser",
+		"  Port 2222",
+		"Host target",
+		"  HostName target.internal",
+		"  User deploy",
+		"  ProxyJump jump",
+		"",
+	}, "\n")
+	withSSHConfig(t, config)
+
+	got := sshRouteText(commandContext{Mode: modeSSH, SSHHost: "target"})
+	want := "jump(jumpuser@jump.example:2222)->target(deploy@target.internal)"
+	if got != want {
+		t.Fatalf("route = %q, want %q", got, want)
+	}
+}
+
+func TestSSHRouteTextRedactsProxyCommand(t *testing.T) {
+	config := strings.Join([]string{
+		"Host private",
+		"  HostName private.internal",
+		"  User deploy",
+		"  ProxyCommand ssh -i /secret/key -W %h:%p bastion",
+		"",
+	}, "\n")
+	withSSHConfig(t, config)
+
+	got := sshRouteText(commandContext{Mode: modeSSH, SSHHost: "private"})
+	want := "private(deploy@private.internal)(proxy-command)"
+	if got != want {
+		t.Fatalf("route = %q, want %q", got, want)
+	}
+	if strings.Contains(got, "secret") || strings.Contains(got, "bastion") {
+		t.Fatalf("route leaked proxy command details: %q", got)
+	}
+}
+
+func TestSSHClientConfigPrefersOpenSSHHostKeyOrder(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	config, closers, err := sh.sshClientConfig(resolvedSSHConfig{
+		User:                  "deploy",
+		HostName:              "example.internal",
+		Port:                  "22",
+		StrictHostKeyChecking: "no",
+	})
+	for _, closer := range closers {
+		t.Cleanup(func() { _ = closer.Close() })
+	}
+	if err != nil {
+		t.Fatalf("ssh client config: %v", err)
+	}
+
+	algorithms := config.HostKeyAlgorithms
+	if len(algorithms) == 0 {
+		t.Fatalf("HostKeyAlgorithms is empty")
+	}
+	if algorithms[0] != cryptossh.CertAlgoED25519v01 {
+		t.Fatalf("first host key algorithm = %q, want %q", algorithms[0], cryptossh.CertAlgoED25519v01)
+	}
+	ed25519Index := slices.Index(algorithms, cryptossh.KeyAlgoED25519)
+	rsaIndex := slices.Index(algorithms, cryptossh.KeyAlgoRSASHA512)
+	if ed25519Index < 0 || rsaIndex < 0 {
+		t.Fatalf("HostKeyAlgorithms = %v, want ED25519 and RSA SHA2 entries", algorithms)
+	}
+	if ed25519Index > rsaIndex {
+		t.Fatalf("HostKeyAlgorithms = %v, want ED25519 before RSA SHA2", algorithms)
+	}
+	if slices.Contains(algorithms, cryptossh.KeyAlgoRSA) {
+		t.Fatalf("HostKeyAlgorithms = %v, should not enable legacy ssh-rsa by default", algorithms)
+	}
+}
+
+func TestSSHProxyCommandFailsExplicitlyWithoutLeakingCommand(t *testing.T) {
+	config := strings.Join([]string{
+		"Host private",
+		"  HostName private.internal",
+		"  User deploy",
+		"  ProxyCommand ssh -i /secret/key -W %h:%p bastion",
+		"",
+	}, "\n")
+	withSSHConfig(t, config)
+	sh := newUnitShell(t, newRecordingShellAPI())
+
+	_, err := sh.sshClientForContext(context.Background(), commandContext{Mode: modeSSH, SSHHost: "private"})
+	if err == nil {
+		t.Fatalf("ssh client error = nil")
+	}
+	got := err.Error()
+	for _, want := range []string{
+		"route=private(deploy@private.internal)(proxy-command)",
+		"ProxyCommand is not supported yet",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("ssh client error = %q, want %q", got, want)
+		}
+	}
+	if strings.Contains(got, "secret") || strings.Contains(got, "bastion") {
+		t.Fatalf("ssh client error leaked proxy command details: %q", got)
 	}
 }
 
@@ -6308,6 +6414,27 @@ func installTestSSHConfigsWithKnownHostsAndStrict(t *testing.T, hosts map[string
 		if err := os.WriteFile(knownHostsPath, []byte(knownHosts.String()), 0o600); err != nil {
 			t.Fatalf("write known_hosts: %v", err)
 		}
+	}
+	oldConfigPaths := sshConfigPaths
+	oldKnownHosts := sshKnownHosts
+	sshConfigPaths = []string{configPath}
+	sshKnownHosts = []string{knownHostsPath}
+	t.Cleanup(func() {
+		sshConfigPaths = oldConfigPaths
+		sshKnownHosts = oldKnownHosts
+	})
+}
+
+func withSSHConfig(t *testing.T, config string) {
+	t.Helper()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config")
+	knownHostsPath := filepath.Join(dir, "known_hosts")
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatalf("write ssh config: %v", err)
+	}
+	if err := os.WriteFile(knownHostsPath, nil, 0o600); err != nil {
+		t.Fatalf("write known hosts: %v", err)
 	}
 	oldConfigPaths := sshConfigPaths
 	oldKnownHosts := sshKnownHosts

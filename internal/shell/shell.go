@@ -7881,6 +7881,9 @@ func (s *shellState) contextStatusLine(ctx commandContext, current bool) (string
 			"cwd=" + emptyText(s.currentSSHCWD(ctx), "-"),
 			"session=" + session,
 		}
+		if route := sshRouteText(ctx); route != "" {
+			parts = append(parts, "route="+route)
+		}
 		if origin := contextOriginText(ctx); origin != "" && origin != "host" {
 			parts = append(parts, "origin="+origin)
 		}
@@ -8140,6 +8143,9 @@ func (s *shellState) printSessionTree(w io.Writer, states []client.InstanceState
 		}
 		if session.CWD != "" {
 			parts = append(parts, "cwd="+session.CWD)
+		}
+		if session.Route != "" {
+			parts = append(parts, "route="+session.Route)
 		}
 		node := &sessionTreeNode{
 			label:   strings.Join(parts, " "),
