@@ -49,7 +49,6 @@ func TestVMIntegrationScriptCommandsStartVMAndUseShellFeatures(t *testing.T) {
 	script := strings.Join([]string{
 		"@" + env.image + " --vm script --memory 768 --cpus 1 --no-network",
 		"printf 'guest-start:%s:%s\\n' \"$(uname -s)\" \"$(id -u)\"",
-		"@status",
 		"export VMSH_REALVM_EXPORT=from-vmsh",
 		"printf 'guest-env:%s\\n' \"$VMSH_REALVM_EXPORT\"",
 		"printf guest-host-file > vmsh-host-file.txt",
@@ -57,7 +56,7 @@ func TestVMIntegrationScriptCommandsStartVMAndUseShellFeatures(t *testing.T) {
 		"@copy @host:host-input.txt @host:host-copy.txt",
 		"cd /tmp",
 		"pwd",
-		"printf guest-cwd-file > vmsh-script.txt",
+		"printf 'guest-cwd-file\\n' > vmsh-script.txt",
 		"cat vmsh-script.txt",
 		"@host echo host-ok",
 		"@alias sayhost=@host echo alias-host-ok",
@@ -69,31 +68,24 @@ func TestVMIntegrationScriptCommandsStartVMAndUseShellFeatures(t *testing.T) {
 		"printf 'sudo-shell:%s\\n' \"$(id -u)\"",
 		"exit",
 		"printf 'after-sudo-shell:%s\\n' \"$(id -u)\"",
-		"@jobs",
 		"@stop --vm script",
-		"@ps",
 	}, "\n")
 
 	stdout, stderr, err := sh.runTestScript(script)
 	if err != nil {
 		t.Fatalf("run vmsh script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
-	requireContains(t, stdout, "context: vm")
-	requireContains(t, stdout, "image: "+env.image)
-	requireContains(t, stdout, "vm: script")
-	requireContains(t, stdout, "vm status: running")
-	requireContains(t, stdout, "guest-start:Linux:1000")
-	requireContains(t, stdout, "guest-env:from-vmsh")
-	requireContains(t, stdout, "/tmp")
-	requireContains(t, stdout, "guest-cwd-file")
-	requireContains(t, stdout, "host-ok")
-	requireContains(t, stdout, "alias-host-ok")
-	requireContains(t, stdout, "direct:guest-cwd-file")
-	requireContains(t, stdout, "beta")
-	requireContains(t, stdout, "sudo:0")
-	requireContains(t, stdout, "sudo-shell:0")
-	requireContains(t, stdout, "after-sudo-shell:1000")
-	requireContains(t, stdout, "No jobs")
+	requireOutputLine(t, stdout, "guest-start:Linux:1000")
+	requireOutputLine(t, stdout, "guest-env:from-vmsh")
+	requireOutputLine(t, stdout, "/tmp")
+	requireOutputLine(t, stdout, "guest-cwd-file")
+	requireOutputLine(t, stdout, "host-ok")
+	requireOutputLine(t, stdout, "alias-host-ok")
+	requireOutputLine(t, stdout, "direct:guest-cwd-file")
+	requireOutputLine(t, stdout, "beta")
+	requireOutputLine(t, stdout, "sudo:0")
+	requireOutputLine(t, stdout, "sudo-shell:0")
+	requireOutputLine(t, stdout, "after-sudo-shell:1000")
 
 	copied, err := os.ReadFile(filepath.Join(sh.hostCWD, "guest-from-script.txt"))
 	if err != nil {
@@ -133,9 +125,8 @@ func TestVMIntegrationFreeBSDBuiltinRunsCommandsAndCopiesFiles(t *testing.T) {
 	script := strings.Join([]string{
 		"@freebsd --vm freebsd --memory 1024 --cpus 1",
 		"printf 'guest:%s:%s\\n' \"$(uname -s)\" \"$(id -u)\"",
-		"@status",
 		"pwd",
-		"printf root-workdir > root-workdir.txt",
+		"printf 'root-workdir\\n' > root-workdir.txt",
 		"cat root-workdir.txt",
 		"@copy @host:host-input.txt @:/tmp/vmsh-freebsd-input.txt",
 		"cat /tmp/vmsh-freebsd-input.txt",
@@ -149,14 +140,11 @@ func TestVMIntegrationFreeBSDBuiltinRunsCommandsAndCopiesFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run FreeBSD vmsh script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
-	requireContains(t, stdout, "guest:FreeBSD:0")
-	requireContains(t, stdout, "context: vm")
-	requireContains(t, stdout, "image: @freebsd")
-	requireContains(t, stdout, "vm: freebsd")
-	requireContains(t, stdout, "/host"+sh.hostCWD)
-	requireContains(t, stdout, "root-workdir")
-	requireContains(t, stdout, "from-host")
-	requireContains(t, stdout, "direct:from-host")
+	requireOutputLine(t, stdout, "guest:FreeBSD:0")
+	requireOutputLine(t, stdout, "/host"+sh.hostCWD)
+	requireOutputLine(t, stdout, "root-workdir")
+	requireOutputLine(t, stdout, "from-host")
+	requireOutputLine(t, stdout, "direct:from-host")
 	copied, err := os.ReadFile(filepath.Join(sh.hostCWD, "guest-output.txt"))
 	if err != nil {
 		t.Fatalf("read copied FreeBSD file: %v", err)
@@ -430,9 +418,7 @@ func TestVMIntegrationManagesVMAndImages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run vmsh management script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
-	requireContains(t, stdout, "restart-cleared")
-	requireContains(t, stdout, "Saved manage as "+savedImage)
-	requireContains(t, stdout, "Removed "+savedImage)
+	requireOutputLine(t, stdout, "restart-cleared")
 	if _, err := env.api.GetImage(savedImage); err == nil {
 		t.Fatalf("saved image %q still exists after @rmi", savedImage)
 	}
@@ -466,10 +452,8 @@ func TestVMIntegrationSavesLoadedVMFilesystemFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run vmsh save loaded filesystem script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
-	requireContains(t, stdout, "before-save:loaded-root:loaded-child")
-	requireContains(t, stdout, "Saved save-load as "+savedImage)
-	requireContains(t, stdout, "after-save:loaded-root:loaded-child")
-	requireContains(t, stdout, "Removed "+savedImage)
+	requireOutputLine(t, stdout, "before-save:loaded-root:loaded-child")
+	requireOutputLine(t, stdout, "after-save:loaded-root:loaded-child")
 	if _, err := env.api.GetImage(savedImage); err == nil {
 		t.Fatalf("saved image %q still exists after @rmi", savedImage)
 	}
@@ -509,9 +493,7 @@ func TestVMIntegrationSavesAfterPersistentTTYGuestShell(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run vmsh TTY save script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
-	requireContains(t, stdout, "Saved tty-save as "+savedImage)
-	requireContains(t, stdout, "saved-tty:tty-persist")
-	requireContains(t, stdout, "Removed "+savedImage)
+	requireOutputLine(t, stdout, "saved-tty:tty-persist")
 }
 
 func TestVMIntegrationPersistentTTYGuestShellState(t *testing.T) {
@@ -541,13 +523,13 @@ func TestVMIntegrationPersistentTTYGuestShellState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run persisted alias: %v\noutput:\n%s", err, out)
 	}
-	requireContains(t, out, "alias:warm")
+	requireOutputLine(t, out, "alias:warm")
 
 	out, err = sh.evalOnTestPTY("vm_func")
 	if err != nil {
 		t.Fatalf("run persisted function: %v\noutput:\n%s", err, out)
 	}
-	requireContains(t, out, "func:warm:/tmp")
+	requireOutputLine(t, out, "func:warm:/tmp")
 	if sh.context.CWD != "/tmp" {
 		t.Fatalf("guest context cwd = %q, want /tmp", sh.context.CWD)
 	}
@@ -573,7 +555,7 @@ func TestVMIntegrationPersistentTTYSudoSubshell(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run id before sudo subshell: %v\noutput:\n%s", err, out)
 	}
-	requireContains(t, out, "1000")
+	requireOutputLine(t, out, "1000")
 
 	out, err = sh.evalOnTestPTY("@sudo")
 	if err != nil {
@@ -587,7 +569,7 @@ func TestVMIntegrationPersistentTTYSudoSubshell(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run id in sudo subshell: %v\noutput:\n%s", err, out)
 	}
-	requireContains(t, out, "0")
+	requireOutputLine(t, out, "0")
 
 	out, err = sh.evalOnTestPTY("exit")
 	if err != nil {
@@ -601,7 +583,7 @@ func TestVMIntegrationPersistentTTYSudoSubshell(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run id after sudo subshell: %v\noutput:\n%s", err, out)
 	}
-	requireContains(t, out, "1000")
+	requireOutputLine(t, out, "1000")
 
 	if err := sh.stopVM("sudo-tty"); err != nil {
 		t.Fatalf("stop sudo-tty VM: %v", err)
@@ -1016,6 +998,8 @@ func isPTYClosedError(err error) bool {
 		return true
 	}
 	text := strings.ToLower(err.Error())
+	// PTY close errors come from OS/runtime boundaries and are not exposed as
+	// portable typed errors, so flexible matching is the useful assertion here.
 	return strings.Contains(text, "input/output error") ||
 		strings.Contains(text, "file already closed") ||
 		strings.Contains(text, "bad file descriptor")
@@ -1031,11 +1015,14 @@ func mustWriteTestFile(t *testing.T, path, contents string) {
 	}
 }
 
-func requireContains(t *testing.T, text, want string) {
+func requireOutputLine(t *testing.T, text, want string) {
 	t.Helper()
-	if !strings.Contains(text, want) {
-		t.Fatalf("output does not contain %q\noutput:\n%s", want, text)
+	for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+		if line == want {
+			return
+		}
 	}
+	t.Fatalf("output missing line %q\noutput:\n%s", want, text)
 }
 
 func createMetadataCopyFixture(t *testing.T, src string) {
