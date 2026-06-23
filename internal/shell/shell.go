@@ -411,7 +411,6 @@ func (c *vmshCompleter) cachedImageNames() []string {
 
 func vmshOptionWords(prefix string) []string {
 	words := []string{
-		"--vm",
 		"--from",
 		"--cwd",
 		"--user",
@@ -2646,7 +2645,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		return s.runMaybeBackground(ctx, command, stdout, stderr)
 	case "start":
 		if at.Command != "" {
-			return fmt.Errorf("usage: @start [--vm id]")
+			return fmt.Errorf("usage: @start")
 		}
 		ctx := s.context.withOptions(at.Options)
 		return s.ensureVMRunning(ctx, stderr)
@@ -6916,19 +6915,10 @@ func (s *shellState) stopSession(at atLine, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if len(fields) > 1 || (at.Options.VMID != "" && len(fields) != 0) {
+	if len(fields) > 1 {
 		return fmt.Errorf("usage: @stop [name|vm:name|ssh:name]")
 	}
 	if len(fields) == 0 {
-		if at.Options.VMID != "" {
-			ctx := s.context.withOptions(at.Options)
-			id := backendVMID(ctx)
-			if err := s.stopVMAndReport(id, stdout); err != nil {
-				return err
-			}
-			s.leaveStoppedVM(id)
-			return nil
-		}
 		if s.context.Mode == modeSSH {
 			host := s.context.SSHHost
 			if key, ok := s.sshSessionKeyForContext(s.context); ok && s.closeSSHSessionKey(key) {
@@ -7006,8 +6996,8 @@ func (s *shellState) restartSession(at atLine, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if len(fields) > 1 || (at.Options.VMID != "" && len(fields) != 0) {
-		return fmt.Errorf("usage: @restart [name|vm:name|--vm id]")
+	if len(fields) > 1 {
+		return fmt.Errorf("usage: @restart [name|vm:name]")
 	}
 	if len(fields) == 0 {
 		ctx := s.context.withOptions(at.Options)
@@ -7136,7 +7126,7 @@ func (s *shellState) resolveVMStopTarget(name string) (stopTargetMatch, error) {
 	}
 	switch {
 	case len(vmMatches) > 1:
-		return stopTargetMatch{}, fmt.Errorf("stop target %q is ambiguous because both shared and isolated VMs are running with that name; this should only happen for sessions started by older vmsh builds, use @stop --vm %s or @stop --vm %s", name, name, backendVMIDFor(name, true))
+		return stopTargetMatch{}, fmt.Errorf("stop target %q is ambiguous because both shared and isolated VMs are running with that name; this should only happen for sessions started by older vmsh builds, use @stop vm:%s or @stop vm:%s", name, name, backendVMIDFor(name, true))
 	case len(vmMatches) == 1:
 		return stopTargetMatch{kind: stopTargetVM, id: vmMatches[0]}, nil
 	default:
@@ -7284,14 +7274,14 @@ func (s *shellState) saveVM(at atLine, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if len(fields) < 1 || len(fields) > 2 || hasSaveOnlyUnsupportedOptions(at.Options) || (at.Options.VMID != "" && len(fields) == 2) {
-		return fmt.Errorf("usage: @save [name|--vm id] tag")
+	if len(fields) < 1 || len(fields) > 2 || len(at.Options.OptionFields) != 0 {
+		return fmt.Errorf("usage: @save [name] tag")
 	}
 	var ctx commandContext
 	var id string
 	name := strings.TrimSpace(fields[len(fields)-1])
 	if name == "" || strings.HasPrefix(name, "-") {
-		return fmt.Errorf("usage: @save [name|--vm id] tag")
+		return fmt.Errorf("usage: @save [name] tag")
 	}
 	if len(fields) == 2 {
 		match, err := s.resolveVMStopTarget(fields[0])
@@ -7329,15 +7319,6 @@ func (s *shellState) saveVM(at atLine, stdout io.Writer) error {
 		return err
 	}
 	return nil
-}
-
-func hasSaveOnlyUnsupportedOptions(opts commandOptions) bool {
-	for _, field := range opts.OptionFields {
-		if strings.TrimSpace(field) != "--vm" {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *shellState) removeImage(at atLine, stdout io.Writer) error {
@@ -8384,10 +8365,10 @@ func (s *shellState) help(w io.Writer) error {
 @ps                      list VMs and SSH sessions
 	@jobs [logs id|stop id]  list background jobs, show captured output, or request stop
 @status                  show vmsh and selected VM state
-@start [--vm id]         start a blank VM
+@start                   start the current VM
 @stop [name|vm:name|ssh:name]  stop an SSH session or VM
-@restart [name|vm:name|--vm id]  restart a VM after confirmation
-@save [name|--vm id] tag save a VM root filesystem as a local image
+@restart [name|vm:name]  restart a VM after confirmation
+@save [name] tag         save a VM root filesystem as a local image
 @rmi image               remove a locally cached image
 @copy SRC DST            copy between @:path, @host:path, @name:path, @vm:id:path, @ssh:host:path, and @image:name:path
                          files overwrite files; existing directory destinations merge; directory/non-directory conflicts fail
@@ -8395,7 +8376,7 @@ func (s *shellState) help(w io.Writer) error {
 @agent --proxy codex     run Codex through a host auth proxy without mounting ~/.codex
 @tmux [session]          open tmux with vmsh as the default pane command
 @forward H:G             forward host port H to guest port G
-opts: --from source --vm id --cwd path --user user --sudo --init --no-init --kernel default|ubuntu --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
+opts: --from source --cwd path --user user --sudo --init --no-init --kernel default|ubuntu --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
 keys: Ctrl+R reverse history search; Esc/Ctrl+G cancel search
 cd <dir>                 change the current host, VM, or SSH working directory
 exit [--force]           leave the current subshell, or vmsh at top level
@@ -8532,12 +8513,6 @@ func parseCommandOptions(tokens []shellToken, start int, target string) (command
 		}
 		opts.OptionFields = append(opts.OptionFields, field)
 		switch name {
-		case "--vm":
-			v, err := readValue()
-			if err != nil {
-				return opts, i, err
-			}
-			opts.VMID = v
 		case "--from":
 			v, err := readValue()
 			if err != nil {

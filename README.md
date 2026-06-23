@@ -35,7 +35,7 @@ Example session:
 @alpine
 cat /etc/alpine-release
 
-@ubuntu:24.04 --vm work --memory 2g --cpus 4
+@work --from ubuntu:24.04 --memory 2g --cpus 4
 python3 --version
 
 @host git status
@@ -119,7 +119,7 @@ Run a non-interactive script:
 ./build/vmsh/cc -ccvm ./build/vmsh/ccvm pull alpine ./cc/fixtures/alpine.simg
 
 cat > /tmp/vmsh-smoke <<'EOF'
-@alpine --vm smoke --memory 256 --no-network sh -lc 'whoami; uname -m'
+@smoke --from alpine --memory 256 --no-network sh -lc 'whoami; uname -m'
 EOF
 
 ./build/vmsh/vmsh -ccvm ./build/vmsh/ccvm -script /tmp/vmsh-smoke
@@ -140,13 +140,13 @@ Common forms:
 @alpine                         # select an image; VM starts lazily
 @alpine uname -a                # run one command in alpine
 @host pwd                       # run one command on the host
-@ --vm work --memory 4g         # update the current VM context
+@work --from alpine --memory 4g # create or switch to a named VM system
 @ --sudo whoami                 # run as root in the current VM
 @alias ll=@host ls -la          # create an alias
 @alias expand ll /tmp           # preview the expanded command
 @jobs                           # list background jobs
 @status                         # show selected context and VM status
-@stop --vm work                 # stop a named VM
+@stop work                      # stop a named VM
 ```
 
 Pipelines can mix host, VM, and SSH stages. `vmsh` follows normal POSIX shell
@@ -176,7 +176,7 @@ when the transfer finishes or fails.
 Supported options:
 
 ```sh
---vm <id>
+--from <source>
 --cwd <guest-path>
 --user <user>
 --sudo

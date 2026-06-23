@@ -41,7 +41,7 @@ func TestShellCommandPassingBuildsGuestRunRequests(t *testing.T) {
 	api := newRecordingShellAPI("alpine", "alpine@amd64")
 	sh := newUnitShell(t, api)
 	script := strings.Join([]string{
-		"@alpine --vm work --arch amd64 --memory 2g --cpus 4 --no-network --nested --cwd /work --user app",
+		"@work --from alpine --arch amd64 --memory 2g --cpus 4 --no-network --nested --cwd /work --user app",
 		"printf 'hello | %s' \"$USER\"",
 		"@sudo whoami",
 	}, "\n")
@@ -385,9 +385,9 @@ func TestIsolatedContextUsesSeparateBackendVM(t *testing.T) {
 	}
 	sh := newUnitShell(t, api)
 	script := strings.Join([]string{
-		"@ubuntu --vm work",
+		"@work --from ubuntu",
 		"true",
-		"@ubuntu --vm sandbox --isolated",
+		"@sandbox --from ubuntu --isolated",
 		"true",
 	}, "\n")
 
@@ -431,7 +431,7 @@ func TestBuiltInOpenBSDRunHostShareBehavior(t *testing.T) {
 	api := newRecordingShellAPI()
 	sh := newUnitShell(t, api)
 	var stdout, stderr bytes.Buffer
-	if err := sh.eval("@openbsd --vm obsd --memory 768 --cpus 1 --no-network", &stdout, &stderr); err != nil {
+	if err := sh.eval("@obsd --from @openbsd --memory 768 --cpus 1 --no-network", &stdout, &stderr); err != nil {
 		t.Fatalf("enter OpenBSD context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
 	}
 	if err := sh.eval("uname -s", &stdout, &stderr); err != nil {
@@ -463,8 +463,8 @@ func TestIsolatedContextRejectsSharedNameCollision(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	sh := newUnitShell(t, api)
 	script := strings.Join([]string{
-		"@ubuntu --vm work",
-		"@ubuntu --vm work --isolated",
+		"@work --from ubuntu",
+		"@work --from ubuntu --isolated",
 	}, "\n")
 
 	stdout, stderr, err := runShellUnitScript(sh, script)
@@ -480,9 +480,9 @@ func TestSharedContextRejectsIsolatedNameCollision(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	sh := newUnitShell(t, api)
 	script := strings.Join([]string{
-		"@ubuntu --vm work --isolated",
+		"@work --from ubuntu --isolated",
 		"@host",
-		"@ubuntu --vm work --shared",
+		"@work --from ubuntu --shared",
 	}, "\n")
 
 	stdout, stderr, err := runShellUnitScript(sh, script)
@@ -499,7 +499,7 @@ func TestBareVMTargetStartsVMWhenActivated(t *testing.T) {
 	sh := newUnitShell(t, api)
 
 	var stdout, stderr bytes.Buffer
-	if err := sh.eval("@ubuntu --vm work --memory 768 --cpus 1 --no-network", &stdout, &stderr); err != nil {
+	if err := sh.eval("@work --from ubuntu --memory 768 --cpus 1 --no-network", &stdout, &stderr); err != nil {
 		t.Fatalf("activate VM context: %v\nstderr:\n%s", err, stderr.String())
 	}
 	if sh.context.Mode != modeVM || sh.context.Image != "ubuntu" || sh.context.VMID != "work" {
@@ -666,7 +666,7 @@ func TestUbuntuInitCanBeDisabled(t *testing.T) {
 	sh := newUnitShell(t, api)
 
 	var stdout, stderr bytes.Buffer
-	if err := sh.eval("@ubuntu --no-init --vm work", &stdout, &stderr); err != nil {
+	if err := sh.eval("@work --from ubuntu --no-init", &stdout, &stderr); err != nil {
 		t.Fatalf("activate VM context: %v\nstderr:\n%s", err, stderr.String())
 	}
 	if len(api.starts) != 1 {
@@ -685,7 +685,7 @@ func TestUbuntuKernelCanUseDefault(t *testing.T) {
 	sh := newUnitShell(t, api)
 
 	var stdout, stderr bytes.Buffer
-	if err := sh.eval("@ubuntu --kernel default --vm work", &stdout, &stderr); err != nil {
+	if err := sh.eval("@work --from ubuntu --kernel default", &stdout, &stderr); err != nil {
 		t.Fatalf("activate VM context: %v\nstderr:\n%s", err, stderr.String())
 	}
 	if len(api.starts) != 1 {
@@ -702,7 +702,7 @@ func TestUbuntuInitRefusesRunningUntrackedVM(t *testing.T) {
 	sh := newUnitShell(t, api)
 
 	var stdout, stderr bytes.Buffer
-	err := sh.eval("@ubuntu --init --vm work", &stdout, &stderr)
+	err := sh.eval("@work --from ubuntu --init", &stdout, &stderr)
 	if err == nil {
 		t.Fatalf("activate VM context succeeded, want init mismatch error")
 	}
@@ -717,7 +717,7 @@ func TestUbuntuNoInitRefusesRunningSystemdVM(t *testing.T) {
 	sh := newUnitShell(t, api)
 
 	var stdout, stderr bytes.Buffer
-	err := sh.eval("@ubuntu --no-init --vm work", &stdout, &stderr)
+	err := sh.eval("@work --from ubuntu --no-init", &stdout, &stderr)
 	if err == nil {
 		t.Fatalf("activate VM context succeeded, want init mismatch error")
 	}
@@ -730,7 +730,7 @@ func TestBuiltInFreeBSDRunHostShareBehavior(t *testing.T) {
 	api := newRecordingShellAPI()
 	sh := newUnitShell(t, api)
 	var stdout, stderr bytes.Buffer
-	if err := sh.eval("@freebsd --vm fbsd --memory 1024 --cpus 1 --no-network", &stdout, &stderr); err != nil {
+	if err := sh.eval("@fbsd --from @freebsd --memory 1024 --cpus 1 --no-network", &stdout, &stderr); err != nil {
 		t.Fatalf("enter FreeBSD context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
 	}
 	if err := sh.eval("uname -s", &stdout, &stderr); err != nil {
@@ -760,7 +760,7 @@ func TestBuiltInNetBSDRunHostShareBehavior(t *testing.T) {
 	api := newRecordingShellAPI()
 	sh := newUnitShell(t, api)
 	var stdout, stderr bytes.Buffer
-	if err := sh.eval("@netbsd --vm nbsd --memory 1024 --cpus 1 --no-network", &stdout, &stderr); err != nil {
+	if err := sh.eval("@nbsd --from @netbsd --memory 1024 --cpus 1 --no-network", &stdout, &stderr); err != nil {
 		t.Fatalf("enter NetBSD context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
 	}
 	if err := sh.eval("uname -s", &stdout, &stderr); err != nil {
@@ -889,7 +889,7 @@ func TestBareVMOptionsStartVMWhenActivated(t *testing.T) {
 	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu", Network: true}
 
 	var stdout, stderr bytes.Buffer
-	if err := sh.eval("@ --vm other --memory 512", &stdout, &stderr); err != nil {
+	if err := sh.eval("@other --from ubuntu --memory 512", &stdout, &stderr); err != nil {
 		t.Fatalf("activate VM context with options: %v\nstderr:\n%s", err, stderr.String())
 	}
 	if sh.context.Mode != modeVM || sh.context.Image != "ubuntu" || sh.context.VMID != "other" {
@@ -908,10 +908,10 @@ func TestStartIsIdempotentAfterBareVMActivation(t *testing.T) {
 	sh := newUnitShell(t, api)
 
 	var stdout, stderr bytes.Buffer
-	if err := sh.eval("@ubuntu --vm work", &stdout, &stderr); err != nil {
+	if err := sh.eval("@work --from ubuntu", &stdout, &stderr); err != nil {
 		t.Fatalf("activate VM context: %v", err)
 	}
-	if err := sh.eval("@start --vm work", &stdout, &stderr); err != nil {
+	if err := sh.eval("@start", &stdout, &stderr); err != nil {
 		t.Fatalf("start already-active VM: %v", err)
 	}
 	if len(api.starts) != 1 {
@@ -4303,7 +4303,7 @@ func TestStopCommandReportsLegacySharedAndIsolatedCollision(t *testing.T) {
 	if err == nil {
 		t.Fatalf("legacy isolated collision error = %v", err)
 	}
-	if err := sh.eval("@stop --vm work-isolated", &stdout, &stderr); err != nil {
+	if err := sh.eval("@stop work-isolated", &stdout, &stderr); err != nil {
 		t.Fatalf("stop isolated VM: %v", err)
 	}
 	if got := api.instances["work"].Status; got != "running" {
@@ -4321,7 +4321,7 @@ func TestStopCommandExplicitVMAndCurrentContext(t *testing.T) {
 	sh.context = commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu"}
 
 	var stdout, stderr bytes.Buffer
-	if err := sh.eval("@stop --vm work", &stdout, &stderr); err != nil {
+	if err := sh.eval("@stop work", &stdout, &stderr); err != nil {
 		t.Fatalf("stop explicit VM: %v", err)
 	}
 	if got := api.instances["work"].Status; got != "stopped" {
