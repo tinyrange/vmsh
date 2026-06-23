@@ -35,6 +35,10 @@ type contextPreparedTargetCommand interface {
 	RunWithInputContext(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error
 }
 
+type pipelinePreparedTargetCommand interface {
+	RunPipelineStage(ctx context.Context, pipeline *pipelineRun, stdin io.Reader, stdout, stderr io.Writer) error
+}
+
 type hostShellTarget struct {
 	shell *shellState
 	ctx   commandContext
@@ -85,6 +89,10 @@ func (c hostPreparedCommand) RunWithInput(stdin io.Reader, stdout, stderr io.Wri
 
 func (c hostPreparedCommand) RunWithInputContext(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error {
 	return c.target.shell.runHostWithInputContext(ctx, c.line, stdin, stdout, stderr)
+}
+
+func (c hostPreparedCommand) RunPipelineStage(ctx context.Context, pipeline *pipelineRun, stdin io.Reader, stdout, stderr io.Writer) error {
+	return c.target.shell.runHostPipelineStage(ctx, pipeline, c.line, stdin, stdout, stderr)
 }
 
 type guestShellTarget struct {

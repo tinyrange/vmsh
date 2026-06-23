@@ -1946,6 +1946,23 @@ type pipelineStageResult struct {
 	err error
 }
 
+type pipelineRun struct {
+	started chan struct{}
+	host    *hostPipelineGroup
+}
+
+func newPipelineRun() *pipelineRun {
+	started := make(chan struct{})
+	return &pipelineRun{started: started, host: newHostPipelineGroup(os.Stdin, started)}
+}
+
+func (p *pipelineRun) restore() {
+	if p == nil || p.host == nil {
+		return
+	}
+	p.host.restore()
+}
+
 func splitPipelineLine(line string) ([]string, bool, error) {
 	var segments []string
 	start := 0
@@ -2030,7 +2047,9 @@ func (s *shellState) runPipeline(base commandContext, segments []string, stdout,
 	results := make([]pipelineStageResult, len(stages))
 	runCtx, cancel := context.WithCancel(context.Background())
 	stopInterrupts, interrupted := s.startInterruptWatcher(cancel)
+	pipeline := newPipelineRun()
 	defer func() {
+		pipeline.restore()
 		stopInterrupts()
 		cancel()
 	}()
@@ -2056,7 +2075,7 @@ func (s *shellState) runPipeline(base commandContext, segments []string, stdout,
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err := s.runPipelineStage(runCtx, stages[i], stdin, stageStdout, stderr)
+			err := s.runPipelineStage(runCtx, pipeline, stages[i], stdin, stageStdout, stderr)
 			results[i] = pipelineStageResult{err: err}
 			if reader, ok := stdin.(*io.PipeReader); ok {
 				_ = reader.Close()
@@ -2070,6 +2089,7 @@ func (s *shellState) runPipeline(base commandContext, segments []string, stdout,
 			}
 		}()
 	}
+	close(pipeline.started)
 	wg.Wait()
 	closePipes()
 
@@ -2200,9 +2220,13 @@ func isControlAtTarget(target string) bool {
 	}
 }
 
-func (s *shellState) runPipelineStage(ctx context.Context, stage pipelineStage, stdin io.Reader, stdout, stderr io.Writer) error {
+func (s *shellState) runPipelineStage(ctx context.Context, pipeline *pipelineRun, stage pipelineStage, stdin io.Reader, stdout, stderr io.Writer) error {
 	done := make(chan error, 1)
 	go func() {
+		if command, ok := stage.command.(pipelinePreparedTargetCommand); ok {
+			done <- command.RunPipelineStage(ctx, pipeline, stdin, stdout, stderr)
+			return
+		}
 		if command, ok := stage.command.(contextPreparedTargetCommand); ok {
 			done <- command.RunWithInputContext(ctx, stdin, stdout, stderr)
 			return
@@ -2767,11 +2791,27 @@ func (s *shellState) runHostWithInput(line string, stdin io.Reader, stdout, stde
 }
 
 func (s *shellState) runHostWithInputContext(ctx context.Context, line string, stdin io.Reader, stdout, stderr io.Writer) error {
+	return s.runHostWithInputCommand(ctx, line, stdin, stdout, stderr, false, nil)
+}
+
+func (s *shellState) runHostPipelineStage(ctx context.Context, pipeline *pipelineRun, line string, stdin io.Reader, stdout, stderr io.Writer) error {
+	var runner hostCommandRunner
+	if pipeline != nil {
+		runner = pipeline.host
+	}
+	return s.runHostWithInputCommand(ctx, line, stdin, stdout, stderr, true, runner)
+}
+
+func (s *shellState) runHostWithInputCommand(ctx context.Context, line string, stdin io.Reader, stdout, stderr io.Writer, inheritStdin bool, runner hostCommandRunner) error {
 	args := hostShellCommand(line, false, s.hostCommandPrelude(false))
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Dir = s.hostCWD
 	if stdin == nil {
-		cmd.Stdin = nil
+		if inheritStdin {
+			cmd.Stdin = os.Stdin
+		} else {
+			cmd.Stdin = nil
+		}
 	} else {
 		cmd.Stdin = stdin
 	}
@@ -2780,7 +2820,12 @@ func (s *shellState) runHostWithInputContext(ctx context.Context, line string, s
 	if len(s.env) > 0 {
 		cmd.Env = mergedEnv(os.Environ(), shellEnv(s.env))
 	}
-	err := cmd.Run()
+	var err error
+	if runner != nil {
+		err = runner.runHostCommand(cmd)
+	} else {
+		err = cmd.Run()
+	}
 	if ctx.Err() != nil {
 		return persistentShellExit{code: 130}
 	}
