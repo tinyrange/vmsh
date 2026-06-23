@@ -416,7 +416,14 @@ func persistentSSHShellKey(clientKey string, ctx commandContext) string {
 		name = strings.TrimSpace(ctx.SSHHost)
 	}
 	if name != "" {
-		return clientKey + "\x00system:" + name
+		key := clientKey + "\x00system:" + name
+		if ctx.ParentKey != "" {
+			key += "\x00parent:" + ctx.ParentKey
+		}
+		return key
+	}
+	if ctx.ParentKey != "" {
+		return clientKey + "\x00parent:" + ctx.ParentKey
 	}
 	return clientKey
 }
@@ -1185,7 +1192,53 @@ func (s *shellState) closeSSHSessionKey(key string) bool {
 	if client != nil {
 		_ = client.client.Close()
 	}
-	return shell != nil || client != nil
+	closed := shell != nil || client != nil
+	if closed {
+		if shell != nil {
+			s.markJobsLostForContext(shell.ctx, "parent SSH session stopped")
+			s.closeSSHChildrenForParentKey(contextSessionKey(shell.ctx))
+		} else {
+			s.markJobsLostForSSHKey(key, "parent SSH connection stopped")
+		}
+	}
+	return closed
+}
+
+func (s *shellState) closeSSHChildrenForStoppedVM(id string) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	for _, shell := range s.sshShellList() {
+		if shell == nil || shell.ctx.ParentKey == "" {
+			continue
+		}
+		if parentKeyNamesVM(shell.ctx.ParentKey, id) {
+			s.closeSSHSessionKey(shell.key)
+		}
+	}
+}
+
+func (s *shellState) closeSSHChildrenForParentKey(parentKey string) {
+	parentKey = strings.TrimSpace(parentKey)
+	if parentKey == "" {
+		return
+	}
+	for _, shell := range s.sshShellList() {
+		if shell == nil || shell.ctx.ParentKey != parentKey {
+			continue
+		}
+		s.closeSSHSessionKey(shell.key)
+	}
+}
+
+func parentKeyNamesVM(parentKey, id string) bool {
+	for _, part := range strings.Split(parentKey, "\x00") {
+		if part == id {
+			return true
+		}
+	}
+	return false
 }
 
 func parseExplicitSSHStopTarget(name string) (bool, string) {
