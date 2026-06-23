@@ -35,7 +35,7 @@ Example session:
 @alpine
 cat /etc/alpine-release
 
-@ubuntu:24.04 --vm work --memory 2g --cpus 4
+@work --from ubuntu:24.04 --memory 2g --cpus 4
 python3 --version
 
 @host git status
@@ -59,6 +59,7 @@ python3 --version
 - `cmd/vmsh`: the `vmsh` shell.
 - `cc`: git submodule containing `ccvm`, VM backends, image import, and the
   lower-level `cc` CLI.
+- `docs`: focused development notes and test recipes.
 - `tools/build.go`: local build and run helper for `cc`, `ccvm`, and `vmsh`.
   It builds guest init payloads, builds `ccvm` from the submodule, builds
   `vmsh`, signs `ccvm` on macOS, and can launch `vmsh -ccvm build/vmsh/ccvm`.
@@ -119,7 +120,7 @@ Run a non-interactive script:
 ./build/vmsh/cc -ccvm ./build/vmsh/ccvm pull alpine ./cc/fixtures/alpine.simg
 
 cat > /tmp/vmsh-smoke <<'EOF'
-@alpine --vm smoke --memory 256 --no-network sh -lc 'whoami; uname -m'
+@smoke --from alpine --memory 256 --no-network sh -lc 'whoami; uname -m'
 EOF
 
 ./build/vmsh/vmsh -ccvm ./build/vmsh/ccvm -script /tmp/vmsh-smoke
@@ -139,14 +140,16 @@ Common forms:
 ```sh
 @alpine                         # select an image; VM starts lazily
 @alpine uname -a                # run one command in alpine
+@work --from ubuntu:24.04       # create/select a named system
+@work                           # switch back to that named system
 @host pwd                       # run one command on the host
-@ --vm work --memory 4g         # update the current VM context
+@work --memory 4g               # update a named VM context
 @ --sudo whoami                 # run as root in the current VM
 @alias ll=@host ls -la          # create an alias
 @alias expand ll /tmp           # preview the expanded command
 @jobs                           # list background jobs
 @status                         # show selected context and VM status
-@stop --vm work                 # stop a named VM
+@stop work                      # stop a named system
 ```
 
 Pipelines can mix host, VM, and SSH stages. `vmsh` follows normal POSIX shell
@@ -176,7 +179,6 @@ when the transfer finishes or fails.
 Supported options:
 
 ```sh
---vm <id>
 --cwd <guest-path>
 --user <user>
 --sudo
@@ -195,6 +197,17 @@ Use `--` when the guest command itself begins with an option:
 ```sh
 @alpine -- --help
 ```
+
+After selecting a context, ordinary command lines run there:
+
+```sh
+@obsd-build --from openbsd --memory 4g --cpus 1 --network
+pwd
+cd /host/path/to/workspace
+```
+
+Use `@host ...` for one command on the host, or another `@<image> ...` line to
+run a one-off command in a different context.
 
 ## Releases
 
