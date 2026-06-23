@@ -4,6 +4,10 @@
 
 `vmsh` must be run from an interactive terminal. Interactive sessions use the native `vmsh` line editor, persistent history stored in the `ccvm` cache directory, and autocomplete support for `@` builtins, cached image names, `vmsh` options, command names, and host paths.
 
+Release builds use a `ccprod` cache/daemon identity by default. Development
+builds use `ccdev`, so a checkout build can run alongside an installed release
+without sharing daemon state. Pass `-cache-dir` to use an explicit cache root.
+
 Guest commands receive a TTY, terminal dimensions, and terminal color environment. `vmsh` keeps command execution non-interactive and adds a small color prelude for common commands such as `ls`.
 
 Interactive host and guest commands run through persistent shell sessions when possible, so shell state such as aliases, functions, `cd`, and exported variables can survive across commands. Commands that need full foreground terminal control fall back to a one-shot shell path.

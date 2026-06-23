@@ -97,6 +97,63 @@ func TestShellCommandPassingBuildsGuestRunRequests(t *testing.T) {
 	}
 }
 
+func TestResolveCacheDirUsesDaemonIdentity(t *testing.T) {
+	userCache := t.TempDir()
+	oldUserCacheDir := userCacheDir
+	userCacheDir = func() (string, error) { return userCache, nil }
+	t.Cleanup(func() { userCacheDir = oldUserCacheDir })
+
+	devDir, err := resolveCacheDir("", "ccdev")
+	if err != nil {
+		t.Fatalf("resolve dev cache: %v", err)
+	}
+	if devDir != filepath.Join(userCache, "ccdev") {
+		t.Fatalf("dev cache dir = %q", devDir)
+	}
+	if _, err := os.Stat(devDir); err != nil {
+		t.Fatalf("stat dev cache: %v", err)
+	}
+
+	prodDir, err := resolveCacheDir("", "ccprod")
+	if err != nil {
+		t.Fatalf("resolve prod cache: %v", err)
+	}
+	if prodDir != filepath.Join(userCache, "ccprod") {
+		t.Fatalf("prod cache dir = %q", prodDir)
+	}
+	if prodDir == devDir {
+		t.Fatalf("prod and dev cache dirs both resolved to %q", prodDir)
+	}
+
+	fallbackDir, err := resolveCacheDir("", "")
+	if err != nil {
+		t.Fatalf("resolve fallback cache: %v", err)
+	}
+	if fallbackDir != devDir {
+		t.Fatalf("fallback cache dir = %q, want %q", fallbackDir, devDir)
+	}
+}
+
+func TestResolveCacheDirKeepsExplicitDirectory(t *testing.T) {
+	explicit := filepath.Join(t.TempDir(), "custom-cache")
+	oldUserCacheDir := userCacheDir
+	userCacheDir = func() (string, error) {
+		t.Fatal("explicit cache dir should not call userCacheDir")
+		return "", nil
+	}
+	t.Cleanup(func() { userCacheDir = oldUserCacheDir })
+	dir, err := resolveCacheDir(explicit, "ccprod")
+	if err != nil {
+		t.Fatalf("resolve explicit cache: %v", err)
+	}
+	if dir != explicit {
+		t.Fatalf("explicit cache dir = %q, want %q", dir, explicit)
+	}
+	if _, err := os.Stat(explicit); err != nil {
+		t.Fatalf("stat explicit cache: %v", err)
+	}
+}
+
 func TestEvalScriptLinesKeepsHostHeredocTogether(t *testing.T) {
 	sh := newUnitShell(t, newRecordingShellAPI())
 	script := strings.Join([]string{
