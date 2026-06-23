@@ -67,6 +67,7 @@ type resolvedSSHConfig struct {
 	IdentityFiles         []string
 	IdentitiesOnly        bool
 	ProxyJump             string
+	ProxyCommand          string
 	StrictHostKeyChecking string
 	ConnectTimeout        time.Duration
 }
@@ -895,7 +896,7 @@ func (s *shellState) sshClientForContext(runCtx context.Context, ctx commandCont
 
 	client, err := s.dialSSHConfigContext(runCtx, cfg)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("connect route=%s: %w", sshRouteTextForConfig(cfg), err)
 	}
 	persistent := &persistentSSHClient{key: key, config: cfg, client: client}
 	s.sshMu.Lock()
@@ -975,10 +976,11 @@ func (s *shellState) sshSessionContext(name string) (commandContext, bool) {
 }
 
 type sshSessionState struct {
-	Name string
-	User string
-	CWD  string
-	Ctx  commandContext
+	Name  string
+	User  string
+	CWD   string
+	Ctx   commandContext
+	Route string
 }
 
 func (s *shellState) sshSessionStates() []sshSessionState {
@@ -986,10 +988,11 @@ func (s *shellState) sshSessionStates() []sshSessionState {
 	states := make([]sshSessionState, 0, len(shells))
 	for _, shell := range shells {
 		states = append(states, sshSessionState{
-			Name: shell.name,
-			User: shell.client.config.User,
-			CWD:  shell.cwd(),
-			Ctx:  shell.ctx,
+			Name:  shell.name,
+			User:  shell.client.config.User,
+			CWD:   shell.cwd(),
+			Ctx:   shell.ctx,
+			Route: sshRouteTextForConfig(shell.client.config),
 		})
 	}
 	sort.Slice(states, func(i, j int) bool { return states[i].Name < states[j].Name })
@@ -1025,6 +1028,9 @@ func (s *shellState) sshConnectionStates() []sshConnectionState {
 		if client.config.HostName != "" {
 			details = append(details, "host="+client.config.HostName)
 		}
+		if route := sshRouteTextForConfig(client.config); route != "" {
+			details = append(details, "route="+route)
+		}
 		states = append(states, sshConnectionState{
 			Name:   firstNonEmpty(client.config.Alias, client.config.HostName),
 			Detail: strings.Join(details, ", "),
@@ -1058,31 +1064,34 @@ func (s *shellState) dialSSHConfigContext(ctx context.Context, cfg resolvedSSHCo
 	}
 	defer closeAll(closers)
 	addr := net.JoinHostPort(cfg.HostName, cfg.Port)
+	if cfg.ProxyCommand != "" && cfg.ProxyJump == "" {
+		return nil, fmt.Errorf("ProxyCommand is not supported yet for %s", sshEndpointText(cfg))
+	}
 	if cfg.ProxyJump != "" {
 		jump, err := s.sshClientForContext(ctx, commandContext{Mode: modeSSH, SSHHost: cfg.ProxyJump})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("jump %s: %w", cfg.ProxyJump, err)
 		}
 		conn, err := jump.client.Dial("tcp", addr)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("dial target %s via %s: %w", sshEndpointText(cfg), cfg.ProxyJump, err)
 		}
 		clientConn, chans, reqs, err := ssh.NewClientConn(conn, addr, clientConfig)
 		if err != nil {
 			_ = conn.Close()
-			return nil, err
+			return nil, fmt.Errorf("handshake target %s via %s: %w", sshEndpointText(cfg), cfg.ProxyJump, err)
 		}
 		return ssh.NewClient(clientConn, chans, reqs), nil
 	}
 	dialer := net.Dialer{Timeout: cfg.ConnectTimeout}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dial %s: %w", sshEndpointText(cfg), err)
 	}
 	clientConn, chans, reqs, err := ssh.NewClientConn(conn, addr, clientConfig)
 	if err != nil {
 		_ = conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("handshake %s: %w", sshEndpointText(cfg), err)
 	}
 	return ssh.NewClient(clientConn, chans, reqs), nil
 }
@@ -1274,10 +1283,11 @@ func (s *shellState) sshClientConfig(cfg resolvedSSHConfig) (*ssh.ClientConfig, 
 	}
 	auth, closers := sshAuthMethods(cfg, s.sshPassword, s.sshKeyboardAuth)
 	config := &ssh.ClientConfig{
-		User:            cfg.User,
-		Auth:            auth,
-		HostKeyCallback: callback,
-		Timeout:         cfg.ConnectTimeout,
+		User:              cfg.User,
+		Auth:              auth,
+		HostKeyCallback:   callback,
+		HostKeyAlgorithms: defaultSSHHostKeyAlgorithms(),
+		Timeout:           cfg.ConnectTimeout,
 	}
 	if s.sshBanner != nil {
 		config.BannerCallback = func(message string) error {
@@ -1285,6 +1295,27 @@ func (s *shellState) sshClientConfig(cfg resolvedSSHConfig) (*ssh.ClientConfig, 
 		}
 	}
 	return config, closers, nil
+}
+
+func defaultSSHHostKeyAlgorithms() []string {
+	return []string{
+		ssh.CertAlgoED25519v01,
+		ssh.CertAlgoECDSA256v01,
+		ssh.CertAlgoECDSA384v01,
+		ssh.CertAlgoECDSA521v01,
+		ssh.CertAlgoSKED25519v01,
+		ssh.CertAlgoSKECDSA256v01,
+		ssh.CertAlgoRSASHA512v01,
+		ssh.CertAlgoRSASHA256v01,
+		ssh.KeyAlgoED25519,
+		ssh.KeyAlgoECDSA256,
+		ssh.KeyAlgoECDSA384,
+		ssh.KeyAlgoECDSA521,
+		ssh.KeyAlgoSKED25519,
+		ssh.KeyAlgoSKECDSA256,
+		ssh.KeyAlgoRSASHA512,
+		ssh.KeyAlgoRSASHA256,
+	}
 }
 
 func (s *shellState) sshHostKeyCallback(cfg resolvedSSHConfig) (ssh.HostKeyCallback, error) {
@@ -1453,7 +1484,58 @@ func closeAll(closers []io.Closer) {
 }
 
 func (cfg resolvedSSHConfig) cacheKey() string {
-	return strings.Join([]string{cfg.User, cfg.HostName, cfg.Port, cfg.ProxyJump}, "\x00")
+	return strings.Join([]string{cfg.User, cfg.HostName, cfg.Port, cfg.ProxyJump, cfg.ProxyCommand}, "\x00")
+}
+
+func sshRouteText(ctx commandContext) string {
+	cfg, err := resolveSSHConfig(ctx)
+	if err != nil {
+		return ""
+	}
+	return sshRouteTextForConfig(cfg)
+}
+
+func sshRouteTextForConfig(cfg resolvedSSHConfig) string {
+	return strings.Join(sshRouteHops(cfg, map[string]bool{}), "->")
+}
+
+func sshRouteHops(cfg resolvedSSHConfig, seen map[string]bool) []string {
+	key := cfg.cacheKey()
+	if seen[key] {
+		return []string{sshEndpointText(cfg) + "(cycle)"}
+	}
+	seen[key] = true
+	var hops []string
+	if cfg.ProxyJump != "" {
+		if jump, err := resolveSSHConfig(commandContext{Mode: modeSSH, SSHHost: cfg.ProxyJump}); err == nil {
+			hops = append(hops, sshRouteHops(jump, seen)...)
+		} else {
+			hops = append(hops, cfg.ProxyJump+"(unresolved)")
+		}
+	}
+	hop := sshEndpointText(cfg)
+	if cfg.ProxyCommand != "" {
+		hop += "(proxy-command)"
+	}
+	return append(hops, hop)
+}
+
+func sshEndpointText(cfg resolvedSSHConfig) string {
+	alias := strings.TrimSpace(cfg.Alias)
+	host := strings.TrimSpace(firstNonEmpty(cfg.HostName, alias))
+	port := strings.TrimSpace(firstNonEmpty(cfg.Port, "22"))
+	user := strings.TrimSpace(cfg.User)
+	target := host
+	if user != "" {
+		target = user + "@" + target
+	}
+	if port != "" && port != "22" {
+		target += ":" + port
+	}
+	if alias != "" && alias != host {
+		return alias + "(" + target + ")"
+	}
+	return target
 }
 
 func resolveSSHConfig(ctx commandContext) (resolvedSSHConfig, error) {
@@ -1496,6 +1578,7 @@ func resolveSSHConfig(ctx commandContext) (resolvedSSHConfig, error) {
 	}
 	cfg.HostName = expandSSHConfigValue(cfg.HostName, cfg)
 	cfg.ProxyJump = expandSSHConfigValue(cfg.ProxyJump, cfg)
+	cfg.ProxyCommand = expandSSHConfigValue(cfg.ProxyCommand, cfg)
 	return cfg, nil
 }
 
@@ -1649,6 +1732,10 @@ func applySSHConfigOption(cfg *resolvedSSHConfig, key string, values []string) {
 	case "proxyjump":
 		if cfg.ProxyJump == "" && strings.ToLower(value) != "none" {
 			cfg.ProxyJump = strings.Split(value, ",")[0]
+		}
+	case "proxycommand":
+		if cfg.ProxyCommand == "" && strings.ToLower(value) != "none" {
+			cfg.ProxyCommand = value
 		}
 	case "stricthostkeychecking":
 		if cfg.StrictHostKeyChecking == "" {
