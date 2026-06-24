@@ -139,7 +139,7 @@ func (s *shellState) runSSHCommandWithSizeContext(runCtx context.Context, ctx co
 		ctx.CWD = s.currentSSHCWD(ctx)
 	}
 	script := sshRemoteCommandScript(ctx, line)
-	err := s.runSSHSessionContext(runCtx, ctx, "sh -lc "+shellQuote(script), stdin, stdout, stderr, tty, cols, rows)
+	err := s.runSSHSessionContext(runCtx, ctx, sshRemoteUserShellCommand(script, false), stdin, stdout, stderr, tty, cols, rows)
 	code := sshSessionExitCode(err)
 	if runCtx.Err() != nil {
 		code = 130
@@ -349,7 +349,11 @@ func (s *shellState) startPersistentSSHShell(runCtx context.Context, ctx command
 		lastCWD:        s.currentSSHCWD(ctx),
 	}
 	setOpenSSHStyleEnv(session)
-	script := sshPersistentShellSidebandScript(ctx, controlPath)
+	envPrelude := ""
+	if env, err := sshRemoteUserEnvSnapshot(runCtx, client); err == nil {
+		envPrelude = sshRemoteEnvExportPrelude(env)
+	}
+	script := sshPersistentShellSidebandScript(ctx, controlPath, envPrelude)
 	if err := session.Start("sh -ic " + shellQuote(script)); err != nil {
 		_ = session.Close()
 		_ = controlSession.Close()
@@ -399,6 +403,7 @@ func setOpenSSHStyleEnv(session *ssh.Session) {
 	if session == nil {
 		return
 	}
+	_ = session.Setenv("VMSH_DISABLE", "1")
 	for _, env := range os.Environ() {
 		name, value, ok := strings.Cut(env, "=")
 		if !ok {
@@ -409,6 +414,35 @@ func setOpenSSHStyleEnv(session *ssh.Session) {
 		}
 		_ = session.Setenv(name, value)
 	}
+}
+
+func sshRemoteUserShellCommand(script string, interactive bool) string {
+	script = strings.TrimSpace(script)
+	if script == "" {
+		script = ":"
+	}
+	posixFlag := "-lc"
+	userFlag := "-lc"
+	if interactive {
+		userFlag = "-ic"
+	}
+	zshFlag := "-ic"
+	quotedScript := shellQuote(script)
+	wrapper := strings.Join([]string{
+		"__vmsh_script=" + quotedScript,
+		"VMSH_DISABLE=1",
+		"export VMSH_DISABLE",
+		"__vmsh_shell=${SHELL:-}",
+		"case ${__vmsh_shell##*/} in",
+		"  zsh) exec \"$__vmsh_shell\" " + zshFlag + " \"$__vmsh_script\" ;;",
+		"  bash|ksh) exec \"$__vmsh_shell\" " + userFlag + " \"$__vmsh_script\" ;;",
+		"  sh|dash) exec \"$__vmsh_shell\" " + posixFlag + " \"$__vmsh_script\" ;;",
+		"esac",
+		"if command -v zsh >/dev/null 2>&1 && [ -r \"${ZDOTDIR:-$HOME}/.zshrc\" ]; then exec zsh " + zshFlag + " \"$__vmsh_script\"; fi",
+		"if command -v bash >/dev/null 2>&1 && [ -r \"$HOME/.bashrc\" ]; then exec bash " + userFlag + " \"$__vmsh_script\"; fi",
+		"exec sh " + posixFlag + " \"$__vmsh_script\"",
+	}, "\n")
+	return "sh -lc " + shellQuote(wrapper)
 }
 
 func persistentSSHShellKey(clientKey string, ctx commandContext) string {
@@ -533,13 +567,18 @@ func sshPersistentShellMatchesContext(shell *persistentSSHShell, ctx commandCont
 	return shell.key == persistentSSHShellKey(cfg.cacheKey(), ctx)
 }
 
-func sshPersistentShellSidebandScript(ctx commandContext, controlPath string) string {
+func sshPersistentShellSidebandScript(ctx commandContext, controlPath, envPrelude string) string {
 	var lines []string
 	cwd := strings.TrimSpace(ctx.CWD)
 	if cwd != "" && cwd != "~" {
 		lines = append(lines, remoteCDCommand(cwd)+" || exit")
 	}
+	if envPrelude != "" {
+		lines = append(lines, envPrelude)
+	}
 	lines = append(lines,
+		"VMSH_DISABLE=1",
+		"export VMSH_DISABLE",
 		"PS1= PS2= PS4=",
 		"set -m 2>/dev/null || true",
 		"stty -echo 2>/dev/null || true",
@@ -560,6 +599,90 @@ func sshPersistentShellSidebandScript(ctx commandContext, controlPath string) st
 		"while IFS= read -r __vmsh_line; do eval \"$__vmsh_line\"; done",
 	)
 	return strings.Join(lines, "\n")
+}
+
+func sshRemoteUserEnvSnapshot(parent context.Context, client *persistentSSHClient) ([]string, error) {
+	if client == nil || client.client == nil {
+		return nil, fmt.Errorf("missing ssh client")
+	}
+	runCtx, cancel := context.WithTimeout(parent, 2*time.Second)
+	defer cancel()
+	session, err := client.client.NewSession()
+	if err != nil {
+		return nil, err
+	}
+	defer session.Close()
+	setOpenSSHStyleEnv(session)
+	var stdout bytes.Buffer
+	session.Stdout = &stdout
+	session.Stderr = io.Discard
+	done := make(chan error, 1)
+	go func() {
+		done <- session.Run(sshRemoteUserShellCommand("printf '\\034VMSH_ENV\\034\\0'; env -0", false))
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			return nil, err
+		}
+	case <-runCtx.Done():
+		_ = session.Close()
+		return nil, runCtx.Err()
+	}
+	marker := []byte("\x1cVMSH_ENV\x1c\x00")
+	data := stdout.Bytes()
+	idx := bytes.Index(data, marker)
+	if idx < 0 {
+		return nil, fmt.Errorf("remote environment marker not found")
+	}
+	data = data[idx+len(marker):]
+	var env []string
+	for _, field := range bytes.Split(data, []byte{0}) {
+		if len(field) == 0 {
+			continue
+		}
+		name, _, ok := bytes.Cut(field, []byte("="))
+		if !ok || !isShellName(string(name)) {
+			continue
+		}
+		env = append(env, string(field))
+	}
+	return env, nil
+}
+
+func sshRemoteEnvExportPrelude(env []string) string {
+	if len(env) == 0 {
+		return ""
+	}
+	var lines []string
+	for _, entry := range env {
+		name, value, ok := strings.Cut(entry, "=")
+		if !ok || !isShellName(name) {
+			continue
+		}
+		switch name {
+		case "PWD", "OLDPWD", "SHLVL", "_":
+			continue
+		}
+		lines = append(lines, name+"="+shellQuote(value))
+	}
+	sort.Strings(lines)
+	if len(lines) == 0 {
+		return ""
+	}
+	lines = append(lines, "export "+strings.Join(sshEnvExportNames(lines), " "))
+	return strings.Join(lines, "\n")
+}
+
+func sshEnvExportNames(assignments []string) []string {
+	names := make([]string, 0, len(assignments))
+	for _, assignment := range assignments {
+		name, _, ok := strings.Cut(assignment, "=")
+		if ok {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 func sshColorPrelude() string {

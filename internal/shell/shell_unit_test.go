@@ -30,9 +30,11 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/creack/pty"
 	cryptossh "golang.org/x/crypto/ssh"
 	"j5.nz/cc/client"
 )
@@ -94,6 +96,120 @@ func TestShellCommandPassingBuildsGuestRunRequests(t *testing.T) {
 	}
 	if !strings.HasSuffix(second.req.Command[2], "whoami") {
 		t.Fatalf("sudo command = %#v", second.req.Command)
+	}
+}
+
+func TestPromptPullConfirmationCtrlCDeclines(t *testing.T) {
+	master, slave, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	defer slave.Close()
+
+	type result struct {
+		ok  bool
+		err error
+	}
+	stderr := newNotifyWriter("")
+	done := make(chan result, 1)
+	go func() {
+		ok, err := promptPullConfirmation(slave, stderr, "docker.io/library/version:latest")
+		done <- result{ok: ok, err: err}
+	}()
+
+	select {
+	case <-stderr.seen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prompt was not written")
+	}
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case got := <-done:
+			if got.err != nil {
+				t.Fatalf("prompt returned error: %v", got.err)
+			}
+			if got.ok {
+				t.Fatal("prompt accepted pull after Ctrl-C")
+			}
+			return
+		case <-timeout:
+			t.Fatal("prompt did not return after Ctrl-C")
+		case <-ticker.C:
+			if _, err := master.Write([]byte{0x03}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+func TestHostCommandEnvMarksNestedShellAsActive(t *testing.T) {
+	env := hostCommandEnv(nil, nil)
+	for _, entry := range env {
+		if entry == "VMSH_ACTIVE=1" {
+			return
+		}
+	}
+	t.Fatalf("host command environment did not include VMSH_ACTIVE=1")
+}
+
+func TestRunHostMarksScriptModeNestedShellAsActive(t *testing.T) {
+	api := newRecordingShellAPI("alpine", "alpine@amd64")
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	err := sh.runHost(`printf '%s\n' "$VMSH_ACTIVE"`, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run host command: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "1" {
+		t.Fatalf("VMSH_ACTIVE output = %q, want 1", stdout.String())
+	}
+}
+
+func TestConfirmExitIgnoresRefusedDaemonStatus(t *testing.T) {
+	api := newRecordingShellAPI("alpine", "alpine@amd64")
+	api.instanceStatusesErr = syscall.ECONNREFUSED
+	sh := newUnitShell(t, api)
+
+	ok, err := sh.confirmExitIfNeeded(io.Discard)
+	if err != nil {
+		t.Fatalf("confirm exit: %v", err)
+	}
+	if !ok {
+		t.Fatal("confirm exit declined after refused daemon status")
+	}
+}
+
+func TestTerminalTitleTracksContext(t *testing.T) {
+	api := newRecordingShellAPI("alpine", "alpine@amd64")
+	sh := newUnitShell(t, api)
+	sh.hostCWD = "/Users/joshua/dev/projects/vmsh"
+	if got := sh.terminalTitle(); got != "vmsh host:vmsh" {
+		t.Fatalf("host title = %q", got)
+	}
+
+	sh.context = commandContext{Mode: modeVM, VMID: "alpine", Image: "alpine", CWD: "/host/Users/joshua/dev/projects/vmsh"}
+	sh.contextCWD[contextCWDKey(sh.context)] = "/host/Users/joshua/dev/projects/vmsh"
+	if got := sh.terminalTitle(); got != "vmsh vm:alpine vmsh" {
+		t.Fatalf("vm title = %q", got)
+	}
+
+	sh.context = commandContext{Mode: modeSSH, SSHHost: "ws1", CWD: "/home/joshua/src"}
+	sh.contextCWD[contextCWDKey(sh.context)] = "/home/joshua/src"
+	if got := sh.terminalTitle(); got != "vmsh ssh:ws1 src" {
+		t.Fatalf("ssh title = %q", got)
+	}
+}
+
+func TestSanitizeTerminalTitleDropsControls(t *testing.T) {
+	got := sanitizeTerminalTitle("vmsh\x1b]0;bad\a vm\n")
+	if got != "vmsh]0;bad vm" {
+		t.Fatalf("sanitized title = %q", got)
 	}
 }
 
@@ -2270,7 +2386,7 @@ func TestSSHWithoutFromStaysHostRootedInsideVM(t *testing.T) {
 	if len(api.runs) != 0 {
 		t.Fatalf("VM runs = %+v, want plain @ssh to stay host-rooted", api.runs)
 	}
-	if commands := server.commands(); len(commands) != 1 || commands[0] != "sh -lc 'printf ok'" {
+	if commands := server.commands(); len(commands) != 1 || commands[0] != sshRemoteUserShellCommand("printf ok", false) {
 		t.Fatalf("ssh commands = %q, want host-side ssh command", commands)
 	}
 }
@@ -3072,6 +3188,22 @@ func TestPersistentHostShellStreamsPartialOutputBeforeCompletion(t *testing.T) {
 	}
 	if stdout.String() != "partialdone" {
 		t.Fatalf("streamed output = %q", stdout.String())
+	}
+}
+
+func TestPersistentHostShellCloseIsCooperative(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("persistent host shell requires a Unix PTY")
+	}
+	session, err := startPersistentHostShell(t.TempDir(), hostCommandEnv(nil, nil), 80, 24, "", nil, nil)
+	if err != nil {
+		t.Fatalf("start persistent host shell: %v", err)
+	}
+
+	start := time.Now()
+	session.close()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("persistent host shell close took %s", elapsed)
 	}
 }
 
@@ -3958,7 +4090,7 @@ func TestSSHAtCommandUsesHostSSHConfigAlias(t *testing.T) {
 	if cfg.HostName != "127.0.0.1" || cfg.Port != server.port || cfg.User != "testuser" {
 		t.Fatalf("resolved ssh config = %+v", cfg)
 	}
-	if commands := server.commands(); len(commands) != 1 || commands[0] != "sh -lc 'printf ok'" {
+	if commands := server.commands(); len(commands) != 1 || commands[0] != sshRemoteUserShellCommand("printf ok", false) {
 		t.Fatalf("ssh commands = %q", commands)
 	}
 }
@@ -4389,6 +4521,53 @@ func TestStopCommandExplicitVMAndCurrentContext(t *testing.T) {
 	}
 }
 
+func TestStopCommandLeavesStaleCurrentVMContext(t *testing.T) {
+	api := newRecordingShellAPI()
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "stopped"}
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu"}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@stop", &stdout, &stderr); err != nil {
+		t.Fatalf("stop stale current VM: %v", err)
+	}
+	if sh.context.Mode != modeHost {
+		t.Fatalf("context after stale stop = %+v, want host", sh.context)
+	}
+}
+
+func TestStoppedVMRunErrorLeavesContext(t *testing.T) {
+	api := newRecordingShellAPI()
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "stopped"}
+	sh := newUnitShell(t, api)
+	sh.context = commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu"}
+	sh.vmRunning["work"] = true
+	sh.guestShell = &persistentGuestShell{
+		key:    "work\x00ubuntu\x00\x00",
+		inputs: make(chan client.ExecInput, 1),
+		events: make(chan client.ExecEvent),
+		done:   make(chan error, 1),
+	}
+	sh.guestShell.done <- nil
+
+	handled, err := sh.handleStoppedVMRunError(sh.context, errors.New("backend stream closed"))
+	if !handled {
+		t.Fatal("stopped VM run error was not handled")
+	}
+	if err == nil {
+		t.Fatal("stopped VM run error returned nil")
+	}
+	if sh.context.Mode != modeHost {
+		t.Fatalf("context after stopped VM run = %+v, want host", sh.context)
+	}
+	if sh.guestShell != nil {
+		t.Fatal("persistent guest shell was not cleared")
+	}
+	if sh.vmRunning["work"] {
+		t.Fatal("VM running marker was not cleared")
+	}
+}
+
 func TestStopCommandExplicitVMPrefix(t *testing.T) {
 	api := newRecordingShellAPI()
 	api.instances["work"] = client.InstanceState{ID: "work", Status: "running"}
@@ -4603,7 +4782,7 @@ func TestSSHPersistentShellSurvivesDotFailure(t *testing.T) {
 		t.Fatalf("start control reader: %v", err)
 	}
 
-	cmd := exec.Command("sh", "-ic", sshPersistentShellSidebandScript(commandContext{}, controlPath))
+	cmd := exec.Command("sh", "-ic", sshPersistentShellSidebandScript(commandContext{}, controlPath, ""))
 	var terminal bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &terminal
@@ -5220,9 +5399,14 @@ func TestSSHCompletionUsesConfigAndRemotePath(t *testing.T) {
 	var sshCommands atomic.Int32
 	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
 		switch sshCommands.Add(1) {
-		case 1, 2:
+		case 1:
 			return sideband.handler(t)(command, stdin, stdout, stderr)
+		case 2:
+			_, _ = stdout.Write([]byte("\x1cVMSH_ENV\x1c\x00PATH=/bin\x00SHELL=/bin/sh\x00"))
+			return 0
 		case 3:
+			return sideband.handler(t)(command, stdin, stdout, stderr)
+		case 4:
 			_, _ = io.WriteString(stdout, "le\nfolder/\n")
 			return 0
 		default:
@@ -6101,6 +6285,7 @@ type recordingShellAPI struct {
 	pullStream            func(context.Context, string, client.PullImageRequest, func(client.ProgressEvent) error) error
 	startStream           func(context.Context, string, client.StartInstanceRequest, func(client.BootEvent) error) (client.InstanceState, error)
 	execStream            func(context.Context, string, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+	instanceStatusesErr   error
 }
 
 type recordedStart struct {
@@ -6211,6 +6396,9 @@ func (a *recordingShellAPI) InstanceStatusOf(id string) (client.InstanceState, e
 }
 
 func (a *recordingShellAPI) InstanceStatuses() ([]client.InstanceState, error) {
+	if a.instanceStatusesErr != nil {
+		return nil, a.instanceStatusesErr
+	}
 	var states []client.InstanceState
 	for _, state := range a.instances {
 		states = append(states, state)
