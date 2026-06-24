@@ -1053,7 +1053,7 @@ func Run(args []string) error {
 		return fmt.Errorf("usage: vmsh [flags]")
 	}
 
-	rootCache, err := resolveCacheDir(*cacheDir, defaultDaemonIdentity())
+	rootCache, err := resolveShellCacheDir(*cacheDir, defaultDaemonIdentity(), nestedVMSHActive())
 	if err != nil {
 		return err
 	}
@@ -9463,6 +9463,26 @@ func resolveCacheDir(arg, identity string) (string, error) {
 	}
 	dir := filepath.Join(cacheRoot, identity)
 	return dir, os.MkdirAll(dir, 0o755)
+}
+
+func resolveShellCacheDir(arg, identity string, nested bool) (string, error) {
+	if arg != "" || !nested {
+		return resolveCacheDir(arg, identity)
+	}
+	cacheRoot, err := userCacheDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user cache dir: %w", err)
+	}
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		identity = "ccdev"
+	}
+	dir := filepath.Join(cacheRoot, identity+"-nested", strconv.Itoa(os.Getpid()))
+	return dir, os.MkdirAll(dir, 0o755)
+}
+
+func nestedVMSHActive() bool {
+	return strings.TrimSpace(os.Getenv("VMSH_ACTIVE")) == "1"
 }
 
 func firstNonEmpty(values ...string) string {

@@ -270,6 +270,47 @@ func TestResolveCacheDirKeepsExplicitDirectory(t *testing.T) {
 	}
 }
 
+func TestResolveShellCacheDirIsolatesNestedDefault(t *testing.T) {
+	userCache := t.TempDir()
+	oldUserCacheDir := userCacheDir
+	userCacheDir = func() (string, error) { return userCache, nil }
+	t.Cleanup(func() { userCacheDir = oldUserCacheDir })
+
+	normal, err := resolveShellCacheDir("", "ccdev", false)
+	if err != nil {
+		t.Fatalf("resolve normal shell cache: %v", err)
+	}
+	if normal != filepath.Join(userCache, "ccdev") {
+		t.Fatalf("normal cache = %q", normal)
+	}
+
+	nested, err := resolveShellCacheDir("", "ccdev", true)
+	if err != nil {
+		t.Fatalf("resolve nested shell cache: %v", err)
+	}
+	wantNested := filepath.Join(userCache, "ccdev-nested", strconv.Itoa(os.Getpid()))
+	if nested != wantNested {
+		t.Fatalf("nested cache = %q, want %q", nested, wantNested)
+	}
+	if nested == normal {
+		t.Fatalf("nested cache reused normal cache %q", nested)
+	}
+	if _, err := os.Stat(nested); err != nil {
+		t.Fatalf("stat nested cache: %v", err)
+	}
+}
+
+func TestResolveShellCacheDirKeepsExplicitDirectoryWhenNested(t *testing.T) {
+	explicit := filepath.Join(t.TempDir(), "explicit")
+	dir, err := resolveShellCacheDir(explicit, "ccdev", true)
+	if err != nil {
+		t.Fatalf("resolve explicit nested cache: %v", err)
+	}
+	if dir != explicit {
+		t.Fatalf("explicit nested cache = %q, want %q", dir, explicit)
+	}
+}
+
 func TestEvalScriptLinesKeepsHostHeredocTogether(t *testing.T) {
 	sh := newUnitShell(t, newRecordingShellAPI())
 	script := strings.Join([]string{
