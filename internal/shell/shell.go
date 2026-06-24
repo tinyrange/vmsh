@@ -52,6 +52,7 @@ const (
 )
 
 var userCacheDir = os.UserCacheDir
+var execProcess = syscall.Exec
 
 type shellMode string
 
@@ -100,6 +101,19 @@ type shellState struct {
 	tmuxExec         func([]string) error
 	interruptSignals <-chan os.Signal
 	evaluatingPaste  bool
+}
+
+type shellExecRequest struct {
+	path string
+	argv []string
+	env  []string
+}
+
+func (e shellExecRequest) Error() string {
+	if len(e.argv) == 0 {
+		return "exec"
+	}
+	return "exec " + strings.Join(e.argv, " ")
 }
 
 type imagePullContextAPI interface {
@@ -310,7 +324,7 @@ func (c *vmshCompleter) completionContext(prefix string) commandContext {
 		if err == nil {
 			ctx = sshCommandContext(ctx, at.Options, host)
 		}
-	case "help", "ps", "jobs", "alias", "status", "where", "start", "stop", "restart", "forward", "tmux", "agent":
+	case "help", "ps", "jobs", "alias", "exec", "status", "where", "start", "stop", "restart", "forward", "tmux", "agent":
 	default:
 		if sshCtx, ok := c.shellSSHSessionContext(at.Target); ok {
 			ctx = sshCtx
@@ -336,7 +350,7 @@ func pathCompletionReplaceLen(token string) int {
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@agent", "@alias", "@copy", "@help", "@host", "@jobs", "@ps", "@restart", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux"}
+	words := []string{"@agent", "@alias", "@copy", "@exec", "@help", "@host", "@jobs", "@ps", "@restart", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux"}
 	if c.shell != nil {
 		for _, name := range c.shell.sshSessionNames() {
 			words = append(words, "@"+name)
@@ -1151,6 +1165,15 @@ func Run(args []string) error {
 	}
 	sh.completion = newVMSHCompleter(sh)
 	defer sh.closeSessions()
+	execRequested := func(err error) (shellExecRequest, bool) {
+		var execReq shellExecRequest
+		if errors.As(err, &execReq) {
+			sh.closeSessions()
+			stopLease()
+			return execReq, true
+		}
+		return shellExecRequest{}, false
+	}
 	if err := sh.loadVMSHRC(defaultVMSHRCPath()); err != nil {
 		return err
 	}
@@ -1165,9 +1188,17 @@ func Run(args []string) error {
 			return err
 		}
 		defer f.Close()
-		return sh.runScript(f, stdout, stderr)
+		err = sh.runScript(f, stdout, stderr)
+		if execReq, ok := execRequested(err); ok {
+			return execProcess(execReq.path, execReq.argv, execReq.env)
+		}
+		return err
 	}
-	return sh.loop(os.Stdin, stdout, stderr)
+	err = sh.loop(os.Stdin, stdout, stderr)
+	if execReq, ok := execRequested(err); ok {
+		return execProcess(execReq.path, execReq.argv, execReq.env)
+	}
+	return err
 }
 
 func defaultContext(vmID, image string, nestedVirt bool) commandContext {
@@ -1245,6 +1276,10 @@ func (s *shellState) evalLineEditor(in *os.File, stdout, stderr io.Writer) error
 		if err := evalErr; err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
+			}
+			var execReq shellExecRequest
+			if errors.As(err, &execReq) {
+				return err
 			}
 			if code := sessionLastCode(err); code >= 0 {
 				s.lastCode = code
@@ -2559,6 +2594,15 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return nil
 		}
 		return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
+	case "exec":
+		if len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @exec [cmd]")
+		}
+		req, err := s.execRequest(at.Command)
+		if err != nil {
+			return err
+		}
+		return req
 	case "ssh":
 		host, command, err := parseSSHAtCommand(at.Command)
 		if err != nil {
@@ -4680,6 +4724,22 @@ func hostShellCommand(line string, tty bool, prelude string) []string {
 	return []string{hostShell(), "-lc", command}
 }
 
+func (s *shellState) execRequest(command string) (shellExecRequest, error) {
+	if runtime.GOOS == "windows" {
+		return shellExecRequest{}, fmt.Errorf("@exec is not supported on Windows")
+	}
+	shellPath := hostShell()
+	env := hostCommandEnv(s.env, nil)
+	env = mergedEnv(env, []string{"VMSH_DISABLE=1"})
+	env = withoutEnv(env, "VMSH_ACTIVE")
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return shellExecRequest{path: shellPath, argv: []string{shellPath, "-i"}, env: env}, nil
+	}
+	script := "exec " + command
+	return shellExecRequest{path: shellPath, argv: []string{shellPath, "-lc", script}, env: env}, nil
+}
+
 func captureHostShellPrelude() (string, error) {
 	const begin = "__VMSH_HOST_INIT_BEGIN__"
 	const end = "__VMSH_HOST_INIT_END__"
@@ -4781,6 +4841,25 @@ func mergedEnv(base, overrides []string) []string {
 			continue
 		}
 		index[key] = len(out)
+		out = append(out, entry)
+	}
+	return out
+}
+
+func withoutEnv(env []string, names ...string) []string {
+	if len(names) == 0 {
+		return append([]string(nil), env...)
+	}
+	drop := map[string]bool{}
+	for _, name := range names {
+		drop[name] = true
+	}
+	out := env[:0]
+	for _, entry := range env {
+		key, _, ok := strings.Cut(entry, "=")
+		if ok && drop[key] {
+			continue
+		}
 		out = append(out, entry)
 	}
 	return out
@@ -8493,6 +8572,7 @@ func (s *shellState) help(w io.Writer) error {
 	@ssh [--from origin] HOST [cmd]  connect from host by default; origin may be @host, current, a VM, or an SSH session
 @ [opts] [cmd]           update or use the current context
 @sudo [cmd]              open a root VM subshell, or run cmd as root in the current VM
+@exec [cmd]              replace vmsh with your normal shell, or exec cmd on the host
 @alias [name=value]      list aliases, or set one (example: @alias clear=@host clear)
 @alias -d name           delete an alias
 @alias expand line       print alias-expanded line without running it
