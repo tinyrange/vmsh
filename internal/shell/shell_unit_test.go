@@ -5440,14 +5440,9 @@ func TestSSHCompletionUsesConfigAndRemotePath(t *testing.T) {
 	var sshCommands atomic.Int32
 	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
 		switch sshCommands.Add(1) {
-		case 1:
+		case 1, 2:
 			return sideband.handler(t)(command, stdin, stdout, stderr)
-		case 2:
-			_, _ = stdout.Write([]byte("\x1cVMSH_ENV\x1c\x00PATH=/bin\x00SHELL=/bin/sh\x00"))
-			return 0
 		case 3:
-			return sideband.handler(t)(command, stdin, stdout, stderr)
-		case 4:
 			_, _ = io.WriteString(stdout, "le\nfolder/\n")
 			return 0
 		default:
@@ -6217,6 +6212,11 @@ func (s *testSSHServer) handleChannel(channel cryptossh.Channel, requests <-chan
 			}
 			cryptossh.Unmarshal(req.Payload, &payload)
 			_ = req.Reply(true, nil)
+			if isTestSSHEnvSnapshotCommand(payload.Command) {
+				_, _ = channel.Write([]byte("\x1cVMSH_ENV\x1c\x00PATH=/bin\x00SHELL=/bin/sh\x00"))
+				_, _ = channel.SendRequest("exit-status", false, cryptossh.Marshal(struct{ Status uint32 }{0}))
+				return
+			}
 			s.mu.Lock()
 			s.execs = append(s.execs, payload.Command)
 			s.mu.Unlock()
@@ -6227,6 +6227,10 @@ func (s *testSSHServer) handleChannel(channel cryptossh.Channel, requests <-chan
 			_ = req.Reply(false, nil)
 		}
 	}
+}
+
+func isTestSSHEnvSnapshotCommand(command string) bool {
+	return strings.Contains(command, "VMSH_ENV") && strings.Contains(command, "env -0")
 }
 
 func (s *testSSHServer) connectionCount() int {
