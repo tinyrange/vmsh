@@ -16,14 +16,15 @@ import (
 )
 
 type paths struct {
-	root      string
-	ccDir     string
-	build     string
-	ccBin     string
-	ccvm      string
-	vmsh      string
-	initAMD64 string
-	initARM64 string
+	root         string
+	ccDir        string
+	build        string
+	ccBin        string
+	ccvm         string
+	vmsh         string
+	initAMD64    string
+	initARM64    string
+	targetGOARCH string
 }
 
 func main() {
@@ -117,6 +118,10 @@ func makePaths(buildDirArg string) (paths, error) {
 	if err != nil {
 		return paths{}, err
 	}
+	targetGOARCH, err := goEnv("GOARCH")
+	if err != nil {
+		return paths{}, err
+	}
 
 	suffix := ""
 	if targetGOOS == "windows" {
@@ -126,14 +131,15 @@ func makePaths(buildDirArg string) (paths, error) {
 	buildDir := resolveBuildDir(root, buildDirArg)
 	ccDir := filepath.Join(root, "cc")
 	return paths{
-		root:      root,
-		ccDir:     ccDir,
-		build:     buildDir,
-		ccBin:     filepath.Join(buildDir, "cc"+suffix),
-		ccvm:      filepath.Join(buildDir, "ccvm"+suffix),
-		vmsh:      filepath.Join(buildDir, "vmsh"+suffix),
-		initAMD64: filepath.Join(buildDir, "init-linux-amd64"),
-		initARM64: filepath.Join(buildDir, "init-linux-arm64"),
+		root:         root,
+		ccDir:        ccDir,
+		build:        buildDir,
+		ccBin:        filepath.Join(buildDir, "cc"+suffix),
+		ccvm:         filepath.Join(buildDir, "ccvm"+suffix),
+		vmsh:         filepath.Join(buildDir, "vmsh"+suffix),
+		initAMD64:    filepath.Join(buildDir, "init-linux-amd64"),
+		initARM64:    filepath.Join(buildDir, "init-linux-arm64"),
+		targetGOARCH: targetGOARCH,
 	}, nil
 }
 
@@ -249,6 +255,21 @@ func build(p paths) error {
 		return copyFile(p.initAMD64, filepath.Join(p.ccDir, "internal", "guestinit", "guest-init-linux-amd64"), 0o644)
 	}); err != nil {
 		return err
+	}
+
+	for _, bsd := range []string{"openbsd", "freebsd", "netbsd"} {
+		bsd := bsd
+		out := filepath.Join(p.build, "guest-init-"+bsd+"-"+p.targetGOARCH)
+		if err := step("build "+bsd+"/"+p.targetGOARCH+" guest init", func() error {
+			return goBuild(p.ccDir, []string{"CGO_ENABLED=0", "GOOS=" + bsd, "GOARCH=" + p.targetGOARCH}, out, "./internal/cmd/"+bsd+"-init")
+		}); err != nil {
+			return err
+		}
+		if err := step("install "+bsd+"/"+p.targetGOARCH+" guest init", func() error {
+			return copyFile(out, filepath.Join(p.ccDir, "internal", bsd, "guestinit", "guest-init-"+bsd+"-"+p.targetGOARCH), 0o644)
+		}); err != nil {
+			return err
+		}
 	}
 
 	if err := step("build ccvm with embedded guest init", func() error {

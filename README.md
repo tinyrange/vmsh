@@ -213,10 +213,12 @@ The workflow builds one standalone `vmsh` binary per target:
 - `darwin/arm64`
 
 Release binaries are built with `embed_ccvm` and `embed_guestinit`. That compiles
-the `ccvm` daemon entrypoint into the same Go executable as `vmsh` and embeds
-the static Linux guest init payloads for amd64 and arm64 guests. At runtime,
-`vmsh` re-execs itself with `VMSH_INTERNAL_CCVM=1` when it needs to start the
-daemon, so release assets do not need a `ccvm` sidecar.
+the `ccvm` daemon entrypoint into the same Go executable as `vmsh`, embeds the
+static Linux guest init payloads for amd64 and arm64 guests, and embeds the
+native OpenBSD, FreeBSD, and NetBSD guest init payloads for the release target
+architecture. At runtime, `vmsh` re-execs itself with `VMSH_INTERNAL_CCVM=1`
+when it needs to start the daemon, so release assets do not need a `ccvm`
+sidecar or a Go toolchain to build guest init helpers.
 
 The release workflow also supports manual dry runs from GitHub Actions. Use
 `workflow_dispatch`, provide a version string for artifact names, and leave
