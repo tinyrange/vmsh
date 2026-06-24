@@ -297,7 +297,7 @@ func TestVMIntegrationCopiesDirectoryMetadataBetweenVMs(t *testing.T) {
 		"@stop copy-dst",
 	}, "\n")
 
-	stdout, stderr, err := sh.runTestScriptWithTimeout(script, 75*time.Second)
+	stdout, stderr, err := sh.runTestScriptWithTimeout(script, vmIntegrationLongTimeout())
 	if err != nil {
 		t.Fatalf("run VM-to-VM metadata copy script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
@@ -377,7 +377,7 @@ func TestVMIntegrationInteractivePasteCopiesDirectoryMetadataHostToVMToHost(t *t
 
 	session := startVMIntegrationPTY(t, vmsh, env.cacheDir, buildVMIntegrationCCVM(t), hostCWD)
 	defer session.close()
-	session.expect("vmsh", 10*time.Second)
+	session.expect("\x1b[?2004h", 10*time.Second)
 
 	paste := strings.Join([]string{
 		"@copy-pty-paste --from " + env.image + " --memory 768 --cpus 1 --no-network",
@@ -388,8 +388,8 @@ func TestVMIntegrationInteractivePasteCopiesDirectoryMetadataHostToVMToHost(t *t
 		"@copy @vm:copy-pty-paste:/tmp/vmsh-meta-vm @host:meta-back",
 		"@stop copy-pty-paste",
 		"@host echo VM_COPY_PASTE_DONE",
-	}, "\n") + "\n"
-	session.write(paste)
+	}, "\n")
+	session.write("\x1b[200~" + paste + "\x1b[201~")
 	session.expectOccurrences("VM_COPY_PASTE_DONE", 2, 60*time.Second)
 	waitForPath(t, filepath.Join(dst, "script.sh"), 60*time.Second, func() string {
 		return session.snapshot()
@@ -719,16 +719,17 @@ func (s *shellState) runTestScriptWithTimeout(script string, timeout time.Durati
 		err    error
 	}
 	ch := make(chan result, 1)
+	var stdout, stderr lockedBuffer
 	go func() {
-		stdout, stderr, err := s.runTestScript(script)
-		ch <- result{stdout: stdout, stderr: stderr, err: err}
+		err := s.evalScriptLines(strings.NewReader(script), &stdout, &stderr)
+		ch <- result{stdout: stdout.String(), stderr: stderr.String(), err: err}
 	}()
 	select {
 	case res := <-ch:
 		return res.stdout, res.stderr, res.err
 	case <-time.After(timeout):
 		s.closeSessions()
-		return "", "", fmt.Errorf("script timed out after %s", timeout)
+		return stdout.String(), stderr.String(), fmt.Errorf("script timed out after %s", timeout)
 	}
 }
 
@@ -739,8 +740,8 @@ func (s *shellState) runPastedLinesWithTimeout(paste string, timeout time.Durati
 		err    error
 	}
 	ch := make(chan result, 1)
+	var stdout, stderr lockedBuffer
 	go func() {
-		var stdout, stderr bytes.Buffer
 		err := s.evalPastedLines(paste, &stdout, &stderr)
 		ch <- result{stdout: stdout.String(), stderr: stderr.String(), err: err}
 	}()
@@ -749,8 +750,25 @@ func (s *shellState) runPastedLinesWithTimeout(paste string, timeout time.Durati
 		return res.stdout, res.stderr, res.err
 	case <-time.After(timeout):
 		s.closeSessions()
-		return "", "", fmt.Errorf("pasted script timed out after %s", timeout)
+		return stdout.String(), stderr.String(), fmt.Errorf("pasted script timed out after %s", timeout)
 	}
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func (s *shellState) evalOnTestPTY(line string) (string, error) {
@@ -816,6 +834,19 @@ func buildVMIntegrationCCVM(t *testing.T) string {
 			cmd.Stderr = &output
 			if err := cmd.Run(); err != nil {
 				vmIntegrationCCVMBuild.err = fmt.Errorf("go build guest init %s: %w\n%s", goarch, err, output.String())
+				return
+			}
+		}
+		for _, bsd := range []string{"openbsd", "freebsd", "netbsd"} {
+			payload := filepath.Join(root, "cc", "internal", bsd, "guestinit", "guest-init-"+bsd+"-"+runtime.GOARCH)
+			cmd := exec.CommandContext(ctx, "go", "build", "-o", payload, "./internal/cmd/"+bsd+"-init")
+			cmd.Dir = filepath.Join(root, "cc")
+			cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS="+bsd, "GOARCH="+runtime.GOARCH)
+			var output bytes.Buffer
+			cmd.Stdout = &output
+			cmd.Stderr = &output
+			if err := cmd.Run(); err != nil {
+				vmIntegrationCCVMBuild.err = fmt.Errorf("go build %s guest init %s: %w\n%s", bsd, runtime.GOARCH, err, output.String())
 				return
 			}
 		}
