@@ -26,6 +26,7 @@ type Status struct {
 	Kind      string                 `json:"kind"`
 	Status    string                 `json:"status"`
 	Sessions  []SessionSummary       `json:"sessions"`
+	Streams   []StreamSummary        `json:"active_streams"`
 	VMs       []client.InstanceState `json:"vms"`
 	StartedAt time.Time              `json:"started_at"`
 }
@@ -36,6 +37,14 @@ type Event struct {
 	Session    *Session          `json:"session,omitempty"`
 	Attachment *ClientAttachment `json:"attachment,omitempty"`
 	At         time.Time         `json:"at"`
+}
+
+type StreamSummary struct {
+	ID          string    `json:"id"`
+	Kind        string    `json:"kind"`
+	State       string    `json:"state"`
+	ConnectedAt time.Time `json:"connected_at"`
+	LastEventID string    `json:"last_event_id,omitempty"`
 }
 
 type Session struct {
@@ -158,7 +167,14 @@ type sessionRegistry struct {
 type eventHub struct {
 	mu          sync.Mutex
 	next        int
-	subscribers map[int]chan Event
+	subscribers map[int]*eventSubscriber
+}
+
+type eventSubscriber struct {
+	id          int
+	ch          chan Event
+	connectedAt time.Time
+	lastEventID string
 }
 
 type Server struct {
@@ -222,6 +238,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			Kind:      Kind,
 			Status:    "ok",
 			Sessions:  s.registry.List(),
+			Streams:   s.events.Streams(),
 			VMs:       runtimeInstanceStatuses(runtime),
 			StartedAt: s.startedAt,
 		})
@@ -331,7 +348,9 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(s.events.Event(Event{Kind: "connected"})); err != nil {
+	connected := s.events.Event(Event{Kind: "connected"})
+	s.events.MarkDelivered(events, connected.ID)
+	if err := json.NewEncoder(w).Encode(connected); err != nil {
 		return
 	}
 	flusher.Flush()
@@ -449,7 +468,7 @@ func newSessionRegistry() *sessionRegistry {
 }
 
 func newEventHub() *eventHub {
-	return &eventHub{subscribers: map[int]chan Event{}}
+	return &eventHub{subscribers: map[int]*eventSubscriber{}}
 }
 
 func (h *eventHub) Event(event Event) Event {
@@ -462,9 +481,10 @@ func (h *eventHub) Publish(event Event) {
 	event = h.Event(event)
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for _, ch := range h.subscribers {
+	for _, sub := range h.subscribers {
 		select {
-		case ch <- event:
+		case sub.ch <- event:
+			sub.lastEventID = event.ID
 		default:
 		}
 	}
@@ -476,13 +496,58 @@ func (h *eventHub) Subscribe() (<-chan Event, func()) {
 	h.next++
 	id := h.next
 	ch := make(chan Event, 16)
-	h.subscribers[id] = ch
+	h.subscribers[id] = &eventSubscriber{
+		id:          id,
+		ch:          ch,
+		connectedAt: time.Now(),
+	}
 	return ch, func() {
 		h.mu.Lock()
 		defer h.mu.Unlock()
+		sub := h.subscribers[id]
 		delete(h.subscribers, id)
+		if sub == nil {
+			return
+		}
 		close(ch)
 	}
+}
+
+func (h *eventHub) MarkDelivered(events <-chan Event, eventID string) {
+	eventID = strings.TrimSpace(eventID)
+	if eventID == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, sub := range h.subscribers {
+		if (<-chan Event)(sub.ch) == events {
+			sub.lastEventID = eventID
+			return
+		}
+	}
+}
+
+func (h *eventHub) Streams() []StreamSummary {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	ids := make([]int, 0, len(h.subscribers))
+	for id := range h.subscribers {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	out := make([]StreamSummary, 0, len(ids))
+	for _, id := range ids {
+		sub := h.subscribers[id]
+		out = append(out, StreamSummary{
+			ID:          fmt.Sprintf("stream_%08x", sub.id),
+			Kind:        "events",
+			State:       "open",
+			ConnectedAt: sub.connectedAt,
+			LastEventID: sub.lastEventID,
+		})
+	}
+	return out
 }
 
 func (h *eventHub) nextEventLocked(event Event) Event {

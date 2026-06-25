@@ -432,6 +432,43 @@ func TestEventStreamPublishesSessionEvents(t *testing.T) {
 	}
 }
 
+func TestStatusReportsActiveEventStreams(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, nil)
+	httpSrv := httptest.NewServer(srv.Authenticate(mux))
+	defer httpSrv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, httpSrv.URL+"/vmsh/events", nil)
+	if err != nil {
+		t.Fatalf("new event request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("open event stream: %v", err)
+	}
+	defer resp.Body.Close()
+	scanner := bufio.NewScanner(resp.Body)
+	connected := readEvent(t, scanner)
+
+	status := getStatusFromServer(t, httpSrv.URL, "secret")
+	if len(status.Streams) != 1 {
+		t.Fatalf("streams = %+v", status.Streams)
+	}
+	stream := status.Streams[0]
+	if stream.ID == "" || stream.Kind != "events" || stream.State != "open" || stream.ConnectedAt.IsZero() || stream.LastEventID != connected.ID {
+		t.Fatalf("stream summary = %+v, connected=%+v", stream, connected)
+	}
+
+	cancel()
+	_ = resp.Body.Close()
+	requireEventually(t, func() bool {
+		return len(getStatusFromServer(t, httpSrv.URL, "secret").Streams) == 0
+	})
+}
+
 func TestEventStreamRequiresAuth(t *testing.T) {
 	srv := NewServer("secret")
 	mux := http.NewServeMux()
@@ -443,6 +480,40 @@ func TestEventStreamRequiresAuth(t *testing.T) {
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("event stream status = %d", rr.Code)
 	}
+}
+
+func getStatusFromServer(t *testing.T, baseURL, token string) Status {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/vmsh/status", nil)
+	if err != nil {
+		t.Fatalf("new status request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get status: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status code = %d", resp.StatusCode)
+	}
+	var status Status
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	return status
+}
+
+func requireEventually(t *testing.T, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ok() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition was not met")
 }
 
 func readEvent(t *testing.T, scanner *bufio.Scanner) Event {
