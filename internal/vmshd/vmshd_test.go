@@ -155,6 +155,163 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 	}
 }
 
+func TestSessionAttachDetachRoutes(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, nil)
+	session := srv.registry.Create("main")
+
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/vmsh/sessions/"+session.ID+"/attach", bytes.NewBufferString(`{"terminal":{"cols":120,"rows":40}}`)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("attach status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var attached AttachSessionResponse
+	if err := json.NewDecoder(rr.Body).Decode(&attached); err != nil {
+		t.Fatalf("decode attach response: %v", err)
+	}
+	if attached.Attachment.ID == "" || attached.Attachment.Mode != "interactive" {
+		t.Fatalf("attachment = %+v", attached.Attachment)
+	}
+	if attached.Attachment.Terminal == nil || attached.Attachment.Terminal.Cols != 120 || attached.Attachment.Terminal.Rows != 40 {
+		t.Fatalf("attachment terminal = %+v", attached.Attachment.Terminal)
+	}
+	if attached.Session.State != "attached" || len(attached.Session.Attachments) != 1 {
+		t.Fatalf("attached session = %+v", attached.Session)
+	}
+
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/vmsh/sessions/"+session.ID+"/attach", bytes.NewBufferString(`{"mode":"interactive"}`)))
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("second interactive attach status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/vmsh/sessions/"+session.ID+"/attach", bytes.NewBufferString(`{"mode":"observer"}`)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("observer attach status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var observer AttachSessionResponse
+	if err := json.NewDecoder(rr.Body).Decode(&observer); err != nil {
+		t.Fatalf("decode observer response: %v", err)
+	}
+	if observer.Attachment.Mode != "observer" || len(observer.Session.Attachments) != 2 {
+		t.Fatalf("observer response = %+v", observer)
+	}
+
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/vmsh/status", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status code = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var status Status
+	if err := json.NewDecoder(rr.Body).Decode(&status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if len(status.Sessions) != 1 || len(status.Sessions[0].AttachedClients) != 2 {
+		t.Fatalf("status sessions = %+v", status.Sessions)
+	}
+
+	rr = httptest.NewRecorder()
+	resizeTarget := "/vmsh/sessions/" + session.ID + "/attachments/" + attached.Attachment.ID + "/terminal"
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, resizeTarget, bytes.NewBufferString(`{"cols":100,"rows":32}`)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("resize status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resized AttachSessionResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resized); err != nil {
+		t.Fatalf("decode resize response: %v", err)
+	}
+	if resized.Attachment.Terminal == nil || resized.Attachment.Terminal.Cols != 100 || resized.Attachment.Terminal.Rows != 32 {
+		t.Fatalf("resized attachment = %+v", resized.Attachment)
+	}
+
+	rr = httptest.NewRecorder()
+	body := `{"attachment_id":"` + attached.Attachment.ID + `"}`
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/vmsh/sessions/"+session.ID+"/detach", bytes.NewBufferString(body)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("detach status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var detached Session
+	if err := json.NewDecoder(rr.Body).Decode(&detached); err != nil {
+		t.Fatalf("decode detached session: %v", err)
+	}
+	if detached.State != "attached" || len(detached.Attachments) != 1 || detached.Attachments[0].ID != observer.Attachment.ID {
+		t.Fatalf("detached session = %+v", detached)
+	}
+
+	rr = httptest.NewRecorder()
+	body = `{"attachment_id":"` + observer.Attachment.ID + `"}`
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/vmsh/sessions/"+session.ID+"/detach", bytes.NewBufferString(body)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("detach observer status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&detached); err != nil {
+		t.Fatalf("decode detached observer session: %v", err)
+	}
+	if detached.State != "detached" || len(detached.Attachments) != 0 {
+		t.Fatalf("fully detached session = %+v", detached)
+	}
+}
+
+func TestSessionAttachRejectsBadRequests(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, nil)
+	session := srv.registry.Create("main")
+
+	for _, tc := range []struct {
+		name   string
+		target string
+		body   string
+		status int
+	}{
+		{name: "missing session", target: "/vmsh/sessions/sess_missing/attach", body: `{}`, status: http.StatusNotFound},
+		{name: "bad mode", target: "/vmsh/sessions/" + session.ID + "/attach", body: `{"mode":"writer"}`, status: http.StatusBadRequest},
+		{name: "bad attach json", target: "/vmsh/sessions/" + session.ID + "/attach", body: `{`, status: http.StatusBadRequest},
+		{name: "missing attachment id", target: "/vmsh/sessions/" + session.ID + "/detach", body: `{}`, status: http.StatusBadRequest},
+		{name: "missing attachment", target: "/vmsh/sessions/" + session.ID + "/detach", body: `{"attachment_id":"attach_missing"}`, status: http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, tc.target, bytes.NewBufferString(tc.body)))
+			if rr.Code != tc.status {
+				t.Fatalf("status = %d want %d body=%s", rr.Code, tc.status, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestSessionTerminalUpdateRejectsBadRequests(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, nil)
+	session := srv.registry.Create("main")
+	_, attachment, err := srv.registry.Attach(session.ID, AttachSessionRequest{})
+	if err != nil {
+		t.Fatalf("attach session: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		target string
+		body   string
+		status int
+	}{
+		{name: "bad json", target: "/vmsh/sessions/" + session.ID + "/attachments/" + attachment.ID + "/terminal", body: `{`, status: http.StatusBadRequest},
+		{name: "missing session", target: "/vmsh/sessions/sess_missing/attachments/" + attachment.ID + "/terminal", body: `{}`, status: http.StatusNotFound},
+		{name: "missing attachment", target: "/vmsh/sessions/" + session.ID + "/attachments/attach_missing/terminal", body: `{}`, status: http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, tc.target, bytes.NewBufferString(tc.body)))
+			if rr.Code != tc.status {
+				t.Fatalf("status = %d want %d body=%s", rr.Code, tc.status, rr.Body.String())
+			}
+		})
+	}
+}
+
 func TestCreateSessionRejectsBadJSON(t *testing.T) {
 	srv := NewServer("secret")
 	mux := http.NewServeMux()

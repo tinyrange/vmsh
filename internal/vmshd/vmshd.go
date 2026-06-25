@@ -31,29 +31,59 @@ type Status struct {
 }
 
 type Session struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	State     string    `json:"state"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID          string             `json:"id"`
+	Name        string             `json:"name"`
+	State       string             `json:"state"`
+	Attachments []ClientAttachment `json:"attached_clients"`
+	CreatedAt   time.Time          `json:"created_at"`
+	UpdatedAt   time.Time          `json:"updated_at"`
 }
 
 type SessionSummary struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	State     string    `json:"state"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID              string             `json:"id"`
+	Name            string             `json:"name"`
+	State           string             `json:"state"`
+	AttachedClients []ClientAttachment `json:"attached_clients"`
+	CreatedAt       time.Time          `json:"created_at"`
+	UpdatedAt       time.Time          `json:"updated_at"`
+}
+
+type ClientAttachment struct {
+	ID         string    `json:"id"`
+	Mode       string    `json:"mode"`
+	Terminal   *Terminal `json:"terminal,omitempty"`
+	AttachedAt time.Time `json:"attached_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+type Terminal struct {
+	Cols int `json:"cols,omitempty"`
+	Rows int `json:"rows,omitempty"`
 }
 
 type CreateSessionRequest struct {
 	Name string `json:"name,omitempty"`
 }
 
+type AttachSessionRequest struct {
+	Mode     string    `json:"mode,omitempty"`
+	Terminal *Terminal `json:"terminal,omitempty"`
+}
+
+type AttachSessionResponse struct {
+	Session    Session          `json:"session"`
+	Attachment ClientAttachment `json:"attachment"`
+}
+
+type DetachSessionRequest struct {
+	AttachmentID string `json:"attachment_id"`
+}
+
 type sessionRegistry struct {
-	mu       sync.Mutex
-	next     int
-	sessions map[string]Session
+	mu         sync.Mutex
+	next       int
+	nextAttach int
+	sessions   map[string]Session
 }
 
 type Server struct {
@@ -145,6 +175,45 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			return
 		}
 		writeJSON(w, http.StatusOK, session)
+	})
+	mux.HandleFunc("POST /vmsh/sessions/{id}/attach", func(w http.ResponseWriter, r *http.Request) {
+		var req AttachSessionRequest
+		if err := decodeOptionalJSON(r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, client.ErrorResponse{Error: err.Error()})
+			return
+		}
+		session, attachment, err := s.registry.Attach(r.PathValue("id"), req)
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, AttachSessionResponse{Session: session, Attachment: attachment})
+	})
+	mux.HandleFunc("POST /vmsh/sessions/{id}/detach", func(w http.ResponseWriter, r *http.Request) {
+		var req DetachSessionRequest
+		if err := decodeOptionalJSON(r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, client.ErrorResponse{Error: err.Error()})
+			return
+		}
+		session, err := s.registry.Detach(r.PathValue("id"), req.AttachmentID)
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, session)
+	})
+	mux.HandleFunc("POST /vmsh/sessions/{id}/attachments/{attachment}/terminal", func(w http.ResponseWriter, r *http.Request) {
+		var req Terminal
+		if err := decodeRequiredJSON(r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, client.ErrorResponse{Error: err.Error()})
+			return
+		}
+		session, attachment, err := s.registry.UpdateTerminal(r.PathValue("id"), r.PathValue("attachment"), req)
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, AttachSessionResponse{Session: session, Attachment: attachment})
 	})
 }
 
@@ -258,11 +327,12 @@ func (r *sessionRegistry) Create(name string) Session {
 	}
 	now := time.Now()
 	session := Session{
-		ID:        id,
-		Name:      name,
-		State:     "detached",
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:          id,
+		Name:        name,
+		State:       "detached",
+		Attachments: []ClientAttachment{},
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 	r.sessions[id] = session
 	return session
@@ -289,6 +359,104 @@ func (r *sessionRegistry) Delete(id string) (Session, bool) {
 	return session, true
 }
 
+func (r *sessionRegistry) Attach(id string, req AttachSessionRequest) (Session, ClientAttachment, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id = strings.TrimSpace(id)
+	session, ok := r.sessions[id]
+	if !ok {
+		return Session{}, ClientAttachment{}, sessionError{status: http.StatusNotFound, err: "session not found"}
+	}
+	mode := strings.TrimSpace(req.Mode)
+	if mode == "" {
+		mode = "interactive"
+	}
+	if mode != "interactive" && mode != "observer" {
+		return Session{}, ClientAttachment{}, sessionError{status: http.StatusBadRequest, err: "unsupported attachment mode"}
+	}
+	if mode == "interactive" {
+		for _, attachment := range session.Attachments {
+			if attachment.Mode == "interactive" {
+				return Session{}, ClientAttachment{}, sessionError{status: http.StatusConflict, err: "session already has an interactive attachment"}
+			}
+		}
+	}
+	r.nextAttach++
+	now := time.Now()
+	attachment := ClientAttachment{
+		ID:         fmt.Sprintf("attach_%08x", r.nextAttach),
+		Mode:       mode,
+		Terminal:   normalizeTerminal(req.Terminal),
+		AttachedAt: now,
+		UpdatedAt:  now,
+	}
+	session.Attachments = append(session.Attachments, attachment)
+	session.State = "attached"
+	session.UpdatedAt = now
+	r.sessions[id] = session
+	return session, attachment, nil
+}
+
+func (r *sessionRegistry) Detach(id, attachmentID string) (Session, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id = strings.TrimSpace(id)
+	session, ok := r.sessions[id]
+	if !ok {
+		return Session{}, sessionError{status: http.StatusNotFound, err: "session not found"}
+	}
+	attachmentID = strings.TrimSpace(attachmentID)
+	if attachmentID == "" {
+		return Session{}, sessionError{status: http.StatusBadRequest, err: "attachment_id is required"}
+	}
+	next := session.Attachments[:0]
+	found := false
+	for _, attachment := range session.Attachments {
+		if attachment.ID == attachmentID {
+			found = true
+			continue
+		}
+		next = append(next, attachment)
+	}
+	if !found {
+		return Session{}, sessionError{status: http.StatusNotFound, err: "attachment not found"}
+	}
+	session.Attachments = append([]ClientAttachment(nil), next...)
+	if len(session.Attachments) == 0 {
+		session.State = "detached"
+	}
+	session.UpdatedAt = time.Now()
+	r.sessions[id] = session
+	return session, nil
+}
+
+func (r *sessionRegistry) UpdateTerminal(id, attachmentID string, term Terminal) (Session, ClientAttachment, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id = strings.TrimSpace(id)
+	session, ok := r.sessions[id]
+	if !ok {
+		return Session{}, ClientAttachment{}, sessionError{status: http.StatusNotFound, err: "session not found"}
+	}
+	attachmentID = strings.TrimSpace(attachmentID)
+	if attachmentID == "" {
+		return Session{}, ClientAttachment{}, sessionError{status: http.StatusBadRequest, err: "attachment id is required"}
+	}
+	for i, attachment := range session.Attachments {
+		if attachment.ID != attachmentID {
+			continue
+		}
+		now := time.Now()
+		attachment.Terminal = normalizeTerminal(&term)
+		attachment.UpdatedAt = now
+		session.Attachments[i] = attachment
+		session.UpdatedAt = now
+		r.sessions[id] = session
+		return session, attachment, nil
+	}
+	return Session{}, ClientAttachment{}, sessionError{status: http.StatusNotFound, err: "attachment not found"}
+}
+
 func (r *sessionRegistry) List() []SessionSummary {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -301,19 +469,61 @@ func (r *sessionRegistry) List() []SessionSummary {
 	for _, id := range ids {
 		session := r.sessions[id]
 		out = append(out, SessionSummary{
-			ID:        session.ID,
-			Name:      session.Name,
-			State:     session.State,
-			CreatedAt: session.CreatedAt,
-			UpdatedAt: session.UpdatedAt,
+			ID:              session.ID,
+			Name:            session.Name,
+			State:           session.State,
+			AttachedClients: append([]ClientAttachment(nil), session.Attachments...),
+			CreatedAt:       session.CreatedAt,
+			UpdatedAt:       session.UpdatedAt,
 		})
 	}
 	return out
 }
 
+type sessionError struct {
+	status int
+	err    string
+}
+
+func (e sessionError) Error() string {
+	return e.err
+}
+
+func writeSessionError(w http.ResponseWriter, err error) {
+	if err, ok := err.(sessionError); ok {
+		writeJSON(w, err.status, client.ErrorResponse{Error: err.err})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, client.ErrorResponse{Error: err.Error()})
+}
+
+func normalizeTerminal(term *Terminal) *Terminal {
+	if term == nil {
+		return nil
+	}
+	out := *term
+	if out.Cols < 0 {
+		out.Cols = 0
+	}
+	if out.Rows < 0 {
+		out.Rows = 0
+	}
+	return &out
+}
+
 func decodeOptionalJSON(r *http.Request, dst any) error {
 	if r.Body == nil || r.ContentLength == 0 {
 		return nil
+	}
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		return fmt.Errorf("decode request body: %w", err)
+	}
+	return nil
+}
+
+func decodeRequiredJSON(r *http.Request, dst any) error {
+	if r.Body == nil {
+		return fmt.Errorf("request body is required")
 	}
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
 		return fmt.Errorf("decode request body: %w", err)
