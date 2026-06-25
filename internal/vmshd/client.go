@@ -128,6 +128,10 @@ func (s *TerminalStream) Resize(term Terminal) error {
 	return s.Send(TerminalStreamMessage{Kind: "resize", Terminal: &term})
 }
 
+func (s *TerminalStream) Write(data []byte) error {
+	return s.Send(TerminalStreamMessage{Kind: "stdin", Data: data})
+}
+
 func (s *TerminalStream) Close() error {
 	if s == nil {
 		return nil

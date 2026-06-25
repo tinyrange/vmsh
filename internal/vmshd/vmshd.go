@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/tinyrange/vmsh/internal/backend"
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/ccvmd"
@@ -186,6 +187,7 @@ type sessionRegistry struct {
 	nextJob    int
 	sessions   map[string]Session
 	jobs       map[string]map[int]JobSummary
+	hostShells map[string]ShellHandle
 }
 
 type eventHub struct {
@@ -213,6 +215,7 @@ type Server struct {
 	events   *eventHub
 	streams  *streamRegistry
 	jobs     *hostJobRunner
+	shells   *hostShellManager
 
 	startedAt time.Time
 }
@@ -220,6 +223,22 @@ type Server struct {
 type hostJobRunner struct {
 	mu      sync.Mutex
 	cancels map[int]context.CancelFunc
+}
+
+type hostShellManager struct {
+	mu     sync.Mutex
+	shells map[string]*hostShell
+}
+
+type hostShell struct {
+	sessionID   string
+	cmd         *exec.Cmd
+	tty         *os.File
+	done        chan struct{}
+	doneOnce    sync.Once
+	mu          sync.Mutex
+	nextSub     int
+	subscribers map[int]chan []byte
 }
 
 func Main(args []string) {
@@ -267,6 +286,7 @@ func NewServer(token string) *Server {
 		events:    newEventHub(),
 		streams:   newStreamRegistry(),
 		jobs:      newHostJobRunner(),
+		shells:    newHostShellManager(),
 		startedAt: time.Now(),
 	}
 }
@@ -330,6 +350,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			return
 		}
 		s.jobs.Cancel(jobIDs)
+		s.shells.Close(session.ID)
 		s.events.Publish(Event{Kind: "session_deleted", Session: &session})
 		writeJSON(w, http.StatusOK, session)
 	})
@@ -478,6 +499,197 @@ func boundedJobLogs(output []byte) string {
 	return string(output[len(output)-maxJobLogBytes:])
 }
 
+func newHostShellManager() *hostShellManager {
+	return &hostShellManager{shells: map[string]*hostShell{}}
+}
+
+func (m *hostShellManager) Start(sessionID string, term *Terminal) (*hostShell, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, fmt.Errorf("session id is required")
+	}
+	m.mu.Lock()
+	if shell := m.shells[sessionID]; shell != nil && shell.Running() {
+		m.mu.Unlock()
+		_ = shell.SetSize(term)
+		return shell, nil
+	}
+	delete(m.shells, sessionID)
+	m.mu.Unlock()
+
+	cmd := exec.Command(hostShellCommand())
+	cmd.Env = append(os.Environ(), "VMSH_ACTIVE=1")
+	tty, err := pty.StartWithSize(cmd, terminalWinsize(term))
+	if err != nil {
+		return nil, err
+	}
+	shell := &hostShell{
+		sessionID:   sessionID,
+		cmd:         cmd,
+		tty:         tty,
+		done:        make(chan struct{}),
+		subscribers: map[int]chan []byte{},
+	}
+	m.mu.Lock()
+	m.shells[sessionID] = shell
+	m.mu.Unlock()
+	go shell.readLoop()
+	go func() {
+		_ = cmd.Wait()
+		shell.closeDone()
+		m.mu.Lock()
+		if m.shells[sessionID] == shell {
+			delete(m.shells, sessionID)
+		}
+		m.mu.Unlock()
+	}()
+	return shell, nil
+}
+
+func (m *hostShellManager) Close(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	m.mu.Lock()
+	shell := m.shells[sessionID]
+	delete(m.shells, sessionID)
+	m.mu.Unlock()
+	if shell == nil {
+		return
+	}
+	shell.Close()
+}
+
+func (s *hostShell) Running() bool {
+	if s == nil {
+		return false
+	}
+	select {
+	case <-s.done:
+		return false
+	default:
+		return true
+	}
+}
+
+func (s *hostShell) SetSize(term *Terminal) error {
+	if s == nil || s.tty == nil || term == nil {
+		return nil
+	}
+	return pty.Setsize(s.tty, terminalWinsize(term))
+}
+
+func (s *hostShell) Write(data []byte) error {
+	if s == nil || s.tty == nil || len(data) == 0 {
+		return nil
+	}
+	_, err := s.tty.Write(data)
+	return err
+}
+
+func (s *hostShell) Subscribe() (<-chan []byte, func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextSub++
+	id := s.nextSub
+	ch := make(chan []byte, 32)
+	s.subscribers[id] = ch
+	return ch, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if sub := s.subscribers[id]; sub != nil {
+			delete(s.subscribers, id)
+			close(sub)
+		}
+	}
+}
+
+func (s *hostShell) readLoop() {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := s.tty.Read(buf)
+		if n > 0 {
+			s.publish(buf[:n])
+		}
+		if err != nil {
+			s.closeDone()
+			return
+		}
+	}
+}
+
+func (s *hostShell) publish(data []byte) {
+	data = append([]byte(nil), data...)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, sub := range s.subscribers {
+		select {
+		case sub <- data:
+		default:
+		}
+	}
+}
+
+func (s *hostShell) Close() {
+	if s == nil {
+		return
+	}
+	_ = s.tty.Close()
+	if s.cmd != nil && s.cmd.Process != nil {
+		_ = s.cmd.Process.Kill()
+	}
+	s.closeDone()
+}
+
+func (s *hostShell) closeDone() {
+	s.doneOnce.Do(func() {
+		_ = s.tty.Close()
+		close(s.done)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for id, sub := range s.subscribers {
+			delete(s.subscribers, id)
+			close(sub)
+		}
+	})
+}
+
+func terminalWinsize(term *Terminal) *pty.Winsize {
+	rows := uint16(24)
+	cols := uint16(80)
+	if term != nil {
+		if term.Rows > 0 {
+			rows = uint16(term.Rows)
+		}
+		if term.Cols > 0 {
+			cols = uint16(term.Cols)
+		}
+	}
+	return &pty.Winsize{Rows: rows, Cols: cols}
+}
+
+func hostShellCommand() string {
+	if runtime.GOOS == "windows" {
+		return firstNonEmpty(os.Getenv("COMSPEC"), "cmd.exe")
+	}
+	return firstNonEmpty(os.Getenv("SHELL"), "/bin/sh")
+}
+
+func currentWorkingDirectory() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return cwd
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 	sessionID := ws.Request().PathValue("id")
 	attachmentID := ws.Request().PathValue("attachment")
@@ -492,34 +704,86 @@ func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 		s.events.Publish(Event{Kind: "terminal_stream_closed", Session: &session, Attachment: &attachment})
 	}()
 	s.events.Publish(Event{Kind: "terminal_stream_opened", Session: &session, Attachment: &attachment})
-	if err := websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "attached", Stream: &stream}); err != nil {
+	sendMu := &sync.Mutex{}
+	send := func(msg TerminalStreamMessage) error {
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		return websocket.JSON.Send(ws, msg)
+	}
+	if err := send(TerminalStreamMessage{Kind: "attached", Stream: &stream}); err != nil {
 		return
 	}
+	shell, err := s.shells.Start(session.ID, attachment.Terminal)
+	if err != nil {
+		_ = send(TerminalStreamMessage{Kind: "error"})
+		return
+	}
+	s.registry.SetDaemonHostShell(session.ID, ShellHandle{
+		ID:      "host",
+		Kind:    "host",
+		Name:    "host",
+		Context: "host",
+		CWD:     firstNonEmpty(strings.TrimSpace(session.HostCWD), currentWorkingDirectory()),
+		State:   "open",
+	})
+	go func(sessionID, cwd string) {
+		<-shell.done
+		s.registry.SetDaemonHostShell(sessionID, ShellHandle{
+			ID:      "host",
+			Kind:    "host",
+			Name:    "host",
+			Context: "host",
+			CWD:     cwd,
+			State:   "closed",
+		})
+	}(session.ID, firstNonEmpty(strings.TrimSpace(session.HostCWD), currentWorkingDirectory()))
+	output, unsubscribe := shell.Subscribe()
+	defer unsubscribe()
+	sendErr := make(chan error, 1)
+	go func() {
+		for data := range output {
+			if err := send(TerminalStreamMessage{Kind: "data", Data: data}); err != nil {
+				sendErr <- err
+				return
+			}
+		}
+	}()
 	for {
 		var msg TerminalStreamMessage
+		select {
+		case <-sendErr:
+			return
+		default:
+		}
 		if err := websocket.JSON.Receive(ws, &msg); err != nil {
 			return
 		}
 		switch strings.TrimSpace(msg.Kind) {
 		case "resize":
 			if msg.Terminal == nil {
-				_ = websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "error"})
+				_ = send(TerminalStreamMessage{Kind: "error"})
 				continue
 			}
 			updated, updatedAttachment, err := s.registry.UpdateTerminal(session.ID, attachment.ID, *msg.Terminal)
 			if err != nil {
-				_ = websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "error"})
+				_ = send(TerminalStreamMessage{Kind: "error"})
 				continue
 			}
 			session = updated
 			attachment = updatedAttachment
+			_ = shell.SetSize(attachment.Terminal)
 			s.events.Publish(Event{Kind: "terminal_updated", Session: &session, Attachment: &attachment})
 		case "stdin", "data":
-			// Terminal bytes are intentionally opaque to vmshd at this layer.
+			if len(msg.Data) > 0 {
+				if err := shell.Write(msg.Data); err != nil {
+					_ = send(TerminalStreamMessage{Kind: "error"})
+					return
+				}
+			}
 		case "close":
 			return
 		default:
-			_ = websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "error"})
+			_ = send(TerminalStreamMessage{Kind: "error"})
 		}
 	}
 }
@@ -651,7 +915,7 @@ func newToken() (string, error) {
 }
 
 func newSessionRegistry() *sessionRegistry {
-	return &sessionRegistry{sessions: map[string]Session{}, jobs: map[string]map[int]JobSummary{}}
+	return &sessionRegistry{sessions: map[string]Session{}, jobs: map[string]map[int]JobSummary{}, hostShells: map[string]ShellHandle{}}
 }
 
 func newEventHub() *eventHub {
@@ -824,6 +1088,7 @@ func (r *sessionRegistry) Get(id string) (Session, bool) {
 	defer r.mu.Unlock()
 	session, ok := r.sessions[strings.TrimSpace(id)]
 	session.Jobs = r.mergedJobsLocked(session.ID, session.Jobs)
+	session.HostShells = r.mergedHostShellsLocked(session.ID, session.HostShells)
 	return cloneSession(session), ok
 }
 
@@ -835,6 +1100,7 @@ func (r *sessionRegistry) GetAttachment(id, attachmentID string) (Session, Clien
 		return Session{}, ClientAttachment{}, false
 	}
 	session.Jobs = r.mergedJobsLocked(session.ID, session.Jobs)
+	session.HostShells = r.mergedHostShellsLocked(session.ID, session.HostShells)
 	attachmentID = strings.TrimSpace(attachmentID)
 	for _, attachment := range session.Attachments {
 		if attachment.ID == attachmentID {
@@ -858,6 +1124,7 @@ func (r *sessionRegistry) Update(id string, req UpdateSessionRequest) (Session, 
 	session.GuestShells = cloneShellHandles(req.GuestShells)
 	session.SSHShells = cloneShellHandles(req.SSHShells)
 	session.Jobs = cloneJobSummaries(req.Jobs)
+	session.HostShells = r.mergedHostShellsLocked(id, session.HostShells)
 	session.UpdatedAt = time.Now()
 	r.sessions[id] = session
 	return cloneSession(session), nil
@@ -872,11 +1139,13 @@ func (r *sessionRegistry) Delete(id string) (Session, []int, bool) {
 		return Session{}, nil, false
 	}
 	session.Jobs = r.mergedJobsLocked(id, session.Jobs)
+	session.HostShells = r.mergedHostShellsLocked(id, session.HostShells)
 	session.State = "closing"
 	session.UpdatedAt = time.Now()
 	jobIDs := r.jobIDsLocked(id)
 	delete(r.sessions, id)
 	delete(r.jobs, id)
+	delete(r.hostShells, id)
 	return cloneSession(session), jobIDs, true
 }
 
@@ -990,6 +1259,7 @@ func (r *sessionRegistry) List() []SessionSummary {
 	for _, id := range ids {
 		session := r.sessions[id]
 		session.Jobs = r.mergedJobsLocked(id, session.Jobs)
+		session.HostShells = r.mergedHostShellsLocked(id, session.HostShells)
 		out = append(out, SessionSummary{
 			ID:              session.ID,
 			Name:            session.Name,
@@ -1089,6 +1359,25 @@ func (r *sessionRegistry) FinishJob(sessionID string, jobID int, result JobSumma
 	return job, true
 }
 
+func (r *sessionRegistry) SetDaemonHostShell(sessionID string, handle ShellHandle) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	sessionID = strings.TrimSpace(sessionID)
+	if _, ok := r.sessions[sessionID]; !ok {
+		return
+	}
+	handle.ID = firstNonEmpty(strings.TrimSpace(handle.ID), "host")
+	handle.Kind = firstNonEmpty(strings.TrimSpace(handle.Kind), "host")
+	handle.Name = strings.TrimSpace(handle.Name)
+	handle.Context = firstNonEmpty(strings.TrimSpace(handle.Context), "host")
+	handle.CWD = strings.TrimSpace(handle.CWD)
+	handle.State = firstNonEmpty(strings.TrimSpace(handle.State), "open")
+	r.hostShells[sessionID] = handle
+	session := r.sessions[sessionID]
+	session.UpdatedAt = time.Now()
+	r.sessions[sessionID] = session
+}
+
 func (r *sessionRegistry) mergedJobsLocked(sessionID string, clientJobs []JobSummary) []JobSummary {
 	out := cloneJobSummaries(clientJobs)
 	ids := r.jobIDsLocked(sessionID)
@@ -1096,6 +1385,21 @@ func (r *sessionRegistry) mergedJobsLocked(sessionID string, clientJobs []JobSum
 		out = append(out, r.jobs[sessionID][id])
 	}
 	return out
+}
+
+func (r *sessionRegistry) mergedHostShellsLocked(sessionID string, clientHandles []ShellHandle) []ShellHandle {
+	out := cloneShellHandles(clientHandles)
+	handle, ok := r.hostShells[sessionID]
+	if !ok {
+		return out
+	}
+	for i := range out {
+		if out[i].ID == handle.ID && out[i].Kind == handle.Kind {
+			out[i] = handle
+			return out
+		}
+	}
+	return append(out, handle)
 }
 
 func (r *sessionRegistry) jobIDsLocked(sessionID string) []int {

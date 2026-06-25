@@ -179,6 +179,7 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 
 func TestHTTPClientDialTerminalStream(t *testing.T) {
 	resized := make(chan Terminal, 1)
+	stdin := make(chan []byte, 1)
 	mux := http.NewServeMux()
 	mux.Handle("/vmsh/sessions/sess_1/attachments/attach_1/stream", websocket.Server{
 		Handshake: func(_ *websocket.Config, r *http.Request) error {
@@ -203,6 +204,15 @@ func TestHTTPClientDialTerminalStream(t *testing.T) {
 				return
 			}
 			resized <- *msg.Terminal
+			if err := websocket.JSON.Receive(ws, &msg); err != nil {
+				t.Errorf("receive stdin: %v", err)
+				return
+			}
+			if msg.Kind != "stdin" || string(msg.Data) != "hello\n" {
+				t.Errorf("stdin message = %+v", msg)
+				return
+			}
+			stdin <- msg.Data
 		},
 	})
 	srv := httptest.NewServer(mux)
@@ -241,6 +251,17 @@ func TestHTTPClientDialTerminalStream(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for resize")
+	}
+	if err := stream.Write([]byte("hello\n")); err != nil {
+		t.Fatalf("write stdin: %v", err)
+	}
+	select {
+	case got := <-stdin:
+		if string(got) != "hello\n" {
+			t.Fatalf("stdin = %q", string(got))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for stdin")
 	}
 }
 

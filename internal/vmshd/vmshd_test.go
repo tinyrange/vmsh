@@ -442,6 +442,10 @@ func TestDaemonHostJobHelper(t *testing.T) {
 }
 
 func TestTerminalAttachmentStreamTracksActiveStreamAndResize(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host PTY shell test requires a Unix shell")
+	}
+	t.Setenv("SHELL", "/bin/sh")
 	srv := NewServer("secret")
 	mux := http.NewServeMux()
 	srv.RegisterHandlers(mux, nil)
@@ -477,6 +481,10 @@ func TestTerminalAttachmentStreamTracksActiveStreamAndResize(t *testing.T) {
 	if len(status.Streams) != 1 || status.Streams[0].Kind != "terminal" || status.Streams[0].AttachmentID != attachment.ID {
 		t.Fatalf("status streams = %+v", status.Streams)
 	}
+	requireEventually(t, func() bool {
+		status := getStatusFromServer(t, httpSrv.URL, "secret")
+		return len(status.Sessions) == 1 && len(status.Sessions[0].HostShells) == 1 && status.Sessions[0].HostShells[0].State == "open"
+	})
 
 	if err := websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "resize", Terminal: &Terminal{Cols: 100, Rows: 40}}); err != nil {
 		t.Fatalf("send resize: %v", err)
@@ -486,6 +494,13 @@ func TestTerminalAttachmentStreamTracksActiveStreamAndResize(t *testing.T) {
 		return ok && len(read.Attachments) == 1 && read.Attachments[0].Terminal != nil && read.Attachments[0].Terminal.Cols == 100 && read.Attachments[0].Terminal.Rows == 40
 	})
 
+	if err := websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "stdin", Data: []byte("printf '__vmshd_pty_ok__\\n'\nexit\n")}); err != nil {
+		t.Fatalf("send stdin: %v", err)
+	}
+	if got := receiveTerminalDataUntil(t, ws, "__vmshd_pty_ok__"); !strings.Contains(got, "__vmshd_pty_ok__") {
+		t.Fatalf("terminal output = %q", got)
+	}
+
 	if err := websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "close"}); err != nil {
 		t.Fatalf("send close: %v", err)
 	}
@@ -493,6 +508,27 @@ func TestTerminalAttachmentStreamTracksActiveStreamAndResize(t *testing.T) {
 	requireEventually(t, func() bool {
 		return len(getStatusFromServer(t, httpSrv.URL, "secret").Streams) == 0
 	})
+}
+
+func receiveTerminalDataUntil(t *testing.T, ws *websocket.Conn, marker string) string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var out strings.Builder
+	for time.Now().Before(deadline) {
+		var msg TerminalStreamMessage
+		if err := websocket.JSON.Receive(ws, &msg); err != nil {
+			t.Fatalf("receive terminal data: %v", err)
+		}
+		if msg.Kind != "data" {
+			continue
+		}
+		out.Write(msg.Data)
+		if strings.Contains(out.String(), marker) {
+			return out.String()
+		}
+	}
+	t.Fatalf("terminal data marker %q not received; output=%q", marker, out.String())
+	return out.String()
 }
 
 func TestEventStreamPublishesSessionEvents(t *testing.T) {
