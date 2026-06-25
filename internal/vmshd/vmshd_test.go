@@ -1,7 +1,9 @@
 package vmshd
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -339,6 +341,80 @@ func TestSessionTerminalUpdateRejectsBadRequests(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEventStreamPublishesSessionEvents(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, nil)
+	httpSrv := httptest.NewServer(srv.Authenticate(mux))
+	defer httpSrv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, httpSrv.URL+"/vmsh/events", nil)
+	if err != nil {
+		t.Fatalf("new event request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("open event stream: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("event stream status = %d", resp.StatusCode)
+	}
+	scanner := bufio.NewScanner(resp.Body)
+	first := readEvent(t, scanner)
+	if first.Kind != "connected" || first.ID == "" || first.At.IsZero() {
+		t.Fatalf("connected event = %+v", first)
+	}
+
+	createReq, err := http.NewRequest(http.MethodPost, httpSrv.URL+"/vmsh/sessions", bytes.NewBufferString(`{"name":"main"}`))
+	if err != nil {
+		t.Fatalf("new create request: %v", err)
+	}
+	createReq.Header.Set("Authorization", "Bearer secret")
+	createReq.Header.Set("Content-Type", "application/json")
+	createResp, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	defer createResp.Body.Close()
+	if createResp.StatusCode != http.StatusOK {
+		t.Fatalf("create status = %d", createResp.StatusCode)
+	}
+
+	event := readEvent(t, scanner)
+	if event.Kind != "session_created" || event.ID == "" || event.Session == nil || event.Session.Name != "main" || event.Session.State != "detached" {
+		t.Fatalf("session created event = %+v", event)
+	}
+}
+
+func TestEventStreamRequiresAuth(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, nil)
+	handler := srv.Authenticate(mux)
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/vmsh/events", nil))
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("event stream status = %d", rr.Code)
+	}
+}
+
+func readEvent(t *testing.T, scanner *bufio.Scanner) Event {
+	t.Helper()
+	if !scanner.Scan() {
+		t.Fatalf("scan event: %v", scanner.Err())
+	}
+	var event Event
+	if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+		t.Fatalf("decode event %q: %v", scanner.Text(), err)
+	}
+	return event
 }
 
 func TestCreateSessionRejectsBadJSON(t *testing.T) {

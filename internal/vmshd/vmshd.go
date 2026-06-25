@@ -30,6 +30,14 @@ type Status struct {
 	StartedAt time.Time              `json:"started_at"`
 }
 
+type Event struct {
+	ID         string            `json:"id"`
+	Kind       string            `json:"kind"`
+	Session    *Session          `json:"session,omitempty"`
+	Attachment *ClientAttachment `json:"attachment,omitempty"`
+	At         time.Time         `json:"at"`
+}
+
 type Session struct {
 	ID              string             `json:"id"`
 	Name            string             `json:"name"`
@@ -108,9 +116,16 @@ type sessionRegistry struct {
 	sessions   map[string]Session
 }
 
+type eventHub struct {
+	mu          sync.Mutex
+	next        int
+	subscribers map[int]chan Event
+}
+
 type Server struct {
 	token    string
 	registry *sessionRegistry
+	events   *eventHub
 
 	startedAt time.Time
 }
@@ -157,6 +172,7 @@ func NewServer(token string) *Server {
 	return &Server{
 		token:     token,
 		registry:  newSessionRegistry(),
+		events:    newEventHub(),
 		startedAt: time.Now(),
 	}
 }
@@ -174,13 +190,18 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 	mux.HandleFunc("GET /vmsh/sessions", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.registry.List())
 	})
+	mux.HandleFunc("GET /vmsh/events", func(w http.ResponseWriter, r *http.Request) {
+		s.streamEvents(w, r)
+	})
 	mux.HandleFunc("POST /vmsh/sessions", func(w http.ResponseWriter, r *http.Request) {
 		var req CreateSessionRequest
 		if err := decodeOptionalJSON(r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, client.ErrorResponse{Error: err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, s.registry.Create(req.Name))
+		session := s.registry.Create(req.Name)
+		s.events.Publish(Event{Kind: "session_created", Session: &session})
+		writeJSON(w, http.StatusOK, session)
 	})
 	mux.HandleFunc("GET /vmsh/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
 		session, ok := s.registry.Get(r.PathValue("id"))
@@ -201,6 +222,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			writeSessionError(w, err)
 			return
 		}
+		s.events.Publish(Event{Kind: "session_updated", Session: &session})
 		writeJSON(w, http.StatusOK, session)
 	})
 	mux.HandleFunc("DELETE /vmsh/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -209,6 +231,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			writeJSON(w, http.StatusNotFound, client.ErrorResponse{Error: "session not found"})
 			return
 		}
+		s.events.Publish(Event{Kind: "session_deleted", Session: &session})
 		writeJSON(w, http.StatusOK, session)
 	})
 	mux.HandleFunc("POST /vmsh/sessions/{id}/attach", func(w http.ResponseWriter, r *http.Request) {
@@ -222,6 +245,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			writeSessionError(w, err)
 			return
 		}
+		s.events.Publish(Event{Kind: "session_attached", Session: &session, Attachment: &attachment})
 		writeJSON(w, http.StatusOK, AttachSessionResponse{Session: session, Attachment: attachment})
 	})
 	mux.HandleFunc("POST /vmsh/sessions/{id}/detach", func(w http.ResponseWriter, r *http.Request) {
@@ -235,6 +259,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			writeSessionError(w, err)
 			return
 		}
+		s.events.Publish(Event{Kind: "session_detached", Session: &session})
 		writeJSON(w, http.StatusOK, session)
 	})
 	mux.HandleFunc("POST /vmsh/sessions/{id}/attachments/{attachment}/terminal", func(w http.ResponseWriter, r *http.Request) {
@@ -248,8 +273,38 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			writeSessionError(w, err)
 			return
 		}
+		s.events.Publish(Event{Kind: "terminal_updated", Session: &session, Attachment: &attachment})
 		writeJSON(w, http.StatusOK, AttachSessionResponse{Session: session, Attachment: attachment})
 	})
+}
+
+func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, client.ErrorResponse{Error: "event streaming is not supported"})
+		return
+	}
+	events, unsubscribe := s.events.Subscribe()
+	defer unsubscribe()
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(s.events.Event(Event{Kind: "connected"})); err != nil {
+		return
+	}
+	flusher.Flush()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case event := <-events:
+			if err := json.NewEncoder(w).Encode(event); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
 }
 
 func runtimeInstanceStatuses(runtime ccvmd.RuntimeView) []client.InstanceState {
@@ -349,6 +404,64 @@ func newToken() (string, error) {
 
 func newSessionRegistry() *sessionRegistry {
 	return &sessionRegistry{sessions: map[string]Session{}}
+}
+
+func newEventHub() *eventHub {
+	return &eventHub{subscribers: map[int]chan Event{}}
+}
+
+func (h *eventHub) Event(event Event) Event {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.nextEventLocked(event)
+}
+
+func (h *eventHub) Publish(event Event) {
+	event = h.Event(event)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, ch := range h.subscribers {
+		select {
+		case ch <- event:
+		default:
+		}
+	}
+}
+
+func (h *eventHub) Subscribe() (<-chan Event, func()) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.next++
+	id := h.next
+	ch := make(chan Event, 16)
+	h.subscribers[id] = ch
+	return ch, func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		delete(h.subscribers, id)
+		close(ch)
+	}
+}
+
+func (h *eventHub) nextEventLocked(event Event) Event {
+	h.next++
+	event.ID = fmt.Sprintf("evt_%08x", h.next)
+	if event.At.IsZero() {
+		event.At = time.Now()
+	}
+	if event.Session != nil {
+		session := cloneSession(*event.Session)
+		event.Session = &session
+	}
+	if event.Attachment != nil {
+		attachment := *event.Attachment
+		if attachment.Terminal != nil {
+			terminal := *attachment.Terminal
+			attachment.Terminal = &terminal
+		}
+		event.Attachment = &attachment
+	}
+	return event
 }
 
 func (r *sessionRegistry) Create(name string) Session {
