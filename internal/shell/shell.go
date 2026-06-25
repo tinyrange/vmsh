@@ -28,6 +28,7 @@ import (
 	"github.com/tinyrange/vmsh/internal/backend"
 	"github.com/tinyrange/vmsh/internal/editor"
 	"github.com/tinyrange/vmsh/internal/terminal"
+	"github.com/tinyrange/vmsh/internal/vmshd"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
 	"j5.nz/cc/client"
@@ -1093,13 +1094,27 @@ func Run(args []string) error {
 		stdout = newRecordingTerminalWriter(os.Stdout, recorder)
 		stderr = newRecordingTerminalWriter(os.Stderr, recorder)
 	}
+	var daemonState backend.DaemonState
+	var haveDaemonState bool
 	api, err := backend.ConnectCCVMWithOptions(ccvmLaunch, rootCache, statePath, backend.ConnectOptions{
+		OnReuse: func(state backend.DaemonState) {
+			daemonState = state
+			haveDaemonState = true
+		},
 		OnStart: func(state backend.DaemonState) {
+			daemonState = state
+			haveDaemonState = true
 			fmt.Fprintf(stderr, "vmsh: warning: using new ccvm daemon at %s\n", state.Addr)
 		},
 	})
 	if err != nil {
 		return err
+	}
+	if !haveDaemonState {
+		if state, err := backend.ReadDaemonState(statePath); err == nil {
+			daemonState = state
+			haveDaemonState = true
+		}
 	}
 	caps, _ := api.Capabilities()
 	stopLease, err := backend.StartDaemonLease(api)
@@ -1107,6 +1122,13 @@ func Run(args []string) error {
 		return err
 	}
 	defer stopLease()
+	if haveDaemonState {
+		stopVMSHDSession, err := startVMSHDSession(daemonState, os.Stdout)
+		if err != nil {
+			return err
+		}
+		defer stopVMSHDSession()
+	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
@@ -1177,6 +1199,34 @@ func daemonStateFilename(launch backend.CCVMLaunch) string {
 		}
 	}
 	return "ccvm.json"
+}
+
+func startVMSHDSession(state backend.DaemonState, output *os.File) (func(), error) {
+	if state.Kind != vmshd.Kind {
+		return func() {}, nil
+	}
+	client, err := vmshd.NewHTTPClient(state)
+	if err != nil {
+		return nil, err
+	}
+	session, err := client.CreateSession(vmshd.CreateSessionRequest{Name: "main"})
+	if err != nil {
+		return nil, err
+	}
+	attachReq := vmshd.AttachSessionRequest{Mode: "interactive"}
+	if output != nil {
+		_, cols, rows := terminalRequestSize(output)
+		if cols > 0 || rows > 0 {
+			attachReq.Terminal = &vmshd.Terminal{Cols: cols, Rows: rows}
+		}
+	}
+	attached, err := client.AttachSession(session.ID, attachReq)
+	if err != nil {
+		return nil, err
+	}
+	return func() {
+		_, _ = client.DetachSession(session.ID, vmshd.DetachSessionRequest{AttachmentID: attached.Attachment.ID})
+	}, nil
 }
 
 func defaultContext(vmID, image string, nestedVirt bool) commandContext {

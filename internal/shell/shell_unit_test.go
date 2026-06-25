@@ -36,6 +36,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/tinyrange/vmsh/internal/backend"
+	"github.com/tinyrange/vmsh/internal/vmshd"
 	cryptossh "golang.org/x/crypto/ssh"
 	"j5.nz/cc/client"
 )
@@ -279,6 +280,74 @@ func TestDaemonStateFilenameUsesVMSHDForEmbeddedLaunch(t *testing.T) {
 	if got := daemonStateFilename(launch); got != "vmshd.json" {
 		t.Fatalf("vmshd launch state file = %q, want vmshd.json", got)
 	}
+}
+
+func TestStartVMSHDSessionCreatesAttachesAndDetaches(t *testing.T) {
+	var calls []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/sessions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("create Authorization = %q", r.Header.Get("Authorization"))
+		}
+		calls = append(calls, "create")
+		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "detached"})
+	})
+	mux.HandleFunc("/vmsh/sessions/sess_1/attach", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("attach Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var req vmshd.AttachSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode attach request: %v", err)
+		}
+		if req.Mode != "interactive" {
+			t.Fatalf("attach request = %+v", req)
+		}
+		calls = append(calls, "attach")
+		writeJSONForShellTest(w, vmshd.AttachSessionResponse{
+			Session:    vmshd.Session{ID: "sess_1", Name: "main", State: "attached"},
+			Attachment: vmshd.ClientAttachment{ID: "attach_1", Mode: "interactive"},
+		})
+	})
+	mux.HandleFunc("/vmsh/sessions/sess_1/detach", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("detach Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var req vmshd.DetachSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode detach request: %v", err)
+		}
+		if req.AttachmentID != "attach_1" {
+			t.Fatalf("detach request = %+v", req)
+		}
+		calls = append(calls, "detach")
+		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "detached"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	stop, err := startVMSHDSession(backend.DaemonState{
+		Kind:      vmshd.Kind,
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	}, nil)
+	if err != nil {
+		t.Fatalf("start vmshd session: %v", err)
+	}
+	stop()
+	if !reflect.DeepEqual(calls, []string{"create", "attach", "detach"}) {
+		t.Fatalf("calls = %q", calls)
+	}
+}
+
+func writeJSONForShellTest(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(value)
 }
 
 func TestResolveShellCacheDirIsolatesNestedDefault(t *testing.T) {
