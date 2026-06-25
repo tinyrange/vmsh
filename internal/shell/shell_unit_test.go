@@ -292,6 +292,26 @@ func TestStartVMSHDSessionCreatesAttachesAndDetaches(t *testing.T) {
 		calls = append(calls, "create")
 		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "detached"})
 	})
+	mux.HandleFunc("/vmsh/sessions/sess_1", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch {
+			t.Fatalf("metadata method = %s", r.Method)
+		}
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("metadata Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var req vmshd.UpdateSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode metadata request: %v", err)
+		}
+		if req.HostCWD != "/work" {
+			t.Fatalf("metadata host cwd = %q", req.HostCWD)
+		}
+		if req.SelectedContext == nil || req.SelectedContext.Mode != "vm" || req.SelectedContext.VMID != "dev" || req.SelectedContext.Image != "debian" || !req.SelectedContext.Isolated {
+			t.Fatalf("metadata selected context = %+v", req.SelectedContext)
+		}
+		calls = append(calls, "metadata")
+		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "detached", HostCWD: req.HostCWD, SelectedContext: req.SelectedContext})
+	})
 	mux.HandleFunc("/vmsh/sessions/sess_1/attach", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer secret" {
 			t.Fatalf("attach Authorization = %q", r.Header.Get("Authorization"))
@@ -334,12 +354,12 @@ func TestStartVMSHDSessionCreatesAttachesAndDetaches(t *testing.T) {
 		Kind:      vmshd.Kind,
 		Addr:      strings.TrimPrefix(srv.URL, "http://"),
 		TokenPath: tokenPath,
-	}, nil)
+	}, nil, vmshdSessionMetadata("/work", commandContext{Mode: modeVM, VMID: "dev", Image: "debian", Isolated: true}))
 	if err != nil {
 		t.Fatalf("start vmshd session: %v", err)
 	}
 	stop()
-	if !reflect.DeepEqual(calls, []string{"create", "attach", "detach"}) {
+	if !reflect.DeepEqual(calls, []string{"create", "metadata", "attach", "detach"}) {
 		t.Fatalf("calls = %q", calls)
 	}
 }

@@ -36,6 +36,12 @@ func (c *HTTPClient) CreateSession(req CreateSessionRequest) (Session, error) {
 	return session, err
 }
 
+func (c *HTTPClient) UpdateSession(id string, req UpdateSessionRequest) (Session, error) {
+	var session Session
+	err := c.doJSON(http.MethodPatch, "/vmsh/sessions/"+id, req, &session)
+	return session, err
+}
+
 func (c *HTTPClient) AttachSession(id string, req AttachSessionRequest) (AttachSessionResponse, error) {
 	var resp AttachSessionResponse
 	err := c.doJSON(http.MethodPost, "/vmsh/sessions/"+id+"/attach", req, &resp)

@@ -69,6 +69,13 @@ func TestStatusRoute(t *testing.T) {
 	runtime := fakeRuntimeView{statuses: []client.InstanceState{{ID: "vm1", Status: "running"}}}
 	srv.RegisterHandlers(mux, runtime)
 	session := srv.registry.Create("main")
+	updated, err := srv.registry.Update(session.ID, UpdateSessionRequest{
+		HostCWD:         "/work",
+		SelectedContext: &SessionContext{Mode: "host", Name: "host", Short: "host", Source: "host"},
+	})
+	if err != nil {
+		t.Fatalf("update session: %v", err)
+	}
 
 	req := httptest.NewRequest(http.MethodGet, "/vmsh/status", nil)
 	rr := httptest.NewRecorder()
@@ -85,6 +92,9 @@ func TestStatusRoute(t *testing.T) {
 	}
 	if status.Sessions[0].ID != session.ID || status.Sessions[0].Name != "main" || status.Sessions[0].State != "detached" {
 		t.Fatalf("status sessions = %+v, want session %+v", status.Sessions, session)
+	}
+	if status.Sessions[0].HostCWD != updated.HostCWD || status.Sessions[0].SelectedContext == nil || status.Sessions[0].SelectedContext.Mode != "host" {
+		t.Fatalf("status session metadata = %+v, want %+v", status.Sessions[0], updated)
 	}
 	if len(status.VMs) != 1 || status.VMs[0].ID != "vm1" || status.VMs[0].Status != "running" {
 		t.Fatalf("status VMs = %+v", status.VMs)
@@ -110,6 +120,19 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 	}
 
 	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPatch, "/vmsh/sessions/"+created.ID, bytes.NewBufferString(`{"host_cwd":"/work","selected_context":{"mode":"vm","name":"dev","short":"vm:dev","source":"docker:debian","vm":"dev","image":"debian","cwd":"/repo","user":"root","isolated":true}}`)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("update status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var updated Session
+	if err := json.NewDecoder(rr.Body).Decode(&updated); err != nil {
+		t.Fatalf("decode updated session: %v", err)
+	}
+	if updated.ID != created.ID || updated.HostCWD != "/work" || updated.SelectedContext == nil || updated.SelectedContext.Mode != "vm" || updated.SelectedContext.VMID != "dev" || updated.SelectedContext.CWD != "/repo" || !updated.SelectedContext.Isolated {
+		t.Fatalf("updated session = %+v", updated)
+	}
+
+	rr = httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/vmsh/sessions", nil))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("list status = %d body=%s", rr.Code, rr.Body.String())
@@ -120,6 +143,9 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 	}
 	if len(sessions) != 1 || sessions[0].ID != created.ID || sessions[0].Name != "main" {
 		t.Fatalf("sessions = %+v, want created %+v", sessions, created)
+	}
+	if sessions[0].HostCWD != updated.HostCWD || sessions[0].SelectedContext == nil || sessions[0].SelectedContext.Short != "vm:dev" {
+		t.Fatalf("session summary metadata = %+v, want %+v", sessions[0], updated)
 	}
 
 	rr = httptest.NewRecorder()
@@ -133,6 +159,9 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 	}
 	if read.ID != created.ID || read.Name != created.Name {
 		t.Fatalf("read session = %+v, want %+v", read, created)
+	}
+	if read.HostCWD != updated.HostCWD || read.SelectedContext == nil || read.SelectedContext.Name != "dev" {
+		t.Fatalf("read session metadata = %+v, want %+v", read, updated)
 	}
 
 	rr = httptest.NewRecorder()

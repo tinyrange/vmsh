@@ -1122,20 +1122,14 @@ func Run(args []string) error {
 		return err
 	}
 	defer stopLease()
-	if haveDaemonState {
-		stopVMSHDSession, err := startVMSHDSession(daemonState, os.Stdout)
-		if err != nil {
-			return err
-		}
-		defer stopVMSHDSession()
-	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
 	}
+	initialContext := defaultContext(strings.TrimSpace(*vmID), strings.TrimSpace(*image), caps.SupportsNestedVirt)
 	sh := &shellState{
 		api:        api,
-		context:    defaultContext(strings.TrimSpace(*vmID), strings.TrimSpace(*image), caps.SupportsNestedVirt),
+		context:    initialContext,
 		hostCWD:    cwd,
 		rootCache:  rootCache,
 		vmshPath:   vmshPath,
@@ -1176,6 +1170,13 @@ func Run(args []string) error {
 	if err := sh.loadVMSHRC(defaultVMSHRCPath()); err != nil {
 		return err
 	}
+	if haveDaemonState {
+		stopVMSHDSession, err := startVMSHDSession(daemonState, os.Stdout, vmshdSessionMetadata(sh.hostCWD, sh.context))
+		if err != nil {
+			return err
+		}
+		defer stopVMSHDSession()
+	}
 	if *startVM {
 		if err := sh.startVM(sh.context.VMID, sh.context, stderr); err != nil {
 			return err
@@ -1201,7 +1202,7 @@ func daemonStateFilename(launch backend.CCVMLaunch) string {
 	return "ccvm.json"
 }
 
-func startVMSHDSession(state backend.DaemonState, output *os.File) (func(), error) {
+func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmshd.UpdateSessionRequest) (func(), error) {
 	if state.Kind != vmshd.Kind {
 		return func() {}, nil
 	}
@@ -1211,6 +1212,9 @@ func startVMSHDSession(state backend.DaemonState, output *os.File) (func(), erro
 	}
 	session, err := client.CreateSession(vmshd.CreateSessionRequest{Name: "main"})
 	if err != nil {
+		return nil, err
+	}
+	if _, err := client.UpdateSession(session.ID, metadata); err != nil {
 		return nil, err
 	}
 	attachReq := vmshd.AttachSessionRequest{Mode: "interactive"}
@@ -1227,6 +1231,24 @@ func startVMSHDSession(state backend.DaemonState, output *os.File) (func(), erro
 	return func() {
 		_, _ = client.DetachSession(session.ID, vmshd.DetachSessionRequest{AttachmentID: attached.Attachment.ID})
 	}, nil
+}
+
+func vmshdSessionMetadata(hostCWD string, ctx commandContext) vmshd.UpdateSessionRequest {
+	return vmshd.UpdateSessionRequest{
+		HostCWD: strings.TrimSpace(hostCWD),
+		SelectedContext: &vmshd.SessionContext{
+			Mode:     string(ctx.Mode),
+			Name:     visibleContextName(ctx),
+			Short:    contextShortText(ctx),
+			Source:   contextSourceText(ctx),
+			VMID:     strings.TrimSpace(ctx.VMID),
+			Image:    contextImageText(ctx),
+			SSHHost:  strings.TrimSpace(ctx.SSHHost),
+			CWD:      strings.TrimSpace(ctx.CWD),
+			User:     strings.TrimSpace(ctx.User),
+			Isolated: ctx.Isolated,
+		},
+	}
 }
 
 func defaultContext(vmID, image string, nestedVirt bool) commandContext {

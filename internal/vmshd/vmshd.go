@@ -31,21 +31,38 @@ type Status struct {
 }
 
 type Session struct {
-	ID          string             `json:"id"`
-	Name        string             `json:"name"`
-	State       string             `json:"state"`
-	Attachments []ClientAttachment `json:"attached_clients"`
-	CreatedAt   time.Time          `json:"created_at"`
-	UpdatedAt   time.Time          `json:"updated_at"`
+	ID              string             `json:"id"`
+	Name            string             `json:"name"`
+	State           string             `json:"state"`
+	HostCWD         string             `json:"host_cwd,omitempty"`
+	SelectedContext *SessionContext    `json:"selected_context,omitempty"`
+	Attachments     []ClientAttachment `json:"attached_clients"`
+	CreatedAt       time.Time          `json:"created_at"`
+	UpdatedAt       time.Time          `json:"updated_at"`
 }
 
 type SessionSummary struct {
 	ID              string             `json:"id"`
 	Name            string             `json:"name"`
 	State           string             `json:"state"`
+	HostCWD         string             `json:"host_cwd,omitempty"`
+	SelectedContext *SessionContext    `json:"selected_context,omitempty"`
 	AttachedClients []ClientAttachment `json:"attached_clients"`
 	CreatedAt       time.Time          `json:"created_at"`
 	UpdatedAt       time.Time          `json:"updated_at"`
+}
+
+type SessionContext struct {
+	Mode     string `json:"mode"`
+	Name     string `json:"name,omitempty"`
+	Short    string `json:"short,omitempty"`
+	Source   string `json:"source,omitempty"`
+	VMID     string `json:"vm,omitempty"`
+	Image    string `json:"image,omitempty"`
+	SSHHost  string `json:"ssh_host,omitempty"`
+	CWD      string `json:"cwd,omitempty"`
+	User     string `json:"user,omitempty"`
+	Isolated bool   `json:"isolated,omitempty"`
 }
 
 type ClientAttachment struct {
@@ -63,6 +80,11 @@ type Terminal struct {
 
 type CreateSessionRequest struct {
 	Name string `json:"name,omitempty"`
+}
+
+type UpdateSessionRequest struct {
+	HostCWD         string          `json:"host_cwd,omitempty"`
+	SelectedContext *SessionContext `json:"selected_context,omitempty"`
 }
 
 type AttachSessionRequest struct {
@@ -164,6 +186,19 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 		session, ok := s.registry.Get(r.PathValue("id"))
 		if !ok {
 			writeJSON(w, http.StatusNotFound, client.ErrorResponse{Error: "session not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, session)
+	})
+	mux.HandleFunc("PATCH /vmsh/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
+		var req UpdateSessionRequest
+		if err := decodeOptionalJSON(r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, client.ErrorResponse{Error: err.Error()})
+			return
+		}
+		session, err := s.registry.Update(r.PathValue("id"), req)
+		if err != nil {
+			writeSessionError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, session)
@@ -335,14 +370,29 @@ func (r *sessionRegistry) Create(name string) Session {
 		UpdatedAt:   now,
 	}
 	r.sessions[id] = session
-	return session
+	return cloneSession(session)
 }
 
 func (r *sessionRegistry) Get(id string) (Session, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	session, ok := r.sessions[strings.TrimSpace(id)]
-	return session, ok
+	return cloneSession(session), ok
+}
+
+func (r *sessionRegistry) Update(id string, req UpdateSessionRequest) (Session, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id = strings.TrimSpace(id)
+	session, ok := r.sessions[id]
+	if !ok {
+		return Session{}, sessionError{status: http.StatusNotFound, err: "session not found"}
+	}
+	session.HostCWD = strings.TrimSpace(req.HostCWD)
+	session.SelectedContext = cloneSessionContext(req.SelectedContext)
+	session.UpdatedAt = time.Now()
+	r.sessions[id] = session
+	return cloneSession(session), nil
 }
 
 func (r *sessionRegistry) Delete(id string) (Session, bool) {
@@ -356,7 +406,7 @@ func (r *sessionRegistry) Delete(id string) (Session, bool) {
 	session.State = "closing"
 	session.UpdatedAt = time.Now()
 	delete(r.sessions, id)
-	return session, true
+	return cloneSession(session), true
 }
 
 func (r *sessionRegistry) Attach(id string, req AttachSessionRequest) (Session, ClientAttachment, error) {
@@ -394,7 +444,7 @@ func (r *sessionRegistry) Attach(id string, req AttachSessionRequest) (Session, 
 	session.State = "attached"
 	session.UpdatedAt = now
 	r.sessions[id] = session
-	return session, attachment, nil
+	return cloneSession(session), attachment, nil
 }
 
 func (r *sessionRegistry) Detach(id, attachmentID string) (Session, error) {
@@ -427,7 +477,7 @@ func (r *sessionRegistry) Detach(id, attachmentID string) (Session, error) {
 	}
 	session.UpdatedAt = time.Now()
 	r.sessions[id] = session
-	return session, nil
+	return cloneSession(session), nil
 }
 
 func (r *sessionRegistry) UpdateTerminal(id, attachmentID string, term Terminal) (Session, ClientAttachment, error) {
@@ -452,7 +502,7 @@ func (r *sessionRegistry) UpdateTerminal(id, attachmentID string, term Terminal)
 		session.Attachments[i] = attachment
 		session.UpdatedAt = now
 		r.sessions[id] = session
-		return session, attachment, nil
+		return cloneSession(session), attachment, nil
 	}
 	return Session{}, ClientAttachment{}, sessionError{status: http.StatusNotFound, err: "attachment not found"}
 }
@@ -472,12 +522,28 @@ func (r *sessionRegistry) List() []SessionSummary {
 			ID:              session.ID,
 			Name:            session.Name,
 			State:           session.State,
+			HostCWD:         session.HostCWD,
+			SelectedContext: cloneSessionContext(session.SelectedContext),
 			AttachedClients: append([]ClientAttachment(nil), session.Attachments...),
 			CreatedAt:       session.CreatedAt,
 			UpdatedAt:       session.UpdatedAt,
 		})
 	}
 	return out
+}
+
+func cloneSession(session Session) Session {
+	session.Attachments = append([]ClientAttachment(nil), session.Attachments...)
+	session.SelectedContext = cloneSessionContext(session.SelectedContext)
+	return session
+}
+
+func cloneSessionContext(ctx *SessionContext) *SessionContext {
+	if ctx == nil {
+		return nil
+	}
+	out := *ctx
+	return &out
 }
 
 type sessionError struct {
