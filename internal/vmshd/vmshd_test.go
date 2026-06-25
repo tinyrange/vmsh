@@ -10,9 +10,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
 )
 
@@ -381,6 +383,60 @@ func TestSessionTerminalUpdateRejectsBadRequests(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTerminalAttachmentStreamTracksActiveStreamAndResize(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, nil)
+	session := srv.registry.Create("main")
+	_, attachment, err := srv.registry.Attach(session.ID, AttachSessionRequest{Terminal: &Terminal{Cols: 80, Rows: 24}})
+	if err != nil {
+		t.Fatalf("attach session: %v", err)
+	}
+	httpSrv := httptest.NewServer(srv.Authenticate(mux))
+	defer httpSrv.Close()
+
+	target := strings.Replace(httpSrv.URL, "http://", "ws://", 1) + "/vmsh/sessions/" + session.ID + "/attachments/" + attachment.ID + "/stream"
+	cfg, err := websocket.NewConfig(target, httpSrv.URL)
+	if err != nil {
+		t.Fatalf("websocket config: %v", err)
+	}
+	cfg.Header.Set("Authorization", "Bearer secret")
+	ws, err := websocket.DialConfig(cfg)
+	if err != nil {
+		t.Fatalf("dial stream: %v", err)
+	}
+	defer ws.Close()
+
+	var attached TerminalStreamMessage
+	if err := websocket.JSON.Receive(ws, &attached); err != nil {
+		t.Fatalf("receive attached message: %v", err)
+	}
+	if attached.Kind != "attached" || attached.Stream == nil || attached.Stream.Kind != "terminal" || attached.Stream.SessionID != session.ID || attached.Stream.AttachmentID != attachment.ID {
+		t.Fatalf("attached message = %+v", attached)
+	}
+
+	status := getStatusFromServer(t, httpSrv.URL, "secret")
+	if len(status.Streams) != 1 || status.Streams[0].Kind != "terminal" || status.Streams[0].AttachmentID != attachment.ID {
+		t.Fatalf("status streams = %+v", status.Streams)
+	}
+
+	if err := websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "resize", Terminal: &Terminal{Cols: 100, Rows: 40}}); err != nil {
+		t.Fatalf("send resize: %v", err)
+	}
+	requireEventually(t, func() bool {
+		read, ok := srv.registry.Get(session.ID)
+		return ok && len(read.Attachments) == 1 && read.Attachments[0].Terminal != nil && read.Attachments[0].Terminal.Cols == 100 && read.Attachments[0].Terminal.Rows == 40
+	})
+
+	if err := websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "close"}); err != nil {
+		t.Fatalf("send close: %v", err)
+	}
+	_ = ws.Close()
+	requireEventually(t, func() bool {
+		return len(getStatusFromServer(t, httpSrv.URL, "secret").Streams) == 0
+	})
 }
 
 func TestEventStreamPublishesSessionEvents(t *testing.T) {

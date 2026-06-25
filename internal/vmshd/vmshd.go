@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/tinyrange/vmsh/internal/backend"
+	"golang.org/x/net/websocket"
 	"j5.nz/cc/ccvmd"
 	"j5.nz/cc/client"
 )
@@ -40,11 +41,13 @@ type Event struct {
 }
 
 type StreamSummary struct {
-	ID          string    `json:"id"`
-	Kind        string    `json:"kind"`
-	State       string    `json:"state"`
-	ConnectedAt time.Time `json:"connected_at"`
-	LastEventID string    `json:"last_event_id,omitempty"`
+	ID           string    `json:"id"`
+	Kind         string    `json:"kind"`
+	State        string    `json:"state"`
+	SessionID    string    `json:"session_id,omitempty"`
+	AttachmentID string    `json:"attachment_id,omitempty"`
+	ConnectedAt  time.Time `json:"connected_at"`
+	LastEventID  string    `json:"last_event_id,omitempty"`
 }
 
 type Session struct {
@@ -130,6 +133,13 @@ type Terminal struct {
 	Rows int `json:"rows,omitempty"`
 }
 
+type TerminalStreamMessage struct {
+	Kind     string         `json:"kind"`
+	Data     []byte         `json:"data,omitempty"`
+	Terminal *Terminal      `json:"terminal,omitempty"`
+	Stream   *StreamSummary `json:"stream,omitempty"`
+}
+
 type CreateSessionRequest struct {
 	Name string `json:"name,omitempty"`
 }
@@ -177,10 +187,17 @@ type eventSubscriber struct {
 	lastEventID string
 }
 
+type streamRegistry struct {
+	mu      sync.Mutex
+	next    int
+	streams map[string]StreamSummary
+}
+
 type Server struct {
 	token    string
 	registry *sessionRegistry
 	events   *eventHub
+	streams  *streamRegistry
 
 	startedAt time.Time
 }
@@ -228,6 +245,7 @@ func NewServer(token string) *Server {
 		token:     token,
 		registry:  newSessionRegistry(),
 		events:    newEventHub(),
+		streams:   newStreamRegistry(),
 		startedAt: time.Now(),
 	}
 }
@@ -238,7 +256,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			Kind:      Kind,
 			Status:    "ok",
 			Sessions:  s.registry.List(),
-			Streams:   s.events.Streams(),
+			Streams:   append(s.events.Streams(), s.streams.List()...),
 			VMs:       runtimeInstanceStatuses(runtime),
 			StartedAt: s.startedAt,
 		})
@@ -335,6 +353,58 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 		s.events.Publish(Event{Kind: "terminal_updated", Session: &session, Attachment: &attachment})
 		writeJSON(w, http.StatusOK, AttachSessionResponse{Session: session, Attachment: attachment})
 	})
+	mux.Handle("GET /vmsh/sessions/{id}/attachments/{attachment}/stream", websocket.Server{
+		Handshake: func(*websocket.Config, *http.Request) error { return nil },
+		Handler: func(ws *websocket.Conn) {
+			s.serveTerminalStream(ws)
+		},
+	})
+}
+
+func (s *Server) serveTerminalStream(ws *websocket.Conn) {
+	sessionID := ws.Request().PathValue("id")
+	attachmentID := ws.Request().PathValue("attachment")
+	session, attachment, ok := s.registry.GetAttachment(sessionID, attachmentID)
+	if !ok {
+		_ = websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "error"})
+		return
+	}
+	stream, closeStream := s.streams.Open("terminal", session.ID, attachment.ID)
+	defer func() {
+		closeStream()
+		s.events.Publish(Event{Kind: "terminal_stream_closed", Session: &session, Attachment: &attachment})
+	}()
+	s.events.Publish(Event{Kind: "terminal_stream_opened", Session: &session, Attachment: &attachment})
+	if err := websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "attached", Stream: &stream}); err != nil {
+		return
+	}
+	for {
+		var msg TerminalStreamMessage
+		if err := websocket.JSON.Receive(ws, &msg); err != nil {
+			return
+		}
+		switch strings.TrimSpace(msg.Kind) {
+		case "resize":
+			if msg.Terminal == nil {
+				_ = websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "error"})
+				continue
+			}
+			updated, updatedAttachment, err := s.registry.UpdateTerminal(session.ID, attachment.ID, *msg.Terminal)
+			if err != nil {
+				_ = websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "error"})
+				continue
+			}
+			session = updated
+			attachment = updatedAttachment
+			s.events.Publish(Event{Kind: "terminal_updated", Session: &session, Attachment: &attachment})
+		case "stdin", "data":
+			// Terminal bytes are intentionally opaque to vmshd at this layer.
+		case "close":
+			return
+		default:
+			_ = websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "error"})
+		}
+	}
 }
 
 func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
@@ -471,6 +541,45 @@ func newEventHub() *eventHub {
 	return &eventHub{subscribers: map[int]*eventSubscriber{}}
 }
 
+func newStreamRegistry() *streamRegistry {
+	return &streamRegistry{streams: map[string]StreamSummary{}}
+}
+
+func (r *streamRegistry) Open(kind, sessionID, attachmentID string) (StreamSummary, func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.next++
+	stream := StreamSummary{
+		ID:           fmt.Sprintf("%s_stream_%08x", strings.TrimSpace(kind), r.next),
+		Kind:         strings.TrimSpace(kind),
+		State:        "open",
+		SessionID:    strings.TrimSpace(sessionID),
+		AttachmentID: strings.TrimSpace(attachmentID),
+		ConnectedAt:  time.Now(),
+	}
+	r.streams[stream.ID] = stream
+	return stream, func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		delete(r.streams, stream.ID)
+	}
+}
+
+func (r *streamRegistry) List() []StreamSummary {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ids := make([]string, 0, len(r.streams))
+	for id := range r.streams {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]StreamSummary, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, r.streams[id])
+	}
+	return out
+}
+
 func (h *eventHub) Event(event Event) Event {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -540,7 +649,7 @@ func (h *eventHub) Streams() []StreamSummary {
 	for _, id := range ids {
 		sub := h.subscribers[id]
 		out = append(out, StreamSummary{
-			ID:          fmt.Sprintf("stream_%08x", sub.id),
+			ID:          fmt.Sprintf("event_stream_%08x", sub.id),
 			Kind:        "events",
 			State:       "open",
 			ConnectedAt: sub.connectedAt,
@@ -598,6 +707,22 @@ func (r *sessionRegistry) Get(id string) (Session, bool) {
 	defer r.mu.Unlock()
 	session, ok := r.sessions[strings.TrimSpace(id)]
 	return cloneSession(session), ok
+}
+
+func (r *sessionRegistry) GetAttachment(id, attachmentID string) (Session, ClientAttachment, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	session, ok := r.sessions[strings.TrimSpace(id)]
+	if !ok {
+		return Session{}, ClientAttachment{}, false
+	}
+	attachmentID = strings.TrimSpace(attachmentID)
+	for _, attachment := range session.Attachments {
+		if attachment.ID == attachmentID {
+			return cloneSession(session), cloneAttachment(attachment), true
+		}
+	}
+	return Session{}, ClientAttachment{}, false
 }
 
 func (r *sessionRegistry) Update(id string, req UpdateSessionRequest) (Session, error) {
@@ -752,7 +877,7 @@ func (r *sessionRegistry) List() []SessionSummary {
 			GuestShells:     cloneShellHandles(session.GuestShells),
 			SSHShells:       cloneShellHandles(session.SSHShells),
 			Jobs:            cloneJobSummaries(session.Jobs),
-			AttachedClients: append([]ClientAttachment(nil), session.Attachments...),
+			AttachedClients: cloneAttachments(session.Attachments),
 			CreatedAt:       session.CreatedAt,
 			UpdatedAt:       session.UpdatedAt,
 		})
@@ -779,13 +904,32 @@ func (r *sessionRegistry) Jobs() []JobSummary {
 }
 
 func cloneSession(session Session) Session {
-	session.Attachments = append([]ClientAttachment(nil), session.Attachments...)
+	session.Attachments = cloneAttachments(session.Attachments)
 	session.SelectedContext = cloneSessionContext(session.SelectedContext)
 	session.HostShells = cloneShellHandles(session.HostShells)
 	session.GuestShells = cloneShellHandles(session.GuestShells)
 	session.SSHShells = cloneShellHandles(session.SSHShells)
 	session.Jobs = cloneJobSummaries(session.Jobs)
 	return session
+}
+
+func cloneAttachments(attachments []ClientAttachment) []ClientAttachment {
+	if attachments == nil {
+		return nil
+	}
+	out := make([]ClientAttachment, 0, len(attachments))
+	for _, attachment := range attachments {
+		out = append(out, cloneAttachment(attachment))
+	}
+	return out
+}
+
+func cloneAttachment(attachment ClientAttachment) ClientAttachment {
+	if attachment.Terminal != nil {
+		term := *attachment.Terminal
+		attachment.Terminal = &term
+	}
+	return attachment
 }
 
 func cloneSessionContext(ctx *SessionContext) *SessionContext {
