@@ -134,10 +134,11 @@ type shellJob struct {
 }
 
 type vmshdSessionReporter struct {
-	client    *vmshd.HTTPClient
-	sessionID string
-	hostCWD   string
-	context   commandContext
+	client       *vmshd.HTTPClient
+	sessionID    string
+	attachmentID string
+	hostCWD      string
+	context      commandContext
 }
 
 type hostShellInit struct {
@@ -1238,10 +1239,11 @@ func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmsh
 		return nil, nil, err
 	}
 	reporter := &vmshdSessionReporter{
-		client:    client,
-		sessionID: session.ID,
-		hostCWD:   metadata.HostCWD,
-		context:   ctx,
+		client:       client,
+		sessionID:    session.ID,
+		attachmentID: attached.Attachment.ID,
+		hostCWD:      metadata.HostCWD,
+		context:      ctx,
 	}
 	return reporter, func() {
 		_, _ = client.DetachSession(session.ID, vmshd.DetachSessionRequest{AttachmentID: attached.Attachment.ID})
@@ -1386,6 +1388,150 @@ func (r *vmshdSessionReporter) publish(jobs []vmshd.JobSummary, hostShells, gues
 	req.SSHShells = sshShells
 	req.Jobs = jobs
 	_, _ = r.client.UpdateSession(r.sessionID, req)
+}
+
+func (r *vmshdSessionReporter) bridgeTerminalStream(ctx context.Context, in *os.File, stdout, stderr io.Writer) error {
+	if r == nil || r.client == nil || strings.TrimSpace(r.sessionID) == "" || strings.TrimSpace(r.attachmentID) == "" {
+		return fmt.Errorf("vmshd terminal attachment is not available")
+	}
+	stream, err := r.client.DialTerminalStream(ctx, r.sessionID, r.attachmentID)
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+
+	_, cols, rows := terminalRequestSize(stdout)
+	if cols > 0 || rows > 0 {
+		_ = stream.Resize(vmshd.Terminal{Cols: cols, Rows: rows})
+	}
+
+	restore := func() {}
+	cancelRead := func() {}
+	var inputCancel *ptyInputCanceller
+	done := make(chan struct{})
+	if in != nil && terminal.IsTerminalFD(int(in.Fd())) {
+		if terminalRestore, err := terminal.MakeAttachedRaw(in); err == nil {
+			restore = terminalRestore
+			inputCancel, err = newPTYInputCanceller(in)
+			if err != nil {
+				restore()
+				return err
+			}
+			cancelRead = inputCancel.cancel
+			defer inputCancel.close()
+		} else {
+			return err
+		}
+	}
+	defer restore()
+
+	errCh := make(chan error, 3)
+	go func() {
+		for {
+			msg, err := stream.Receive()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			switch strings.TrimSpace(msg.Kind) {
+			case "data":
+				if len(msg.Data) > 0 {
+					if _, err := stdout.Write(msg.Data); err != nil {
+						errCh <- err
+						return
+					}
+				}
+			case "error":
+				errCh <- fmt.Errorf("vmshd terminal stream reported an error")
+				return
+			}
+		}
+	}()
+	go func() {
+		if in == nil {
+			return
+		}
+		var buf [4096]byte
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			n, err := readPTYInput(in, buf[:], done, inputCancel)
+			if n > 0 {
+				if err := stream.Write(append([]byte(nil), buf[:n]...)); err != nil {
+					errCh <- err
+					return
+				}
+			}
+			if err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
+					return
+				}
+				errCh <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		signals := terminal.HostSignals(true)
+		sigCh := make(chan os.Signal, 8)
+		signal.Notify(sigCh, signals...)
+		defer signal.Stop(sigCh)
+		for {
+			select {
+			case <-done:
+				errCh <- nil
+				return
+			case sig := <-sigCh:
+				if sig == nil {
+					continue
+				}
+				if terminal.IsResizeSignal(sig) {
+					_, cols, rows := terminalRequestSize(stdout)
+					if cols > 0 || rows > 0 {
+						_ = stream.Resize(vmshd.Terminal{Cols: cols, Rows: rows})
+					}
+					continue
+				}
+				name, ok := terminal.SignalName(sig)
+				if !ok {
+					continue
+				}
+				switch name {
+				case "INT":
+					if _, err := fmt.Fprintln(stderr); err != nil {
+						errCh <- err
+						return
+					}
+					if err := stream.Write([]byte{0x03}); err != nil {
+						errCh <- err
+						return
+					}
+				case "QUIT":
+					if err := stream.Write([]byte{0x1c}); err != nil {
+						errCh <- err
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	var errOut error
+	select {
+	case <-ctx.Done():
+		errOut = ctx.Err()
+	case errOut = <-errCh:
+	}
+	close(done)
+	cancelRead()
+	_ = stream.Close()
+	if errors.Is(errOut, io.EOF) || errors.Is(errOut, os.ErrClosed) || errors.Is(errOut, context.Canceled) {
+		return nil
+	}
+	return errOut
 }
 
 func defaultContext(vmID, image string, nestedVirt bool) commandContext {

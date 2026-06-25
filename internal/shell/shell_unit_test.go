@@ -38,6 +38,7 @@ import (
 	"github.com/tinyrange/vmsh/internal/backend"
 	"github.com/tinyrange/vmsh/internal/vmshd"
 	cryptossh "golang.org/x/crypto/ssh"
+	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
 )
 
@@ -364,6 +365,90 @@ func TestStartVMSHDSessionCreatesAttachesAndDetaches(t *testing.T) {
 	stop()
 	if !reflect.DeepEqual(calls, []string{"create", "metadata", "attach", "detach"}) {
 		t.Fatalf("calls = %q", calls)
+	}
+}
+
+func TestVMSHDTerminalBridgeForwardsStdinAndOutput(t *testing.T) {
+	stdinSeen := make(chan []byte, 1)
+	mux := http.NewServeMux()
+	mux.Handle("/vmsh/sessions/sess_1/attachments/attach_1/stream", websocket.Server{
+		Handshake: func(_ *websocket.Config, r *http.Request) error {
+			if r.Header.Get("Authorization") != "Bearer secret" {
+				t.Fatalf("stream Authorization = %q", r.Header.Get("Authorization"))
+			}
+			return nil
+		},
+		Handler: func(ws *websocket.Conn) {
+			if err := websocket.JSON.Send(ws, vmshd.TerminalStreamMessage{
+				Kind:   "attached",
+				Stream: &vmshd.StreamSummary{ID: "terminal_stream_1", Kind: "terminal", SessionID: "sess_1", AttachmentID: "attach_1"},
+			}); err != nil {
+				t.Errorf("send attached: %v", err)
+				return
+			}
+			var msg vmshd.TerminalStreamMessage
+			if err := websocket.JSON.Receive(ws, &msg); err != nil {
+				t.Errorf("receive first client message: %v", err)
+				return
+			}
+			if msg.Kind == "resize" {
+				if err := websocket.JSON.Receive(ws, &msg); err != nil {
+					t.Errorf("receive stdin after resize: %v", err)
+					return
+				}
+			}
+			if msg.Kind != "stdin" || string(msg.Data) != "printf bridge\n" {
+				t.Errorf("stdin message = %+v", msg)
+				return
+			}
+			stdinSeen <- msg.Data
+			if err := websocket.JSON.Send(ws, vmshd.TerminalStreamMessage{Kind: "data", Data: []byte("bridge-output\n")}); err != nil {
+				t.Errorf("send output: %v", err)
+			}
+			_ = ws.Close()
+		},
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	reporter := &vmshdSessionReporter{client: httpClient, sessionID: "sess_1", attachmentID: "attach_1"}
+	in, writeInput, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer in.Close()
+	if _, err := writeInput.Write([]byte("printf bridge\n")); err != nil {
+		t.Fatalf("write input: %v", err)
+	}
+	_ = writeInput.Close()
+	var stdout, stderr bytes.Buffer
+	if err := reporter.bridgeTerminalStream(context.Background(), in, &stdout, &stderr); err != nil {
+		t.Fatalf("bridge terminal stream: %v", err)
+	}
+	if got := stdout.String(); got != "bridge-output\n" {
+		t.Fatalf("stdout = %q", got)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q", got)
+	}
+	select {
+	case got := <-stdinSeen:
+		if string(got) != "printf bridge\n" {
+			t.Fatalf("stdin = %q", string(got))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for stdin")
 	}
 }
 
