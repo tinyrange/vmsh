@@ -2544,6 +2544,34 @@ func TestStartBackgroundJobPublishesVMSHDJobs(t *testing.T) {
 	}
 }
 
+func TestVMSHDShellHandlesSummarizePersistentShells(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.hostShell = &persistentHostShell{lastCWD: "/work"}
+	sh.guestShell = &persistentGuestShell{
+		key:     strings.Join([]string{"dev", "debian", "root", ""}, "\x00"),
+		lastCWD: "/repo",
+	}
+	sh.sshShells = map[string]*persistentSSHShell{
+		"ssh-key": {
+			key:     "ssh-key",
+			name:    "app",
+			ctx:     commandContext{Mode: modeSSH, SSHHost: "app.example", User: "me"},
+			lastCWD: "/srv",
+		},
+	}
+
+	hostShells, guestShells, sshShells := sh.vmshdShellHandles()
+	if len(hostShells) != 1 || hostShells[0].Kind != "host" || hostShells[0].CWD != "/work" || hostShells[0].State != "open" {
+		t.Fatalf("host shells = %+v", hostShells)
+	}
+	if len(guestShells) != 1 || guestShells[0].Kind != "guest" || guestShells[0].VMID != "dev" || guestShells[0].User != "root" || guestShells[0].CWD != "/repo" {
+		t.Fatalf("guest shells = %+v", guestShells)
+	}
+	if len(sshShells) != 1 || sshShells[0].Kind != "ssh" || sshShells[0].SSHHost != "app.example" || sshShells[0].User != "me" || sshShells[0].CWD != "/srv" {
+		t.Fatalf("ssh shells = %+v", sshShells)
+	}
+}
+
 func readVMSHDJobUpdate(t *testing.T, updates <-chan []vmshd.JobSummary) []vmshd.JobSummary {
 	t.Helper()
 	select {

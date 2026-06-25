@@ -1266,12 +1266,13 @@ func vmshdSessionMetadata(hostCWD string, ctx commandContext) vmshd.UpdateSessio
 	}
 }
 
-func (s *shellState) publishVMSHDSessionJobs() {
+func (s *shellState) publishVMSHDSessionState() {
 	if s.vmshd == nil {
 		return
 	}
 	jobs := s.vmshdJobSummaries()
-	s.vmshd.publish(jobs)
+	hostShells, guestShells, sshShells := s.vmshdShellHandles()
+	s.vmshd.publish(jobs, hostShells, guestShells, sshShells)
 }
 
 func (s *shellState) vmshdJobSummaries() []vmshd.JobSummary {
@@ -1300,6 +1301,68 @@ func vmshdJobSummary(job shellJob) vmshd.JobSummary {
 	}
 }
 
+func (s *shellState) vmshdShellHandles() ([]vmshd.ShellHandle, []vmshd.ShellHandle, []vmshd.ShellHandle) {
+	var hostShells []vmshd.ShellHandle
+	if s.hostShell != nil {
+		hostShells = append(hostShells, vmshd.ShellHandle{
+			ID:      "host",
+			Kind:    "host",
+			Name:    "host",
+			Context: "host",
+			CWD:     s.hostShell.cwd(),
+			State:   "open",
+		})
+	}
+	var guestShells []vmshd.ShellHandle
+	if s.guestShell != nil {
+		parts := strings.Split(s.guestShell.key, "\x00")
+		vmID := ""
+		image := ""
+		user := ""
+		if len(parts) > 0 {
+			vmID = parts[0]
+		}
+		if len(parts) > 1 {
+			image = parts[1]
+		}
+		if len(parts) > 2 {
+			user = parts[2]
+		}
+		name := emptyText(vmID, "vm")
+		guestShells = append(guestShells, vmshd.ShellHandle{
+			ID:      s.guestShell.key,
+			Kind:    "guest",
+			Name:    name,
+			Context: "vm:" + name,
+			CWD:     s.guestShell.cwd(),
+			VMID:    vmID,
+			User:    user,
+			State:   "open",
+		})
+		if image != "" {
+			guestShells[0].Name = name + " " + image
+		}
+	}
+	var sshShells []vmshd.ShellHandle
+	for _, shell := range s.sshShellList() {
+		if shell == nil {
+			continue
+		}
+		ctx := shell.ctx
+		sshShells = append(sshShells, vmshd.ShellHandle{
+			ID:      shell.key,
+			Kind:    "ssh",
+			Name:    shell.name,
+			Context: contextShortText(ctx),
+			CWD:     shell.cwd(),
+			SSHHost: ctx.SSHHost,
+			User:    ctx.User,
+			State:   "open",
+		})
+	}
+	return hostShells, guestShells, sshShells
+}
+
 func jobStatus(job shellJob) string {
 	if !job.Done {
 		return "running"
@@ -1313,11 +1376,14 @@ func jobStatus(job shellJob) string {
 	return "done"
 }
 
-func (r *vmshdSessionReporter) publish(jobs []vmshd.JobSummary) {
+func (r *vmshdSessionReporter) publish(jobs []vmshd.JobSummary, hostShells, guestShells, sshShells []vmshd.ShellHandle) {
 	if r == nil || r.client == nil || strings.TrimSpace(r.sessionID) == "" {
 		return
 	}
 	req := vmshdSessionMetadata(r.hostCWD, r.context)
+	req.HostShells = hostShells
+	req.GuestShells = guestShells
+	req.SSHShells = sshShells
 	req.Jobs = jobs
 	_, _ = r.client.UpdateSession(r.sessionID, req)
 }
@@ -2581,7 +2647,7 @@ func (s *shellState) startBackgroundJob(ctx commandContext, line string, stdout,
 	})
 	idx := len(s.jobs) - 1
 	s.jobsMu.Unlock()
-	s.publishVMSHDSessionJobs()
+	s.publishVMSHDSessionState()
 	fmt.Fprintf(stdout, "[%d] running context=%s %s\n    logs: @jobs logs %d\n", id, contextText, line, id)
 	go func() {
 		logs := jobLogWriter{shell: s, index: idx}
@@ -2599,7 +2665,7 @@ func (s *shellState) startBackgroundJob(ctx commandContext, line string, stdout,
 			s.jobs[idx].Err = err.Error()
 		}
 		s.jobsMu.Unlock()
-		s.publishVMSHDSessionJobs()
+		s.publishVMSHDSessionState()
 		_ = stderr
 	}()
 	return nil
@@ -4515,6 +4581,7 @@ func (s *shellState) hostPersistentShell(env []string, cols, rows int, stdout, s
 		return nil, err
 	}
 	s.hostShell = session
+	s.publishVMSHDSessionState()
 	return session, nil
 }
 
@@ -4752,6 +4819,7 @@ func (p *persistentHostShell) cwd() string {
 }
 
 func (s *shellState) closeSessions() {
+	changed := s.guestShell != nil || s.hostShell != nil || len(s.sshShells) > 0
 	if s.guestShell != nil {
 		s.guestShell.close()
 		s.guestShell = nil
@@ -4761,6 +4829,9 @@ func (s *shellState) closeSessions() {
 		s.hostShell = nil
 	}
 	s.closeSSHClients()
+	if changed {
+		s.publishVMSHDSessionState()
+	}
 }
 
 func (s *shellState) closeGuestSession() {
@@ -4773,6 +4844,7 @@ func (s *shellState) closeGuestSession() {
 	}
 	s.guestShell.close()
 	s.guestShell = nil
+	s.publishVMSHDSessionState()
 }
 
 func (p *persistentHostShell) close() {
@@ -5335,6 +5407,7 @@ func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequ
 		return nil, err
 	}
 	s.guestShell = session
+	s.publishVMSHDSessionState()
 	return session, nil
 }
 
@@ -8640,7 +8713,7 @@ func (s *shellState) markJobsLost(match func(shellJob) bool, reason string) {
 	}
 	s.jobsMu.Unlock()
 	if changed {
-		s.publishVMSHDSessionJobs()
+		s.publishVMSHDSessionState()
 	}
 }
 

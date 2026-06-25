@@ -51,10 +51,10 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode update request: %v", err)
 		}
-		if req.HostCWD != "/work" || req.SelectedContext == nil || req.SelectedContext.Mode != "host" {
+		if req.HostCWD != "/work" || req.SelectedContext == nil || req.SelectedContext.Mode != "host" || len(req.HostShells) != 1 {
 			t.Fatalf("update request = %+v", req)
 		}
-		writeJSON(w, http.StatusOK, Session{ID: "sess_1", Name: "main", State: "detached", HostCWD: req.HostCWD, SelectedContext: req.SelectedContext})
+		writeJSON(w, http.StatusOK, Session{ID: "sess_1", Name: "main", State: "detached", HostCWD: req.HostCWD, SelectedContext: req.SelectedContext, HostShells: req.HostShells})
 	})
 	mux.HandleFunc("/vmsh/sessions/sess_1/attachments/attach_1/terminal", func(w http.ResponseWriter, r *http.Request) {
 		requireBearer(t, r)
@@ -112,11 +112,12 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 	updated, err := client.UpdateSession(session.ID, UpdateSessionRequest{
 		HostCWD:         "/work",
 		SelectedContext: &SessionContext{Mode: "host", Name: "host"},
+		HostShells:      []ShellHandle{{ID: "host", Kind: "host", State: "open"}},
 	})
 	if err != nil {
 		t.Fatalf("update session: %v", err)
 	}
-	if updated.HostCWD != "/work" || updated.SelectedContext == nil || updated.SelectedContext.Mode != "host" {
+	if updated.HostCWD != "/work" || updated.SelectedContext == nil || updated.SelectedContext.Mode != "host" || len(updated.HostShells) != 1 {
 		t.Fatalf("updated = %+v", updated)
 	}
 	attached, err := client.AttachSession(session.ID, AttachSessionRequest{

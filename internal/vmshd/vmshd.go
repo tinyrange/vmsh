@@ -44,6 +44,9 @@ type Session struct {
 	State           string             `json:"state"`
 	HostCWD         string             `json:"host_cwd,omitempty"`
 	SelectedContext *SessionContext    `json:"selected_context,omitempty"`
+	HostShells      []ShellHandle      `json:"host_shells,omitempty"`
+	GuestShells     []ShellHandle      `json:"guest_shells,omitempty"`
+	SSHShells       []ShellHandle      `json:"ssh_shells,omitempty"`
 	Jobs            []JobSummary       `json:"jobs,omitempty"`
 	Attachments     []ClientAttachment `json:"attached_clients"`
 	CreatedAt       time.Time          `json:"created_at"`
@@ -56,6 +59,9 @@ type SessionSummary struct {
 	State           string             `json:"state"`
 	HostCWD         string             `json:"host_cwd,omitempty"`
 	SelectedContext *SessionContext    `json:"selected_context,omitempty"`
+	HostShells      []ShellHandle      `json:"host_shells,omitempty"`
+	GuestShells     []ShellHandle      `json:"guest_shells,omitempty"`
+	SSHShells       []ShellHandle      `json:"ssh_shells,omitempty"`
 	Jobs            []JobSummary       `json:"jobs,omitempty"`
 	AttachedClients []ClientAttachment `json:"attached_clients"`
 	CreatedAt       time.Time          `json:"created_at"`
@@ -90,6 +96,18 @@ type JobSummary struct {
 	FinishedAt time.Time `json:"finished_at,omitempty"`
 }
 
+type ShellHandle struct {
+	ID      string `json:"id"`
+	Kind    string `json:"kind"`
+	Name    string `json:"name,omitempty"`
+	Context string `json:"context,omitempty"`
+	CWD     string `json:"cwd,omitempty"`
+	VMID    string `json:"vm,omitempty"`
+	SSHHost string `json:"ssh_host,omitempty"`
+	User    string `json:"user,omitempty"`
+	State   string `json:"state"`
+}
+
 type ClientAttachment struct {
 	ID         string    `json:"id"`
 	Mode       string    `json:"mode"`
@@ -110,6 +128,9 @@ type CreateSessionRequest struct {
 type UpdateSessionRequest struct {
 	HostCWD         string          `json:"host_cwd,omitempty"`
 	SelectedContext *SessionContext `json:"selected_context,omitempty"`
+	HostShells      []ShellHandle   `json:"host_shells,omitempty"`
+	GuestShells     []ShellHandle   `json:"guest_shells,omitempty"`
+	SSHShells       []ShellHandle   `json:"ssh_shells,omitempty"`
 	Jobs            []JobSummary    `json:"jobs,omitempty"`
 }
 
@@ -524,6 +545,9 @@ func (r *sessionRegistry) Update(id string, req UpdateSessionRequest) (Session, 
 	}
 	session.HostCWD = strings.TrimSpace(req.HostCWD)
 	session.SelectedContext = cloneSessionContext(req.SelectedContext)
+	session.HostShells = cloneShellHandles(req.HostShells)
+	session.GuestShells = cloneShellHandles(req.GuestShells)
+	session.SSHShells = cloneShellHandles(req.SSHShells)
 	session.Jobs = cloneJobSummaries(req.Jobs)
 	session.UpdatedAt = time.Now()
 	r.sessions[id] = session
@@ -659,6 +683,9 @@ func (r *sessionRegistry) List() []SessionSummary {
 			State:           session.State,
 			HostCWD:         session.HostCWD,
 			SelectedContext: cloneSessionContext(session.SelectedContext),
+			HostShells:      cloneShellHandles(session.HostShells),
+			GuestShells:     cloneShellHandles(session.GuestShells),
+			SSHShells:       cloneShellHandles(session.SSHShells),
 			Jobs:            cloneJobSummaries(session.Jobs),
 			AttachedClients: append([]ClientAttachment(nil), session.Attachments...),
 			CreatedAt:       session.CreatedAt,
@@ -689,6 +716,9 @@ func (r *sessionRegistry) Jobs() []JobSummary {
 func cloneSession(session Session) Session {
 	session.Attachments = append([]ClientAttachment(nil), session.Attachments...)
 	session.SelectedContext = cloneSessionContext(session.SelectedContext)
+	session.HostShells = cloneShellHandles(session.HostShells)
+	session.GuestShells = cloneShellHandles(session.GuestShells)
+	session.SSHShells = cloneShellHandles(session.SSHShells)
 	session.Jobs = cloneJobSummaries(session.Jobs)
 	return session
 }
@@ -713,6 +743,25 @@ func cloneJobSummaries(jobs []JobSummary) []JobSummary {
 		out[i].Error = strings.TrimSpace(out[i].Error)
 		out[i].Control = strings.TrimSpace(out[i].Control)
 		out[i].Logs = strings.TrimSpace(out[i].Logs)
+	}
+	return out
+}
+
+func cloneShellHandles(handles []ShellHandle) []ShellHandle {
+	if handles == nil {
+		return nil
+	}
+	out := append([]ShellHandle(nil), handles...)
+	for i := range out {
+		out[i].ID = strings.TrimSpace(out[i].ID)
+		out[i].Kind = strings.TrimSpace(out[i].Kind)
+		out[i].Name = strings.TrimSpace(out[i].Name)
+		out[i].Context = strings.TrimSpace(out[i].Context)
+		out[i].CWD = strings.TrimSpace(out[i].CWD)
+		out[i].VMID = strings.TrimSpace(out[i].VMID)
+		out[i].SSHHost = strings.TrimSpace(out[i].SSHHost)
+		out[i].User = strings.TrimSpace(out[i].User)
+		out[i].State = strings.TrimSpace(out[i].State)
 	}
 	return out
 }

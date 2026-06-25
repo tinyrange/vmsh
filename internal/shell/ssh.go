@@ -285,6 +285,7 @@ func (s *shellState) sshPersistentShell(ctx commandContext, output, stderr io.Wr
 	}
 	s.sshShells[key] = shell
 	s.sshMu.Unlock()
+	s.publishVMSHDSessionState()
 	return shell, nil
 }
 
@@ -1332,6 +1333,7 @@ func (s *shellState) closeSSHSessionKey(key string) bool {
 		} else {
 			s.markJobsLostForSSHKey(key, "parent SSH connection stopped")
 		}
+		s.publishVMSHDSessionState()
 	}
 	return closed
 }

@@ -75,6 +75,7 @@ func TestStatusRoute(t *testing.T) {
 	updated, err := srv.registry.Update(session.ID, UpdateSessionRequest{
 		HostCWD:         "/work",
 		SelectedContext: &SessionContext{Mode: "host", Name: "host", Short: "host", Source: "host"},
+		HostShells:      []ShellHandle{{ID: "host", Kind: "host", Name: "host", CWD: "/work", State: "open"}},
 		Jobs:            []JobSummary{{ID: 1, Command: "sleep 1", Status: "running", StartedAt: time.Now()}},
 	})
 	if err != nil {
@@ -103,6 +104,9 @@ func TestStatusRoute(t *testing.T) {
 	if len(status.Sessions[0].Jobs) != 1 || status.Sessions[0].Jobs[0].Command != "sleep 1" {
 		t.Fatalf("status session jobs = %+v", status.Sessions[0].Jobs)
 	}
+	if len(status.Sessions[0].HostShells) != 1 || status.Sessions[0].HostShells[0].CWD != "/work" {
+		t.Fatalf("status host shells = %+v", status.Sessions[0].HostShells)
+	}
 	if len(status.VMs) != 1 || status.VMs[0].ID != "vm1" || status.VMs[0].Status != "running" {
 		t.Fatalf("status VMs = %+v", status.VMs)
 	}
@@ -127,7 +131,7 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 	}
 
 	rr = httptest.NewRecorder()
-	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPatch, "/vmsh/sessions/"+created.ID, bytes.NewBufferString(`{"host_cwd":"/work","selected_context":{"mode":"vm","name":"dev","short":"vm:dev","source":"docker:debian","vm":"dev","image":"debian","cwd":"/repo","user":"root","isolated":true},"jobs":[{"id":1,"context":"vm:dev","command":"make","status":"running","control":"vm:dev","logs":"@jobs logs 1","started_at":"2026-06-25T00:00:00Z"}]}`)))
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPatch, "/vmsh/sessions/"+created.ID, bytes.NewBufferString(`{"host_cwd":"/work","selected_context":{"mode":"vm","name":"dev","short":"vm:dev","source":"docker:debian","vm":"dev","image":"debian","cwd":"/repo","user":"root","isolated":true},"host_shells":[{"id":"host","kind":"host","name":"host","cwd":"/work","state":"open"}],"guest_shells":[{"id":"dev","kind":"guest","name":"dev","context":"vm:dev","cwd":"/repo","vm":"dev","user":"root","state":"open"}],"ssh_shells":[{"id":"ssh","kind":"ssh","name":"app","context":"ssh:app","cwd":"/srv","ssh_host":"app","user":"me","state":"open"}],"jobs":[{"id":1,"context":"vm:dev","command":"make","status":"running","control":"vm:dev","logs":"@jobs logs 1","started_at":"2026-06-25T00:00:00Z"}]}`)))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("update status = %d body=%s", rr.Code, rr.Body.String())
 	}
@@ -140,6 +144,9 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 	}
 	if len(updated.Jobs) != 1 || updated.Jobs[0].Command != "make" || updated.Jobs[0].Status != "running" {
 		t.Fatalf("updated jobs = %+v", updated.Jobs)
+	}
+	if len(updated.HostShells) != 1 || len(updated.GuestShells) != 1 || len(updated.SSHShells) != 1 {
+		t.Fatalf("updated shell handles host=%+v guest=%+v ssh=%+v", updated.HostShells, updated.GuestShells, updated.SSHShells)
 	}
 
 	rr = httptest.NewRecorder()
@@ -159,6 +166,9 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 	}
 	if len(sessions[0].Jobs) != 1 || sessions[0].Jobs[0].Logs != "@jobs logs 1" {
 		t.Fatalf("session summary jobs = %+v", sessions[0].Jobs)
+	}
+	if len(sessions[0].GuestShells) != 1 || sessions[0].GuestShells[0].VMID != "dev" {
+		t.Fatalf("session summary guest shells = %+v", sessions[0].GuestShells)
 	}
 
 	rr = httptest.NewRecorder()
@@ -191,6 +201,9 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 	}
 	if len(read.Jobs) != 1 || read.Jobs[0].Context != "vm:dev" {
 		t.Fatalf("read session jobs = %+v", read.Jobs)
+	}
+	if len(read.SSHShells) != 1 || read.SSHShells[0].SSHHost != "app" {
+		t.Fatalf("read session ssh shells = %+v", read.SSHShells)
 	}
 
 	rr = httptest.NewRecorder()
