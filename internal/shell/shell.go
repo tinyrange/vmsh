@@ -320,7 +320,7 @@ func (c *vmshCompleter) completionContext(prefix string) commandContext {
 		if err == nil {
 			ctx = sshCommandContext(ctx, at.Options, host)
 		}
-	case "help", "ps", "jobs", "alias", "status", "where", "start", "stop", "restart", "forward", "tmux", "agent":
+	case "help", "ps", "jobs", "alias", "status", "where", "attach", "start", "stop", "restart", "forward", "tmux", "agent":
 	default:
 		if sshCtx, ok := c.shellSSHSessionContext(at.Target); ok {
 			ctx = sshCtx
@@ -346,7 +346,7 @@ func pathCompletionReplaceLen(token string) int {
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@agent", "@alias", "@copy", "@help", "@host", "@jobs", "@ps", "@restart", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux"}
+	words := []string{"@agent", "@alias", "@attach", "@copy", "@help", "@host", "@jobs", "@ps", "@restart", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux"}
 	if c.shell != nil {
 		for _, name := range c.shell.sshSessionNames() {
 			words = append(words, "@"+name)
@@ -1532,6 +1532,16 @@ func (r *vmshdSessionReporter) bridgeTerminalStream(ctx context.Context, in *os.
 		return nil
 	}
 	return errOut
+}
+
+func (s *shellState) attachVMSHDTerminal(stdout, stderr io.Writer) error {
+	if s.vmshd == nil {
+		return fmt.Errorf("@attach requires a vmshd session")
+	}
+	if !writerIsTerminal(stdout) || !terminal.IsTerminalFD(int(os.Stdin.Fd())) {
+		return fmt.Errorf("@attach requires an interactive terminal")
+	}
+	return s.vmshd.bridgeTerminalStream(context.Background(), os.Stdin, stdout, stderr)
 }
 
 func defaultContext(vmID, image string, nestedVirt bool) commandContext {
@@ -2976,6 +2986,11 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("usage: @%s", at.Target)
 		}
 		return s.printStatus(stdout)
+	case "attach":
+		if at.Command != "" || len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @attach")
+		}
+		return s.attachVMSHDTerminal(stdout, stderr)
 	case "sudo":
 		ctx := s.context.withOptions(at.Options)
 		if at.Command == "" {
@@ -8877,6 +8892,7 @@ func (s *shellState) help(w io.Writer) error {
 @ps                      list VMs and SSH sessions
 	@jobs [logs id|stop id]  list background jobs, show captured output, or request stop
 @status                  show vmsh and selected VM state
+@attach                  attach this terminal to the daemon-owned vmshd host shell
 @start                   start the current VM
 @stop [name|vm:name|ssh:name]  stop an SSH session or VM
 @restart [name|vm:name]  restart a VM after confirmation

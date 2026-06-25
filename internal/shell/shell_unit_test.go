@@ -452,6 +452,17 @@ func TestVMSHDTerminalBridgeForwardsStdinAndOutput(t *testing.T) {
 	}
 }
 
+func TestAttachCommandRequiresVMSHDSessionAndNoArguments(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@attach extra", &stdout, &stderr); err == nil {
+		t.Fatal("@attach with arguments unexpectedly succeeded")
+	}
+	if err := sh.eval("@attach", &stdout, &stderr); err == nil {
+		t.Fatal("@attach without vmshd session unexpectedly succeeded")
+	}
+}
+
 func writeJSONForShellTest(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -2371,6 +2382,10 @@ func TestCompletionsUseCachedImagesOptionsAndHostMappedPaths(t *testing.T) {
 	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@ss"), len("@ss"))
 	if kind != completionAt || replaceLen != len("@ss") || !hasString(candidates, "h") {
 		t.Fatalf("ssh target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
+	}
+	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@att"), len("@att"))
+	if kind != completionAt || replaceLen != len("@att") || !hasString(candidates, "ach") {
+		t.Fatalf("attach target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 	candidates, _, _ = c.CompleteWithKind([]rune("@alpine --pr"), len("@alpine --pr"))
 	if hasString(candidates, "oxy") {
