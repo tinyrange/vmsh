@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -155,9 +156,13 @@ func TestConnectCCVMWithOptionsReportsDaemonReuse(t *testing.T) {
 	}
 
 	var reused DaemonState
+	var started bool
 	api, err := ConnectCCVMWithOptions(launch, t.TempDir(), statePath, ConnectOptions{
 		OnReuse: func(state DaemonState) {
 			reused = state
+		},
+		OnStart: func(DaemonState) {
+			started = true
 		},
 	})
 	if err != nil {
@@ -166,8 +171,80 @@ func TestConnectCCVMWithOptionsReportsDaemonReuse(t *testing.T) {
 	if reused.Addr != state.Addr {
 		t.Fatalf("reused state = %+v, want %+v", reused, state)
 	}
+	if started {
+		t.Fatal("new daemon callback was called for reused daemon")
+	}
 	if err := api.HealthCheck(); err != nil {
 		t.Fatalf("reused client health check: %v", err)
+	}
+}
+
+func TestConnectCCVMWithOptionsReportsNewDaemonStart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script fake daemon is Unix-only")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := &http.Server{Handler: mux}
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+	t.Cleanup(func() {
+		_ = srv.Close()
+	})
+
+	cacheDir := t.TempDir()
+	keepalive := filepath.Join(cacheDir, "keepalive")
+	if err := os.WriteFile(keepalive, []byte("1"), 0o600); err != nil {
+		t.Fatalf("write keepalive: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Remove(keepalive)
+	})
+
+	bin := filepath.Join(t.TempDir(), "fake-ccvm")
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' '{\"addr\":\"%s\"}'\nwhile [ -f \"$2/keepalive\" ]; do sleep 0.1; done\n", ln.Addr().String())
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ccvm: %v", err)
+	}
+
+	statePath := filepath.Join(t.TempDir(), "ccvm.json")
+	launch := CCVMLaunch{Path: bin}
+	var reused bool
+	var started DaemonState
+	api, err := ConnectCCVMWithOptions(launch, cacheDir, statePath, ConnectOptions{
+		OnReuse: func(DaemonState) {
+			reused = true
+		},
+		OnStart: func(state DaemonState) {
+			started = state
+		},
+	})
+	if err != nil {
+		t.Fatalf("connect new daemon: %v", err)
+	}
+	if reused {
+		t.Fatal("reuse callback was called for new daemon")
+	}
+	want := DaemonState{Addr: ln.Addr().String(), LaunchKey: DaemonLaunchKey(launch)}
+	if started != want {
+		t.Fatalf("started state = %+v, want %+v", started, want)
+	}
+	if err := api.HealthCheck(); err != nil {
+		t.Fatalf("new client health check: %v", err)
+	}
+	written, err := ReadDaemonState(statePath)
+	if err != nil {
+		t.Fatalf("read written state: %v", err)
+	}
+	if written != want {
+		t.Fatalf("written state = %+v, want %+v", written, want)
 	}
 }
 

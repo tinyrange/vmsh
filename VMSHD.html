@@ -1,0 +1,729 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>vmshd Design Plan</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --text: #202124;
+      --muted: #5f6368;
+      --border: #d9dce1;
+      --bg: #ffffff;
+      --panel: #f7f8fa;
+      --accent: #0b6f6a;
+      --warn: #a15c00;
+      --code: #eef3f2;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(1040px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 48px 0 72px;
+    }
+
+    header {
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 32px;
+      padding-bottom: 24px;
+    }
+
+    h1, h2, h3 {
+      line-height: 1.2;
+      margin: 0;
+    }
+
+    h1 {
+      font-size: 2.2rem;
+      font-weight: 720;
+    }
+
+    h2 {
+      border-top: 1px solid var(--border);
+      font-size: 1.35rem;
+      margin-top: 34px;
+      padding-top: 28px;
+    }
+
+    h3 {
+      font-size: 1.05rem;
+      margin-top: 22px;
+    }
+
+    p {
+      margin: 12px 0;
+    }
+
+    ul, ol {
+      margin: 12px 0 0;
+      padding-left: 24px;
+    }
+
+    li {
+      margin: 7px 0;
+    }
+
+    code {
+      background: var(--code);
+      border-radius: 4px;
+      padding: 0.12rem 0.28rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    pre {
+      background: #17201f;
+      border-radius: 8px;
+      color: #f4fbfa;
+      overflow-x: auto;
+      padding: 16px;
+    }
+
+    pre code {
+      background: transparent;
+      color: inherit;
+      padding: 0;
+    }
+
+    table {
+      border-collapse: collapse;
+      margin-top: 16px;
+      width: 100%;
+    }
+
+    th, td {
+      border: 1px solid var(--border);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: var(--panel);
+    }
+
+    .summary {
+      color: var(--muted);
+      font-size: 1.05rem;
+      margin-top: 12px;
+      max-width: 820px;
+    }
+
+    .decision {
+      background: var(--panel);
+      border-left: 4px solid var(--accent);
+      margin: 22px 0;
+      padding: 14px 18px;
+    }
+
+    .warning {
+      background: #fff8ef;
+      border-left: 4px solid var(--warn);
+      margin: 22px 0;
+      padding: 14px 18px;
+    }
+
+    .grid {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      margin-top: 16px;
+    }
+
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+    }
+
+    .card h3 {
+      margin-top: 0;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>vmshd Design Plan</h1>
+      <p class="summary">
+        Introduce <code>vmshd</code> as the authenticated local daemon for
+        vmsh. It should host the existing ccvm API and the new vmsh session API
+        in one process, so VM runtime state and shell workflow state have a
+        single lifecycle, one cache identity, and one local security boundary.
+      </p>
+    </header>
+
+    <section>
+      <h2>Goal</h2>
+      <p>
+        Replace the current direct <code>vmsh</code> to <code>ccvm</code>
+        relationship with an embedded daemon mode that serves both the existing
+        ccvm runtime API and vmsh-specific shell/session APIs from the same
+        process.
+      </p>
+
+      <div class="decision">
+        <strong>Key decision:</strong> <code>vmshd</code> is not a proxy process
+        that starts a separate <code>ccvm</code> daemon. The preferred local
+        architecture is one daemon process that mounts the ccvm handlers and the
+        vmshd handlers on the same authenticated listener.
+      </div>
+
+      <pre><code>release binary
+  vmsh client mode
+  vmshd daemon mode
+    ccvm runtime API
+    vmsh session API
+    auth middleware
+    watchdog leases
+    shell/session registry</code></pre>
+
+      <p>
+        The first implementation can keep most of the existing ccvm API surface
+        intact. The meaningful change is ownership: <code>vmshd</code> becomes
+        the process users connect to, the state file users discover, and the
+        local authority for both VM operations and shell sessions.
+      </p>
+    </section>
+
+    <section>
+      <h2>Why Change</h2>
+      <div class="grid">
+        <article class="card">
+          <h3>Unified View</h3>
+          <p>
+            vmsh currently knows about shell state and ccvm knows about VM
+            state. A user asking "what is running?" needs one answer that
+            includes VM instances, host shells, SSH sessions, background jobs,
+            attached clients, and detached sessions.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Simpler Lifecycle</h3>
+          <p>
+            One daemon process means one startup path, one health check, one
+            watchdog lease system, one shutdown operation, one cache directory,
+            and one place to reason about compatibility.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Security Boundary</h3>
+          <p>
+            Every local request should authenticate. Adding that once at the
+            shared daemon boundary is cleaner than teaching multiple local
+            services to coordinate secrets.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section>
+      <h2>Non-Goals</h2>
+      <ul>
+        <li>
+          Do not redesign the VM runtime at the same time. Existing ccvm
+          semantics should survive the first vmshd landing.
+        </li>
+        <li>
+          Do not require a network-visible daemon. The daemon is local-user
+          infrastructure, not a remote service.
+        </li>
+        <li>
+          Do not make terminal bytes part of the correctness protocol. Shell
+          status, cwd, job state, and session attachment state belong in
+          structured daemon data.
+        </li>
+        <li>
+          Do not make user-facing prose a hard API contract. Tests should
+          assert structured state, status codes, auth behavior, and command
+          routing.
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Process Model</h2>
+      <p>
+        The released <code>vmsh</code> binary should be able to run in client
+        mode or daemon mode. This matches the current embedded ccvm release
+        pattern, but the internal daemon mode should become vmshd rather than
+        raw ccvm.
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Mode</th>
+            <th>Entrypoint</th>
+            <th>Responsibility</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Client</td>
+            <td><code>vmsh</code></td>
+            <td>Interactive line editor, terminal bridge, command parser, and session attachment client.</td>
+          </tr>
+          <tr>
+            <td>Daemon</td>
+            <td><code>VMSH_INTERNAL_VMSHD=1 vmsh</code></td>
+            <td>Authenticated local API, ccvm runtime handlers, vmsh session registry, and durable daemon state.</td>
+          </tr>
+          <tr>
+            <td>Compatibility</td>
+            <td><code>VMSH_INTERNAL_CCVM=1 vmsh</code></td>
+            <td>Temporary compatibility path while existing code still starts the embedded ccvm mode directly.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Same-Process ccvm</h3>
+      <p>
+        The ccvm daemon code should become a mountable component. Instead of
+        only exposing a top-level <code>ccvmd.Main</code>, it should provide a
+        function that returns an <code>http.Handler</code> or registers routes
+        on a shared mux using an explicit runtime object.
+      </p>
+
+      <pre><code>type Server struct {
+    Runtime *ccvmd.Server
+    Sessions *SessionRegistry
+    Auth *TokenAuth
+}
+
+func (s *Server) Handler() http.Handler {
+    mux := http.NewServeMux()
+    ccvmd.RegisterHandlers(mux, s.Runtime)
+    RegisterSessionHandlers(mux, s.Sessions)
+    return s.Auth.Wrap(mux)
+}</code></pre>
+
+      <p>
+        The exact type names should follow the cc tree, but the dependency
+        direction matters: vmshd composes ccvm runtime handlers inside the same
+        process. It does not shell out to a sibling daemon during normal local
+        operation.
+      </p>
+    </section>
+
+    <section>
+      <h2>State Files</h2>
+      <p>
+        The client needs a small discovery file in the cache directory. The
+        file should be private to the user and should identify the daemon,
+        transport, auth token path, launch identity, and compatibility level.
+      </p>
+
+      <pre><code>{
+  "kind": "vmshd",
+  "version": 1,
+  "addr": "127.0.0.1:55433",
+  "socket": "",
+  "token_path": "/Users/joshua/Library/Caches/vmsh/ccprod/vmshd.token",
+  "launch_key": "path=...",
+  "api_version": "2026-06-25"
+}</code></pre>
+
+      <ul>
+        <li>
+          The state file should be written with mode <code>0600</code> on Unix
+          platforms.
+        </li>
+        <li>
+          A stale, unreadable, unauthenticated, or incompatible state file
+          should be removed before starting a new daemon.
+        </li>
+        <li>
+          The state file should not contain the token value unless there is no
+          safer practical alternative.
+        </li>
+        <li>
+          Existing <code>ccvm.json</code> readers may be supported for a short
+          compatibility window, but new vmsh clients should prefer
+          <code>vmshd.json</code>.
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Authentication</h2>
+      <p>
+        All daemon requests should authenticate, including health checks,
+        capability checks, VM routes, session routes, event streams, and
+        shutdown requests.
+      </p>
+
+      <div class="decision">
+        <strong>Key decision:</strong> Generate a fresh high-entropy bearer
+        token when the daemon starts. Store it in a local filesystem path with
+        private permissions. The client reads the token path from daemon state
+        and sends <code>Authorization: Bearer &lt;token&gt;</code> on every
+        request.
+      </div>
+
+      <h3>Token Lifecycle</h3>
+      <ol>
+        <li>Daemon creates the cache directory with private permissions.</li>
+        <li>Daemon generates at least 32 random bytes using <code>crypto/rand</code>.</li>
+        <li>Daemon stores the encoded token at <code>vmshd.token</code> with mode <code>0600</code>.</li>
+        <li>Daemon writes <code>vmshd.json</code> with the token path and listener address.</li>
+        <li>Client reads <code>vmshd.json</code>, then reads the token file.</li>
+        <li>Client sends the token with every HTTP request and WebSocket upgrade.</li>
+        <li>Daemon removes the token file on clean shutdown when possible.</li>
+      </ol>
+
+      <h3>Failure Rules</h3>
+      <ul>
+        <li>Missing token: <code>401 Unauthorized</code>.</li>
+        <li>Malformed authorization header: <code>401 Unauthorized</code>.</li>
+        <li>Wrong token: <code>403 Forbidden</code> or <code>401 Unauthorized</code>, chosen once and tested.</li>
+        <li>Token file has permissive mode on Unix: client refuses to use it and treats the daemon as unsafe.</li>
+        <li>State file refers to a missing token file: client removes stale state and starts a new daemon.</li>
+      </ul>
+
+      <h3>Transport Preference</h3>
+      <p>
+        A Unix domain socket is the best default on Unix and macOS when the
+        existing client stack can support it cleanly. The socket directory gives
+        a second local permission boundary. TCP loopback plus bearer token is
+        still acceptable and preserves the current cc client shape.
+      </p>
+
+      <div class="warning">
+        <strong>Security boundary:</strong> Token auth protects against other
+        local processes that can reach the listener but cannot read the user's
+        private cache files. It is not a remote multi-user authorization system
+        and should not be exposed beyond localhost or a private socket.
+      </div>
+    </section>
+
+    <section>
+      <h2>Session Registry</h2>
+      <p>
+        vmshd should own the authoritative list of shell sessions. A shell
+        session is broader than a VM instance: it may include host shell state,
+        selected VM context, SSH clients, persistent guest shells, background
+        jobs, terminal attachments, and copy operations.
+      </p>
+
+      <pre><code>Session {
+  id: "sess_...",
+  name: "main",
+  owner_uid: 501,
+  state: "attached" | "detached" | "closing",
+  created_at: "...",
+  updated_at: "...",
+  selected_context: Context,
+  attached_clients: [ClientAttachment],
+  host_shells: [ShellHandle],
+  guest_shells: [ShellHandle],
+  ssh_shells: [ShellHandle],
+  jobs: [JobSummary],
+  vm_refs: [VMRef]
+}</code></pre>
+
+      <h3>Session Properties</h3>
+      <ul>
+        <li>
+          Sessions are named by users but addressed by stable daemon-generated
+          IDs.
+        </li>
+        <li>
+          Multiple clients may attach when the terminal model supports it, but
+          the first implementation can enforce one interactive attachment per
+          session.
+        </li>
+        <li>
+          Detached sessions may keep shells and background jobs alive.
+        </li>
+        <li>
+          Session state should be observable without attaching to the terminal
+          stream.
+        </li>
+        <li>
+          Sessions should carry enough structured metadata to implement
+          <code>@status</code>, <code>@jobs</code>, and future session list
+          views without scraping terminal output.
+        </li>
+      </ul>
+
+      <h3>Unified Status</h3>
+      <p>
+        A single status request should answer the practical question: what is
+        vmsh doing right now?
+      </p>
+
+      <pre><code>GET /vmsh/sessions
+GET /vmsh/sessions/{id}
+GET /vmsh/jobs
+GET /vmsh/status</code></pre>
+
+      <p>
+        The response should include session summaries, VM instance summaries,
+        active streams, attached clients, and daemon metadata. Tests should
+        assert structured fields rather than wording.
+      </p>
+    </section>
+
+    <section>
+      <h2>Terminal and Control Planes</h2>
+      <p>
+        vmshd should reinforce the design from <code>SHELL.md</code>: terminal
+        bytes are opaque and control data is structured. The daemon registry
+        makes that cleaner because command lifecycle and shell metadata can be
+        sent to vmshd side channels instead of being parsed from visible output.
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Plane</th>
+            <th>Data</th>
+            <th>Correctness Rule</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Terminal</td>
+            <td>PTY input/output, resize, interactive control bytes</td>
+            <td>Forward as opaque bytes. Do not parse for command status.</td>
+          </tr>
+          <tr>
+            <td>Control</td>
+            <td>Command lifecycle, cwd, exit status, selected context, jobs</td>
+            <td>Send structured records through daemon APIs or private control channels.</td>
+          </tr>
+          <tr>
+            <td>Runtime</td>
+            <td>VM start, exec, image pulls, port forwards, capabilities</td>
+            <td>Use the mounted ccvm runtime handlers through the authenticated daemon.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>API Shape</h2>
+      <p>
+        Keep ccvm routes stable where possible and add vmsh-specific routes
+        under a clear prefix. That gives existing client code a path to move
+        without changing every runtime operation at once.
+      </p>
+
+      <h3>Daemon Routes</h3>
+      <ul>
+        <li><code>GET /healthz</code> checks authenticated daemon reachability.</li>
+        <li><code>GET /capabilities</code> returns existing runtime capabilities.</li>
+        <li><code>POST /shutdown</code> requests daemon shutdown.</li>
+        <li><code>POST /watchdog/lease</code> keeps the daemon alive for active clients.</li>
+      </ul>
+
+      <h3>vmsh Routes</h3>
+      <ul>
+        <li><code>GET /vmsh/status</code> returns daemon, runtime, and session summaries.</li>
+        <li><code>GET /vmsh/sessions</code> lists shell sessions.</li>
+        <li><code>POST /vmsh/sessions</code> creates a session.</li>
+        <li><code>GET /vmsh/sessions/{id}</code> reads one session.</li>
+        <li><code>POST /vmsh/sessions/{id}/attach</code> attaches an interactive client.</li>
+        <li><code>POST /vmsh/sessions/{id}/detach</code> detaches a client.</li>
+        <li><code>DELETE /vmsh/sessions/{id}</code> closes a session and owned resources.</li>
+        <li><code>GET /vmsh/events</code> streams daemon-level events.</li>
+      </ul>
+
+      <h3>Compatibility</h3>
+      <p>
+        Existing ccvm routes can remain at their current paths. If vmshd later
+        needs versioned routes, add them without breaking the current local
+        client all at once.
+      </p>
+    </section>
+
+    <section>
+      <h2>Client Behavior</h2>
+      <p>
+        The vmsh client should connect to vmshd by default. It should only fall
+        back to direct ccvm mode behind an explicit compatibility path or while
+        the refactor is in progress.
+      </p>
+
+      <ol>
+        <li>Resolve cache identity and locate <code>vmshd.json</code>.</li>
+        <li>Read daemon state and token path.</li>
+        <li>Authenticate a health check.</li>
+        <li>Validate launch key, API compatibility, and required routes.</li>
+        <li>Reuse the daemon if compatible.</li>
+        <li>Start embedded vmshd if no safe compatible daemon exists.</li>
+        <li>Warn when a new daemon is started, stay quiet on reuse.</li>
+        <li>Create or attach a shell session.</li>
+      </ol>
+
+      <p>
+        The new daemon warning should continue to come from structured startup
+        state, not from text scraping or process output guessing.
+      </p>
+    </section>
+
+    <section>
+      <h2>Implementation Phases</h2>
+      <h3>Phase 1: Authenticated Daemon Foundation</h3>
+      <ul>
+        <li>Add token generation, token file writing, and auth middleware.</li>
+        <li>Extend daemon state with kind, token path, launch key, and API version.</li>
+        <li>Teach the client to read the token and authenticate every request.</li>
+        <li>Add tests for missing, wrong, and accepted token cases.</li>
+      </ul>
+
+      <h3>Phase 2: Same-Process vmshd Entrypoint</h3>
+      <ul>
+        <li>Add <code>VMSH_INTERNAL_VMSHD</code> daemon mode to the release binary.</li>
+        <li>Factor ccvm daemon code into a mountable handler/runtime component.</li>
+        <li>Start vmshd instead of embedded ccvm from vmsh.</li>
+        <li>Keep existing ccvm routes passing through the same listener.</li>
+      </ul>
+
+      <h3>Phase 3: Session Registry API</h3>
+      <ul>
+        <li>Add in-memory session registry with stable IDs and names.</li>
+        <li>Add <code>/vmsh/sessions</code> and <code>/vmsh/status</code>.</li>
+        <li>Move shell-owned session metadata into daemon-visible state.</li>
+        <li>Keep terminal byte forwarding in the client until attach/detach semantics are explicit.</li>
+      </ul>
+
+      <h3>Phase 4: Shell Attachment and Detached Sessions</h3>
+      <ul>
+        <li>Define attach protocol for interactive terminal clients.</li>
+        <li>Track attached clients and terminal size in session state.</li>
+        <li>Support detach without killing daemon-owned shells or jobs.</li>
+        <li>Expose enough state for <code>@status</code> and future UI views.</li>
+      </ul>
+
+      <h3>Phase 5: Cleanup and Compatibility Removal</h3>
+      <ul>
+        <li>Remove direct embedded ccvm startup from vmsh once vmshd is stable.</li>
+        <li>Delete compatibility state readers after a reasonable transition window.</li>
+        <li>Consolidate daemon lease and shutdown behavior under vmshd.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Testing Plan</h2>
+      <p>
+        Tests should focus on objective behavior: structured state, request
+        routing, auth results, daemon reuse decisions, session records, and
+        process lifecycle.
+      </p>
+
+      <ul>
+        <li>
+          Unit test token generation and file permissions. On Unix, assert
+          <code>0600</code>.
+        </li>
+        <li>
+          Unit test auth middleware with missing, malformed, wrong, and correct
+          bearer tokens.
+        </li>
+        <li>
+          Unit test daemon state read/write and stale state cleanup.
+        </li>
+        <li>
+          Unit test that ccvm routes and vmsh routes are both mounted behind
+          the same auth middleware.
+        </li>
+        <li>
+          Unit test daemon reuse versus fresh daemon startup using structured
+          callbacks.
+        </li>
+        <li>
+          Unit test session create/list/read/delete behavior.
+        </li>
+        <li>
+          Integration test that a locally started embedded vmshd can answer
+          authenticated <code>/healthz</code>, <code>/capabilities</code>, and
+          <code>/vmsh/status</code>.
+        </li>
+      </ul>
+
+      <div class="warning">
+        <strong>Test discipline:</strong> Avoid asserting incidental UI wording.
+        Exact assertions belong on JSON fields, status codes, route selection,
+        file modes, token acceptance, session IDs, and daemon state transitions.
+      </div>
+    </section>
+
+    <section>
+      <h2>Open Questions</h2>
+      <ul>
+        <li>
+          Should the first transport remain TCP loopback for minimum churn, or
+          should Unix sockets land before session attachment work begins?
+        </li>
+        <li>
+          Should token rotation happen only on daemon restart, or should vmshd
+          support explicit rotation while clients are attached?
+        </li>
+        <li>
+          How much session state should be durable across daemon restart versus
+          in-memory only?
+        </li>
+        <li>
+          Should attached clients be limited to one writer, or should vmshd
+          support multiple read-only observers early?
+        </li>
+        <li>
+          Which ccvm package boundaries need to move so vmshd can compose the
+          runtime without importing a command package?
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Done Criteria</h2>
+      <ul>
+        <li>
+          A local vmsh client starts or reuses <code>vmshd</code>, not a
+          separate ccvm daemon process.
+        </li>
+        <li>
+          The same daemon process serves existing ccvm runtime routes and new
+          vmsh session routes.
+        </li>
+        <li>
+          Every request requires the generated local bearer token.
+        </li>
+        <li>
+          Daemon state points to a private token file and is validated before
+          reuse.
+        </li>
+        <li>
+          <code>/vmsh/status</code> returns a unified structured view of daemon,
+          session, and runtime state.
+        </li>
+        <li>
+          Reuse stays quiet; fresh daemon startup warns through structured
+          startup state.
+        </li>
+        <li>
+          Focused unit and integration tests pass without making incidental
+          prose a contract.
+        </li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

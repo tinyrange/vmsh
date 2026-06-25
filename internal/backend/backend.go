@@ -104,6 +104,7 @@ func CompanionExecutablePath(exePath, suffix string) string {
 
 type ConnectOptions struct {
 	OnReuse func(DaemonState)
+	OnStart func(DaemonState)
 }
 
 func ConnectCCVM(launch CCVMLaunch, cacheDir, statePath string) (*client.Client, error) {
@@ -149,7 +150,8 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		_ = proc.Wait()
 		return nil, err
 	}
-	if err := WriteDaemonState(statePath, DaemonState{Addr: hello.Addr, LaunchKey: launchKey}); err != nil {
+	state := DaemonState{Addr: hello.Addr, LaunchKey: launchKey}
+	if err := WriteDaemonState(statePath, state); err != nil {
 		_ = proc.Process.Kill()
 		_ = proc.Wait()
 		return nil, fmt.Errorf("write daemon state %s for %s: %w", statePath, hello.Addr, err)
@@ -160,6 +162,9 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		_ = proc.Process.Kill()
 		_ = proc.Wait()
 		return nil, fmt.Errorf("ccvm daemon started at %s but health check failed: %w", hello.Addr, err)
+	}
+	if opts.OnStart != nil {
+		opts.OnStart(state)
 	}
 	return api, nil
 }

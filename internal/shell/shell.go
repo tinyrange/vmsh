@@ -1094,8 +1094,8 @@ func Run(args []string) error {
 		stderr = newRecordingTerminalWriter(os.Stderr, recorder)
 	}
 	api, err := backend.ConnectCCVMWithOptions(ccvmLaunch, rootCache, statePath, backend.ConnectOptions{
-		OnReuse: func(state backend.DaemonState) {
-			fmt.Fprintf(stderr, "vmsh: reusing ccvm daemon at %s\n", state.Addr)
+		OnStart: func(state backend.DaemonState) {
+			fmt.Fprintf(stderr, "vmsh: warning: using new ccvm daemon at %s\n", state.Addr)
 		},
 	})
 	if err != nil {
