@@ -40,6 +40,9 @@ func TestDaemonStateRoundTripAndValidation(t *testing.T) {
 	if state.Addr != "localhost:9999" {
 		t.Fatalf("state addr = %q", state.Addr)
 	}
+	if state.Version != DaemonStateVersion || state.APIVersion != DaemonAPIVersion {
+		t.Fatalf("state compatibility metadata = %+v", state)
+	}
 	if runtime.GOOS != "windows" {
 		info, err := os.Stat(path)
 		if err != nil {
@@ -47,6 +50,13 @@ func TestDaemonStateRoundTripAndValidation(t *testing.T) {
 		}
 		if got := info.Mode().Perm(); got != 0o600 {
 			t.Fatalf("daemon state mode = %o, want 600", got)
+		}
+		parent, err := os.Stat(filepath.Dir(path))
+		if err != nil {
+			t.Fatalf("stat daemon state directory: %v", err)
+		}
+		if got := parent.Mode().Perm(); got != 0o700 {
+			t.Fatalf("daemon state directory mode = %o, want 700", got)
 		}
 	}
 
@@ -56,6 +66,32 @@ func TestDaemonStateRoundTripAndValidation(t *testing.T) {
 	}
 	if _, err := ReadDaemonState(blankPath); err == nil {
 		t.Fatalf("blank daemon state error = %v", err)
+	}
+
+	if runtime.GOOS != "windows" {
+		permissivePath := filepath.Join(t.TempDir(), "permissive.json")
+		if err := os.WriteFile(permissivePath, []byte(`{"addr":"localhost:9999"}`), 0o644); err != nil {
+			t.Fatalf("write permissive state: %v", err)
+		}
+		if _, err := ReadDaemonState(permissivePath); err == nil {
+			t.Fatal("permissive daemon state was accepted")
+		}
+	}
+
+	badVersionPath := filepath.Join(t.TempDir(), "bad-version.json")
+	if err := os.WriteFile(badVersionPath, []byte(`{"addr":"localhost:9999","version":2}`), 0o600); err != nil {
+		t.Fatalf("write bad version state: %v", err)
+	}
+	if _, err := ReadDaemonState(badVersionPath); err == nil {
+		t.Fatal("unsupported daemon state version was accepted")
+	}
+
+	badAPIPath := filepath.Join(t.TempDir(), "bad-api.json")
+	if err := os.WriteFile(badAPIPath, []byte(`{"addr":"localhost:9999","api_version":"old"}`), 0o600); err != nil {
+		t.Fatalf("write bad api state: %v", err)
+	}
+	if _, err := ReadDaemonState(badAPIPath); err == nil {
+		t.Fatal("unsupported daemon API version was accepted")
 	}
 }
 
@@ -150,7 +186,7 @@ func TestConnectCCVMWithOptionsReportsDaemonReuse(t *testing.T) {
 
 	statePath := filepath.Join(t.TempDir(), "ccvm.json")
 	launch := CCVMLaunch{Path: "/missing/ccvm"}
-	state := DaemonState{Addr: ln.Addr().String(), LaunchKey: DaemonLaunchKey(launch)}
+	state := normalizeDaemonState(DaemonState{Addr: ln.Addr().String(), LaunchKey: DaemonLaunchKey(launch)})
 	if err := WriteDaemonState(statePath, state); err != nil {
 		t.Fatalf("write state: %v", err)
 	}
@@ -222,7 +258,7 @@ func TestConnectCCVMWithOptionsReusesAuthenticatedDaemon(t *testing.T) {
 	}
 	statePath := filepath.Join(dir, "ccvm.json")
 	launch := CCVMLaunch{Path: "/missing/ccvm"}
-	state := DaemonState{Addr: ln.Addr().String(), Kind: "vmshd", TokenPath: tokenPath, LaunchKey: DaemonLaunchKey(launch)}
+	state := normalizeDaemonState(DaemonState{Addr: ln.Addr().String(), Kind: "vmshd", TokenPath: tokenPath, LaunchKey: DaemonLaunchKey(launch)})
 	if err := WriteDaemonState(statePath, state); err != nil {
 		t.Fatalf("write state: %v", err)
 	}
@@ -297,7 +333,7 @@ func TestConnectCCVMWithOptionsReportsNewDaemonStart(t *testing.T) {
 	if reused {
 		t.Fatal("reuse callback was called for new daemon")
 	}
-	want := DaemonState{Addr: ln.Addr().String(), LaunchKey: DaemonLaunchKey(launch)}
+	want := normalizeDaemonState(DaemonState{Addr: ln.Addr().String(), LaunchKey: DaemonLaunchKey(launch)})
 	if started != want {
 		t.Fatalf("started state = %+v, want %+v", started, want)
 	}

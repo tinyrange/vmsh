@@ -20,6 +20,8 @@ const InternalCCVMEnv = "VMSH_INTERNAL_CCVM"
 const InternalVMSHDEnv = "VMSH_INTERNAL_VMSHD"
 const InternalCCVMSidecarModeEnv = "CCX3_CCVM_SIDECAR_MODE"
 const InternalCCVMSidecarMode = "vmsh-internal"
+const DaemonStateVersion = 1
+const DaemonAPIVersion = "2026-06-25"
 
 type API interface {
 	HealthCheck() error
@@ -45,10 +47,13 @@ type API interface {
 }
 
 type DaemonState struct {
-	Addr      string `json:"addr"`
-	Kind      string `json:"kind,omitempty"`
-	TokenPath string `json:"token_path,omitempty"`
-	LaunchKey string `json:"launch_key,omitempty"`
+	Addr       string `json:"addr"`
+	Socket     string `json:"socket,omitempty"`
+	Kind       string `json:"kind,omitempty"`
+	Version    int    `json:"version,omitempty"`
+	APIVersion string `json:"api_version,omitempty"`
+	TokenPath  string `json:"token_path,omitempty"`
+	LaunchKey  string `json:"launch_key,omitempty"`
 }
 
 type CCVMLaunch struct {
@@ -154,7 +159,7 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		_ = proc.Wait()
 		return nil, err
 	}
-	state := DaemonState{Addr: hello.Addr, Kind: hello.Kind, TokenPath: hello.TokenPath, LaunchKey: launchKey}
+	state := normalizeDaemonState(DaemonState{Addr: hello.Addr, Kind: hello.Kind, TokenPath: hello.TokenPath, LaunchKey: launchKey})
 	if err := WriteDaemonState(statePath, state); err != nil {
 		_ = proc.Process.Kill()
 		_ = proc.Wait()
@@ -322,6 +327,11 @@ func daemonWatchdogTimeout() time.Duration {
 
 func ReadDaemonState(path string) (DaemonState, error) {
 	var state DaemonState
+	if info, err := os.Stat(path); err != nil {
+		return state, err
+	} else if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return state, fmt.Errorf("daemon state %s has mode %o, want private permissions", path, info.Mode().Perm())
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return state, err
@@ -332,18 +342,35 @@ func ReadDaemonState(path string) (DaemonState, error) {
 	if strings.TrimSpace(state.Addr) == "" {
 		return state, fmt.Errorf("daemon state %s has no addr", path)
 	}
+	if state.Version != 0 && state.Version != DaemonStateVersion {
+		return state, fmt.Errorf("daemon state %s has unsupported version %d", path, state.Version)
+	}
+	if strings.TrimSpace(state.APIVersion) != "" && strings.TrimSpace(state.APIVersion) != DaemonAPIVersion {
+		return state, fmt.Errorf("daemon state %s has unsupported api version %q", path, state.APIVersion)
+	}
 	return state, nil
 }
 
 func WriteDaemonState(path string, state DaemonState) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
+	state = normalizeDaemonState(state)
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(path, append(data, '\n'), 0o600)
+}
+
+func normalizeDaemonState(state DaemonState) DaemonState {
+	if state.Version == 0 {
+		state.Version = DaemonStateVersion
+	}
+	if strings.TrimSpace(state.APIVersion) == "" {
+		state.APIVersion = DaemonAPIVersion
+	}
+	return state
 }
 
 func firstNonEmpty(values ...string) string {
