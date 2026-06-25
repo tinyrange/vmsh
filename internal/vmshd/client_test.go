@@ -80,6 +80,20 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 		}
 		writeJSON(w, http.StatusOK, []JobSummary{{ID: 1, SessionID: "sess_1", Command: "make", Status: "running"}})
 	})
+	mux.HandleFunc("/vmsh/sessions/sess_1/jobs", func(w http.ResponseWriter, r *http.Request) {
+		requireBearer(t, r)
+		if r.Method != http.MethodPost {
+			t.Fatalf("start job method = %s", r.Method)
+		}
+		var req StartHostJobRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode start job request: %v", err)
+		}
+		if len(req.Command) != 2 || req.Command[0] != "make" || req.Command[1] != "test" || req.Context != "host" {
+			t.Fatalf("start job request = %+v", req)
+		}
+		writeJSON(w, http.StatusOK, JobSummary{ID: 2, SessionID: "sess_1", Command: "make test", Status: "running", Control: "vmshd"})
+	})
 	mux.HandleFunc("/vmsh/sessions/sess_1/detach", func(w http.ResponseWriter, r *http.Request) {
 		requireBearer(t, r)
 		var req DetachSessionRequest
@@ -146,6 +160,13 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 	}
 	if len(jobs) != 1 || jobs[0].SessionID != "sess_1" || jobs[0].Command != "make" {
 		t.Fatalf("jobs = %+v", jobs)
+	}
+	job, err := client.StartHostJob(session.ID, StartHostJobRequest{Command: []string{"make", "test"}, Context: "host"})
+	if err != nil {
+		t.Fatalf("start host job: %v", err)
+	}
+	if job.ID != 2 || job.Status != "running" || job.Control != "vmshd" {
+		t.Fatalf("started job = %+v", job)
 	}
 	detached, err := client.DetachSession(session.ID, DetachSessionRequest{AttachmentID: attached.Attachment.ID})
 	if err != nil {

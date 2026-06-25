@@ -58,6 +58,12 @@ func (c *HTTPClient) Jobs() ([]JobSummary, error) {
 	return jobs, err
 }
 
+func (c *HTTPClient) StartHostJob(sessionID string, req StartHostJobRequest) (JobSummary, error) {
+	var job JobSummary
+	err := c.doJSON(http.MethodPost, "/vmsh/sessions/"+url.PathEscape(sessionID)+"/jobs", req, &job)
+	return job, err
+}
+
 func (c *HTTPClient) AttachSession(id string, req AttachSessionRequest) (AttachSessionResponse, error) {
 	var resp AttachSessionResponse
 	err := c.doJSON(http.MethodPost, "/vmsh/sessions/"+id+"/attach", req, &resp)

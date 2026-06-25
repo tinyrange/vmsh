@@ -1,13 +1,16 @@
 package vmshd
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -22,6 +25,8 @@ import (
 )
 
 const Kind = "vmshd"
+
+const maxJobLogBytes = 64 * 1024
 
 type Status struct {
 	Kind      string                 `json:"kind"`
@@ -108,6 +113,13 @@ type JobSummary struct {
 	FinishedAt time.Time `json:"finished_at,omitempty"`
 }
 
+type StartHostJobRequest struct {
+	Command []string `json:"command"`
+	WorkDir string   `json:"workdir,omitempty"`
+	Env     []string `json:"env,omitempty"`
+	Context string   `json:"context,omitempty"`
+}
+
 type ShellHandle struct {
 	ID      string `json:"id"`
 	Kind    string `json:"kind"`
@@ -171,7 +183,9 @@ type sessionRegistry struct {
 	mu         sync.Mutex
 	next       int
 	nextAttach int
+	nextJob    int
 	sessions   map[string]Session
+	jobs       map[string]map[int]JobSummary
 }
 
 type eventHub struct {
@@ -198,8 +212,14 @@ type Server struct {
 	registry *sessionRegistry
 	events   *eventHub
 	streams  *streamRegistry
+	jobs     *hostJobRunner
 
 	startedAt time.Time
+}
+
+type hostJobRunner struct {
+	mu      sync.Mutex
+	cancels map[int]context.CancelFunc
 }
 
 func Main(args []string) {
@@ -246,6 +266,7 @@ func NewServer(token string) *Server {
 		registry:  newSessionRegistry(),
 		events:    newEventHub(),
 		streams:   newStreamRegistry(),
+		jobs:      newHostJobRunner(),
 		startedAt: time.Now(),
 	}
 }
@@ -303,11 +324,12 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 		writeJSON(w, http.StatusOK, session)
 	})
 	mux.HandleFunc("DELETE /vmsh/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
-		session, ok := s.registry.Delete(r.PathValue("id"))
+		session, jobIDs, ok := s.registry.Delete(r.PathValue("id"))
 		if !ok {
 			writeJSON(w, http.StatusNotFound, client.ErrorResponse{Error: "session not found"})
 			return
 		}
+		s.jobs.Cancel(jobIDs)
 		s.events.Publish(Event{Kind: "session_deleted", Session: &session})
 		writeJSON(w, http.StatusOK, session)
 	})
@@ -339,6 +361,21 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 		s.events.Publish(Event{Kind: "session_detached", Session: &session})
 		writeJSON(w, http.StatusOK, session)
 	})
+	mux.HandleFunc("POST /vmsh/sessions/{id}/jobs", func(w http.ResponseWriter, r *http.Request) {
+		var req StartHostJobRequest
+		if err := decodeRequiredJSON(r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, client.ErrorResponse{Error: err.Error()})
+			return
+		}
+		job, err := s.startHostJob(r.PathValue("id"), req)
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		session, _ := s.registry.Get(r.PathValue("id"))
+		s.events.Publish(Event{Kind: "job_started", Session: &session})
+		writeJSON(w, http.StatusOK, job)
+	})
 	mux.HandleFunc("POST /vmsh/sessions/{id}/attachments/{attachment}/terminal", func(w http.ResponseWriter, r *http.Request) {
 		var req Terminal
 		if err := decodeRequiredJSON(r, &req); err != nil {
@@ -359,6 +396,86 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			s.serveTerminalStream(ws)
 		},
 	})
+}
+
+func (s *Server) startHostJob(sessionID string, req StartHostJobRequest) (JobSummary, error) {
+	if len(req.Command) == 0 || strings.TrimSpace(req.Command[0]) == "" {
+		return JobSummary{}, sessionError{status: http.StatusBadRequest, err: "command is required"}
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	job, err := s.registry.StartJob(sessionID, req)
+	if err != nil {
+		return JobSummary{}, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.jobs.Track(job.ID, cancel)
+	go func() {
+		defer s.jobs.Forget(job.ID)
+		cmd := exec.CommandContext(ctx, req.Command[0], req.Command[1:]...)
+		cmd.Dir = strings.TrimSpace(req.WorkDir)
+		cmd.Env = append(os.Environ(), req.Env...)
+		output, runErr := cmd.CombinedOutput()
+		_, ok := s.registry.FinishJob(sessionID, job.ID, summarizeHostJobResult(output, runErr))
+		if !ok {
+			return
+		}
+		session, _ := s.registry.Get(sessionID)
+		s.events.Publish(Event{Kind: "job_finished", Session: &session})
+	}()
+	return job, nil
+}
+
+func newHostJobRunner() *hostJobRunner {
+	return &hostJobRunner{cancels: map[int]context.CancelFunc{}}
+}
+
+func (r *hostJobRunner) Track(id int, cancel context.CancelFunc) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cancels[id] = cancel
+}
+
+func (r *hostJobRunner) Forget(id int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.cancels, id)
+}
+
+func (r *hostJobRunner) Cancel(ids []int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, id := range ids {
+		if cancel := r.cancels[id]; cancel != nil {
+			cancel()
+			delete(r.cancels, id)
+		}
+	}
+}
+
+func summarizeHostJobResult(output []byte, err error) JobSummary {
+	job := JobSummary{
+		Status:     "exited",
+		Logs:       boundedJobLogs(output),
+		LogDropped: len(output) > maxJobLogBytes,
+		FinishedAt: time.Now(),
+	}
+	if err == nil {
+		return job
+	}
+	job.Status = "failed"
+	job.Error = err.Error()
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		job.ExitCode = exitErr.ExitCode()
+	}
+	return job
+}
+
+func boundedJobLogs(output []byte) string {
+	if len(output) <= maxJobLogBytes {
+		return string(output)
+	}
+	return string(output[len(output)-maxJobLogBytes:])
 }
 
 func (s *Server) serveTerminalStream(ws *websocket.Conn) {
@@ -534,7 +651,7 @@ func newToken() (string, error) {
 }
 
 func newSessionRegistry() *sessionRegistry {
-	return &sessionRegistry{sessions: map[string]Session{}}
+	return &sessionRegistry{sessions: map[string]Session{}, jobs: map[string]map[int]JobSummary{}}
 }
 
 func newEventHub() *eventHub {
@@ -706,6 +823,7 @@ func (r *sessionRegistry) Get(id string) (Session, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	session, ok := r.sessions[strings.TrimSpace(id)]
+	session.Jobs = r.mergedJobsLocked(session.ID, session.Jobs)
 	return cloneSession(session), ok
 }
 
@@ -716,6 +834,7 @@ func (r *sessionRegistry) GetAttachment(id, attachmentID string) (Session, Clien
 	if !ok {
 		return Session{}, ClientAttachment{}, false
 	}
+	session.Jobs = r.mergedJobsLocked(session.ID, session.Jobs)
 	attachmentID = strings.TrimSpace(attachmentID)
 	for _, attachment := range session.Attachments {
 		if attachment.ID == attachmentID {
@@ -744,18 +863,21 @@ func (r *sessionRegistry) Update(id string, req UpdateSessionRequest) (Session, 
 	return cloneSession(session), nil
 }
 
-func (r *sessionRegistry) Delete(id string) (Session, bool) {
+func (r *sessionRegistry) Delete(id string) (Session, []int, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	id = strings.TrimSpace(id)
 	session, ok := r.sessions[id]
 	if !ok {
-		return Session{}, false
+		return Session{}, nil, false
 	}
+	session.Jobs = r.mergedJobsLocked(id, session.Jobs)
 	session.State = "closing"
 	session.UpdatedAt = time.Now()
+	jobIDs := r.jobIDsLocked(id)
 	delete(r.sessions, id)
-	return cloneSession(session), true
+	delete(r.jobs, id)
+	return cloneSession(session), jobIDs, true
 }
 
 func (r *sessionRegistry) Attach(id string, req AttachSessionRequest) (Session, ClientAttachment, error) {
@@ -867,6 +989,7 @@ func (r *sessionRegistry) List() []SessionSummary {
 	out := make([]SessionSummary, 0, len(ids))
 	for _, id := range ids {
 		session := r.sessions[id]
+		session.Jobs = r.mergedJobsLocked(id, session.Jobs)
 		out = append(out, SessionSummary{
 			ID:              session.ID,
 			Name:            session.Name,
@@ -895,12 +1018,94 @@ func (r *sessionRegistry) Jobs() []JobSummary {
 	sort.Strings(sessionIDs)
 	var out []JobSummary
 	for _, sessionID := range sessionIDs {
-		for _, job := range r.sessions[sessionID].Jobs {
+		for _, job := range r.mergedJobsLocked(sessionID, r.sessions[sessionID].Jobs) {
 			job.SessionID = sessionID
 			out = append(out, job)
 		}
 	}
 	return out
+}
+
+func (r *sessionRegistry) StartJob(sessionID string, req StartHostJobRequest) (JobSummary, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	sessionID = strings.TrimSpace(sessionID)
+	if _, ok := r.sessions[sessionID]; !ok {
+		return JobSummary{}, sessionError{status: http.StatusNotFound, err: "session not found"}
+	}
+	r.nextJob++
+	command := strings.Join(req.Command, " ")
+	if strings.TrimSpace(req.Context) == "" {
+		req.Context = "host"
+	}
+	job := JobSummary{
+		ID:        r.nextJob,
+		SessionID: sessionID,
+		Context:   strings.TrimSpace(req.Context),
+		Command:   strings.TrimSpace(command),
+		Status:    "running",
+		Control:   "vmshd",
+		StartedAt: time.Now(),
+	}
+	if r.jobs[sessionID] == nil {
+		r.jobs[sessionID] = map[int]JobSummary{}
+	}
+	r.jobs[sessionID][job.ID] = job
+	session := r.sessions[sessionID]
+	session.UpdatedAt = job.StartedAt
+	r.sessions[sessionID] = session
+	return job, nil
+}
+
+func (r *sessionRegistry) FinishJob(sessionID string, jobID int, result JobSummary) (JobSummary, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	sessionID = strings.TrimSpace(sessionID)
+	jobs := r.jobs[sessionID]
+	if jobs == nil {
+		return JobSummary{}, false
+	}
+	job, ok := jobs[jobID]
+	if !ok {
+		return JobSummary{}, false
+	}
+	job.Status = strings.TrimSpace(result.Status)
+	if job.Status == "" {
+		job.Status = "exited"
+	}
+	job.ExitCode = result.ExitCode
+	job.Error = strings.TrimSpace(result.Error)
+	job.Logs = result.Logs
+	job.LogDropped = result.LogDropped
+	job.FinishedAt = result.FinishedAt
+	if job.FinishedAt.IsZero() {
+		job.FinishedAt = time.Now()
+	}
+	jobs[jobID] = job
+	if session, ok := r.sessions[sessionID]; ok {
+		session.UpdatedAt = job.FinishedAt
+		r.sessions[sessionID] = session
+	}
+	return job, true
+}
+
+func (r *sessionRegistry) mergedJobsLocked(sessionID string, clientJobs []JobSummary) []JobSummary {
+	out := cloneJobSummaries(clientJobs)
+	ids := r.jobIDsLocked(sessionID)
+	for _, id := range ids {
+		out = append(out, r.jobs[sessionID][id])
+	}
+	return out
+}
+
+func (r *sessionRegistry) jobIDsLocked(sessionID string) []int {
+	jobs := r.jobs[sessionID]
+	ids := make([]int, 0, len(jobs))
+	for id := range jobs {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	return ids
 }
 
 func cloneSession(session Session) Session {

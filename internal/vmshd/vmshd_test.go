@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -385,6 +386,61 @@ func TestSessionTerminalUpdateRejectsBadRequests(t *testing.T) {
 	}
 }
 
+func TestDaemonOwnedHostJobRunsDetachedAndUpdatesSessionState(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, nil)
+	session := srv.registry.Create("main")
+	httpSrv := httptest.NewServer(srv.Authenticate(mux))
+	defer httpSrv.Close()
+
+	body := fmt.Sprintf(`{"command":[%q,"-test.run=TestDaemonHostJobHelper","--"],"env":["VMSHD_TEST_HOST_JOB=1","VMSHD_TEST_VALUE=ok"],"context":"host"}`, os.Args[0])
+	req, err := http.NewRequest(http.MethodPost, httpSrv.URL+"/vmsh/sessions/"+session.ID+"/jobs", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("new job request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("start job: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("start job status = %d", resp.StatusCode)
+	}
+	var started JobSummary
+	if err := json.NewDecoder(resp.Body).Decode(&started); err != nil {
+		t.Fatalf("decode started job: %v", err)
+	}
+	if started.ID == 0 || started.SessionID != session.ID || started.Status != "running" || started.Context != "host" {
+		t.Fatalf("started job = %+v", started)
+	}
+
+	jobs := getJobsFromServer(t, httpSrv.URL, "secret")
+	if len(jobs) != 1 || jobs[0].ID != started.ID || jobs[0].Status != "running" {
+		t.Fatalf("running jobs = %+v", jobs)
+	}
+	read, ok := srv.registry.Get(session.ID)
+	if !ok || read.State != "detached" || len(read.Jobs) != 1 || read.Jobs[0].ID != started.ID {
+		t.Fatalf("detached session jobs = %+v ok=%v", read, ok)
+	}
+
+	requireEventually(t, func() bool {
+		jobs := getJobsFromServer(t, httpSrv.URL, "secret")
+		return len(jobs) == 1 && jobs[0].Status == "exited" && jobs[0].FinishedAt.After(jobs[0].StartedAt) && strings.Contains(jobs[0].Logs, "daemon-job:ok")
+	})
+}
+
+func TestDaemonHostJobHelper(t *testing.T) {
+	if os.Getenv("VMSHD_TEST_HOST_JOB") != "1" {
+		return
+	}
+	time.Sleep(100 * time.Millisecond)
+	fmt.Fprintf(os.Stdout, "daemon-job:%s\n", os.Getenv("VMSHD_TEST_VALUE"))
+	os.Exit(0)
+}
+
 func TestTerminalAttachmentStreamTracksActiveStreamAndResize(t *testing.T) {
 	srv := NewServer("secret")
 	mux := http.NewServeMux()
@@ -558,6 +614,28 @@ func getStatusFromServer(t *testing.T, baseURL, token string) Status {
 		t.Fatalf("decode status: %v", err)
 	}
 	return status
+}
+
+func getJobsFromServer(t *testing.T, baseURL, token string) []JobSummary {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/vmsh/jobs", nil)
+	if err != nil {
+		t.Fatalf("new jobs request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get jobs: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("jobs status = %d", resp.StatusCode)
+	}
+	var jobs []JobSummary
+	if err := json.NewDecoder(resp.Body).Decode(&jobs); err != nil {
+		t.Fatalf("decode jobs: %v", err)
+	}
+	return jobs
 }
 
 func requireEventually(t *testing.T, ok func() bool) {
