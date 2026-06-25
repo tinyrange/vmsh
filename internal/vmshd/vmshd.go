@@ -44,6 +44,7 @@ type Session struct {
 	State           string             `json:"state"`
 	HostCWD         string             `json:"host_cwd,omitempty"`
 	SelectedContext *SessionContext    `json:"selected_context,omitempty"`
+	Jobs            []JobSummary       `json:"jobs,omitempty"`
 	Attachments     []ClientAttachment `json:"attached_clients"`
 	CreatedAt       time.Time          `json:"created_at"`
 	UpdatedAt       time.Time          `json:"updated_at"`
@@ -55,6 +56,7 @@ type SessionSummary struct {
 	State           string             `json:"state"`
 	HostCWD         string             `json:"host_cwd,omitempty"`
 	SelectedContext *SessionContext    `json:"selected_context,omitempty"`
+	Jobs            []JobSummary       `json:"jobs,omitempty"`
 	AttachedClients []ClientAttachment `json:"attached_clients"`
 	CreatedAt       time.Time          `json:"created_at"`
 	UpdatedAt       time.Time          `json:"updated_at"`
@@ -71,6 +73,21 @@ type SessionContext struct {
 	CWD      string `json:"cwd,omitempty"`
 	User     string `json:"user,omitempty"`
 	Isolated bool   `json:"isolated,omitempty"`
+}
+
+type JobSummary struct {
+	ID         int       `json:"id"`
+	SessionID  string    `json:"session_id,omitempty"`
+	Context    string    `json:"context,omitempty"`
+	Command    string    `json:"command"`
+	Status     string    `json:"status"`
+	ExitCode   int       `json:"exit_code,omitempty"`
+	Error      string    `json:"error,omitempty"`
+	Control    string    `json:"control,omitempty"`
+	Logs       string    `json:"logs,omitempty"`
+	LogDropped bool      `json:"log_dropped,omitempty"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at,omitempty"`
 }
 
 type ClientAttachment struct {
@@ -93,6 +110,7 @@ type CreateSessionRequest struct {
 type UpdateSessionRequest struct {
 	HostCWD         string          `json:"host_cwd,omitempty"`
 	SelectedContext *SessionContext `json:"selected_context,omitempty"`
+	Jobs            []JobSummary    `json:"jobs,omitempty"`
 }
 
 type AttachSessionRequest struct {
@@ -189,6 +207,9 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 	})
 	mux.HandleFunc("GET /vmsh/sessions", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.registry.List())
+	})
+	mux.HandleFunc("GET /vmsh/jobs", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, s.registry.Jobs())
 	})
 	mux.HandleFunc("GET /vmsh/events", func(w http.ResponseWriter, r *http.Request) {
 		s.streamEvents(w, r)
@@ -503,6 +524,7 @@ func (r *sessionRegistry) Update(id string, req UpdateSessionRequest) (Session, 
 	}
 	session.HostCWD = strings.TrimSpace(req.HostCWD)
 	session.SelectedContext = cloneSessionContext(req.SelectedContext)
+	session.Jobs = cloneJobSummaries(req.Jobs)
 	session.UpdatedAt = time.Now()
 	r.sessions[id] = session
 	return cloneSession(session), nil
@@ -637,6 +659,7 @@ func (r *sessionRegistry) List() []SessionSummary {
 			State:           session.State,
 			HostCWD:         session.HostCWD,
 			SelectedContext: cloneSessionContext(session.SelectedContext),
+			Jobs:            cloneJobSummaries(session.Jobs),
 			AttachedClients: append([]ClientAttachment(nil), session.Attachments...),
 			CreatedAt:       session.CreatedAt,
 			UpdatedAt:       session.UpdatedAt,
@@ -645,9 +668,28 @@ func (r *sessionRegistry) List() []SessionSummary {
 	return out
 }
 
+func (r *sessionRegistry) Jobs() []JobSummary {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	sessionIDs := make([]string, 0, len(r.sessions))
+	for id := range r.sessions {
+		sessionIDs = append(sessionIDs, id)
+	}
+	sort.Strings(sessionIDs)
+	var out []JobSummary
+	for _, sessionID := range sessionIDs {
+		for _, job := range r.sessions[sessionID].Jobs {
+			job.SessionID = sessionID
+			out = append(out, job)
+		}
+	}
+	return out
+}
+
 func cloneSession(session Session) Session {
 	session.Attachments = append([]ClientAttachment(nil), session.Attachments...)
 	session.SelectedContext = cloneSessionContext(session.SelectedContext)
+	session.Jobs = cloneJobSummaries(session.Jobs)
 	return session
 }
 
@@ -657,6 +699,22 @@ func cloneSessionContext(ctx *SessionContext) *SessionContext {
 	}
 	out := *ctx
 	return &out
+}
+
+func cloneJobSummaries(jobs []JobSummary) []JobSummary {
+	if jobs == nil {
+		return nil
+	}
+	out := append([]JobSummary(nil), jobs...)
+	for i := range out {
+		out[i].Context = strings.TrimSpace(out[i].Context)
+		out[i].Command = strings.TrimSpace(out[i].Command)
+		out[i].Status = strings.TrimSpace(out[i].Status)
+		out[i].Error = strings.TrimSpace(out[i].Error)
+		out[i].Control = strings.TrimSpace(out[i].Control)
+		out[i].Logs = strings.TrimSpace(out[i].Logs)
+	}
+	return out
 }
 
 type sessionError struct {

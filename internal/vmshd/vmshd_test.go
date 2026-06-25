@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"j5.nz/cc/client"
 )
@@ -74,6 +75,7 @@ func TestStatusRoute(t *testing.T) {
 	updated, err := srv.registry.Update(session.ID, UpdateSessionRequest{
 		HostCWD:         "/work",
 		SelectedContext: &SessionContext{Mode: "host", Name: "host", Short: "host", Source: "host"},
+		Jobs:            []JobSummary{{ID: 1, Command: "sleep 1", Status: "running", StartedAt: time.Now()}},
 	})
 	if err != nil {
 		t.Fatalf("update session: %v", err)
@@ -97,6 +99,9 @@ func TestStatusRoute(t *testing.T) {
 	}
 	if status.Sessions[0].HostCWD != updated.HostCWD || status.Sessions[0].SelectedContext == nil || status.Sessions[0].SelectedContext.Mode != "host" {
 		t.Fatalf("status session metadata = %+v, want %+v", status.Sessions[0], updated)
+	}
+	if len(status.Sessions[0].Jobs) != 1 || status.Sessions[0].Jobs[0].Command != "sleep 1" {
+		t.Fatalf("status session jobs = %+v", status.Sessions[0].Jobs)
 	}
 	if len(status.VMs) != 1 || status.VMs[0].ID != "vm1" || status.VMs[0].Status != "running" {
 		t.Fatalf("status VMs = %+v", status.VMs)
@@ -122,7 +127,7 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 	}
 
 	rr = httptest.NewRecorder()
-	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPatch, "/vmsh/sessions/"+created.ID, bytes.NewBufferString(`{"host_cwd":"/work","selected_context":{"mode":"vm","name":"dev","short":"vm:dev","source":"docker:debian","vm":"dev","image":"debian","cwd":"/repo","user":"root","isolated":true}}`)))
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPatch, "/vmsh/sessions/"+created.ID, bytes.NewBufferString(`{"host_cwd":"/work","selected_context":{"mode":"vm","name":"dev","short":"vm:dev","source":"docker:debian","vm":"dev","image":"debian","cwd":"/repo","user":"root","isolated":true},"jobs":[{"id":1,"context":"vm:dev","command":"make","status":"running","control":"vm:dev","logs":"@jobs logs 1","started_at":"2026-06-25T00:00:00Z"}]}`)))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("update status = %d body=%s", rr.Code, rr.Body.String())
 	}
@@ -132,6 +137,9 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 	}
 	if updated.ID != created.ID || updated.HostCWD != "/work" || updated.SelectedContext == nil || updated.SelectedContext.Mode != "vm" || updated.SelectedContext.VMID != "dev" || updated.SelectedContext.CWD != "/repo" || !updated.SelectedContext.Isolated {
 		t.Fatalf("updated session = %+v", updated)
+	}
+	if len(updated.Jobs) != 1 || updated.Jobs[0].Command != "make" || updated.Jobs[0].Status != "running" {
+		t.Fatalf("updated jobs = %+v", updated.Jobs)
 	}
 
 	rr = httptest.NewRecorder()
@@ -149,6 +157,22 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 	if sessions[0].HostCWD != updated.HostCWD || sessions[0].SelectedContext == nil || sessions[0].SelectedContext.Short != "vm:dev" {
 		t.Fatalf("session summary metadata = %+v, want %+v", sessions[0], updated)
 	}
+	if len(sessions[0].Jobs) != 1 || sessions[0].Jobs[0].Logs != "@jobs logs 1" {
+		t.Fatalf("session summary jobs = %+v", sessions[0].Jobs)
+	}
+
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/vmsh/jobs", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("jobs status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var jobs []JobSummary
+	if err := json.NewDecoder(rr.Body).Decode(&jobs); err != nil {
+		t.Fatalf("decode jobs: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].SessionID != created.ID || jobs[0].Command != "make" {
+		t.Fatalf("jobs = %+v", jobs)
+	}
 
 	rr = httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/vmsh/sessions/"+created.ID, nil))
@@ -164,6 +188,9 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 	}
 	if read.HostCWD != updated.HostCWD || read.SelectedContext == nil || read.SelectedContext.Name != "dev" {
 		t.Fatalf("read session metadata = %+v, want %+v", read, updated)
+	}
+	if len(read.Jobs) != 1 || read.Jobs[0].Context != "vm:dev" {
+		t.Fatalf("read session jobs = %+v", read.Jobs)
 	}
 
 	rr = httptest.NewRecorder()

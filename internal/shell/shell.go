@@ -83,6 +83,7 @@ type shellState struct {
 	env              map[string]string
 	contextEnv       map[string]map[string]string
 	aliases          map[string]string
+	vmshd            *vmshdSessionReporter
 	confirmPull      func(string, io.Writer) (bool, error)
 	confirmVMRestart func(string, io.Writer) (bool, error)
 	confirmSSHHost   func(resolvedSSHConfig, string, net.Addr, ssh.PublicKey) (bool, error)
@@ -130,6 +131,13 @@ type shellJob struct {
 	Control     string
 	Log         []byte
 	LogDropped  bool
+}
+
+type vmshdSessionReporter struct {
+	client    *vmshd.HTTPClient
+	sessionID string
+	hostCWD   string
+	context   commandContext
 }
 
 type hostShellInit struct {
@@ -1171,10 +1179,11 @@ func Run(args []string) error {
 		return err
 	}
 	if haveDaemonState {
-		stopVMSHDSession, err := startVMSHDSession(daemonState, os.Stdout, vmshdSessionMetadata(sh.hostCWD, sh.context))
+		reporter, stopVMSHDSession, err := startVMSHDSession(daemonState, os.Stdout, vmshdSessionMetadata(sh.hostCWD, sh.context), sh.context)
 		if err != nil {
 			return err
 		}
+		sh.vmshd = reporter
 		defer stopVMSHDSession()
 	}
 	if *startVM {
@@ -1202,20 +1211,20 @@ func daemonStateFilename(launch backend.CCVMLaunch) string {
 	return "ccvm.json"
 }
 
-func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmshd.UpdateSessionRequest) (func(), error) {
+func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmshd.UpdateSessionRequest, ctx commandContext) (*vmshdSessionReporter, func(), error) {
 	if state.Kind != vmshd.Kind {
-		return func() {}, nil
+		return nil, func() {}, nil
 	}
 	client, err := vmshd.NewHTTPClient(state)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	session, err := client.CreateSession(vmshd.CreateSessionRequest{Name: "main"})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if _, err := client.UpdateSession(session.ID, metadata); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	attachReq := vmshd.AttachSessionRequest{Mode: "interactive"}
 	if output != nil {
@@ -1226,9 +1235,15 @@ func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmsh
 	}
 	attached, err := client.AttachSession(session.ID, attachReq)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return func() {
+	reporter := &vmshdSessionReporter{
+		client:    client,
+		sessionID: session.ID,
+		hostCWD:   metadata.HostCWD,
+		context:   ctx,
+	}
+	return reporter, func() {
 		_, _ = client.DetachSession(session.ID, vmshd.DetachSessionRequest{AttachmentID: attached.Attachment.ID})
 	}, nil
 }
@@ -1249,6 +1264,62 @@ func vmshdSessionMetadata(hostCWD string, ctx commandContext) vmshd.UpdateSessio
 			Isolated: ctx.Isolated,
 		},
 	}
+}
+
+func (s *shellState) publishVMSHDSessionJobs() {
+	if s.vmshd == nil {
+		return
+	}
+	jobs := s.vmshdJobSummaries()
+	s.vmshd.publish(jobs)
+}
+
+func (s *shellState) vmshdJobSummaries() []vmshd.JobSummary {
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	out := make([]vmshd.JobSummary, 0, len(s.jobs))
+	for _, job := range s.jobs {
+		out = append(out, vmshdJobSummary(job))
+	}
+	return out
+}
+
+func vmshdJobSummary(job shellJob) vmshd.JobSummary {
+	return vmshd.JobSummary{
+		ID:         job.ID,
+		Context:    emptyText(job.ContextText, jobContextText(job.Context)),
+		Command:    job.Command,
+		Status:     jobStatus(job),
+		ExitCode:   job.Code,
+		Error:      job.Err,
+		Control:    job.Control,
+		Logs:       fmt.Sprintf("@jobs logs %d", job.ID),
+		LogDropped: job.LogDropped,
+		StartedAt:  job.Started,
+		FinishedAt: job.Finished,
+	}
+}
+
+func jobStatus(job shellJob) string {
+	if !job.Done {
+		return "running"
+	}
+	if job.Lost {
+		return "lost"
+	}
+	if job.Err != "" {
+		return "error"
+	}
+	return "done"
+}
+
+func (r *vmshdSessionReporter) publish(jobs []vmshd.JobSummary) {
+	if r == nil || r.client == nil || strings.TrimSpace(r.sessionID) == "" {
+		return
+	}
+	req := vmshdSessionMetadata(r.hostCWD, r.context)
+	req.Jobs = jobs
+	_, _ = r.client.UpdateSession(r.sessionID, req)
 }
 
 func defaultContext(vmID, image string, nestedVirt bool) commandContext {
@@ -2510,6 +2581,7 @@ func (s *shellState) startBackgroundJob(ctx commandContext, line string, stdout,
 	})
 	idx := len(s.jobs) - 1
 	s.jobsMu.Unlock()
+	s.publishVMSHDSessionJobs()
 	fmt.Fprintf(stdout, "[%d] running context=%s %s\n    logs: @jobs logs %d\n", id, contextText, line, id)
 	go func() {
 		logs := jobLogWriter{shell: s, index: idx}
@@ -2527,6 +2599,7 @@ func (s *shellState) startBackgroundJob(ctx commandContext, line string, stdout,
 			s.jobs[idx].Err = err.Error()
 		}
 		s.jobsMu.Unlock()
+		s.publishVMSHDSessionJobs()
 		_ = stderr
 	}()
 	return nil
@@ -8553,7 +8626,7 @@ func (s *shellState) markJobsLostForSSHKey(key string, reason string) {
 
 func (s *shellState) markJobsLost(match func(shellJob) bool, reason string) {
 	s.jobsMu.Lock()
-	defer s.jobsMu.Unlock()
+	changed := false
 	for i := range s.jobs {
 		if s.jobs[i].Done || !match(s.jobs[i]) {
 			continue
@@ -8563,6 +8636,11 @@ func (s *shellState) markJobsLost(match func(shellJob) bool, reason string) {
 		s.jobs[i].Code = -1
 		s.jobs[i].Finished = time.Now()
 		s.jobs[i].Err = reason
+		changed = true
+	}
+	s.jobsMu.Unlock()
+	if changed {
+		s.publishVMSHDSessionJobs()
 	}
 }
 

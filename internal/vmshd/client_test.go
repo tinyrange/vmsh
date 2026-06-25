@@ -70,6 +70,13 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 			Attachment: ClientAttachment{ID: "attach_1", Mode: "interactive", Terminal: &req},
 		})
 	})
+	mux.HandleFunc("/vmsh/jobs", func(w http.ResponseWriter, r *http.Request) {
+		requireBearer(t, r)
+		if r.Method != http.MethodGet {
+			t.Fatalf("jobs method = %s", r.Method)
+		}
+		writeJSON(w, http.StatusOK, []JobSummary{{ID: 1, SessionID: "sess_1", Command: "make", Status: "running"}})
+	})
 	mux.HandleFunc("/vmsh/sessions/sess_1/detach", func(w http.ResponseWriter, r *http.Request) {
 		requireBearer(t, r)
 		var req DetachSessionRequest
@@ -128,6 +135,13 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 	}
 	if resized.Attachment.Terminal == nil || resized.Attachment.Terminal.Cols != 100 {
 		t.Fatalf("resized = %+v", resized)
+	}
+	jobs, err := client.Jobs()
+	if err != nil {
+		t.Fatalf("jobs: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].SessionID != "sess_1" || jobs[0].Command != "make" {
+		t.Fatalf("jobs = %+v", jobs)
 	}
 	detached, err := client.DetachSession(session.ID, DetachSessionRequest{AttachmentID: attached.Attachment.ID})
 	if err != nil {

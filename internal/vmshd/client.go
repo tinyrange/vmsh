@@ -42,6 +42,12 @@ func (c *HTTPClient) UpdateSession(id string, req UpdateSessionRequest) (Session
 	return session, err
 }
 
+func (c *HTTPClient) Jobs() ([]JobSummary, error) {
+	var jobs []JobSummary
+	err := c.doJSON(http.MethodGet, "/vmsh/jobs", nil, &jobs)
+	return jobs, err
+}
+
 func (c *HTTPClient) AttachSession(id string, req AttachSessionRequest) (AttachSessionResponse, error) {
 	var resp AttachSessionResponse
 	err := c.doJSON(http.MethodPost, "/vmsh/sessions/"+id+"/attach", req, &resp)
