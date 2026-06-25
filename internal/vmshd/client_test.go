@@ -1,6 +1,7 @@
 package vmshd
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -8,8 +9,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tinyrange/vmsh/internal/backend"
+	"golang.org/x/net/websocket"
 )
 
 func TestHTTPClientSessionLifecycle(t *testing.T) {
@@ -150,6 +153,86 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 	}
 	if detached.State != "detached" {
 		t.Fatalf("detached = %+v", detached)
+	}
+}
+
+func TestHTTPClientDialTerminalStream(t *testing.T) {
+	resized := make(chan Terminal, 1)
+	mux := http.NewServeMux()
+	mux.Handle("/vmsh/sessions/sess_1/attachments/attach_1/stream", websocket.Server{
+		Handshake: func(_ *websocket.Config, r *http.Request) error {
+			requireBearer(t, r)
+			return nil
+		},
+		Handler: func(ws *websocket.Conn) {
+			if err := websocket.JSON.Send(ws, TerminalStreamMessage{
+				Kind:   "attached",
+				Stream: &StreamSummary{ID: "terminal_stream_1", Kind: "terminal", SessionID: "sess_1", AttachmentID: "attach_1"},
+			}); err != nil {
+				t.Errorf("send attached: %v", err)
+				return
+			}
+			var msg TerminalStreamMessage
+			if err := websocket.JSON.Receive(ws, &msg); err != nil {
+				t.Errorf("receive resize: %v", err)
+				return
+			}
+			if msg.Kind != "resize" || msg.Terminal == nil {
+				t.Errorf("resize message = %+v", msg)
+				return
+			}
+			resized <- *msg.Terminal
+		},
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	client, err := NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	stream, err := client.DialTerminalStream(context.Background(), "sess_1", "attach_1")
+	if err != nil {
+		t.Fatalf("dial terminal stream: %v", err)
+	}
+	defer stream.Close()
+	msg, err := stream.Receive()
+	if err != nil {
+		t.Fatalf("receive attached: %v", err)
+	}
+	if msg.Kind != "attached" || msg.Stream == nil || msg.Stream.Kind != "terminal" || msg.Stream.AttachmentID != "attach_1" {
+		t.Fatalf("attached message = %+v", msg)
+	}
+	if err := stream.Resize(Terminal{Cols: 120, Rows: 50}); err != nil {
+		t.Fatalf("resize: %v", err)
+	}
+	select {
+	case got := <-resized:
+		if got.Cols != 120 || got.Rows != 50 {
+			t.Fatalf("resize terminal = %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for resize")
+	}
+}
+
+func TestWebSocketURL(t *testing.T) {
+	got, err := websocketURL("https://example.test/base?x=1", "/vmsh/events")
+	if err != nil {
+		t.Fatalf("websocketURL: %v", err)
+	}
+	if got != "wss://example.test/vmsh/events" {
+		t.Fatalf("websocketURL = %q", got)
+	}
+	if _, err := websocketURL("unix:///tmp/vmshd.sock", "/vmsh/events"); err == nil {
+		t.Fatal("unsupported websocket URL unexpectedly succeeded")
 	}
 }
 

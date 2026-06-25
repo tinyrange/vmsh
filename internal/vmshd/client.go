@@ -2,13 +2,17 @@ package vmshd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/tinyrange/vmsh/internal/backend"
+	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
 )
 
@@ -16,6 +20,12 @@ type HTTPClient struct {
 	baseURL string
 	token   string
 	client  *http.Client
+}
+
+type TerminalStream struct {
+	ws        *websocket.Conn
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 func NewHTTPClient(state backend.DaemonState) (*HTTPClient, error) {
@@ -61,6 +71,72 @@ func (c *HTTPClient) UpdateTerminal(sessionID, attachmentID string, req Terminal
 	return resp, err
 }
 
+func (c *HTTPClient) DialTerminalStream(ctx context.Context, sessionID, attachmentID string) (*TerminalStream, error) {
+	path := "/vmsh/sessions/" + url.PathEscape(sessionID) + "/attachments/" + url.PathEscape(attachmentID) + "/stream"
+	wsURL, err := websocketURL(c.baseURL, path)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := websocket.NewConfig(wsURL, c.baseURL)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Header == nil {
+		cfg.Header = http.Header{}
+	}
+	cfg.Header.Set("Authorization", "Bearer "+c.token)
+	ws, err := websocket.DialConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	stream := &TerminalStream{ws: ws, done: make(chan struct{})}
+	if ctx != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = stream.Close()
+			case <-stream.done:
+			}
+		}()
+	}
+	return stream, nil
+}
+
+func (s *TerminalStream) Send(msg TerminalStreamMessage) error {
+	if s == nil || s.ws == nil {
+		return fmt.Errorf("terminal stream is closed")
+	}
+	return websocket.JSON.Send(s.ws, msg)
+}
+
+func (s *TerminalStream) Receive() (TerminalStreamMessage, error) {
+	var msg TerminalStreamMessage
+	if s == nil || s.ws == nil {
+		return msg, fmt.Errorf("terminal stream is closed")
+	}
+	err := websocket.JSON.Receive(s.ws, &msg)
+	return msg, err
+}
+
+func (s *TerminalStream) Resize(term Terminal) error {
+	return s.Send(TerminalStreamMessage{Kind: "resize", Terminal: &term})
+}
+
+func (s *TerminalStream) Close() error {
+	if s == nil {
+		return nil
+	}
+	var err error
+	s.closeOnce.Do(func() {
+		close(s.done)
+		if s.ws != nil {
+			err = s.ws.Close()
+			s.ws = nil
+		}
+	})
+	return err
+}
+
 func (c *HTTPClient) DetachSession(id string, req DetachSessionRequest) (Session, error) {
 	var session Session
 	err := c.doJSON(http.MethodPost, "/vmsh/sessions/"+id+"/detach", req, &session)
@@ -100,4 +176,23 @@ func (c *HTTPClient) doJSON(method, path string, reqBody any, respBody any) erro
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(respBody)
+}
+
+func websocketURL(baseURL, path string) (string, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "", err
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	default:
+		return "", fmt.Errorf("unsupported base URL scheme %q", u.Scheme)
+	}
+	u.Path = path
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String(), nil
 }
