@@ -1057,11 +1057,11 @@ func Run(args []string) error {
 	if err != nil {
 		return err
 	}
-	statePath := filepath.Join(rootCache, "ccvm.json")
 	ccvmLaunch, err := backend.ResolveCCVMPath(*ccvmPath, bundledCCVMAvailable())
 	if err != nil {
 		return err
 	}
+	statePath := filepath.Join(rootCache, daemonStateFilename(ccvmLaunch))
 	vmshPath, err := os.Executable()
 	if err != nil {
 		return err
@@ -1168,6 +1168,15 @@ func Run(args []string) error {
 		return sh.runScript(f, stdout, stderr)
 	}
 	return sh.loop(os.Stdin, stdout, stderr)
+}
+
+func daemonStateFilename(launch backend.CCVMLaunch) string {
+	for _, env := range launch.Env {
+		if env == backend.InternalVMSHDEnv+"=1" {
+			return "vmshd.json"
+		}
+	}
+	return "ccvm.json"
 }
 
 func defaultContext(vmID, image string, nestedVirt bool) commandContext {

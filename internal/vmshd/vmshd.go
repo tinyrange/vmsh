@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tinyrange/vmsh/internal/backend"
@@ -21,20 +23,43 @@ import (
 const Kind = "vmshd"
 
 type Status struct {
-	Kind      string           `json:"kind"`
-	Status    string           `json:"status"`
-	Sessions  []SessionSummary `json:"sessions"`
-	StartedAt time.Time        `json:"started_at"`
+	Kind      string                 `json:"kind"`
+	Status    string                 `json:"status"`
+	Sessions  []SessionSummary       `json:"sessions"`
+	VMs       []client.InstanceState `json:"vms"`
+	StartedAt time.Time              `json:"started_at"`
+}
+
+type Session struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	State     string    `json:"state"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type SessionSummary struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	State string `json:"state"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	State     string    `json:"state"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type CreateSessionRequest struct {
+	Name string `json:"name,omitempty"`
+}
+
+type sessionRegistry struct {
+	mu       sync.Mutex
+	next     int
+	sessions map[string]Session
 }
 
 type Server struct {
-	token     string
+	token    string
+	registry *sessionRegistry
+
 	startedAt time.Time
 }
 
@@ -65,26 +90,73 @@ func Run(args []string) (bool, error) {
 		return false, err
 	}
 
-	srv := &Server{token: token, startedAt: time.Now()}
+	srv := NewServer(token)
 	return ccvmd.RunServer(args, ccvmd.ServerOptions{
 		Kind:      Kind,
 		TokenPath: tokenPath,
-		RegisterHandlers: func(mux *http.ServeMux) {
-			srv.RegisterHandlers(mux)
+		RegisterHandlers: func(mux *http.ServeMux, runtime ccvmd.RuntimeView) {
+			srv.RegisterHandlers(mux, runtime)
 		},
 		WrapHandler: srv.Authenticate,
 	})
 }
 
-func (s *Server) RegisterHandlers(mux *http.ServeMux) {
+func NewServer(token string) *Server {
+	return &Server{
+		token:     token,
+		registry:  newSessionRegistry(),
+		startedAt: time.Now(),
+	}
+}
+
+func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView) {
 	mux.HandleFunc("GET /vmsh/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, Status{
 			Kind:      Kind,
 			Status:    "ok",
-			Sessions:  []SessionSummary{},
+			Sessions:  s.registry.List(),
+			VMs:       runtimeInstanceStatuses(runtime),
 			StartedAt: s.startedAt,
 		})
 	})
+	mux.HandleFunc("GET /vmsh/sessions", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, s.registry.List())
+	})
+	mux.HandleFunc("POST /vmsh/sessions", func(w http.ResponseWriter, r *http.Request) {
+		var req CreateSessionRequest
+		if err := decodeOptionalJSON(r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, client.ErrorResponse{Error: err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, s.registry.Create(req.Name))
+	})
+	mux.HandleFunc("GET /vmsh/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
+		session, ok := s.registry.Get(r.PathValue("id"))
+		if !ok {
+			writeJSON(w, http.StatusNotFound, client.ErrorResponse{Error: "session not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, session)
+	})
+	mux.HandleFunc("DELETE /vmsh/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
+		session, ok := s.registry.Delete(r.PathValue("id"))
+		if !ok {
+			writeJSON(w, http.StatusNotFound, client.ErrorResponse{Error: "session not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, session)
+	})
+}
+
+func runtimeInstanceStatuses(runtime ccvmd.RuntimeView) []client.InstanceState {
+	if runtime == nil {
+		return []client.InstanceState{}
+	}
+	statuses := runtime.InstanceStatuses()
+	if statuses == nil {
+		return []client.InstanceState{}
+	}
+	return statuses
 }
 
 func (s *Server) Authenticate(next http.Handler) http.Handler {
@@ -169,6 +241,84 @@ func newToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf[:]), nil
+}
+
+func newSessionRegistry() *sessionRegistry {
+	return &sessionRegistry{sessions: map[string]Session{}}
+}
+
+func (r *sessionRegistry) Create(name string) Session {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.next++
+	id := fmt.Sprintf("sess_%08x", r.next)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = id
+	}
+	now := time.Now()
+	session := Session{
+		ID:        id,
+		Name:      name,
+		State:     "detached",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	r.sessions[id] = session
+	return session
+}
+
+func (r *sessionRegistry) Get(id string) (Session, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	session, ok := r.sessions[strings.TrimSpace(id)]
+	return session, ok
+}
+
+func (r *sessionRegistry) Delete(id string) (Session, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id = strings.TrimSpace(id)
+	session, ok := r.sessions[id]
+	if !ok {
+		return Session{}, false
+	}
+	session.State = "closing"
+	session.UpdatedAt = time.Now()
+	delete(r.sessions, id)
+	return session, true
+}
+
+func (r *sessionRegistry) List() []SessionSummary {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ids := make([]string, 0, len(r.sessions))
+	for id := range r.sessions {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]SessionSummary, 0, len(ids))
+	for _, id := range ids {
+		session := r.sessions[id]
+		out = append(out, SessionSummary{
+			ID:        session.ID,
+			Name:      session.Name,
+			State:     session.State,
+			CreatedAt: session.CreatedAt,
+			UpdatedAt: session.UpdatedAt,
+		})
+	}
+	return out
+}
+
+func decodeOptionalJSON(r *http.Request, dst any) error {
+	if r.Body == nil || r.ContentLength == 0 {
+		return nil
+	}
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		return fmt.Errorf("decode request body: %w", err)
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

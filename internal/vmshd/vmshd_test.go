@@ -1,6 +1,7 @@
 package vmshd
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +9,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"j5.nz/cc/client"
 )
 
 func TestTokenFileIsPrivate(t *testing.T) {
@@ -31,7 +34,7 @@ func TestTokenFileIsPrivate(t *testing.T) {
 }
 
 func TestAuthenticateRequiresBearerToken(t *testing.T) {
-	srv := &Server{token: "secret"}
+	srv := NewServer("secret")
 	handler := srv.Authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -61,9 +64,11 @@ func TestAuthenticateRequiresBearerToken(t *testing.T) {
 }
 
 func TestStatusRoute(t *testing.T) {
-	srv := &Server{token: "secret"}
+	srv := NewServer("secret")
 	mux := http.NewServeMux()
-	srv.RegisterHandlers(mux)
+	runtime := fakeRuntimeView{statuses: []client.InstanceState{{ID: "vm1", Status: "running"}}}
+	srv.RegisterHandlers(mux, runtime)
+	session := srv.registry.Create("main")
 
 	req := httptest.NewRequest(http.MethodGet, "/vmsh/status", nil)
 	rr := httptest.NewRecorder()
@@ -75,7 +80,97 @@ func TestStatusRoute(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&status); err != nil {
 		t.Fatalf("decode status: %v", err)
 	}
-	if status.Kind != Kind || status.Status != "ok" || len(status.Sessions) != 0 {
+	if status.Kind != Kind || status.Status != "ok" || len(status.Sessions) != 1 {
 		t.Fatalf("status = %+v", status)
 	}
+	if status.Sessions[0].ID != session.ID || status.Sessions[0].Name != "main" || status.Sessions[0].State != "detached" {
+		t.Fatalf("status sessions = %+v, want session %+v", status.Sessions, session)
+	}
+	if len(status.VMs) != 1 || status.VMs[0].ID != "vm1" || status.VMs[0].Status != "running" {
+		t.Fatalf("status VMs = %+v", status.VMs)
+	}
+}
+
+func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, nil)
+
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/vmsh/sessions", bytes.NewBufferString(`{"name":"main"}`)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("create status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var created Session
+	if err := json.NewDecoder(rr.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created session: %v", err)
+	}
+	if created.ID == "" || created.Name != "main" || created.State != "detached" {
+		t.Fatalf("created session = %+v", created)
+	}
+
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/vmsh/sessions", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var sessions []SessionSummary
+	if err := json.NewDecoder(rr.Body).Decode(&sessions); err != nil {
+		t.Fatalf("decode sessions: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != created.ID || sessions[0].Name != "main" {
+		t.Fatalf("sessions = %+v, want created %+v", sessions, created)
+	}
+
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/vmsh/sessions/"+created.ID, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("read status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var read Session
+	if err := json.NewDecoder(rr.Body).Decode(&read); err != nil {
+		t.Fatalf("decode read session: %v", err)
+	}
+	if read.ID != created.ID || read.Name != created.Name {
+		t.Fatalf("read session = %+v, want %+v", read, created)
+	}
+
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/vmsh/sessions/"+created.ID, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("delete status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var deleted Session
+	if err := json.NewDecoder(rr.Body).Decode(&deleted); err != nil {
+		t.Fatalf("decode deleted session: %v", err)
+	}
+	if deleted.ID != created.ID || deleted.State != "closing" {
+		t.Fatalf("deleted session = %+v", deleted)
+	}
+
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/vmsh/sessions/"+created.ID, nil))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("read deleted status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestCreateSessionRejectsBadJSON(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, nil)
+
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/vmsh/sessions", bytes.NewBufferString("{")))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+type fakeRuntimeView struct {
+	statuses []client.InstanceState
+}
+
+func (f fakeRuntimeView) InstanceStatuses() []client.InstanceState {
+	return f.statuses
 }

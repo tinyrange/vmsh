@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/tinyrange/vmsh/internal/backend"
 	cryptossh "golang.org/x/crypto/ssh"
 	"j5.nz/cc/client"
 )
@@ -267,6 +268,16 @@ func TestResolveCacheDirKeepsExplicitDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(explicit); err != nil {
 		t.Fatalf("stat explicit cache: %v", err)
+	}
+}
+
+func TestDaemonStateFilenameUsesVMSHDForEmbeddedLaunch(t *testing.T) {
+	if got := daemonStateFilename(backend.CCVMLaunch{}); got != "ccvm.json" {
+		t.Fatalf("plain launch state file = %q, want ccvm.json", got)
+	}
+	launch := backend.CCVMLaunch{Env: []string{backend.InternalVMSHDEnv + "=1"}}
+	if got := daemonStateFilename(launch); got != "vmshd.json" {
+		t.Fatalf("vmshd launch state file = %q, want vmshd.json", got)
 	}
 }
 
