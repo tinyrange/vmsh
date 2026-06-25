@@ -102,7 +102,7 @@ func TestResolveCCVMPathExplicitBundledAndPathFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve bundled ccvm: %v", err)
 	}
-	if bundled.Path != exe || len(bundled.Env) != 1 || bundled.Env[0] != InternalCCVMEnv+"=1" {
+	if bundled.Path != exe || len(bundled.Env) != 1 || bundled.Env[0] != InternalVMSHDEnv+"=1" {
 		t.Fatalf("bundled launch = %+v, executable %q", bundled, exe)
 	}
 
@@ -176,6 +176,71 @@ func TestConnectCCVMWithOptionsReportsDaemonReuse(t *testing.T) {
 	}
 	if err := api.HealthCheck(); err != nil {
 		t.Fatalf("reused client health check: %v", err)
+	}
+}
+
+func TestConnectCCVMWithOptionsReusesAuthenticatedDaemon(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	mux := http.NewServeMux()
+	requireAuth := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "Bearer secret" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			next(w, r)
+		}
+	}
+	mux.HandleFunc("/healthz", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	mux.HandleFunc("/capabilities", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"host":"test","vm_supported":true}`))
+	}))
+	mux.HandleFunc("/watchdog/lease", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	mux.HandleFunc("/vm/start", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	srv := &http.Server{Handler: mux}
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+	t.Cleanup(func() {
+		_ = srv.Close()
+	})
+
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	statePath := filepath.Join(dir, "ccvm.json")
+	launch := CCVMLaunch{Path: "/missing/ccvm"}
+	state := DaemonState{Addr: ln.Addr().String(), Kind: "vmshd", TokenPath: tokenPath, LaunchKey: DaemonLaunchKey(launch)}
+	if err := WriteDaemonState(statePath, state); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+
+	var reused DaemonState
+	api, err := ConnectCCVMWithOptions(launch, t.TempDir(), statePath, ConnectOptions{
+		OnReuse: func(state DaemonState) {
+			reused = state
+		},
+	})
+	if err != nil {
+		t.Fatalf("connect authenticated daemon: %v", err)
+	}
+	if reused != state {
+		t.Fatalf("reused state = %+v, want %+v", reused, state)
+	}
+	if err := api.HealthCheck(); err != nil {
+		t.Fatalf("authenticated health check: %v", err)
 	}
 }
 

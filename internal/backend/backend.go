@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +17,7 @@ import (
 )
 
 const InternalCCVMEnv = "VMSH_INTERNAL_CCVM"
+const InternalVMSHDEnv = "VMSH_INTERNAL_VMSHD"
 const InternalCCVMSidecarModeEnv = "CCX3_CCVM_SIDECAR_MODE"
 const InternalCCVMSidecarMode = "vmsh-internal"
 
@@ -46,6 +46,8 @@ type API interface {
 
 type DaemonState struct {
 	Addr      string `json:"addr"`
+	Kind      string `json:"kind,omitempty"`
+	TokenPath string `json:"token_path,omitempty"`
 	LaunchKey string `json:"launch_key,omitempty"`
 }
 
@@ -69,7 +71,7 @@ func ResolveCCVMPath(path string, bundledAvailable bool) (CCVMLaunch, error) {
 		}
 	}
 	if bundledAvailable {
-		return CCVMLaunch{Path: exePath, Env: []string{InternalCCVMEnv + "=1"}}, nil
+		return CCVMLaunch{Path: exePath, Env: []string{InternalVMSHDEnv + "=1"}}, nil
 	}
 	if found, err := exec.LookPath("ccvm"); err == nil {
 		return CCVMLaunch{Path: found}, nil
@@ -115,7 +117,9 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 	launchKey := DaemonLaunchKey(launch)
 	if state, err := ReadDaemonState(statePath); err == nil {
 		api := NewClient(state.Addr)
-		if state.LaunchKey == launchKey && api.HealthCheck() == nil && apiCompatible(state.Addr, api) {
+		if err := ApplyDaemonStateAuth(api, state); err != nil {
+			_ = os.Remove(statePath)
+		} else if state.LaunchKey == launchKey && api.HealthCheck() == nil && apiCompatible(api) {
 			if opts.OnReuse != nil {
 				opts.OnReuse(state)
 			}
@@ -150,13 +154,19 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		_ = proc.Wait()
 		return nil, err
 	}
-	state := DaemonState{Addr: hello.Addr, LaunchKey: launchKey}
+	state := DaemonState{Addr: hello.Addr, Kind: hello.Kind, TokenPath: hello.TokenPath, LaunchKey: launchKey}
 	if err := WriteDaemonState(statePath, state); err != nil {
 		_ = proc.Process.Kill()
 		_ = proc.Wait()
 		return nil, fmt.Errorf("write daemon state %s for %s: %w", statePath, hello.Addr, err)
 	}
 	api := NewClient(hello.Addr)
+	if err := ApplyDaemonStateAuth(api, state); err != nil {
+		_ = os.Remove(statePath)
+		_ = proc.Process.Kill()
+		_ = proc.Wait()
+		return nil, fmt.Errorf("read daemon auth token: %w", err)
+	}
 	if err := api.HealthCheck(); err != nil {
 		_ = os.Remove(statePath)
 		_ = proc.Process.Kill()
@@ -169,7 +179,7 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 	return api, nil
 }
 
-func apiCompatible(addr string, api *client.Client) bool {
+func apiCompatible(api *client.Client) bool {
 	if api == nil {
 		return false
 	}
@@ -178,20 +188,11 @@ func apiCompatible(addr string, api *client.Client) bool {
 		return false
 	}
 	for _, route := range []string{"/watchdog/lease", "/vm/start"} {
-		if !daemonRouteExists(addr, route) {
+		if !api.RouteExists(route) {
 			return false
 		}
 	}
 	return true
-}
-
-func daemonRouteExists(addr, route string) bool {
-	resp, err := http.Get("http://" + addr + route)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	return resp.StatusCode != http.StatusNotFound
 }
 
 func CCVMLaunchName(launch CCVMLaunch) string {
@@ -233,6 +234,37 @@ func NewClient(addr string) *client.Client {
 	return client.NewClient("http://"+addr, func() (net.Conn, error) {
 		return net.Dial("tcp", addr)
 	})
+}
+
+func ApplyDaemonStateAuth(api *client.Client, state DaemonState) error {
+	if api == nil || strings.TrimSpace(state.TokenPath) == "" {
+		return nil
+	}
+	token, err := ReadDaemonToken(state.TokenPath)
+	if err != nil {
+		return err
+	}
+	api.SetBearerToken(token)
+	return nil
+}
+
+func ReadDaemonToken(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("token file %s has mode %o, want private permissions", path, info.Mode().Perm())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		return "", fmt.Errorf("token file %s is empty", path)
+	}
+	return token, nil
 }
 
 func StartDaemonLease(api watchdogAPI) (func(), error) {
