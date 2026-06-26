@@ -541,6 +541,63 @@ func TestDaemonOwnedHostJobCanBeCanceled(t *testing.T) {
 	})
 }
 
+func TestDaemonOwnedVMJobRunsThroughRuntime(t *testing.T) {
+	runSeen := make(chan client.RunRequest, 1)
+	runtime := fakeRuntimeView{
+		runStream: func(_ context.Context, id string, req client.RunRequest, _ <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+			if id != "dev" {
+				t.Fatalf("runtime id = %q", id)
+			}
+			runSeen <- req
+			if err := onEvent(client.ExecEvent{Kind: "stdout", Output: "vm-job:ok\n"}); err != nil {
+				return err
+			}
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+		},
+	}
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, runtime)
+	session := srv.registry.Create("main")
+	httpSrv := httptest.NewServer(srv.Authenticate(mux))
+	defer httpSrv.Close()
+
+	body := `{"kind":"vm","vm":"dev","context":"vm:dev","run":{"image":"ubuntu","command":["sh","-lc","printf ok"],"workdir":"/work","user":"1000:1000"}}`
+	req, err := http.NewRequest(http.MethodPost, httpSrv.URL+"/vmsh/sessions/"+session.ID+"/jobs", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("new job request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("start job: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("start job status = %d", resp.StatusCode)
+	}
+	var started JobSummary
+	if err := json.NewDecoder(resp.Body).Decode(&started); err != nil {
+		t.Fatalf("decode started job: %v", err)
+	}
+	if started.ID == 0 || started.Context != "vm:dev" || started.Control != "vmshd" || started.Status != "running" {
+		t.Fatalf("started job = %+v", started)
+	}
+	select {
+	case got := <-runSeen:
+		if got.Image != "ubuntu" || got.WorkDir != "/work" || got.User != "1000:1000" {
+			t.Fatalf("runtime request = %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for runtime run")
+	}
+	requireEventually(t, func() bool {
+		jobs := getJobsFromServer(t, httpSrv.URL, "secret")
+		return len(jobs) == 1 && jobs[0].ID == started.ID && jobs[0].Status == "exited" && jobs[0].Logs == "vm-job:ok\n"
+	})
+}
+
 func TestDaemonHostJobHelper(t *testing.T) {
 	if os.Getenv("VMSHD_TEST_HOST_JOB") != "1" {
 		return
@@ -849,9 +906,17 @@ func TestCreateSessionRejectsBadJSON(t *testing.T) {
 }
 
 type fakeRuntimeView struct {
-	statuses []client.InstanceState
+	statuses  []client.InstanceState
+	runStream func(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 }
 
 func (f fakeRuntimeView) InstanceStatuses() []client.InstanceState {
 	return f.statuses
+}
+
+func (f fakeRuntimeView) RunStreamIn(ctx context.Context, id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	if f.runStream != nil {
+		return f.runStream(ctx, id, req, inputs, onEvent)
+	}
+	return fmt.Errorf("run stream is not configured")
 }

@@ -2891,6 +2891,76 @@ func TestStartBackgroundHostJobUsesVMSHD(t *testing.T) {
 	}
 }
 
+func TestStartBackgroundVMJobUsesVMSHD(t *testing.T) {
+	started := make(chan vmshd.StartHostJobRequest, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/sessions/sess_1/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("job method = %s", r.Method)
+		}
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var req vmshd.StartHostJobRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode job request: %v", err)
+		}
+		started <- req
+		writeJSONForShellTest(w, vmshd.JobSummary{
+			ID:        10,
+			SessionID: "sess_1",
+			Context:   req.Context,
+			Command:   strings.Join(req.Run.Command, " "),
+			Status:    "running",
+			Control:   "vmshd",
+			StartedAt: time.Unix(9, 0),
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: defaultKernelForImage("ubuntu")}
+	sh := newUnitShell(t, api)
+	sh.vmshd = &vmshdSessionReporter{
+		client:    httpClient,
+		sessionID: "sess_1",
+		hostCWD:   sh.hostCWD,
+		context:   sh.context,
+	}
+	ctx := commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", CWD: "/repo", User: "app"}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.startBackgroundJob(ctx, "printf ok", &stdout, &stderr); err != nil {
+		t.Fatalf("start background job: %v\nstderr:\n%s", err, stderr.String())
+	}
+	req := readVMSHDHostJobStart(t, started)
+	if req.Kind != "vm" || req.VMID != "work" || req.Context != "vm:work" || req.Run == nil {
+		t.Fatalf("start request = %+v", req)
+	}
+	if req.Run.Image != "ubuntu" || req.Run.WorkDir != "/repo" || req.Run.User != "app" || len(req.Run.Command) == 0 {
+		t.Fatalf("run request = %+v", req.Run)
+	}
+	sh.jobsMu.Lock()
+	if len(sh.jobs) != 1 || sh.jobs[0].ID != 10 || sh.jobs[0].Control != "vmshd" || sh.jobs[0].Command != "printf ok" || !sh.jobs[0].Started.Equal(time.Unix(9, 0)) {
+		t.Fatalf("jobs = %+v", sh.jobs)
+	}
+	sh.jobsMu.Unlock()
+	if got, want := stdout.String(), "[10] running context=vm:work printf ok\n    logs: @jobs logs 10\n"; got != want {
+		t.Fatalf("stdout = %q", got)
+	}
+}
+
 func TestVMSHDHostJobControlUsesDaemonState(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/vmsh/jobs", func(w http.ResponseWriter, r *http.Request) {

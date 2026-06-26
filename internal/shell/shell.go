@@ -2877,7 +2877,7 @@ func stripBackground(line string) (string, bool, error) {
 }
 
 func (s *shellState) startBackgroundJob(ctx commandContext, line string, stdout, stderr io.Writer) error {
-	if handled, err := s.startVMSHDHostBackgroundJob(ctx, line, stdout); handled || err != nil {
+	if handled, err := s.startVMSHDBackgroundJob(ctx, line, stdout, stderr); handled || err != nil {
 		return err
 	}
 	bgShell := &shellState{
@@ -2935,10 +2935,21 @@ func (s *shellState) startBackgroundJob(ctx commandContext, line string, stdout,
 	return nil
 }
 
-func (s *shellState) startVMSHDHostBackgroundJob(ctx commandContext, line string, stdout io.Writer) (bool, error) {
-	if ctx.Mode != modeHost || s.vmshd == nil || s.vmshd.client == nil || strings.TrimSpace(s.vmshd.sessionID) == "" {
+func (s *shellState) startVMSHDBackgroundJob(ctx commandContext, line string, stdout, stderr io.Writer) (bool, error) {
+	if s.vmshd == nil || s.vmshd.client == nil || strings.TrimSpace(s.vmshd.sessionID) == "" {
 		return false, nil
 	}
+	switch ctx.Mode {
+	case modeHost:
+		return s.startVMSHDHostBackgroundJob(ctx, line, stdout)
+	case modeVM:
+		return s.startVMSHDGuestBackgroundJob(ctx, line, stdout, stderr)
+	default:
+		return false, nil
+	}
+}
+
+func (s *shellState) startVMSHDHostBackgroundJob(ctx commandContext, line string, stdout io.Writer) (bool, error) {
 	job, err := s.vmshd.client.StartHostJob(s.vmshd.sessionID, vmshd.StartHostJobRequest{
 		Command: []string{hostShell(), "-lc", line},
 		WorkDir: s.hostCWD,
@@ -2949,6 +2960,41 @@ func (s *shellState) startVMSHDHostBackgroundJob(ctx commandContext, line string
 		return true, err
 	}
 	contextText := jobContextText(ctx)
+	started := job.StartedAt
+	if started.IsZero() {
+		started = time.Now()
+	}
+	s.jobsMu.Lock()
+	s.jobs = append(s.jobs, shellJob{
+		ID:          job.ID,
+		Context:     ctx,
+		ContextKey:  contextSessionKey(ctx),
+		ContextText: contextText,
+		Command:     line,
+		Started:     started,
+		Control:     "vmshd",
+	})
+	s.jobsMu.Unlock()
+	fmt.Fprintf(stdout, "[%d] running context=%s %s\n    logs: @jobs logs %d\n", job.ID, contextText, line, job.ID)
+	return true, nil
+}
+
+func (s *shellState) startVMSHDGuestBackgroundJob(ctx commandContext, line string, stdout, stderr io.Writer) (bool, error) {
+	req, err := s.prepareGuestRunRequest(ctx, line, false, 0, 0, stderr)
+	if err != nil {
+		return true, err
+	}
+	vmID := backendVMID(ctx)
+	contextText := jobContextText(ctx)
+	job, err := s.vmshd.client.StartHostJob(s.vmshd.sessionID, vmshd.StartHostJobRequest{
+		Kind:    "vm",
+		VMID:    vmID,
+		Context: contextText,
+		Run:     &req,
+	})
+	if err != nil {
+		return true, err
+	}
 	started := job.StartedAt
 	if started.IsZero() {
 		started = time.Now()

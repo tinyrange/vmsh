@@ -140,10 +140,13 @@ type CopySummary struct {
 }
 
 type StartHostJobRequest struct {
-	Command []string `json:"command"`
-	WorkDir string   `json:"workdir,omitempty"`
-	Env     []string `json:"env,omitempty"`
-	Context string   `json:"context,omitempty"`
+	Command []string           `json:"command"`
+	WorkDir string             `json:"workdir,omitempty"`
+	Env     []string           `json:"env,omitempty"`
+	Context string             `json:"context,omitempty"`
+	Kind    string             `json:"kind,omitempty"`
+	VMID    string             `json:"vm,omitempty"`
+	Run     *client.RunRequest `json:"run,omitempty"`
 }
 
 type ShellHandle struct {
@@ -415,7 +418,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			writeJSON(w, http.StatusBadRequest, client.ErrorResponse{Error: err.Error()})
 			return
 		}
-		job, err := s.startHostJob(r.PathValue("id"), req)
+		job, err := s.startJob(r.PathValue("id"), req, runtime)
 		if err != nil {
 			writeSessionError(w, err)
 			return
@@ -461,10 +464,33 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 	})
 }
 
+func (s *Server) startJob(sessionID string, req StartHostJobRequest, runtime ccvmd.RuntimeView) (JobSummary, error) {
+	switch startJobKind(req) {
+	case "host":
+		return s.startHostJob(sessionID, req)
+	case "vm":
+		return s.startVMJob(sessionID, req, runtime)
+	default:
+		return JobSummary{}, sessionError{status: http.StatusBadRequest, err: "unsupported job kind"}
+	}
+}
+
+func startJobKind(req StartHostJobRequest) string {
+	kind := strings.TrimSpace(req.Kind)
+	if kind != "" {
+		return kind
+	}
+	if strings.TrimSpace(req.VMID) != "" || req.Run != nil {
+		return "vm"
+	}
+	return "host"
+}
+
 func (s *Server) startHostJob(sessionID string, req StartHostJobRequest) (JobSummary, error) {
 	if len(req.Command) == 0 || strings.TrimSpace(req.Command[0]) == "" {
 		return JobSummary{}, sessionError{status: http.StatusBadRequest, err: "command is required"}
 	}
+	req.Kind = "host"
 	sessionID = strings.TrimSpace(sessionID)
 	job, err := s.registry.StartJob(sessionID, req)
 	if err != nil {
@@ -488,6 +514,43 @@ func (s *Server) startHostJob(sessionID string, req StartHostJobRequest) (JobSum
 	return job, nil
 }
 
+func (s *Server) startVMJob(sessionID string, req StartHostJobRequest, runtime ccvmd.RuntimeView) (JobSummary, error) {
+	if runtime == nil {
+		return JobSummary{}, sessionError{status: http.StatusBadRequest, err: "runtime is required"}
+	}
+	vmID := strings.TrimSpace(req.VMID)
+	if vmID == "" {
+		return JobSummary{}, sessionError{status: http.StatusBadRequest, err: "vm is required"}
+	}
+	if req.Run == nil {
+		return JobSummary{}, sessionError{status: http.StatusBadRequest, err: "run request is required"}
+	}
+	if len(req.Run.Command) == 0 || strings.TrimSpace(req.Run.Command[0]) == "" {
+		return JobSummary{}, sessionError{status: http.StatusBadRequest, err: "command is required"}
+	}
+	req.Kind = "vm"
+	req.Context = firstNonEmpty(strings.TrimSpace(req.Context), "vm:"+vmID)
+	req.Command = append([]string(nil), req.Run.Command...)
+	sessionID = strings.TrimSpace(sessionID)
+	job, err := s.registry.StartJob(sessionID, req)
+	if err != nil {
+		return JobSummary{}, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.jobs.Track(job.ID, cancel)
+	go func() {
+		defer s.jobs.Forget(job.ID)
+		result := runVMJob(ctx, runtime, vmID, *req.Run)
+		finished, ok := s.registry.FinishJob(sessionID, job.ID, result)
+		if !ok {
+			return
+		}
+		session, _ := s.registry.Get(sessionID)
+		s.events.Publish(Event{Kind: "job_finished", Session: &session, Job: &finished})
+	}()
+	return job, nil
+}
+
 func (s *Server) cancelHostJob(sessionID string, jobID int) (JobSummary, error) {
 	job, err := s.registry.RequestCancelJob(sessionID, jobID)
 	if err != nil {
@@ -499,6 +562,86 @@ func (s *Server) cancelHostJob(sessionID string, jobID int) (JobSummary, error) 
 		}
 	}
 	return job, nil
+}
+
+func runVMJob(ctx context.Context, runtime ccvmd.RuntimeView, vmID string, req client.RunRequest) JobSummary {
+	var output strings.Builder
+	var logDropped bool
+	exitCode := 0
+	var eventErr error
+	err := runtime.RunStreamIn(ctx, vmID, req, nil, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "stdout", "stderr", "output":
+			appendJobLog(&output, execEventOutput(event), &logDropped)
+		case "exit":
+			exitCode = event.ExitCode
+		case "error":
+			eventErr = fmt.Errorf("%s", firstNonEmpty(event.Error, execEventOutput(event), "guest command failed"))
+		}
+		return nil
+	})
+	canceled := ctx.Err() != nil
+	result := JobSummary{
+		Status:     "exited",
+		ExitCode:   exitCode,
+		Logs:       output.String(),
+		LogDropped: logDropped,
+		FinishedAt: time.Now(),
+	}
+	if canceled {
+		result.Status = "canceled"
+		result.Error = firstNonEmpty(errorString(err), errorString(eventErr))
+		return result
+	}
+	if eventErr != nil {
+		result.Status = "failed"
+		result.Error = eventErr.Error()
+		return result
+	}
+	if err != nil {
+		result.Status = "failed"
+		result.Error = err.Error()
+		return result
+	}
+	return result
+}
+
+func execEventOutput(event client.ExecEvent) string {
+	if event.Output != "" {
+		return event.Output
+	}
+	if len(event.Data) != 0 {
+		return string(event.Data)
+	}
+	return ""
+}
+
+func appendJobLog(out *strings.Builder, text string, dropped *bool) {
+	if text == "" {
+		return
+	}
+	if out.Len()+len(text) <= maxJobLogBytes {
+		_, _ = out.WriteString(text)
+		return
+	}
+	*dropped = true
+	combined := out.String() + text
+	if len(combined) > maxJobLogBytes {
+		combined = combined[len(combined)-maxJobLogBytes:]
+	}
+	out.Reset()
+	if combined == "" {
+		*dropped = true
+		return
+	}
+	_, _ = out.WriteString(combined)
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func newHostJobRunner() *hostJobRunner {
