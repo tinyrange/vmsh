@@ -1141,7 +1141,7 @@ func Run(args []string) error {
 		OnStart: func(state backend.DaemonState) {
 			daemonState = state
 			haveDaemonState = true
-			fmt.Fprintf(stderr, "vmsh: warning: using new ccvm daemon at %s\n", state.Addr)
+			fmt.Fprintf(stderr, "vmsh: warning: using new %s daemon at %s\n", daemonDisplayName(state, ccvmLaunch), state.Addr)
 		},
 	})
 	if err != nil {
@@ -1255,6 +1255,22 @@ func daemonStateFilename(launch backend.CCVMLaunch) string {
 		}
 	}
 	return "ccvm.json"
+}
+
+func daemonDisplayName(state backend.DaemonState, launch backend.CCVMLaunch) string {
+	switch strings.TrimSpace(state.Kind) {
+	case vmshd.Kind:
+		return "vmshd"
+	case "":
+	default:
+		return strings.TrimSpace(state.Kind)
+	}
+	for _, env := range launch.Env {
+		if env == backend.InternalVMSHDEnv+"=1" {
+			return "vmshd"
+		}
+	}
+	return "ccvm"
 }
 
 func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmshd.UpdateSessionRequest, ctx commandContext) (*vmshdSessionReporter, func(), error) {

@@ -340,6 +340,22 @@ func TestDaemonStateFilenameUsesVMSHDForEmbeddedLaunch(t *testing.T) {
 	}
 }
 
+func TestDaemonDisplayNameUsesStructuredKind(t *testing.T) {
+	if got := daemonDisplayName(backend.DaemonState{Kind: vmshd.Kind}, backend.CCVMLaunch{}); got != "vmshd" {
+		t.Fatalf("vmshd state name = %q, want vmshd", got)
+	}
+	if got := daemonDisplayName(backend.DaemonState{Kind: "customd"}, backend.CCVMLaunch{}); got != "customd" {
+		t.Fatalf("custom state name = %q, want customd", got)
+	}
+	launch := backend.CCVMLaunch{Env: []string{backend.InternalVMSHDEnv + "=1"}}
+	if got := daemonDisplayName(backend.DaemonState{}, launch); got != "vmshd" {
+		t.Fatalf("vmshd launch name = %q, want vmshd", got)
+	}
+	if got := daemonDisplayName(backend.DaemonState{}, backend.CCVMLaunch{}); got != "ccvm" {
+		t.Fatalf("legacy launch name = %q, want ccvm", got)
+	}
+}
+
 func TestStartVMSHDSessionCreatesAttachesAndDetaches(t *testing.T) {
 	var calls []string
 	mux := http.NewServeMux()
