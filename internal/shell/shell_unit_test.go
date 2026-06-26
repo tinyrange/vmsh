@@ -35,7 +35,10 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/tinyrange/vmsh/internal/backend"
+	"github.com/tinyrange/vmsh/internal/vmshd"
 	cryptossh "golang.org/x/crypto/ssh"
+	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
 )
 
@@ -286,6 +289,7 @@ func TestResolveCacheDirUsesDaemonIdentity(t *testing.T) {
 	if _, err := os.Stat(devDir); err != nil {
 		t.Fatalf("stat dev cache: %v", err)
 	}
+	assertPrivateCacheDir(t, devDir)
 
 	prodDir, err := resolveCacheDir("", "ccprod")
 	if err != nil {
@@ -325,6 +329,374 @@ func TestResolveCacheDirKeepsExplicitDirectory(t *testing.T) {
 	if _, err := os.Stat(explicit); err != nil {
 		t.Fatalf("stat explicit cache: %v", err)
 	}
+	assertPrivateCacheDir(t, explicit)
+}
+
+func assertPrivateCacheDir(t *testing.T, path string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat cache dir: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("cache dir mode = %o, want 700", got)
+	}
+}
+
+func TestDaemonStateFilenameUsesVMSHDForEmbeddedLaunch(t *testing.T) {
+	if got := daemonStateFilename(backend.CCVMLaunch{}); got != "ccvm.json" {
+		t.Fatalf("plain launch state file = %q, want ccvm.json", got)
+	}
+	launch := backend.CCVMLaunch{Env: []string{backend.InternalVMSHDEnv + "=1"}}
+	if got := daemonStateFilename(launch); got != "vmshd.json" {
+		t.Fatalf("vmshd launch state file = %q, want vmshd.json", got)
+	}
+}
+
+func TestDaemonDisplayNameUsesStructuredKind(t *testing.T) {
+	if got := daemonDisplayName(backend.DaemonState{Kind: vmshd.Kind}, backend.CCVMLaunch{}); got != "vmshd" {
+		t.Fatalf("vmshd state name = %q, want vmshd", got)
+	}
+	if got := daemonDisplayName(backend.DaemonState{Kind: "customd"}, backend.CCVMLaunch{}); got != "customd" {
+		t.Fatalf("custom state name = %q, want customd", got)
+	}
+	launch := backend.CCVMLaunch{Env: []string{backend.InternalVMSHDEnv + "=1"}}
+	if got := daemonDisplayName(backend.DaemonState{}, launch); got != "vmshd" {
+		t.Fatalf("vmshd launch name = %q, want vmshd", got)
+	}
+	if got := daemonDisplayName(backend.DaemonState{}, backend.CCVMLaunch{}); got != "ccvm" {
+		t.Fatalf("legacy launch name = %q, want ccvm", got)
+	}
+}
+
+func TestStartVMSHDSessionCreatesAttachesAndDetaches(t *testing.T) {
+	var calls []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/sessions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("create Authorization = %q", r.Header.Get("Authorization"))
+		}
+		calls = append(calls, "create")
+		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "detached"})
+	})
+	mux.HandleFunc("/vmsh/sessions/sess_1", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch {
+			t.Fatalf("metadata method = %s", r.Method)
+		}
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("metadata Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var req vmshd.UpdateSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode metadata request: %v", err)
+		}
+		if req.HostCWD != "/work" {
+			t.Fatalf("metadata host cwd = %q", req.HostCWD)
+		}
+		if req.SelectedContext == nil || req.SelectedContext.Mode != "vm" || req.SelectedContext.VMID != "dev" || req.SelectedContext.Image != "debian" || !req.SelectedContext.Isolated {
+			t.Fatalf("metadata selected context = %+v", req.SelectedContext)
+		}
+		calls = append(calls, "metadata")
+		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "detached", HostCWD: req.HostCWD, SelectedContext: req.SelectedContext})
+	})
+	mux.HandleFunc("/vmsh/sessions/sess_1/attach", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("attach Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var req vmshd.AttachSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode attach request: %v", err)
+		}
+		if req.Mode != "interactive" {
+			t.Fatalf("attach request = %+v", req)
+		}
+		calls = append(calls, "attach")
+		writeJSONForShellTest(w, vmshd.AttachSessionResponse{
+			Session:    vmshd.Session{ID: "sess_1", Name: "main", State: "attached"},
+			Attachment: vmshd.ClientAttachment{ID: "attach_1", Mode: "interactive"},
+		})
+	})
+	mux.HandleFunc("/vmsh/sessions/sess_1/detach", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("detach Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var req vmshd.DetachSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode detach request: %v", err)
+		}
+		if req.AttachmentID != "attach_1" {
+			t.Fatalf("detach request = %+v", req)
+		}
+		calls = append(calls, "detach")
+		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "detached"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	reporter, stop, err := startVMSHDSession(backend.DaemonState{
+		Kind:      vmshd.Kind,
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	}, nil, vmshdSessionMetadata("/work", commandContext{Mode: modeVM, VMID: "dev", Image: "debian", Isolated: true}), commandContext{Mode: modeVM, VMID: "dev", Image: "debian", Isolated: true})
+	if err != nil {
+		t.Fatalf("start vmshd session: %v", err)
+	}
+	if reporter == nil || reporter.sessionID != "sess_1" {
+		t.Fatalf("reporter = %+v", reporter)
+	}
+	stop()
+	if !reflect.DeepEqual(calls, []string{"create", "metadata", "attach", "detach"}) {
+		t.Fatalf("calls = %q", calls)
+	}
+}
+
+func TestVMSHDTerminalBridgeForwardsStdinAndOutput(t *testing.T) {
+	stdinSeen := make(chan []byte, 1)
+	mux := http.NewServeMux()
+	mux.Handle("/vmsh/sessions/sess_1/attachments/attach_1/stream", websocket.Server{
+		Handshake: func(_ *websocket.Config, r *http.Request) error {
+			if r.Header.Get("Authorization") != "Bearer secret" {
+				t.Fatalf("stream Authorization = %q", r.Header.Get("Authorization"))
+			}
+			return nil
+		},
+		Handler: func(ws *websocket.Conn) {
+			if err := websocket.JSON.Send(ws, vmshd.TerminalStreamMessage{
+				Kind:   "attached",
+				Stream: &vmshd.StreamSummary{ID: "terminal_stream_1", Kind: "terminal", SessionID: "sess_1", AttachmentID: "attach_1"},
+			}); err != nil {
+				t.Errorf("send attached: %v", err)
+				return
+			}
+			var msg vmshd.TerminalStreamMessage
+			if err := websocket.JSON.Receive(ws, &msg); err != nil {
+				t.Errorf("receive first client message: %v", err)
+				return
+			}
+			if msg.Kind == "resize" {
+				if err := websocket.JSON.Receive(ws, &msg); err != nil {
+					t.Errorf("receive stdin after resize: %v", err)
+					return
+				}
+			}
+			if msg.Kind != "stdin" || string(msg.Data) != "printf bridge\n" {
+				t.Errorf("stdin message = %+v", msg)
+				return
+			}
+			stdinSeen <- msg.Data
+			if err := websocket.JSON.Send(ws, vmshd.TerminalStreamMessage{Kind: "data", Data: []byte("bridge-output\n")}); err != nil {
+				t.Errorf("send output: %v", err)
+			}
+			_ = ws.Close()
+		},
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	reporter := &vmshdSessionReporter{client: httpClient, sessionID: "sess_1", attachmentID: "attach_1"}
+	in, writeInput, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer in.Close()
+	if _, err := writeInput.Write([]byte("printf bridge\n")); err != nil {
+		t.Fatalf("write input: %v", err)
+	}
+	_ = writeInput.Close()
+	var stdout, stderr bytes.Buffer
+	if err := reporter.bridgeTerminalStream(context.Background(), in, &stdout, &stderr); err != nil {
+		t.Fatalf("bridge terminal stream: %v", err)
+	}
+	if got := stdout.String(); got != "bridge-output\n" {
+		t.Fatalf("stdout = %q", got)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q", got)
+	}
+	select {
+	case got := <-stdinSeen:
+		if string(got) != "printf bridge\n" {
+			t.Fatalf("stdin = %q", string(got))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for stdin")
+	}
+}
+
+func TestVMSHDSessionsCommandReadsDaemonSessions(t *testing.T) {
+	requests := make(chan string, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/sessions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s", r.Method)
+		}
+		requests <- r.Header.Get("Authorization")
+		writeJSONForShellTest(w, []vmshd.SessionSummary{{
+			ID:    "sess_1",
+			Name:  "main",
+			State: "attached",
+			SelectedContext: &vmshd.SessionContext{
+				Short: "host",
+			},
+			AttachedClients: []vmshd.ClientAttachment{{ID: "attach_1"}},
+			Jobs:            []vmshd.JobSummary{{ID: 1}},
+			Copies:          []vmshd.CopySummary{{ID: 1}},
+			HostShells:      []vmshd.ShellHandle{{ID: "host"}},
+		}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.vmshd = &vmshdSessionReporter{client: httpClient, sessionID: "sess_1"}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@sessions", &stdout, &stderr); err != nil {
+		t.Fatalf("@sessions: %v", err)
+	}
+	select {
+	case got := <-requests:
+		if got != "Bearer secret" {
+			t.Fatalf("authorization = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for sessions request")
+	}
+	if stdout.Len() == 0 {
+		t.Fatal("@sessions wrote no output")
+	}
+}
+
+func TestVMSHDSessionRowsExposeStructuredResourceCounts(t *testing.T) {
+	rows := vmshdSessionRows([]vmshd.SessionSummary{{
+		ID:              "sess_1",
+		Name:            "main",
+		State:           "attached",
+		SelectedContext: &vmshd.SessionContext{Short: "vm:dev", Name: "dev"},
+		AttachedClients: []vmshd.ClientAttachment{{ID: "attach_1"}},
+		Jobs:            []vmshd.JobSummary{{ID: 1}, {ID: 2}},
+		Copies:          []vmshd.CopySummary{{ID: 1}},
+		HostShells:      []vmshd.ShellHandle{{ID: "host"}},
+		GuestShells:     []vmshd.ShellHandle{{ID: "guest"}},
+		SSHShells:       []vmshd.ShellHandle{{ID: "ssh"}},
+		VMRefs:          []vmshd.VMRef{{ID: "dev"}},
+	}}, "sess_1")
+	want := []vmshdSessionRow{{
+		ID:          "sess_1",
+		Name:        "main",
+		State:       "attached",
+		Context:     "vm:dev",
+		Attachments: 1,
+		Jobs:        2,
+		Copies:      1,
+		HostShells:  1,
+		GuestShells: 1,
+		SSHShells:   1,
+		VMRefs:      1,
+		Current:     true,
+	}}
+	if !reflect.DeepEqual(rows, want) {
+		t.Fatalf("rows = %+v, want %+v", rows, want)
+	}
+}
+
+func TestVMSHDSessionMetadataIncludesSelectedVMRef(t *testing.T) {
+	req := vmshdSessionMetadata("/work", commandContext{
+		Mode:     modeVM,
+		VMID:     "dev",
+		Image:    "debian",
+		Isolated: true,
+	})
+	if req.SelectedContext == nil || req.SelectedContext.VMID != "dev" || !req.SelectedContext.Isolated {
+		t.Fatalf("selected context = %+v", req.SelectedContext)
+	}
+	if len(req.VMRefs) != 1 || req.VMRefs[0].ID != "dev" || req.VMRefs[0].BackendID != "dev-isolated" || req.VMRefs[0].Image != "debian" || !req.VMRefs[0].Isolated {
+		t.Fatalf("vm refs = %+v", req.VMRefs)
+	}
+}
+
+func TestVMSHDSessionPublishUsesCurrentContext(t *testing.T) {
+	updates := make(chan vmshd.UpdateSessionRequest, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/sessions/sess_1", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch {
+			t.Fatalf("method = %s", r.Method)
+		}
+		var req vmshd.UpdateSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode update request: %v", err)
+		}
+		updates <- req
+		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "attached"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.context = commandContext{Mode: modeVM, VMID: "dev", Image: "debian", Isolated: true}
+	sh.vmshd = &vmshdSessionReporter{
+		client:    httpClient,
+		sessionID: "sess_1",
+		hostCWD:   "/old",
+		context:   commandContext{Mode: modeHost},
+	}
+
+	sh.publishVMSHDSessionState()
+	select {
+	case req := <-updates:
+		if req.HostCWD != sh.hostCWD || req.SelectedContext == nil || req.SelectedContext.VMID != "dev" {
+			t.Fatalf("published metadata = %+v", req)
+		}
+		if len(req.VMRefs) != 1 || req.VMRefs[0].BackendID != "dev-isolated" {
+			t.Fatalf("published vm refs = %+v", req.VMRefs)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for vmshd update")
+	}
+}
+
+func writeJSONForShellTest(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(value)
 }
 
 func TestResolveShellCacheDirIsolatesNestedDefault(t *testing.T) {
@@ -2241,6 +2613,10 @@ func TestCompletionsUseCachedImagesOptionsAndHostMappedPaths(t *testing.T) {
 	if kind != completionAt || replaceLen != len("@ss") || !hasString(candidates, "h") {
 		t.Fatalf("ssh target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
+	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@sta"), len("@sta"))
+	if kind != completionAt || replaceLen != len("@sta") || !hasString(candidates, "tus") || !hasString(candidates, "rt") {
+		t.Fatalf("status/start target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
+	}
 	candidates, _, _ = c.CompleteWithKind([]rune("@alpine --pr"), len("@alpine --pr"))
 	if hasString(candidates, "oxy") {
 		t.Fatalf("non-agent option completion included proxy: %q", candidates)
@@ -2443,6 +2819,366 @@ func TestStartBackgroundJobRecordsJob(t *testing.T) {
 	job := sh.jobs[0]
 	if job.ID != 1 || job.Context.Mode != modeHost || job.Command != ":" || job.Done || job.Lost {
 		t.Fatalf("background job = %+v, want running host job", job)
+	}
+}
+
+func TestStartBackgroundHostJobUsesVMSHD(t *testing.T) {
+	started := make(chan vmshd.StartHostJobRequest, 1)
+	metadata := make(chan vmshd.UpdateSessionRequest, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/sessions/sess_1", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch {
+			t.Fatalf("method = %s", r.Method)
+		}
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var req vmshd.UpdateSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode update request: %v", err)
+		}
+		metadata <- req
+		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "attached", Jobs: req.Jobs})
+	})
+	mux.HandleFunc("/vmsh/sessions/sess_1/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("job method = %s", r.Method)
+		}
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var req vmshd.StartHostJobRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode job request: %v", err)
+		}
+		started <- req
+		writeJSONForShellTest(w, vmshd.JobSummary{
+			ID:        9,
+			SessionID: "sess_1",
+			Context:   req.Context,
+			Command:   strings.Join(req.Command, " "),
+			Status:    "running",
+			Control:   "vmshd",
+			StartedAt: time.Unix(7, 0),
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.env["VMSHD_TEST_ENV"] = "present"
+	sh.vmshd = &vmshdSessionReporter{
+		client:    httpClient,
+		sessionID: "sess_1",
+		hostCWD:   sh.hostCWD,
+		context:   sh.context,
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.startBackgroundJob(commandContext{Mode: modeHost}, "printf ok", &stdout, &stderr); err != nil {
+		t.Fatalf("start background job: %v", err)
+	}
+	req := readVMSHDHostJobStart(t, started)
+	if len(req.Command) != 3 || req.Command[1] != "-lc" || req.Command[2] != "printf ok" || req.WorkDir != sh.hostCWD || req.Context != "host" {
+		t.Fatalf("start request = %+v", req)
+	}
+	if !envHasValue(req.Env, "VMSHD_TEST_ENV", "present") {
+		t.Fatalf("start env missing shell export: %+v", req.Env)
+	}
+	sh.jobsMu.Lock()
+	if len(sh.jobs) != 1 || sh.jobs[0].ID != 9 || sh.jobs[0].Control != "vmshd" || sh.jobs[0].Command != "printf ok" || !sh.jobs[0].Started.Equal(time.Unix(7, 0)) {
+		t.Fatalf("jobs = %+v", sh.jobs)
+	}
+	sh.jobsMu.Unlock()
+	if got, want := stdout.String(), "[9] running context=host printf ok\n    logs: @jobs logs 9\n"; got != want {
+		t.Fatalf("stdout = %q", got)
+	}
+	select {
+	case update := <-metadata:
+		if len(update.Jobs) != 0 {
+			t.Fatalf("metadata jobs = %+v, want no client-owned vmshd duplicate", update.Jobs)
+		}
+	default:
+	}
+}
+
+func TestStartBackgroundVMJobUsesVMSHD(t *testing.T) {
+	started := make(chan vmshd.StartHostJobRequest, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/sessions/sess_1/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("job method = %s", r.Method)
+		}
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var req vmshd.StartHostJobRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode job request: %v", err)
+		}
+		started <- req
+		writeJSONForShellTest(w, vmshd.JobSummary{
+			ID:        10,
+			SessionID: "sess_1",
+			Context:   req.Context,
+			Command:   strings.Join(req.Run.Command, " "),
+			Status:    "running",
+			Control:   "vmshd",
+			StartedAt: time.Unix(9, 0),
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	api := newRecordingShellAPI("ubuntu")
+	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: defaultKernelForImage("ubuntu")}
+	sh := newUnitShell(t, api)
+	sh.vmshd = &vmshdSessionReporter{
+		client:    httpClient,
+		sessionID: "sess_1",
+		hostCWD:   sh.hostCWD,
+		context:   sh.context,
+	}
+	ctx := commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", CWD: "/repo", User: "app"}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.startBackgroundJob(ctx, "printf ok", &stdout, &stderr); err != nil {
+		t.Fatalf("start background job: %v\nstderr:\n%s", err, stderr.String())
+	}
+	req := readVMSHDHostJobStart(t, started)
+	if req.Kind != "vm" || req.VMID != "work" || req.Context != "vm:work" || req.Run == nil {
+		t.Fatalf("start request = %+v", req)
+	}
+	if req.Run.Image != "ubuntu" || req.Run.WorkDir != "/repo" || req.Run.User != "app" || len(req.Run.Command) == 0 {
+		t.Fatalf("run request = %+v", req.Run)
+	}
+	sh.jobsMu.Lock()
+	if len(sh.jobs) != 1 || sh.jobs[0].ID != 10 || sh.jobs[0].Control != "vmshd" || sh.jobs[0].Command != "printf ok" || !sh.jobs[0].Started.Equal(time.Unix(9, 0)) {
+		t.Fatalf("jobs = %+v", sh.jobs)
+	}
+	sh.jobsMu.Unlock()
+	if got, want := stdout.String(), "[10] running context=vm:work printf ok\n    logs: @jobs logs 10\n"; got != want {
+		t.Fatalf("stdout = %q", got)
+	}
+}
+
+func TestStartBackgroundSSHJobUsesVMSHDForHostOrigin(t *testing.T) {
+	started := make(chan vmshd.StartHostJobRequest, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/sessions/sess_1/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("job method = %s", r.Method)
+		}
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var req vmshd.StartHostJobRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode job request: %v", err)
+		}
+		started <- req
+		writeJSONForShellTest(w, vmshd.JobSummary{
+			ID:        11,
+			SessionID: "sess_1",
+			Context:   req.Context,
+			Command:   strings.Join(req.Command, " "),
+			Status:    "running",
+			Control:   "vmshd",
+			StartedAt: time.Unix(11, 0),
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.vmshd = &vmshdSessionReporter{client: httpClient, sessionID: "sess_1", hostCWD: sh.hostCWD, context: sh.context}
+	ctx := commandContext{Mode: modeSSH, SSHHost: "app.example", User: "me", CWD: "/srv/app"}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.startBackgroundJob(ctx, "make deploy", &stdout, &stderr); err != nil {
+		t.Fatalf("start background job: %v", err)
+	}
+	req := readVMSHDHostJobStart(t, started)
+	if req.Kind != "ssh" || req.Context != "ssh:app.example" || len(req.Command) != 3 || req.Command[1] != "-lc" {
+		t.Fatalf("start request = %+v", req)
+	}
+	if !strings.Contains(req.Command[2], "ssh --") || !strings.Contains(req.Command[2], "me@app.example") || !strings.Contains(req.Command[2], "cd '/srv/app'") || !strings.Contains(req.Command[2], "make deploy") {
+		t.Fatalf("ssh command = %q", req.Command[2])
+	}
+	sh.jobsMu.Lock()
+	if len(sh.jobs) != 1 || sh.jobs[0].ID != 11 || sh.jobs[0].Control != "vmshd" || sh.jobs[0].Command != "make deploy" || !sh.jobs[0].Started.Equal(time.Unix(11, 0)) {
+		t.Fatalf("jobs = %+v", sh.jobs)
+	}
+	sh.jobsMu.Unlock()
+	if got, want := stdout.String(), "[11] running context=ssh:app.example make deploy\n    logs: @jobs logs 11\n"; got != want {
+		t.Fatalf("stdout = %q", got)
+	}
+}
+
+func TestStartBackgroundSSHJobKeepsNonHostOriginLocal(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.vmshd = &vmshdSessionReporter{client: &vmshd.HTTPClient{}, sessionID: "sess_1"}
+	ctx := commandContext{Mode: modeSSH, SSHHost: "app.example", ParentKey: "vm\x00work", ParentText: "vm:work"}
+
+	var stdout bytes.Buffer
+	handled, err := sh.startVMSHDBackgroundJob(ctx, "uptime", &stdout, io.Discard)
+	if err != nil {
+		t.Fatalf("start vmshd background job: %v", err)
+	}
+	if handled {
+		t.Fatal("non-host-origin SSH job was routed to vmshd")
+	}
+}
+
+func TestVMSHDHostJobControlUsesDaemonState(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("jobs method = %s", r.Method)
+		}
+		writeJSONForShellTest(w, []vmshd.JobSummary{{
+			ID:         9,
+			SessionID:  "sess_1",
+			Context:    "host",
+			Command:    "printf ok",
+			Status:     "exited",
+			ExitCode:   0,
+			Control:    "vmshd",
+			Logs:       "ok\n",
+			StartedAt:  time.Unix(7, 0),
+			FinishedAt: time.Unix(8, 0),
+		}})
+	})
+	mux.HandleFunc("/vmsh/sessions/sess_1/jobs/9", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Fatalf("cancel method = %s", r.Method)
+		}
+		writeJSONForShellTest(w, vmshd.JobSummary{
+			ID:        9,
+			SessionID: "sess_1",
+			Context:   "host",
+			Command:   "printf ok",
+			Status:    "canceling",
+			Control:   "vmshd",
+			StartedAt: time.Unix(7, 0),
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.vmshd = &vmshdSessionReporter{client: httpClient, sessionID: "sess_1", hostCWD: sh.hostCWD, context: sh.context}
+	sh.jobs = append(sh.jobs, shellJob{
+		ID:          9,
+		Context:     commandContext{Mode: modeHost},
+		ContextText: "host",
+		Command:     "printf ok",
+		Started:     time.Unix(7, 0),
+		Control:     "vmshd",
+	})
+
+	var stdout bytes.Buffer
+	if err := sh.printJobs(&stdout); err != nil {
+		t.Fatalf("print jobs: %v", err)
+	}
+	sh.jobsMu.Lock()
+	job := sh.jobs[0]
+	sh.jobsMu.Unlock()
+	if !job.Done || job.Code != 0 || !job.Finished.Equal(time.Unix(8, 0)) {
+		t.Fatalf("synced job = %+v", job)
+	}
+	stdout.Reset()
+	if err := sh.controlJob("logs 9", &stdout); err != nil {
+		t.Fatalf("job logs: %v", err)
+	}
+	if got := stdout.String(); got != "ok\n" {
+		t.Fatalf("logs = %q", got)
+	}
+	stdout.Reset()
+	if err := sh.controlJob("stop 9", &stdout); err != nil {
+		t.Fatalf("job stop: %v", err)
+	}
+	if got := stdout.String(); got != "[9] canceling\n" {
+		t.Fatalf("stop output = %q", got)
+	}
+}
+
+func readVMSHDHostJobStart(t *testing.T, starts <-chan vmshd.StartHostJobRequest) vmshd.StartHostJobRequest {
+	t.Helper()
+	select {
+	case req := <-starts:
+		return req
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for vmshd host job start")
+	}
+	return vmshd.StartHostJobRequest{}
+}
+
+func TestVMSHDShellHandlesSummarizePersistentShells(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.hostShell = &persistentHostShell{lastCWD: "/work"}
+	sh.guestShell = &persistentGuestShell{
+		key:     strings.Join([]string{"dev", "debian", "root", ""}, "\x00"),
+		lastCWD: "/repo",
+	}
+	sh.sshShells = map[string]*persistentSSHShell{
+		"ssh-key": {
+			key:     "ssh-key",
+			name:    "app",
+			ctx:     commandContext{Mode: modeSSH, SSHHost: "app.example", User: "me"},
+			lastCWD: "/srv",
+		},
+	}
+
+	hostShells, guestShells, sshShells := sh.vmshdShellHandles()
+	if len(hostShells) != 1 || hostShells[0].Kind != "host" || hostShells[0].CWD != "/work" || hostShells[0].State != "open" {
+		t.Fatalf("host shells = %+v", hostShells)
+	}
+	if len(guestShells) != 1 || guestShells[0].Kind != "guest" || guestShells[0].VMID != "dev" || guestShells[0].User != "root" || guestShells[0].CWD != "/repo" {
+		t.Fatalf("guest shells = %+v", guestShells)
+	}
+	if len(sshShells) != 1 || sshShells[0].Kind != "ssh" || sshShells[0].SSHHost != "app.example" || sshShells[0].User != "me" || sshShells[0].CWD != "/srv" {
+		t.Fatalf("ssh shells = %+v", sshShells)
 	}
 }
 
@@ -5026,6 +5762,71 @@ func TestCopyProgressIsQuietForNonTerminalStderr(t *testing.T) {
 	}
 	if got := readTestFile(t, filepath.Join(sh.hostCWD, "copied.txt")); got != "copy-data" {
 		t.Fatalf("copied data = %q", got)
+	}
+}
+
+func TestCopyPathPublishesVMSHDCopyState(t *testing.T) {
+	updates := make(chan vmshd.UpdateSessionRequest, 4)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/sessions/sess_1", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch {
+			t.Fatalf("method = %s", r.Method)
+		}
+		var req vmshd.UpdateSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode update request: %v", err)
+		}
+		updates <- req
+		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "attached", Copies: req.Copies})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.vmshd = &vmshdSessionReporter{client: httpClient, sessionID: "sess_1", hostCWD: sh.hostCWD, context: sh.context}
+	if err := os.WriteFile(filepath.Join(sh.hostCWD, "local.txt"), []byte("copy-data"), 0o644); err != nil {
+		t.Fatalf("write local source: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.copyPath("@host:local.txt @host:copied.txt", &stdout, &stderr); err != nil {
+		t.Fatalf("copy local file: %v", err)
+	}
+	running := readVMSHDCopyUpdate(t, updates, "running")
+	if len(running.Copies) != 1 || running.Copies[0].ID != 1 || running.Copies[0].Source != "host" || running.Copies[0].Dest != "host" || !running.Copies[0].FinishedAt.IsZero() {
+		t.Fatalf("running copy update = %+v", running.Copies)
+	}
+	done := readVMSHDCopyUpdate(t, updates, "done")
+	if len(done.Copies) != 1 || done.Copies[0].ID != 1 || done.Copies[0].Status != "done" || done.Copies[0].Error != "" || done.Copies[0].FinishedAt.IsZero() {
+		t.Fatalf("done copy update = %+v", done.Copies)
+	}
+	if got := readTestFile(t, filepath.Join(sh.hostCWD, "copied.txt")); got != "copy-data" {
+		t.Fatalf("copied data = %q", got)
+	}
+}
+
+func readVMSHDCopyUpdate(t *testing.T, updates <-chan vmshd.UpdateSessionRequest, status string) vmshd.UpdateSessionRequest {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case update := <-updates:
+			if len(update.Copies) > 0 && update.Copies[0].Status == status {
+				return update
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for vmshd copy status %q", status)
+		}
 	}
 }
 

@@ -610,6 +610,9 @@ func newVMIntegrationTestEnv(t *testing.T) *vmIntegrationTestEnv {
 	if testing.Short() {
 		t.Skip("skipping VM integration test in short mode")
 	}
+	if strings.TrimSpace(os.Getenv("VMSH_TEST_VM_INTEGRATION")) == "" {
+		t.Skip("set VMSH_TEST_VM_INTEGRATION=1 to run VM integration tests")
+	}
 	skipUnsupportedVMIntegrationPlatform(t)
 	bootTimeout := vmIntegrationTimeoutSeconds()
 	t.Setenv("CCX3_VM_BOOT_TIMEOUT", bootTimeout)

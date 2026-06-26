@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,9 +16,11 @@ import (
 	"j5.nz/cc/client"
 )
 
-const InternalCCVMEnv = "VMSH_INTERNAL_CCVM"
+const InternalVMSHDEnv = "VMSH_INTERNAL_VMSHD"
 const InternalCCVMSidecarModeEnv = "CCX3_CCVM_SIDECAR_MODE"
 const InternalCCVMSidecarMode = "vmsh-internal"
+const DaemonStateVersion = 1
+const DaemonAPIVersion = "2026-06-25"
 
 type API interface {
 	HealthCheck() error
@@ -45,8 +46,13 @@ type API interface {
 }
 
 type DaemonState struct {
-	Addr      string `json:"addr"`
-	LaunchKey string `json:"launch_key,omitempty"`
+	Addr       string `json:"addr"`
+	Socket     string `json:"socket,omitempty"`
+	Kind       string `json:"kind,omitempty"`
+	Version    int    `json:"version,omitempty"`
+	APIVersion string `json:"api_version,omitempty"`
+	TokenPath  string `json:"token_path,omitempty"`
+	LaunchKey  string `json:"launch_key,omitempty"`
 }
 
 type CCVMLaunch struct {
@@ -63,13 +69,13 @@ func ResolveCCVMPath(path string, bundledAvailable bool) (CCVMLaunch, error) {
 	if err != nil {
 		return CCVMLaunch{}, err
 	}
+	if bundledAvailable {
+		return CCVMLaunch{Path: exePath, Env: []string{InternalVMSHDEnv + "=1"}}, nil
+	}
 	for _, candidate := range CCVMPathCandidates(exePath) {
 		if _, err := os.Stat(candidate); err == nil {
 			return CCVMLaunch{Path: candidate}, nil
 		}
-	}
-	if bundledAvailable {
-		return CCVMLaunch{Path: exePath, Env: []string{InternalCCVMEnv + "=1"}}, nil
 	}
 	if found, err := exec.LookPath("ccvm"); err == nil {
 		return CCVMLaunch{Path: found}, nil
@@ -104,6 +110,7 @@ func CompanionExecutablePath(exePath, suffix string) string {
 
 type ConnectOptions struct {
 	OnReuse func(DaemonState)
+	OnStart func(DaemonState)
 }
 
 func ConnectCCVM(launch CCVMLaunch, cacheDir, statePath string) (*client.Client, error) {
@@ -114,7 +121,9 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 	launchKey := DaemonLaunchKey(launch)
 	if state, err := ReadDaemonState(statePath); err == nil {
 		api := NewClient(state.Addr)
-		if state.LaunchKey == launchKey && api.HealthCheck() == nil && apiCompatible(state.Addr, api) {
+		if err := ApplyDaemonStateAuth(api, state); err != nil {
+			_ = os.Remove(statePath)
+		} else if state.LaunchKey == launchKey && api.HealthCheck() == nil && apiCompatible(api, state) {
 			if opts.OnReuse != nil {
 				opts.OnReuse(state)
 			}
@@ -149,22 +158,38 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		_ = proc.Wait()
 		return nil, err
 	}
-	if err := WriteDaemonState(statePath, DaemonState{Addr: hello.Addr, LaunchKey: launchKey}); err != nil {
+	state := normalizeDaemonState(DaemonState{Addr: hello.Addr, Kind: hello.Kind, TokenPath: hello.TokenPath, LaunchKey: launchKey})
+	if err := WriteDaemonState(statePath, state); err != nil {
 		_ = proc.Process.Kill()
 		_ = proc.Wait()
 		return nil, fmt.Errorf("write daemon state %s for %s: %w", statePath, hello.Addr, err)
 	}
 	api := NewClient(hello.Addr)
+	if err := ApplyDaemonStateAuth(api, state); err != nil {
+		_ = os.Remove(statePath)
+		_ = proc.Process.Kill()
+		_ = proc.Wait()
+		return nil, fmt.Errorf("read daemon auth token: %w", err)
+	}
 	if err := api.HealthCheck(); err != nil {
 		_ = os.Remove(statePath)
 		_ = proc.Process.Kill()
 		_ = proc.Wait()
 		return nil, fmt.Errorf("ccvm daemon started at %s but health check failed: %w", hello.Addr, err)
 	}
+	if strings.TrimSpace(state.Kind) == "vmshd" && !apiCompatible(api, state) {
+		_ = os.Remove(statePath)
+		_ = proc.Process.Kill()
+		_ = proc.Wait()
+		return nil, fmt.Errorf("vmshd daemon started at %s but required routes are unavailable", hello.Addr)
+	}
+	if opts.OnStart != nil {
+		opts.OnStart(state)
+	}
 	return api, nil
 }
 
-func apiCompatible(addr string, api *client.Client) bool {
+func apiCompatible(api *client.Client, state DaemonState) bool {
 	if api == nil {
 		return false
 	}
@@ -173,20 +198,14 @@ func apiCompatible(addr string, api *client.Client) bool {
 		return false
 	}
 	for _, route := range []string{"/watchdog/lease", "/vm/start"} {
-		if !daemonRouteExists(addr, route) {
+		if !api.RouteExists(route) {
 			return false
 		}
 	}
-	return true
-}
-
-func daemonRouteExists(addr, route string) bool {
-	resp, err := http.Get("http://" + addr + route)
-	if err != nil {
+	if strings.TrimSpace(state.Kind) == "vmshd" && !api.RouteExists("/vmsh/status") {
 		return false
 	}
-	defer resp.Body.Close()
-	return resp.StatusCode != http.StatusNotFound
+	return true
 }
 
 func CCVMLaunchName(launch CCVMLaunch) string {
@@ -221,6 +240,9 @@ func ValidateServerHello(hello client.ServerHello, cacheDir string) error {
 	if strings.TrimSpace(hello.Addr) == "" {
 		return fmt.Errorf("ccvm daemon sent a startup banner without an address: %+v", hello)
 	}
+	if strings.TrimSpace(hello.Kind) == "vmshd" && strings.TrimSpace(hello.TokenPath) == "" {
+		return fmt.Errorf("vmshd daemon sent a startup banner without a token path")
+	}
 	return nil
 }
 
@@ -228,6 +250,43 @@ func NewClient(addr string) *client.Client {
 	return client.NewClient("http://"+addr, func() (net.Conn, error) {
 		return net.Dial("tcp", addr)
 	})
+}
+
+func ApplyDaemonStateAuth(api *client.Client, state DaemonState) error {
+	if api == nil {
+		return nil
+	}
+	if strings.TrimSpace(state.TokenPath) == "" {
+		if strings.TrimSpace(state.Kind) == "vmshd" {
+			return fmt.Errorf("vmshd daemon state has no token path")
+		}
+		return nil
+	}
+	token, err := ReadDaemonToken(state.TokenPath)
+	if err != nil {
+		return err
+	}
+	api.SetBearerToken(token)
+	return nil
+}
+
+func ReadDaemonToken(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("token file %s has mode %o, want private permissions", path, info.Mode().Perm())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		return "", fmt.Errorf("token file %s is empty", path)
+	}
+	return token, nil
 }
 
 func StartDaemonLease(api watchdogAPI) (func(), error) {
@@ -285,6 +344,11 @@ func daemonWatchdogTimeout() time.Duration {
 
 func ReadDaemonState(path string) (DaemonState, error) {
 	var state DaemonState
+	if info, err := os.Stat(path); err != nil {
+		return state, err
+	} else if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return state, fmt.Errorf("daemon state %s has mode %o, want private permissions", path, info.Mode().Perm())
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return state, err
@@ -295,18 +359,35 @@ func ReadDaemonState(path string) (DaemonState, error) {
 	if strings.TrimSpace(state.Addr) == "" {
 		return state, fmt.Errorf("daemon state %s has no addr", path)
 	}
+	if state.Version != 0 && state.Version != DaemonStateVersion {
+		return state, fmt.Errorf("daemon state %s has unsupported version %d", path, state.Version)
+	}
+	if strings.TrimSpace(state.APIVersion) != "" && strings.TrimSpace(state.APIVersion) != DaemonAPIVersion {
+		return state, fmt.Errorf("daemon state %s has unsupported api version %q", path, state.APIVersion)
+	}
 	return state, nil
 }
 
 func WriteDaemonState(path string, state DaemonState) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
+	state = normalizeDaemonState(state)
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(path, append(data, '\n'), 0o600)
+}
+
+func normalizeDaemonState(state DaemonState) DaemonState {
+	if state.Version == 0 {
+		state.Version = DaemonStateVersion
+	}
+	if strings.TrimSpace(state.APIVersion) == "" {
+		state.APIVersion = DaemonAPIVersion
+	}
+	return state
 }
 
 func firstNonEmpty(values ...string) string {
