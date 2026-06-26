@@ -287,8 +287,8 @@
           </tr>
           <tr>
             <td>Compatibility</td>
-            <td><code>VMSH_INTERNAL_CCVM=1 vmsh</code></td>
-            <td>Temporary compatibility path while existing code still starts the embedded ccvm mode directly.</td>
+            <td><code>vmsh -ccvm /path/to/ccvm</code></td>
+            <td>Explicit sidecar compatibility path for users who need to target a separate ccvm binary.</td>
           </tr>
         </tbody>
       </table>
@@ -621,7 +621,7 @@ GET /vmsh/status</code></pre>
 
       <h3>Phase 5: Cleanup and Compatibility Removal</h3>
       <ul>
-        <li>Remove direct embedded ccvm startup from vmsh once vmshd is stable.</li>
+        <li>Remove direct embedded ccvm startup from vmsh once vmshd is stable. This is now handled by keeping embedded startup on <code>VMSH_INTERNAL_VMSHD=1</code> and leaving separate ccvm usage behind explicit <code>-ccvm</code>.</li>
         <li>Delete compatibility state readers after a reasonable transition window.</li>
         <li>Consolidate daemon lease and shutdown behavior under vmshd.</li>
       </ul>

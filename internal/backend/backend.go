@@ -16,7 +16,6 @@ import (
 	"j5.nz/cc/client"
 )
 
-const InternalCCVMEnv = "VMSH_INTERNAL_CCVM"
 const InternalVMSHDEnv = "VMSH_INTERNAL_VMSHD"
 const InternalCCVMSidecarModeEnv = "CCX3_CCVM_SIDECAR_MODE"
 const InternalCCVMSidecarMode = "vmsh-internal"
