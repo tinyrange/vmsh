@@ -2961,6 +2961,84 @@ func TestStartBackgroundVMJobUsesVMSHD(t *testing.T) {
 	}
 }
 
+func TestStartBackgroundSSHJobUsesVMSHDForHostOrigin(t *testing.T) {
+	started := make(chan vmshd.StartHostJobRequest, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/sessions/sess_1/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("job method = %s", r.Method)
+		}
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var req vmshd.StartHostJobRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode job request: %v", err)
+		}
+		started <- req
+		writeJSONForShellTest(w, vmshd.JobSummary{
+			ID:        11,
+			SessionID: "sess_1",
+			Context:   req.Context,
+			Command:   strings.Join(req.Command, " "),
+			Status:    "running",
+			Control:   "vmshd",
+			StartedAt: time.Unix(11, 0),
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.vmshd = &vmshdSessionReporter{client: httpClient, sessionID: "sess_1", hostCWD: sh.hostCWD, context: sh.context}
+	ctx := commandContext{Mode: modeSSH, SSHHost: "app.example", User: "me", CWD: "/srv/app"}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.startBackgroundJob(ctx, "make deploy", &stdout, &stderr); err != nil {
+		t.Fatalf("start background job: %v", err)
+	}
+	req := readVMSHDHostJobStart(t, started)
+	if req.Kind != "ssh" || req.Context != "ssh:app.example" || len(req.Command) != 3 || req.Command[1] != "-lc" {
+		t.Fatalf("start request = %+v", req)
+	}
+	if !strings.Contains(req.Command[2], "ssh --") || !strings.Contains(req.Command[2], "me@app.example") || !strings.Contains(req.Command[2], "cd '/srv/app'") || !strings.Contains(req.Command[2], "make deploy") {
+		t.Fatalf("ssh command = %q", req.Command[2])
+	}
+	sh.jobsMu.Lock()
+	if len(sh.jobs) != 1 || sh.jobs[0].ID != 11 || sh.jobs[0].Control != "vmshd" || sh.jobs[0].Command != "make deploy" || !sh.jobs[0].Started.Equal(time.Unix(11, 0)) {
+		t.Fatalf("jobs = %+v", sh.jobs)
+	}
+	sh.jobsMu.Unlock()
+	if got, want := stdout.String(), "[11] running context=ssh:app.example make deploy\n    logs: @jobs logs 11\n"; got != want {
+		t.Fatalf("stdout = %q", got)
+	}
+}
+
+func TestStartBackgroundSSHJobKeepsNonHostOriginLocal(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.vmshd = &vmshdSessionReporter{client: &vmshd.HTTPClient{}, sessionID: "sess_1"}
+	ctx := commandContext{Mode: modeSSH, SSHHost: "app.example", ParentKey: "vm\x00work", ParentText: "vm:work"}
+
+	var stdout bytes.Buffer
+	handled, err := sh.startVMSHDBackgroundJob(ctx, "uptime", &stdout, io.Discard)
+	if err != nil {
+		t.Fatalf("start vmshd background job: %v", err)
+	}
+	if handled {
+		t.Fatal("non-host-origin SSH job was routed to vmshd")
+	}
+}
+
 func TestVMSHDHostJobControlUsesDaemonState(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/vmsh/jobs", func(w http.ResponseWriter, r *http.Request) {

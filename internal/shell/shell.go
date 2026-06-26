@@ -2944,6 +2944,8 @@ func (s *shellState) startVMSHDBackgroundJob(ctx commandContext, line string, st
 		return s.startVMSHDHostBackgroundJob(ctx, line, stdout)
 	case modeVM:
 		return s.startVMSHDGuestBackgroundJob(ctx, line, stdout, stderr)
+	case modeSSH:
+		return s.startVMSHDSSHBackgroundJob(ctx, line, stdout)
 	default:
 		return false, nil
 	}
@@ -2991,6 +2993,41 @@ func (s *shellState) startVMSHDGuestBackgroundJob(ctx commandContext, line strin
 		VMID:    vmID,
 		Context: contextText,
 		Run:     &req,
+	})
+	if err != nil {
+		return true, err
+	}
+	started := job.StartedAt
+	if started.IsZero() {
+		started = time.Now()
+	}
+	s.jobsMu.Lock()
+	s.jobs = append(s.jobs, shellJob{
+		ID:          job.ID,
+		Context:     ctx,
+		ContextKey:  contextSessionKey(ctx),
+		ContextText: contextText,
+		Command:     line,
+		Started:     started,
+		Control:     "vmshd",
+	})
+	s.jobsMu.Unlock()
+	fmt.Fprintf(stdout, "[%d] running context=%s %s\n    logs: @jobs logs %d\n", job.ID, contextText, line, job.ID)
+	return true, nil
+}
+
+func (s *shellState) startVMSHDSSHBackgroundJob(ctx commandContext, line string, stdout io.Writer) (bool, error) {
+	if strings.TrimSpace(ctx.ParentKey) != "" {
+		return false, nil
+	}
+	command := sshCLICommand(ctx, sshRemoteCommandScript(ctx, line))
+	contextText := jobContextText(ctx)
+	job, err := s.vmshd.client.StartHostJob(s.vmshd.sessionID, vmshd.StartHostJobRequest{
+		Kind:    "ssh",
+		Command: []string{hostShell(), "-lc", command},
+		WorkDir: s.hostCWD,
+		Env:     hostCommandEnv(s.env, nil),
+		Context: contextText,
 	})
 	if err != nil {
 		return true, err
