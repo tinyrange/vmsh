@@ -641,6 +641,27 @@ func TestEventStreamPublishesSessionEvents(t *testing.T) {
 	if event.Kind != "session_created" || event.ID == "" || event.Session == nil || event.Session.Name != "main" || event.Session.State != "detached" {
 		t.Fatalf("session created event = %+v", event)
 	}
+
+	body := fmt.Sprintf(`{"command":[%q,"-test.run=TestDaemonHostJobHelper","--"],"env":["VMSHD_TEST_HOST_JOB=1"],"context":"host"}`, os.Args[0])
+	jobReq, err := http.NewRequest(http.MethodPost, httpSrv.URL+"/vmsh/sessions/"+event.Session.ID+"/jobs", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("new job request: %v", err)
+	}
+	jobReq.Header.Set("Authorization", "Bearer secret")
+	jobReq.Header.Set("Content-Type", "application/json")
+	jobResp, err := http.DefaultClient.Do(jobReq)
+	if err != nil {
+		t.Fatalf("start job: %v", err)
+	}
+	defer jobResp.Body.Close()
+	if jobResp.StatusCode != http.StatusOK {
+		t.Fatalf("job status = %d", jobResp.StatusCode)
+	}
+
+	event = readEvent(t, scanner)
+	if event.Kind != "job_started" || event.Session == nil || event.Session.ID == "" || event.Job == nil || event.Job.SessionID != event.Session.ID || event.Job.Status != "running" || event.Job.Control != "vmshd" {
+		t.Fatalf("job started event = %+v", event)
+	}
 }
 
 func TestStatusReportsActiveEventStreams(t *testing.T) {

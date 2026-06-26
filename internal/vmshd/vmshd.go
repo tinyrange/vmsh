@@ -396,7 +396,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			return
 		}
 		session, _ := s.registry.Get(r.PathValue("id"))
-		s.events.Publish(Event{Kind: "job_started", Session: &session})
+		s.events.Publish(Event{Kind: "job_started", Session: &session, Job: &job})
 		writeJSON(w, http.StatusOK, job)
 	})
 	mux.HandleFunc("DELETE /vmsh/sessions/{id}/jobs/{job}", func(w http.ResponseWriter, r *http.Request) {
@@ -453,12 +453,12 @@ func (s *Server) startHostJob(sessionID string, req StartHostJobRequest) (JobSum
 		cmd.Dir = strings.TrimSpace(req.WorkDir)
 		cmd.Env = append(os.Environ(), req.Env...)
 		output, runErr := cmd.CombinedOutput()
-		_, ok := s.registry.FinishJob(sessionID, job.ID, summarizeHostJobResult(output, runErr, ctx.Err() != nil))
+		finished, ok := s.registry.FinishJob(sessionID, job.ID, summarizeHostJobResult(output, runErr, ctx.Err() != nil))
 		if !ok {
 			return
 		}
 		session, _ := s.registry.Get(sessionID)
-		s.events.Publish(Event{Kind: "job_finished", Session: &session})
+		s.events.Publish(Event{Kind: "job_finished", Session: &session, Job: &finished})
 	}()
 	return job, nil
 }
