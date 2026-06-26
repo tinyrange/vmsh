@@ -36,6 +36,13 @@ func TestTokenFileIsPrivate(t *testing.T) {
 		if got := info.Mode().Perm(); got != 0o600 {
 			t.Fatalf("token mode = %o, want 600", got)
 		}
+		parent, err := os.Stat(filepath.Dir(path))
+		if err != nil {
+			t.Fatalf("stat token directory: %v", err)
+		}
+		if got := parent.Mode().Perm(); got != 0o700 {
+			t.Fatalf("token directory mode = %o, want 700", got)
+		}
 	}
 }
 

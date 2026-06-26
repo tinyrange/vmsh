@@ -1104,7 +1104,7 @@ func scanCacheDir(args []string) string {
 
 func resolveCacheDir(arg string) (string, error) {
 	if strings.TrimSpace(arg) != "" {
-		if err := os.MkdirAll(arg, 0o700); err != nil {
+		if err := ensurePrivateDir(arg); err != nil {
 			return "", err
 		}
 		return arg, nil
@@ -1114,7 +1114,7 @@ func resolveCacheDir(arg string) (string, error) {
 		return "", fmt.Errorf("resolve user cache dir: %w", err)
 	}
 	dir := filepath.Join(userCacheDir, "vmshd")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := ensurePrivateDir(dir); err != nil {
 		return "", err
 	}
 	return dir, nil
@@ -1125,7 +1125,7 @@ func writeTokenFile(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := ensurePrivateDir(filepath.Dir(path)); err != nil {
 		return "", err
 	}
 	if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
@@ -1135,6 +1135,16 @@ func writeTokenFile(path string) (string, error) {
 		_ = os.Chmod(path, 0o600)
 	}
 	return token, nil
+}
+
+func ensurePrivateDir(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	if runtime.GOOS != "windows" {
+		return os.Chmod(path, 0o700)
+	}
+	return nil
 }
 
 func newToken() (string, error) {

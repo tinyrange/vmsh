@@ -10439,7 +10439,7 @@ func formatBootEvent(event client.BootEvent) string {
 
 func resolveCacheDir(arg, identity string) (string, error) {
 	if arg != "" {
-		return arg, os.MkdirAll(arg, 0o755)
+		return arg, ensurePrivateCacheDir(arg)
 	}
 	cacheRoot, err := userCacheDir()
 	if err != nil {
@@ -10450,7 +10450,7 @@ func resolveCacheDir(arg, identity string) (string, error) {
 		identity = "ccdev"
 	}
 	dir := filepath.Join(cacheRoot, identity)
-	return dir, os.MkdirAll(dir, 0o755)
+	return dir, ensurePrivateCacheDir(dir)
 }
 
 func resolveShellCacheDir(arg, identity string, nested bool) (string, error) {
@@ -10466,7 +10466,17 @@ func resolveShellCacheDir(arg, identity string, nested bool) (string, error) {
 		identity = "ccdev"
 	}
 	dir := filepath.Join(cacheRoot, identity+"-nested", strconv.Itoa(os.Getpid()))
-	return dir, os.MkdirAll(dir, 0o755)
+	return dir, ensurePrivateCacheDir(dir)
+}
+
+func ensurePrivateCacheDir(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	if runtime.GOOS != "windows" {
+		return os.Chmod(path, 0o700)
+	}
+	return nil
 }
 
 func nestedVMSHActive() bool {

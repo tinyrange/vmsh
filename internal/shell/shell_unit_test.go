@@ -289,6 +289,7 @@ func TestResolveCacheDirUsesDaemonIdentity(t *testing.T) {
 	if _, err := os.Stat(devDir); err != nil {
 		t.Fatalf("stat dev cache: %v", err)
 	}
+	assertPrivateCacheDir(t, devDir)
 
 	prodDir, err := resolveCacheDir("", "ccprod")
 	if err != nil {
@@ -327,6 +328,21 @@ func TestResolveCacheDirKeepsExplicitDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(explicit); err != nil {
 		t.Fatalf("stat explicit cache: %v", err)
+	}
+	assertPrivateCacheDir(t, explicit)
+}
+
+func assertPrivateCacheDir(t *testing.T, path string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat cache dir: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("cache dir mode = %o, want 700", got)
 	}
 }
 
