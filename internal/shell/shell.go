@@ -1296,6 +1296,7 @@ func vmshdSessionMetadata(hostCWD string, ctx commandContext) vmshd.UpdateSessio
 			User:     strings.TrimSpace(ctx.User),
 			Isolated: ctx.Isolated,
 		},
+		VMRefs: vmshdVMRefs(ctx),
 	}
 }
 
@@ -1303,9 +1304,29 @@ func (s *shellState) publishVMSHDSessionState() {
 	if s.vmshd == nil {
 		return
 	}
+	s.vmshd.hostCWD = s.hostCWD
+	s.vmshd.context = s.context
 	jobs := s.vmshdJobSummaries()
 	hostShells, guestShells, sshShells := s.vmshdShellHandles()
 	s.vmshd.publish(jobs, hostShells, guestShells, sshShells)
+}
+
+func vmshdVMRefs(ctx commandContext) []vmshd.VMRef {
+	if ctx.Mode != modeVM {
+		return nil
+	}
+	id := strings.TrimSpace(ctx.VMID)
+	backendID := backendVMID(ctx)
+	if id == "" && backendID == "" {
+		return nil
+	}
+	return []vmshd.VMRef{{
+		ID:        firstNonEmpty(id, backendID),
+		BackendID: backendID,
+		Context:   contextShortText(ctx),
+		Image:     contextImageText(ctx),
+		Isolated:  ctx.Isolated,
+	}}
 }
 
 func (s *shellState) vmshdJobSummaries() []vmshd.JobSummary {

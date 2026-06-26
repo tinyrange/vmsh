@@ -64,6 +64,7 @@ type Session struct {
 	State           string             `json:"state"`
 	HostCWD         string             `json:"host_cwd,omitempty"`
 	SelectedContext *SessionContext    `json:"selected_context,omitempty"`
+	VMRefs          []VMRef            `json:"vm_refs,omitempty"`
 	HostShells      []ShellHandle      `json:"host_shells,omitempty"`
 	GuestShells     []ShellHandle      `json:"guest_shells,omitempty"`
 	SSHShells       []ShellHandle      `json:"ssh_shells,omitempty"`
@@ -79,6 +80,7 @@ type SessionSummary struct {
 	State           string             `json:"state"`
 	HostCWD         string             `json:"host_cwd,omitempty"`
 	SelectedContext *SessionContext    `json:"selected_context,omitempty"`
+	VMRefs          []VMRef            `json:"vm_refs,omitempty"`
 	HostShells      []ShellHandle      `json:"host_shells,omitempty"`
 	GuestShells     []ShellHandle      `json:"guest_shells,omitempty"`
 	SSHShells       []ShellHandle      `json:"ssh_shells,omitempty"`
@@ -99,6 +101,14 @@ type SessionContext struct {
 	CWD      string `json:"cwd,omitempty"`
 	User     string `json:"user,omitempty"`
 	Isolated bool   `json:"isolated,omitempty"`
+}
+
+type VMRef struct {
+	ID        string `json:"id"`
+	BackendID string `json:"backend_id,omitempty"`
+	Context   string `json:"context,omitempty"`
+	Image     string `json:"image,omitempty"`
+	Isolated  bool   `json:"isolated,omitempty"`
 }
 
 type JobSummary struct {
@@ -162,6 +172,7 @@ type CreateSessionRequest struct {
 type UpdateSessionRequest struct {
 	HostCWD         string          `json:"host_cwd,omitempty"`
 	SelectedContext *SessionContext `json:"selected_context,omitempty"`
+	VMRefs          []VMRef         `json:"vm_refs,omitempty"`
 	HostShells      []ShellHandle   `json:"host_shells,omitempty"`
 	GuestShells     []ShellHandle   `json:"guest_shells,omitempty"`
 	SSHShells       []ShellHandle   `json:"ssh_shells,omitempty"`
@@ -1181,6 +1192,7 @@ func (r *sessionRegistry) Update(id string, req UpdateSessionRequest) (Session, 
 	}
 	session.HostCWD = strings.TrimSpace(req.HostCWD)
 	session.SelectedContext = cloneSessionContext(req.SelectedContext)
+	session.VMRefs = cloneVMRefs(req.VMRefs)
 	session.HostShells = cloneShellHandles(req.HostShells)
 	session.GuestShells = cloneShellHandles(req.GuestShells)
 	session.SSHShells = cloneShellHandles(req.SSHShells)
@@ -1327,6 +1339,7 @@ func (r *sessionRegistry) List() []SessionSummary {
 			State:           session.State,
 			HostCWD:         session.HostCWD,
 			SelectedContext: cloneSessionContext(session.SelectedContext),
+			VMRefs:          cloneVMRefs(session.VMRefs),
 			HostShells:      cloneShellHandles(session.HostShells),
 			GuestShells:     cloneShellHandles(session.GuestShells),
 			SSHShells:       cloneShellHandles(session.SSHShells),
@@ -1506,6 +1519,7 @@ func (r *sessionRegistry) jobIDsLocked(sessionID string) []int {
 func cloneSession(session Session) Session {
 	session.Attachments = cloneAttachments(session.Attachments)
 	session.SelectedContext = cloneSessionContext(session.SelectedContext)
+	session.VMRefs = cloneVMRefs(session.VMRefs)
 	session.HostShells = cloneShellHandles(session.HostShells)
 	session.GuestShells = cloneShellHandles(session.GuestShells)
 	session.SSHShells = cloneShellHandles(session.SSHShells)
@@ -1538,6 +1552,13 @@ func cloneSessionContext(ctx *SessionContext) *SessionContext {
 	}
 	out := *ctx
 	return &out
+}
+
+func cloneVMRefs(refs []VMRef) []VMRef {
+	if refs == nil {
+		return nil
+	}
+	return append([]VMRef(nil), refs...)
 }
 
 func cloneJobSummaries(jobs []JobSummary) []JobSummary {

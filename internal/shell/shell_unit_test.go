@@ -520,6 +520,71 @@ func TestAttachCommandRequiresVMSHDSessionAndNoArguments(t *testing.T) {
 	}
 }
 
+func TestVMSHDSessionMetadataIncludesSelectedVMRef(t *testing.T) {
+	req := vmshdSessionMetadata("/work", commandContext{
+		Mode:     modeVM,
+		VMID:     "dev",
+		Image:    "debian",
+		Isolated: true,
+	})
+	if req.SelectedContext == nil || req.SelectedContext.VMID != "dev" || !req.SelectedContext.Isolated {
+		t.Fatalf("selected context = %+v", req.SelectedContext)
+	}
+	if len(req.VMRefs) != 1 || req.VMRefs[0].ID != "dev" || req.VMRefs[0].BackendID != "dev-isolated" || req.VMRefs[0].Image != "debian" || !req.VMRefs[0].Isolated {
+		t.Fatalf("vm refs = %+v", req.VMRefs)
+	}
+}
+
+func TestVMSHDSessionPublishUsesCurrentContext(t *testing.T) {
+	updates := make(chan vmshd.UpdateSessionRequest, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/sessions/sess_1", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch {
+			t.Fatalf("method = %s", r.Method)
+		}
+		var req vmshd.UpdateSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode update request: %v", err)
+		}
+		updates <- req
+		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "attached"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.context = commandContext{Mode: modeVM, VMID: "dev", Image: "debian", Isolated: true}
+	sh.vmshd = &vmshdSessionReporter{
+		client:    httpClient,
+		sessionID: "sess_1",
+		hostCWD:   "/old",
+		context:   commandContext{Mode: modeHost},
+	}
+
+	sh.publishVMSHDSessionState()
+	select {
+	case req := <-updates:
+		if req.HostCWD != sh.hostCWD || req.SelectedContext == nil || req.SelectedContext.VMID != "dev" {
+			t.Fatalf("published metadata = %+v", req)
+		}
+		if len(req.VMRefs) != 1 || req.VMRefs[0].BackendID != "dev-isolated" {
+			t.Fatalf("published vm refs = %+v", req.VMRefs)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for vmshd update")
+	}
+}
+
 func writeJSONForShellTest(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
