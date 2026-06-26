@@ -69,6 +69,7 @@ type Session struct {
 	GuestShells     []ShellHandle      `json:"guest_shells,omitempty"`
 	SSHShells       []ShellHandle      `json:"ssh_shells,omitempty"`
 	Jobs            []JobSummary       `json:"jobs,omitempty"`
+	Copies          []CopySummary      `json:"copies,omitempty"`
 	Attachments     []ClientAttachment `json:"attached_clients"`
 	CreatedAt       time.Time          `json:"created_at"`
 	UpdatedAt       time.Time          `json:"updated_at"`
@@ -85,6 +86,7 @@ type SessionSummary struct {
 	GuestShells     []ShellHandle      `json:"guest_shells,omitempty"`
 	SSHShells       []ShellHandle      `json:"ssh_shells,omitempty"`
 	Jobs            []JobSummary       `json:"jobs,omitempty"`
+	Copies          []CopySummary      `json:"copies,omitempty"`
 	AttachedClients []ClientAttachment `json:"attached_clients"`
 	CreatedAt       time.Time          `json:"created_at"`
 	UpdatedAt       time.Time          `json:"updated_at"`
@@ -122,6 +124,17 @@ type JobSummary struct {
 	Control    string    `json:"control,omitempty"`
 	Logs       string    `json:"logs,omitempty"`
 	LogDropped bool      `json:"log_dropped,omitempty"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at,omitempty"`
+}
+
+type CopySummary struct {
+	ID         int       `json:"id"`
+	Source     string    `json:"source"`
+	Dest       string    `json:"dest"`
+	Status     string    `json:"status"`
+	Bytes      int64     `json:"bytes,omitempty"`
+	Error      string    `json:"error,omitempty"`
 	StartedAt  time.Time `json:"started_at"`
 	FinishedAt time.Time `json:"finished_at,omitempty"`
 }
@@ -177,6 +190,7 @@ type UpdateSessionRequest struct {
 	GuestShells     []ShellHandle   `json:"guest_shells,omitempty"`
 	SSHShells       []ShellHandle   `json:"ssh_shells,omitempty"`
 	Jobs            []JobSummary    `json:"jobs,omitempty"`
+	Copies          []CopySummary   `json:"copies,omitempty"`
 }
 
 type AttachSessionRequest struct {
@@ -1197,6 +1211,7 @@ func (r *sessionRegistry) Update(id string, req UpdateSessionRequest) (Session, 
 	session.GuestShells = cloneShellHandles(req.GuestShells)
 	session.SSHShells = cloneShellHandles(req.SSHShells)
 	session.Jobs = cloneJobSummaries(req.Jobs)
+	session.Copies = cloneCopySummaries(req.Copies)
 	session.HostShells = r.mergedHostShellsLocked(id, session.HostShells)
 	session.UpdatedAt = time.Now()
 	r.sessions[id] = session
@@ -1344,6 +1359,7 @@ func (r *sessionRegistry) List() []SessionSummary {
 			GuestShells:     cloneShellHandles(session.GuestShells),
 			SSHShells:       cloneShellHandles(session.SSHShells),
 			Jobs:            cloneJobSummaries(session.Jobs),
+			Copies:          cloneCopySummaries(session.Copies),
 			AttachedClients: cloneAttachments(session.Attachments),
 			CreatedAt:       session.CreatedAt,
 			UpdatedAt:       session.UpdatedAt,
@@ -1524,6 +1540,7 @@ func cloneSession(session Session) Session {
 	session.GuestShells = cloneShellHandles(session.GuestShells)
 	session.SSHShells = cloneShellHandles(session.SSHShells)
 	session.Jobs = cloneJobSummaries(session.Jobs)
+	session.Copies = cloneCopySummaries(session.Copies)
 	return session
 }
 
@@ -1573,6 +1590,20 @@ func cloneJobSummaries(jobs []JobSummary) []JobSummary {
 		out[i].Error = strings.TrimSpace(out[i].Error)
 		out[i].Control = strings.TrimSpace(out[i].Control)
 		out[i].Logs = strings.TrimSpace(out[i].Logs)
+	}
+	return out
+}
+
+func cloneCopySummaries(copies []CopySummary) []CopySummary {
+	if copies == nil {
+		return nil
+	}
+	out := append([]CopySummary(nil), copies...)
+	for i := range out {
+		out[i].Source = strings.TrimSpace(out[i].Source)
+		out[i].Dest = strings.TrimSpace(out[i].Dest)
+		out[i].Status = strings.TrimSpace(out[i].Status)
+		out[i].Error = strings.TrimSpace(out[i].Error)
 	}
 	return out
 }

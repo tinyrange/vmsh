@@ -81,6 +81,7 @@ func TestStatusRoute(t *testing.T) {
 		VMRefs:          []VMRef{{ID: "dev", BackendID: "dev-isolated", Context: "vm:dev", Image: "debian", Isolated: true}},
 		HostShells:      []ShellHandle{{ID: "host", Kind: "host", Name: "host", CWD: "/work", State: "open"}},
 		Jobs:            []JobSummary{{ID: 1, Command: "sleep 1", Status: "running", StartedAt: time.Now()}},
+		Copies:          []CopySummary{{ID: 1, Source: "@host:a", Dest: "@host:b", Status: "running", StartedAt: time.Now()}},
 	})
 	if err != nil {
 		t.Fatalf("update session: %v", err)
@@ -111,6 +112,9 @@ func TestStatusRoute(t *testing.T) {
 	if len(status.Sessions[0].VMRefs) != 1 || status.Sessions[0].VMRefs[0].BackendID != "dev-isolated" || !status.Sessions[0].VMRefs[0].Isolated {
 		t.Fatalf("status session vm refs = %+v", status.Sessions[0].VMRefs)
 	}
+	if len(status.Sessions[0].Copies) != 1 || status.Sessions[0].Copies[0].Source != "@host:a" || status.Sessions[0].Copies[0].Status != "running" {
+		t.Fatalf("status session copies = %+v", status.Sessions[0].Copies)
+	}
 	if len(status.Sessions[0].HostShells) != 1 || status.Sessions[0].HostShells[0].CWD != "/work" {
 		t.Fatalf("status host shells = %+v", status.Sessions[0].HostShells)
 	}
@@ -138,7 +142,7 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 	}
 
 	rr = httptest.NewRecorder()
-	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPatch, "/vmsh/sessions/"+created.ID, bytes.NewBufferString(`{"host_cwd":"/work","selected_context":{"mode":"vm","name":"dev","short":"vm:dev","source":"docker:debian","vm":"dev","image":"debian","cwd":"/repo","user":"root","isolated":true},"vm_refs":[{"id":"dev","backend_id":"dev-isolated","context":"vm:dev","image":"debian","isolated":true}],"host_shells":[{"id":"host","kind":"host","name":"host","cwd":"/work","state":"open"}],"guest_shells":[{"id":"dev","kind":"guest","name":"dev","context":"vm:dev","cwd":"/repo","vm":"dev","user":"root","state":"open"}],"ssh_shells":[{"id":"ssh","kind":"ssh","name":"app","context":"ssh:app","cwd":"/srv","ssh_host":"app","user":"me","state":"open"}],"jobs":[{"id":1,"context":"vm:dev","command":"make","status":"running","control":"vm:dev","logs":"@jobs logs 1","started_at":"2026-06-25T00:00:00Z"}]}`)))
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPatch, "/vmsh/sessions/"+created.ID, bytes.NewBufferString(`{"host_cwd":"/work","selected_context":{"mode":"vm","name":"dev","short":"vm:dev","source":"docker:debian","vm":"dev","image":"debian","cwd":"/repo","user":"root","isolated":true},"vm_refs":[{"id":"dev","backend_id":"dev-isolated","context":"vm:dev","image":"debian","isolated":true}],"host_shells":[{"id":"host","kind":"host","name":"host","cwd":"/work","state":"open"}],"guest_shells":[{"id":"dev","kind":"guest","name":"dev","context":"vm:dev","cwd":"/repo","vm":"dev","user":"root","state":"open"}],"ssh_shells":[{"id":"ssh","kind":"ssh","name":"app","context":"ssh:app","cwd":"/srv","ssh_host":"app","user":"me","state":"open"}],"jobs":[{"id":1,"context":"vm:dev","command":"make","status":"running","control":"vm:dev","logs":"@jobs logs 1","started_at":"2026-06-25T00:00:00Z"}],"copies":[{"id":1,"source":"@host:src","dest":"@host:dst","status":"done","started_at":"2026-06-25T00:00:00Z","finished_at":"2026-06-25T00:00:01Z"}]}`)))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("update status = %d body=%s", rr.Code, rr.Body.String())
 	}
@@ -154,6 +158,9 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 	}
 	if len(updated.VMRefs) != 1 || updated.VMRefs[0].ID != "dev" || updated.VMRefs[0].BackendID != "dev-isolated" || !updated.VMRefs[0].Isolated {
 		t.Fatalf("updated vm refs = %+v", updated.VMRefs)
+	}
+	if len(updated.Copies) != 1 || updated.Copies[0].Status != "done" || updated.Copies[0].Dest != "@host:dst" {
+		t.Fatalf("updated copies = %+v", updated.Copies)
 	}
 	if len(updated.HostShells) != 1 || len(updated.GuestShells) != 1 || len(updated.SSHShells) != 1 {
 		t.Fatalf("updated shell handles host=%+v guest=%+v ssh=%+v", updated.HostShells, updated.GuestShells, updated.SSHShells)
@@ -179,6 +186,9 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 	}
 	if len(sessions[0].VMRefs) != 1 || sessions[0].VMRefs[0].Context != "vm:dev" {
 		t.Fatalf("session summary vm refs = %+v", sessions[0].VMRefs)
+	}
+	if len(sessions[0].Copies) != 1 || sessions[0].Copies[0].Source != "@host:src" {
+		t.Fatalf("session summary copies = %+v", sessions[0].Copies)
 	}
 	if len(sessions[0].GuestShells) != 1 || sessions[0].GuestShells[0].VMID != "dev" {
 		t.Fatalf("session summary guest shells = %+v", sessions[0].GuestShells)

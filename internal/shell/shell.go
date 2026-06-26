@@ -95,6 +95,9 @@ type shellState struct {
 	jobs             []shellJob
 	nextJobID        int
 	jobsMu           sync.Mutex
+	copies           []shellCopy
+	nextCopyID       int
+	copiesMu         sync.Mutex
 	contextCWD       map[string]string
 	guestHomeCache   map[string]string
 	contextStack     []commandContext
@@ -145,6 +148,17 @@ type shellJob struct {
 	Control     string
 	Log         []byte
 	LogDropped  bool
+}
+
+type shellCopy struct {
+	ID       int
+	Source   string
+	Dest     string
+	Started  time.Time
+	Finished time.Time
+	Done     bool
+	Bytes    int64
+	Err      string
 }
 
 type vmshdSessionReporter struct {
@@ -1307,8 +1321,9 @@ func (s *shellState) publishVMSHDSessionState() {
 	s.vmshd.hostCWD = s.hostCWD
 	s.vmshd.context = s.context
 	jobs := s.vmshdJobSummaries()
+	copies := s.vmshdCopySummaries()
 	hostShells, guestShells, sshShells := s.vmshdShellHandles()
-	s.vmshd.publish(jobs, hostShells, guestShells, sshShells)
+	s.vmshd.publish(jobs, copies, hostShells, guestShells, sshShells)
 }
 
 func vmshdVMRefs(ctx commandContext) []vmshd.VMRef {
@@ -1355,6 +1370,36 @@ func vmshdJobSummary(job shellJob) vmshd.JobSummary {
 		LogDropped: job.LogDropped,
 		StartedAt:  job.Started,
 		FinishedAt: job.Finished,
+	}
+}
+
+func (s *shellState) vmshdCopySummaries() []vmshd.CopySummary {
+	s.copiesMu.Lock()
+	defer s.copiesMu.Unlock()
+	out := make([]vmshd.CopySummary, 0, len(s.copies))
+	for _, copyOp := range s.copies {
+		out = append(out, vmshdCopySummary(copyOp))
+	}
+	return out
+}
+
+func vmshdCopySummary(copyOp shellCopy) vmshd.CopySummary {
+	status := "running"
+	if copyOp.Done {
+		status = "done"
+		if copyOp.Err != "" {
+			status = "error"
+		}
+	}
+	return vmshd.CopySummary{
+		ID:         copyOp.ID,
+		Source:     copyOp.Source,
+		Dest:       copyOp.Dest,
+		Status:     status,
+		Bytes:      copyOp.Bytes,
+		Error:      copyOp.Err,
+		StartedAt:  copyOp.Started,
+		FinishedAt: copyOp.Finished,
 	}
 }
 
@@ -1433,7 +1478,7 @@ func jobStatus(job shellJob) string {
 	return "done"
 }
 
-func (r *vmshdSessionReporter) publish(jobs []vmshd.JobSummary, hostShells, guestShells, sshShells []vmshd.ShellHandle) {
+func (r *vmshdSessionReporter) publish(jobs []vmshd.JobSummary, copies []vmshd.CopySummary, hostShells, guestShells, sshShells []vmshd.ShellHandle) {
 	if r == nil || r.client == nil || strings.TrimSpace(r.sessionID) == "" {
 		return
 	}
@@ -1442,6 +1487,7 @@ func (r *vmshdSessionReporter) publish(jobs []vmshd.JobSummary, hostShells, gues
 	req.GuestShells = guestShells
 	req.SSHShells = sshShells
 	req.Jobs = jobs
+	req.Copies = copies
 	_, _ = r.client.UpdateSession(r.sessionID, req)
 }
 
@@ -3414,7 +3460,7 @@ func (e copyEndpoint) targetPath() copyTargetPath {
 	return copyTargetPath{path: e.path, directory: e.directory}
 }
 
-func (s *shellState) copyPath(command string, stdout, stderr io.Writer) error {
+func (s *shellState) copyPath(command string, stdout, stderr io.Writer) (err error) {
 	fields, err := splitShellFields(command)
 	if err != nil {
 		return err
@@ -3430,20 +3476,68 @@ func (s *shellState) copyPath(command string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	progress := newCopyProgress(stderr, copyEndpointLabel(src), copyEndpointLabel(dst))
-	defer progress.Close()
+	srcLabel := copyEndpointLabel(src)
+	dstLabel := copyEndpointLabel(dst)
+	copyID := s.startVMSHDCopy(srcLabel, dstLabel)
+	progress := newCopyProgress(stderr, srcLabel, dstLabel)
+	defer func() {
+		progress.Close()
+		if copyID != 0 {
+			s.finishVMSHDCopy(copyID, progress.Bytes(), err)
+		}
+	}()
 	srcHost, srcOK := src.target.LocalPath(src.path)
 	dstHost, dstOK := dst.target.LocalPath(dst.path)
 	if srcOK && dstOK {
-		return wrapCopyPathError(fields[0], fields[1], copyHostPath(srcHost, copyTargetPath{path: dstHost, directory: dst.directory}, progress))
+		err = wrapCopyPathError(fields[0], fields[1], copyHostPath(srcHost, copyTargetPath{path: dstHost, directory: dst.directory}, progress))
+		return err
 	}
 	if srcOK {
-		return wrapCopyPathError(fields[0], fields[1], dst.target.CopyFromLocal(srcHost, dst.targetPath(), stderr, progress))
+		err = wrapCopyPathError(fields[0], fields[1], dst.target.CopyFromLocal(srcHost, dst.targetPath(), stderr, progress))
+		return err
 	}
 	if dstOK {
-		return wrapCopyPathError(fields[0], fields[1], src.target.CopyToLocal(src.targetPath(), copyTargetPath{path: dstHost, directory: dst.directory}, stderr, progress))
+		err = wrapCopyPathError(fields[0], fields[1], src.target.CopyToLocal(src.targetPath(), copyTargetPath{path: dstHost, directory: dst.directory}, stderr, progress))
+		return err
 	}
-	return wrapCopyPathError(fields[0], fields[1], copyRemoteToRemote(src, dst, stderr, progress))
+	err = wrapCopyPathError(fields[0], fields[1], copyRemoteToRemote(src, dst, stderr, progress))
+	return err
+}
+
+func (s *shellState) startVMSHDCopy(src, dst string) int {
+	if s.vmshd == nil {
+		return 0
+	}
+	s.copiesMu.Lock()
+	s.nextCopyID++
+	id := s.nextCopyID
+	s.copies = append(s.copies, shellCopy{
+		ID:      id,
+		Source:  src,
+		Dest:    dst,
+		Started: time.Now(),
+	})
+	s.copiesMu.Unlock()
+	s.publishVMSHDSessionState()
+	return id
+}
+
+func (s *shellState) finishVMSHDCopy(id int, bytesCopied int64, runErr error) {
+	s.copiesMu.Lock()
+	for i := range s.copies {
+		if s.copies[i].ID != id {
+			continue
+		}
+		s.copies[i].Done = true
+		s.copies[i].Bytes = bytesCopied
+		s.copies[i].Finished = time.Now()
+		if runErr != nil {
+			s.copies[i].Err = runErr.Error()
+		}
+		break
+	}
+	s.copiesMu.Unlock()
+	s.publishVMSHDSessionState()
 }
 
 func wrapCopyPathError(src, dst string, err error) error {
@@ -3537,6 +3631,15 @@ func (p *copyProgress) AddBytes(n int) {
 	p.bytes += int64(n)
 	p.updateLocked(time.Now())
 	p.mu.Unlock()
+}
+
+func (p *copyProgress) Bytes() int64 {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.bytes
 }
 
 func (p *copyProgress) updateLocked(now time.Time) {

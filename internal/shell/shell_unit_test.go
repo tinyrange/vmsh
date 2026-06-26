@@ -5509,6 +5509,71 @@ func TestCopyProgressIsQuietForNonTerminalStderr(t *testing.T) {
 	}
 }
 
+func TestCopyPathPublishesVMSHDCopyState(t *testing.T) {
+	updates := make(chan vmshd.UpdateSessionRequest, 4)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/sessions/sess_1", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch {
+			t.Fatalf("method = %s", r.Method)
+		}
+		var req vmshd.UpdateSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode update request: %v", err)
+		}
+		updates <- req
+		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "attached", Copies: req.Copies})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.vmshd = &vmshdSessionReporter{client: httpClient, sessionID: "sess_1", hostCWD: sh.hostCWD, context: sh.context}
+	if err := os.WriteFile(filepath.Join(sh.hostCWD, "local.txt"), []byte("copy-data"), 0o644); err != nil {
+		t.Fatalf("write local source: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.copyPath("@host:local.txt @host:copied.txt", &stdout, &stderr); err != nil {
+		t.Fatalf("copy local file: %v", err)
+	}
+	running := readVMSHDCopyUpdate(t, updates, "running")
+	if len(running.Copies) != 1 || running.Copies[0].ID != 1 || running.Copies[0].Source != "host" || running.Copies[0].Dest != "host" || !running.Copies[0].FinishedAt.IsZero() {
+		t.Fatalf("running copy update = %+v", running.Copies)
+	}
+	done := readVMSHDCopyUpdate(t, updates, "done")
+	if len(done.Copies) != 1 || done.Copies[0].ID != 1 || done.Copies[0].Status != "done" || done.Copies[0].Error != "" || done.Copies[0].FinishedAt.IsZero() {
+		t.Fatalf("done copy update = %+v", done.Copies)
+	}
+	if got := readTestFile(t, filepath.Join(sh.hostCWD, "copied.txt")); got != "copy-data" {
+		t.Fatalf("copied data = %q", got)
+	}
+}
+
+func readVMSHDCopyUpdate(t *testing.T, updates <-chan vmshd.UpdateSessionRequest, status string) vmshd.UpdateSessionRequest {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case update := <-updates:
+			if len(update.Copies) > 0 && update.Copies[0].Status == status {
+				return update
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for vmshd copy status %q", status)
+		}
+	}
+}
+
 func TestSSHCopyPreservesDirectoryMetadataHostToSSHToHost(t *testing.T) {
 	remoteRoot := t.TempDir()
 	var sshCommands atomic.Int32
