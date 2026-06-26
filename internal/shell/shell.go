@@ -348,7 +348,7 @@ func (c *vmshCompleter) completionContext(prefix string) commandContext {
 		if err == nil {
 			ctx = sshCommandContext(ctx, at.Options, host)
 		}
-	case "help", "ps", "jobs", "alias", "attach", "exec", "status", "where", "start", "stop", "restart", "forward", "tmux", "agent":
+	case "help", "ps", "jobs", "sessions", "alias", "attach", "exec", "status", "where", "start", "stop", "restart", "forward", "tmux", "agent":
 	default:
 		if sshCtx, ok := c.shellSSHSessionContext(at.Target); ok {
 			ctx = sshCtx
@@ -374,7 +374,7 @@ func pathCompletionReplaceLen(token string) int {
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@agent", "@alias", "@attach", "@copy", "@exec", "@help", "@host", "@jobs", "@ps", "@restart", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux"}
+	words := []string{"@agent", "@alias", "@attach", "@copy", "@exec", "@help", "@host", "@jobs", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux"}
 	if c.shell != nil {
 		for _, name := range c.shell.sshSessionNames() {
 			words = append(words, "@"+name)
@@ -2673,7 +2673,7 @@ func (s *shellState) preparePipelineStage(base commandContext, index int, segmen
 
 func isControlAtTarget(target string) bool {
 	switch target {
-	case "help", "?", "ps", "jobs", "alias", "status", "where", "start", "stop", "restart", "save", "rmi", "tmux", "forward", "copy", "cp", "agent", "ssh":
+	case "help", "?", "ps", "jobs", "sessions", "alias", "status", "where", "start", "stop", "restart", "save", "rmi", "tmux", "forward", "copy", "cp", "agent", "ssh":
 		return true
 	default:
 		return false
@@ -3126,6 +3126,11 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return s.controlJob(at.Command, stdout)
 		}
 		return s.printJobs(stdout)
+	case "sessions":
+		if at.Command != "" || len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @sessions")
+		}
+		return s.printSessions(stdout)
 	case "alias":
 		if len(at.Options.OptionFields) != 0 {
 			return fmt.Errorf("usage: @alias [name=value] | @alias -d name | @alias expand <line>")
@@ -9073,6 +9078,84 @@ func (s *shellState) printJobs(w io.Writer) error {
 	return nil
 }
 
+type vmshdSessionRow struct {
+	ID          string
+	Name        string
+	State       string
+	Context     string
+	Attachments int
+	Jobs        int
+	Copies      int
+	HostShells  int
+	GuestShells int
+	SSHShells   int
+	VMRefs      int
+	Current     bool
+}
+
+func (s *shellState) printSessions(w io.Writer) error {
+	if s.vmshd == nil || s.vmshd.client == nil {
+		return fmt.Errorf("@sessions requires a vmshd session")
+	}
+	sessions, err := s.vmshd.client.Sessions()
+	if err != nil {
+		return err
+	}
+	rows := vmshdSessionRows(sessions, s.vmshd.sessionID)
+	if len(rows) == 0 {
+		_, err := fmt.Fprintln(w, "No vmshd sessions")
+		return err
+	}
+	for _, row := range rows {
+		parts := []string{
+			row.ID,
+			"name=" + strconv.Quote(emptyText(row.Name, "-")),
+			"state=" + emptyText(row.State, "unknown"),
+			"context=" + strconv.Quote(emptyText(row.Context, "-")),
+			fmt.Sprintf("attachments=%d", row.Attachments),
+			fmt.Sprintf("jobs=%d", row.Jobs),
+			fmt.Sprintf("copies=%d", row.Copies),
+			fmt.Sprintf("host_shells=%d", row.HostShells),
+			fmt.Sprintf("guest_shells=%d", row.GuestShells),
+			fmt.Sprintf("ssh_shells=%d", row.SSHShells),
+			fmt.Sprintf("vm_refs=%d", row.VMRefs),
+		}
+		if row.Current {
+			parts = append(parts, "[current]")
+		}
+		if _, err := fmt.Fprintln(w, strings.Join(parts, " ")); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func vmshdSessionRows(sessions []vmshd.SessionSummary, currentID string) []vmshdSessionRow {
+	rows := make([]vmshdSessionRow, 0, len(sessions))
+	currentID = strings.TrimSpace(currentID)
+	for _, session := range sessions {
+		context := ""
+		if session.SelectedContext != nil {
+			context = emptyText(session.SelectedContext.Short, session.SelectedContext.Name)
+		}
+		rows = append(rows, vmshdSessionRow{
+			ID:          session.ID,
+			Name:        session.Name,
+			State:       session.State,
+			Context:     context,
+			Attachments: len(session.AttachedClients),
+			Jobs:        len(session.Jobs),
+			Copies:      len(session.Copies),
+			HostShells:  len(session.HostShells),
+			GuestShells: len(session.GuestShells),
+			SSHShells:   len(session.SSHShells),
+			VMRefs:      len(session.VMRefs),
+			Current:     currentID != "" && session.ID == currentID,
+		})
+	}
+	return rows
+}
+
 func (s *shellState) controlJob(command string, w io.Writer) error {
 	fields, err := splitShellFields(command)
 	if err != nil {
@@ -9302,6 +9385,7 @@ func (s *shellState) help(w io.Writer) error {
 @alias expand line       print alias-expanded line without running it
 @ps                      list VMs and SSH sessions
 	@jobs [logs id|stop id]  list background jobs, show captured output, or request stop
+@sessions                list vmshd shell sessions and resource counts
 @status                  show vmsh and selected VM state
 @attach                  attach this terminal to the daemon-owned vmshd host shell
 @start                   start the current VM

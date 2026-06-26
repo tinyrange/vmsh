@@ -520,6 +520,93 @@ func TestAttachCommandRequiresVMSHDSessionAndNoArguments(t *testing.T) {
 	}
 }
 
+func TestVMSHDSessionsCommandReadsDaemonSessions(t *testing.T) {
+	requests := make(chan string, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/sessions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s", r.Method)
+		}
+		requests <- r.Header.Get("Authorization")
+		writeJSONForShellTest(w, []vmshd.SessionSummary{{
+			ID:    "sess_1",
+			Name:  "main",
+			State: "attached",
+			SelectedContext: &vmshd.SessionContext{
+				Short: "host",
+			},
+			AttachedClients: []vmshd.ClientAttachment{{ID: "attach_1"}},
+			Jobs:            []vmshd.JobSummary{{ID: 1}},
+			Copies:          []vmshd.CopySummary{{ID: 1}},
+			HostShells:      []vmshd.ShellHandle{{ID: "host"}},
+		}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.vmshd = &vmshdSessionReporter{client: httpClient, sessionID: "sess_1"}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@sessions", &stdout, &stderr); err != nil {
+		t.Fatalf("@sessions: %v", err)
+	}
+	select {
+	case got := <-requests:
+		if got != "Bearer secret" {
+			t.Fatalf("authorization = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for sessions request")
+	}
+	if stdout.Len() == 0 {
+		t.Fatal("@sessions wrote no output")
+	}
+}
+
+func TestVMSHDSessionRowsExposeStructuredResourceCounts(t *testing.T) {
+	rows := vmshdSessionRows([]vmshd.SessionSummary{{
+		ID:              "sess_1",
+		Name:            "main",
+		State:           "attached",
+		SelectedContext: &vmshd.SessionContext{Short: "vm:dev", Name: "dev"},
+		AttachedClients: []vmshd.ClientAttachment{{ID: "attach_1"}},
+		Jobs:            []vmshd.JobSummary{{ID: 1}, {ID: 2}},
+		Copies:          []vmshd.CopySummary{{ID: 1}},
+		HostShells:      []vmshd.ShellHandle{{ID: "host"}},
+		GuestShells:     []vmshd.ShellHandle{{ID: "guest"}},
+		SSHShells:       []vmshd.ShellHandle{{ID: "ssh"}},
+		VMRefs:          []vmshd.VMRef{{ID: "dev"}},
+	}}, "sess_1")
+	want := []vmshdSessionRow{{
+		ID:          "sess_1",
+		Name:        "main",
+		State:       "attached",
+		Context:     "vm:dev",
+		Attachments: 1,
+		Jobs:        2,
+		Copies:      1,
+		HostShells:  1,
+		GuestShells: 1,
+		SSHShells:   1,
+		VMRefs:      1,
+		Current:     true,
+	}}
+	if !reflect.DeepEqual(rows, want) {
+		t.Fatalf("rows = %+v, want %+v", rows, want)
+	}
+}
+
 func TestVMSHDSessionMetadataIncludesSelectedVMRef(t *testing.T) {
 	req := vmshdSessionMetadata("/work", commandContext{
 		Mode:     modeVM,

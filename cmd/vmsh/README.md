@@ -91,6 +91,7 @@ These attention words are reserved:
 @help
 @host [command...]
 @jobs
+@sessions
 @ps
 @status
 @start
