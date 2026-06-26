@@ -19,8 +19,13 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/vmsh/sessions", func(w http.ResponseWriter, r *http.Request) {
 		requireBearer(t, r)
-		if r.Method != http.MethodPost {
-			t.Fatalf("create method = %s", r.Method)
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, http.StatusOK, []SessionSummary{{ID: "sess_1", Name: "main", State: "attached"}})
+			return
+		case http.MethodPost:
+		default:
+			t.Fatalf("sessions method = %s", r.Method)
 		}
 		var req CreateSessionRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -30,6 +35,19 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 			t.Fatalf("create request = %+v", req)
 		}
 		writeJSON(w, http.StatusOK, Session{ID: "sess_1", Name: req.Name, State: "detached"})
+	})
+	mux.HandleFunc("/vmsh/status", func(w http.ResponseWriter, r *http.Request) {
+		requireBearer(t, r)
+		if r.Method != http.MethodGet {
+			t.Fatalf("status method = %s", r.Method)
+		}
+		writeJSON(w, http.StatusOK, Status{
+			Kind:      "vmshd",
+			Status:    "running",
+			Sessions:  []SessionSummary{{ID: "sess_1", Name: "main", State: "attached"}},
+			Streams:   []StreamSummary{{ID: "terminal_stream_1", Kind: "terminal", SessionID: "sess_1"}},
+			StartedAt: time.Unix(10, 0),
+		})
 	})
 	mux.HandleFunc("/vmsh/sessions/sess_1/attach", func(w http.ResponseWriter, r *http.Request) {
 		requireBearer(t, r)
@@ -47,8 +65,13 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 	})
 	mux.HandleFunc("/vmsh/sessions/sess_1", func(w http.ResponseWriter, r *http.Request) {
 		requireBearer(t, r)
-		if r.Method != http.MethodPatch {
-			t.Fatalf("update method = %s", r.Method)
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, http.StatusOK, Session{ID: "sess_1", Name: "main", State: "attached", HostCWD: "/work"})
+			return
+		case http.MethodPatch:
+		default:
+			t.Fatalf("session method = %s", r.Method)
 		}
 		var req UpdateSessionRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -132,6 +155,27 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 	}
 	if session.ID != "sess_1" {
 		t.Fatalf("session = %+v", session)
+	}
+	status, err := client.Status()
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if status.Kind != "vmshd" || status.Status != "running" || len(status.Sessions) != 1 || len(status.Streams) != 1 {
+		t.Fatalf("status = %+v", status)
+	}
+	sessions, err := client.Sessions()
+	if err != nil {
+		t.Fatalf("sessions: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != session.ID || sessions[0].State != "attached" {
+		t.Fatalf("sessions = %+v", sessions)
+	}
+	read, err := client.Session(session.ID)
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	if read.ID != session.ID || read.HostCWD != "/work" {
+		t.Fatalf("read session = %+v", read)
 	}
 	updated, err := client.UpdateSession(session.ID, UpdateSessionRequest{
 		HostCWD:         "/work",

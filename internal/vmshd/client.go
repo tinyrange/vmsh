@@ -46,9 +46,27 @@ func (c *HTTPClient) CreateSession(req CreateSessionRequest) (Session, error) {
 	return session, err
 }
 
+func (c *HTTPClient) Status() (Status, error) {
+	var status Status
+	err := c.doJSON(http.MethodGet, "/vmsh/status", nil, &status)
+	return status, err
+}
+
+func (c *HTTPClient) Sessions() ([]SessionSummary, error) {
+	var sessions []SessionSummary
+	err := c.doJSON(http.MethodGet, "/vmsh/sessions", nil, &sessions)
+	return sessions, err
+}
+
+func (c *HTTPClient) Session(id string) (Session, error) {
+	var session Session
+	err := c.doJSON(http.MethodGet, "/vmsh/sessions/"+url.PathEscape(id), nil, &session)
+	return session, err
+}
+
 func (c *HTTPClient) UpdateSession(id string, req UpdateSessionRequest) (Session, error) {
 	var session Session
-	err := c.doJSON(http.MethodPatch, "/vmsh/sessions/"+id, req, &session)
+	err := c.doJSON(http.MethodPatch, "/vmsh/sessions/"+url.PathEscape(id), req, &session)
 	return session, err
 }
 
@@ -73,13 +91,13 @@ func (c *HTTPClient) CancelHostJob(sessionID string, jobID int) (JobSummary, err
 
 func (c *HTTPClient) AttachSession(id string, req AttachSessionRequest) (AttachSessionResponse, error) {
 	var resp AttachSessionResponse
-	err := c.doJSON(http.MethodPost, "/vmsh/sessions/"+id+"/attach", req, &resp)
+	err := c.doJSON(http.MethodPost, "/vmsh/sessions/"+url.PathEscape(id)+"/attach", req, &resp)
 	return resp, err
 }
 
 func (c *HTTPClient) UpdateTerminal(sessionID, attachmentID string, req Terminal) (AttachSessionResponse, error) {
 	var resp AttachSessionResponse
-	path := "/vmsh/sessions/" + sessionID + "/attachments/" + attachmentID + "/terminal"
+	path := "/vmsh/sessions/" + url.PathEscape(sessionID) + "/attachments/" + url.PathEscape(attachmentID) + "/terminal"
 	err := c.doJSON(http.MethodPost, path, req, &resp)
 	return resp, err
 }
@@ -156,7 +174,7 @@ func (s *TerminalStream) Close() error {
 
 func (c *HTTPClient) DetachSession(id string, req DetachSessionRequest) (Session, error) {
 	var session Session
-	err := c.doJSON(http.MethodPost, "/vmsh/sessions/"+id+"/detach", req, &session)
+	err := c.doJSON(http.MethodPost, "/vmsh/sessions/"+url.PathEscape(id)+"/detach", req, &session)
 	return session, err
 }
 

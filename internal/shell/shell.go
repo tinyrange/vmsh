@@ -8568,7 +8568,10 @@ func (s *shellState) printStatus(w io.Writer) error {
 	if _, err := fmt.Fprintf(w, "current: %s\n", current); err != nil {
 		return err
 	}
-	return s.printCurrentStatusDetails(w)
+	if err := s.printCurrentStatusDetails(w); err != nil {
+		return err
+	}
+	return s.printVMSHDStatus(w)
 }
 
 func (s *shellState) activeContextChain() []commandContext {
@@ -8703,6 +8706,48 @@ func (s *shellState) printCurrentStatusDetails(w io.Writer) error {
 		_, err := fmt.Fprintf(w, "context: %s\n", s.context.Mode)
 		return err
 	}
+}
+
+func (s *shellState) printVMSHDStatus(w io.Writer) error {
+	if s.vmshd == nil || s.vmshd.client == nil {
+		return nil
+	}
+	status, err := s.vmshd.client.Status()
+	if err != nil {
+		_, writeErr := fmt.Fprintf(w, "vmshd: unavailable: %v\n", err)
+		return writeErr
+	}
+	if _, err := fmt.Fprintf(w, "vmshd:\n  daemon: %s sessions=%d streams=%d vms=%d\n",
+		emptyText(status.Status, "unknown"),
+		len(status.Sessions),
+		len(status.Streams),
+		len(status.VMs),
+	); err != nil {
+		return err
+	}
+	sessionID := strings.TrimSpace(s.vmshd.sessionID)
+	if sessionID == "" {
+		return nil
+	}
+	for _, session := range status.Sessions {
+		if session.ID != sessionID {
+			continue
+		}
+		_, err := fmt.Fprintf(w, "  session: %s state=%s attachments=%d jobs=%d copies=%d host_shells=%d guest_shells=%d ssh_shells=%d vm_refs=%d\n",
+			session.ID,
+			emptyText(session.State, "unknown"),
+			len(session.AttachedClients),
+			len(session.Jobs),
+			len(session.Copies),
+			len(session.HostShells),
+			len(session.GuestShells),
+			len(session.SSHShells),
+			len(session.VMRefs),
+		)
+		return err
+	}
+	_, err = fmt.Fprintf(w, "  session: %s state=missing\n", sessionID)
+	return err
 }
 
 func contextBoundaryError(ctx commandContext, op string, err error) error {
