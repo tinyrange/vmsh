@@ -482,7 +482,44 @@ func TestDaemonOwnedHostJobRunsDetachedAndUpdatesSessionState(t *testing.T) {
 
 	requireEventually(t, func() bool {
 		jobs := getJobsFromServer(t, httpSrv.URL, "secret")
-		return len(jobs) == 1 && jobs[0].Status == "exited" && jobs[0].FinishedAt.After(jobs[0].StartedAt) && strings.Contains(jobs[0].Logs, "daemon-job:ok")
+		return len(jobs) == 1 && jobs[0].Status == "exited" && jobs[0].FinishedAt.After(jobs[0].StartedAt) && jobs[0].Logs == "daemon-job:ok\n"
+	})
+}
+
+func TestDaemonOwnedSSHJobRunsAsHostProcess(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, nil)
+	session := srv.registry.Create("main")
+	httpSrv := httptest.NewServer(srv.Authenticate(mux))
+	defer httpSrv.Close()
+
+	body := fmt.Sprintf(`{"kind":"ssh","command":[%q,"-test.run=TestDaemonHostJobHelper","--"],"env":["VMSHD_TEST_HOST_JOB=1","VMSHD_TEST_VALUE=ssh"],"context":"ssh:server"}`, os.Args[0])
+	req, err := http.NewRequest(http.MethodPost, httpSrv.URL+"/vmsh/sessions/"+session.ID+"/jobs", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("new job request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("start job: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("start job status = %d", resp.StatusCode)
+	}
+	var started JobSummary
+	if err := json.NewDecoder(resp.Body).Decode(&started); err != nil {
+		t.Fatalf("decode started job: %v", err)
+	}
+	if started.ID == 0 || started.SessionID != session.ID || started.Status != "running" || started.Context != "ssh:server" || started.Control != "vmshd" {
+		t.Fatalf("started job = %+v", started)
+	}
+
+	requireEventually(t, func() bool {
+		jobs := getJobsFromServer(t, httpSrv.URL, "secret")
+		return len(jobs) == 1 && jobs[0].ID == started.ID && jobs[0].Status == "exited" && jobs[0].Logs == "daemon-job:ssh\n"
 	})
 }
 

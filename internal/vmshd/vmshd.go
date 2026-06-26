@@ -466,7 +466,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 
 func (s *Server) startJob(sessionID string, req StartHostJobRequest, runtime ccvmd.RuntimeView) (JobSummary, error) {
 	switch startJobKind(req) {
-	case "host":
+	case "host", "ssh":
 		return s.startHostJob(sessionID, req)
 	case "vm":
 		return s.startVMJob(sessionID, req, runtime)
@@ -490,7 +490,9 @@ func (s *Server) startHostJob(sessionID string, req StartHostJobRequest) (JobSum
 	if len(req.Command) == 0 || strings.TrimSpace(req.Command[0]) == "" {
 		return JobSummary{}, sessionError{status: http.StatusBadRequest, err: "command is required"}
 	}
-	req.Kind = "host"
+	if strings.TrimSpace(req.Kind) == "" {
+		req.Kind = "host"
+	}
 	sessionID = strings.TrimSpace(sessionID)
 	job, err := s.registry.StartJob(sessionID, req)
 	if err != nil {
