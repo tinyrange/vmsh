@@ -174,6 +174,63 @@ func TestRunHostMarksScriptModeNestedShellAsActive(t *testing.T) {
 	}
 }
 
+func TestExecRequestDefaultsToInteractiveHostShell(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("@exec is Unix-only")
+	}
+	t.Setenv("SHELL", "/bin/zsh")
+	t.Setenv("VMSH_ACTIVE", "1")
+	sh := newUnitShell(t, newRecordingShellAPI())
+
+	var stdout, stderr bytes.Buffer
+	err := sh.eval("@exec", &stdout, &stderr)
+	var req shellExecRequest
+	if !errors.As(err, &req) {
+		t.Fatalf("@exec error = %v, want shellExecRequest", err)
+	}
+	if req.path != "/bin/zsh" || !reflect.DeepEqual(req.argv, []string{"/bin/zsh", "-i"}) {
+		t.Fatalf("@exec request = path %q argv %#v", req.path, req.argv)
+	}
+	if envHas(req.env, "VMSH_ACTIVE") {
+		t.Fatalf("@exec env still has VMSH_ACTIVE")
+	}
+	if !envHasValue(req.env, "VMSH_DISABLE", "1") {
+		t.Fatalf("@exec env missing VMSH_DISABLE=1")
+	}
+}
+
+func TestExecRequestRunsCommandThroughHostShell(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("@exec is Unix-only")
+	}
+	t.Setenv("SHELL", "/bin/zsh")
+	sh := newUnitShell(t, newRecordingShellAPI())
+
+	var stdout, stderr bytes.Buffer
+	err := sh.eval("@exec tmux attach -t work", &stdout, &stderr)
+	var req shellExecRequest
+	if !errors.As(err, &req) {
+		t.Fatalf("@exec command error = %v, want shellExecRequest", err)
+	}
+	if req.path != "/bin/zsh" || !reflect.DeepEqual(req.argv, []string{"/bin/zsh", "-lc", "exec tmux attach -t work"}) {
+		t.Fatalf("@exec command request = path %q argv %#v", req.path, req.argv)
+	}
+}
+
+func TestExecRequestPropagatesFromScript(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("@exec is Unix-only")
+	}
+	t.Setenv("SHELL", "/bin/zsh")
+	sh := newUnitShell(t, newRecordingShellAPI())
+
+	err := sh.runScript(strings.NewReader("@exec\n"), io.Discard, io.Discard)
+	var req shellExecRequest
+	if !errors.As(err, &req) {
+		t.Fatalf("script error = %v, want shellExecRequest", err)
+	}
+}
+
 func TestConfirmExitIgnoresRefusedDaemonStatus(t *testing.T) {
 	api := newRecordingShellAPI("alpine", "alpine@amd64")
 	api.instanceStatusesErr = syscall.ECONNREFUSED
@@ -6830,6 +6887,26 @@ func (a *recordingShellAPI) ExecStreamInContext(ctx context.Context, id string, 
 func hasString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func envHas(env []string, name string) bool {
+	for _, entry := range env {
+		key, _, ok := strings.Cut(entry, "=")
+		if ok && key == name {
+			return true
+		}
+	}
+	return false
+}
+
+func envHasValue(env []string, name, value string) bool {
+	for _, entry := range env {
+		key, got, ok := strings.Cut(entry, "=")
+		if ok && key == name && got == value {
 			return true
 		}
 	}
