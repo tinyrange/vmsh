@@ -178,6 +178,12 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		_ = proc.Wait()
 		return nil, fmt.Errorf("ccvm daemon started at %s but health check failed: %w", hello.Addr, err)
 	}
+	if strings.TrimSpace(state.Kind) == "vmshd" && !apiCompatible(api, state) {
+		_ = os.Remove(statePath)
+		_ = proc.Process.Kill()
+		_ = proc.Wait()
+		return nil, fmt.Errorf("vmshd daemon started at %s but required routes are unavailable", hello.Addr)
+	}
 	if opts.OnStart != nil {
 		opts.OnStart(state)
 	}

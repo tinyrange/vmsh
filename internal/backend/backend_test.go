@@ -467,6 +467,83 @@ func TestConnectCCVMWithOptionsReportsNewDaemonStart(t *testing.T) {
 	}
 }
 
+func TestConnectCCVMWithOptionsRejectsStartedVMSHDWithoutSessionRoute(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script fake daemon is Unix-only")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	const token = "secret"
+	requireAuth := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "Bearer "+token {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			next(w, r)
+		}
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	mux.HandleFunc("/capabilities", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"host":"test","vm_supported":true}`))
+	}))
+	mux.HandleFunc("/watchdog/lease", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	mux.HandleFunc("/vm/start", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	srv := &http.Server{Handler: mux}
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+	t.Cleanup(func() {
+		_ = srv.Close()
+	})
+
+	cacheDir := t.TempDir()
+	tokenPath := filepath.Join(cacheDir, "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte(token+"\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	keepalive := filepath.Join(cacheDir, "keepalive")
+	if err := os.WriteFile(keepalive, []byte("1"), 0o600); err != nil {
+		t.Fatalf("write keepalive: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Remove(keepalive)
+	})
+
+	bin := filepath.Join(t.TempDir(), "fake-vmshd")
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' '{\"addr\":\"%s\",\"kind\":\"vmshd\",\"token_path\":\"%s\"}'\nwhile [ -f \"$2/keepalive\" ]; do sleep 0.1; done\n", ln.Addr().String(), tokenPath)
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake vmshd: %v", err)
+	}
+
+	statePath := filepath.Join(t.TempDir(), "vmshd.json")
+	var started bool
+	_, err = ConnectCCVMWithOptions(CCVMLaunch{Path: bin}, cacheDir, statePath, ConnectOptions{
+		OnStart: func(DaemonState) {
+			started = true
+		},
+	})
+	if err == nil {
+		t.Fatalf("connect started vmshd without session route error = %v", err)
+	}
+	if started {
+		t.Fatal("start callback was called for route-incomplete vmshd")
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("state file after started vmshd route rejection stat err = %v, want not exist", err)
+	}
+}
+
 func TestConnectCCVMWithOptionsRejectsLegacyDaemon(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
