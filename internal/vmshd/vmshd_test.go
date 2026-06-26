@@ -229,6 +229,12 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 		t.Fatalf("read session ssh shells = %+v", read.SSHShells)
 	}
 
+	daemonJob, err := srv.registry.StartJob(created.ID, StartHostJobRequest{Command: []string{"sleep", "30"}, Context: "host"})
+	if err != nil {
+		t.Fatalf("start daemon job: %v", err)
+	}
+	srv.registry.SetDaemonHostShell(created.ID, ShellHandle{ID: "host", Kind: "host", Name: "host", CWD: "/daemon", State: "open"})
+
 	rr = httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/vmsh/sessions/"+created.ID, nil))
 	if rr.Code != http.StatusOK {
@@ -240,6 +246,34 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 	}
 	if deleted.ID != created.ID || deleted.State != "closing" {
 		t.Fatalf("deleted session = %+v", deleted)
+	}
+	if len(deleted.Jobs) != 2 {
+		t.Fatalf("deleted jobs = %+v", deleted.Jobs)
+	}
+	var deletedDaemonJob JobSummary
+	for _, job := range deleted.Jobs {
+		if job.ID == daemonJob.ID && job.Control == "vmshd" {
+			deletedDaemonJob = job
+		}
+	}
+	if deletedDaemonJob.ID != daemonJob.ID || deletedDaemonJob.Status != "canceling" {
+		t.Fatalf("deleted daemon job = %+v", deletedDaemonJob)
+	}
+	if len(deleted.HostShells) != 1 || deleted.HostShells[0].CWD != "/daemon" {
+		t.Fatalf("deleted host shells = %+v", deleted.HostShells)
+	}
+
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/vmsh/jobs", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("jobs after delete status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	jobs = nil
+	if err := json.NewDecoder(rr.Body).Decode(&jobs); err != nil {
+		t.Fatalf("decode jobs after delete: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("jobs after delete = %+v", jobs)
 	}
 
 	rr = httptest.NewRecorder()

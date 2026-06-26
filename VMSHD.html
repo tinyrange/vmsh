@@ -547,7 +547,7 @@ GET /vmsh/status</code></pre>
         <li><code>POST /vmsh/sessions/{id}/detach</code> detaches a client.</li>
         <li><code>POST /vmsh/sessions/{id}/jobs</code> starts a daemon-owned host job.</li>
         <li><code>DELETE /vmsh/sessions/{id}/jobs/{job}</code> requests cancellation for a daemon-owned host job.</li>
-        <li><code>DELETE /vmsh/sessions/{id}</code> closes a session and owned resources.</li>
+        <li><code>DELETE /vmsh/sessions/{id}</code> closes a session, marks daemon-owned running jobs as canceling, and removes owned resources from daemon views.</li>
         <li><code>GET /vmsh/events</code> streams daemon-level events.</li>
       </ul>
 

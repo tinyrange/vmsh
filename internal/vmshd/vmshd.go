@@ -1227,6 +1227,7 @@ func (r *sessionRegistry) Delete(id string) (Session, []int, bool) {
 		return Session{}, nil, false
 	}
 	session.Jobs = r.mergedJobsLocked(id, session.Jobs)
+	markDaemonJobsCanceling(session.Jobs)
 	session.HostShells = r.mergedHostShellsLocked(id, session.HostShells)
 	session.State = "closing"
 	session.UpdatedAt = time.Now()
@@ -1235,6 +1236,17 @@ func (r *sessionRegistry) Delete(id string) (Session, []int, bool) {
 	delete(r.jobs, id)
 	delete(r.hostShells, id)
 	return cloneSession(session), jobIDs, true
+}
+
+func markDaemonJobsCanceling(jobs []JobSummary) {
+	for i := range jobs {
+		if jobs[i].Control != "vmshd" {
+			continue
+		}
+		if jobs[i].Status == "running" {
+			jobs[i].Status = "canceling"
+		}
+	}
 }
 
 func (r *sessionRegistry) Attach(id string, req AttachSessionRequest) (Session, ClientAttachment, error) {
