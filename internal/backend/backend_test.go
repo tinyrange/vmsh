@@ -135,13 +135,13 @@ func TestResolveCCVMPathExplicitBundledAndPathFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("executable: %v", err)
 	}
-	for _, candidate := range CCVMPathCandidates(exe) {
-		if _, err := os.Stat(candidate); err == nil {
-			t.Skipf("ccvm companion exists next to test binary, skipping fallback-order test: %s", candidate)
-		}
+	pathDir := t.TempDir()
+	ccvmPath := filepath.Join(pathDir, HostExecutableName("ccvm"))
+	if err := os.WriteFile(ccvmPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write path ccvm: %v", err)
 	}
+	t.Setenv("PATH", pathDir)
 
-	t.Setenv("PATH", t.TempDir())
 	bundled, err := ResolveCCVMPath("", true)
 	if err != nil {
 		t.Fatalf("resolve bundled ccvm: %v", err)
@@ -150,12 +150,6 @@ func TestResolveCCVMPathExplicitBundledAndPathFallback(t *testing.T) {
 		t.Fatalf("bundled launch = %+v, executable %q", bundled, exe)
 	}
 
-	pathDir := t.TempDir()
-	ccvmPath := filepath.Join(pathDir, HostExecutableName("ccvm"))
-	if err := os.WriteFile(ccvmPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatalf("write path ccvm: %v", err)
-	}
-	t.Setenv("PATH", pathDir)
 	fromPath, err := ResolveCCVMPath("", false)
 	if err != nil {
 		t.Fatalf("resolve ccvm from PATH: %v", err)

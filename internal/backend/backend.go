@@ -70,13 +70,13 @@ func ResolveCCVMPath(path string, bundledAvailable bool) (CCVMLaunch, error) {
 	if err != nil {
 		return CCVMLaunch{}, err
 	}
+	if bundledAvailable {
+		return CCVMLaunch{Path: exePath, Env: []string{InternalVMSHDEnv + "=1"}}, nil
+	}
 	for _, candidate := range CCVMPathCandidates(exePath) {
 		if _, err := os.Stat(candidate); err == nil {
 			return CCVMLaunch{Path: candidate}, nil
 		}
-	}
-	if bundledAvailable {
-		return CCVMLaunch{Path: exePath, Env: []string{InternalVMSHDEnv + "=1"}}, nil
 	}
 	if found, err := exec.LookPath("ccvm"); err == nil {
 		return CCVMLaunch{Path: found}, nil
