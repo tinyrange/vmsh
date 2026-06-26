@@ -2649,8 +2649,9 @@ func TestStartBackgroundJobRecordsJob(t *testing.T) {
 	}
 }
 
-func TestStartBackgroundJobPublishesVMSHDJobs(t *testing.T) {
-	updates := make(chan []vmshd.JobSummary, 4)
+func TestStartBackgroundHostJobUsesVMSHD(t *testing.T) {
+	started := make(chan vmshd.StartHostJobRequest, 1)
+	metadata := make(chan vmshd.UpdateSessionRequest, 1)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/vmsh/sessions/sess_1", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPatch {
@@ -2663,8 +2664,30 @@ func TestStartBackgroundJobPublishesVMSHDJobs(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode update request: %v", err)
 		}
-		updates <- req.Jobs
+		metadata <- req
 		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "attached", Jobs: req.Jobs})
+	})
+	mux.HandleFunc("/vmsh/sessions/sess_1/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("job method = %s", r.Method)
+		}
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var req vmshd.StartHostJobRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode job request: %v", err)
+		}
+		started <- req
+		writeJSONForShellTest(w, vmshd.JobSummary{
+			ID:        9,
+			SessionID: "sess_1",
+			Context:   req.Context,
+			Command:   strings.Join(req.Command, " "),
+			Status:    "running",
+			Control:   "vmshd",
+			StartedAt: time.Unix(7, 0),
+		})
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -2680,6 +2703,7 @@ func TestStartBackgroundJobPublishesVMSHDJobs(t *testing.T) {
 		t.Fatalf("new vmshd client: %v", err)
 	}
 	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.env["VMSHD_TEST_ENV"] = "present"
 	sh.vmshd = &vmshdSessionReporter{
 		client:    httpClient,
 		sessionID: "sess_1",
@@ -2688,17 +2712,125 @@ func TestStartBackgroundJobPublishesVMSHDJobs(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if err := sh.startBackgroundJob(commandContext{Mode: modeHost}, ":", &stdout, &stderr); err != nil {
+	if err := sh.startBackgroundJob(commandContext{Mode: modeHost}, "printf ok", &stdout, &stderr); err != nil {
 		t.Fatalf("start background job: %v", err)
 	}
-	running := readVMSHDJobUpdate(t, updates)
-	if len(running) != 1 || running[0].ID != 1 || running[0].Command != ":" || running[0].Status != "running" {
-		t.Fatalf("running update = %+v", running)
+	req := readVMSHDHostJobStart(t, started)
+	if len(req.Command) != 3 || req.Command[1] != "-lc" || req.Command[2] != "printf ok" || req.WorkDir != sh.hostCWD || req.Context != "host" {
+		t.Fatalf("start request = %+v", req)
 	}
-	done := waitForVMSHDJobStatus(t, updates, "done")
-	if done[0].ExitCode != 0 || done[0].Logs != "@jobs logs 1" {
-		t.Fatalf("done update = %+v", done)
+	if !envHasValue(req.Env, "VMSHD_TEST_ENV", "present") {
+		t.Fatalf("start env missing shell export: %+v", req.Env)
 	}
+	sh.jobsMu.Lock()
+	if len(sh.jobs) != 1 || sh.jobs[0].ID != 9 || sh.jobs[0].Control != "vmshd" || sh.jobs[0].Command != "printf ok" || !sh.jobs[0].Started.Equal(time.Unix(7, 0)) {
+		t.Fatalf("jobs = %+v", sh.jobs)
+	}
+	sh.jobsMu.Unlock()
+	if got, want := stdout.String(), "[9] running context=host printf ok\n    logs: @jobs logs 9\n"; got != want {
+		t.Fatalf("stdout = %q", got)
+	}
+	select {
+	case update := <-metadata:
+		if len(update.Jobs) != 0 {
+			t.Fatalf("metadata jobs = %+v, want no client-owned vmshd duplicate", update.Jobs)
+		}
+	default:
+	}
+}
+
+func TestVMSHDHostJobControlUsesDaemonState(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("jobs method = %s", r.Method)
+		}
+		writeJSONForShellTest(w, []vmshd.JobSummary{{
+			ID:         9,
+			SessionID:  "sess_1",
+			Context:    "host",
+			Command:    "printf ok",
+			Status:     "exited",
+			ExitCode:   0,
+			Control:    "vmshd",
+			Logs:       "ok\n",
+			StartedAt:  time.Unix(7, 0),
+			FinishedAt: time.Unix(8, 0),
+		}})
+	})
+	mux.HandleFunc("/vmsh/sessions/sess_1/jobs/9", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Fatalf("cancel method = %s", r.Method)
+		}
+		writeJSONForShellTest(w, vmshd.JobSummary{
+			ID:        9,
+			SessionID: "sess_1",
+			Context:   "host",
+			Command:   "printf ok",
+			Status:    "canceling",
+			Control:   "vmshd",
+			StartedAt: time.Unix(7, 0),
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.vmshd = &vmshdSessionReporter{client: httpClient, sessionID: "sess_1", hostCWD: sh.hostCWD, context: sh.context}
+	sh.jobs = append(sh.jobs, shellJob{
+		ID:          9,
+		Context:     commandContext{Mode: modeHost},
+		ContextText: "host",
+		Command:     "printf ok",
+		Started:     time.Unix(7, 0),
+		Control:     "vmshd",
+	})
+
+	var stdout bytes.Buffer
+	if err := sh.printJobs(&stdout); err != nil {
+		t.Fatalf("print jobs: %v", err)
+	}
+	sh.jobsMu.Lock()
+	job := sh.jobs[0]
+	sh.jobsMu.Unlock()
+	if !job.Done || job.Code != 0 || !job.Finished.Equal(time.Unix(8, 0)) {
+		t.Fatalf("synced job = %+v", job)
+	}
+	stdout.Reset()
+	if err := sh.controlJob("logs 9", &stdout); err != nil {
+		t.Fatalf("job logs: %v", err)
+	}
+	if got := stdout.String(); got != "ok\n" {
+		t.Fatalf("logs = %q", got)
+	}
+	stdout.Reset()
+	if err := sh.controlJob("stop 9", &stdout); err != nil {
+		t.Fatalf("job stop: %v", err)
+	}
+	if got := stdout.String(); got != "[9] canceling\n" {
+		t.Fatalf("stop output = %q", got)
+	}
+}
+
+func readVMSHDHostJobStart(t *testing.T, starts <-chan vmshd.StartHostJobRequest) vmshd.StartHostJobRequest {
+	t.Helper()
+	select {
+	case req := <-starts:
+		return req
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for vmshd host job start")
+	}
+	return vmshd.StartHostJobRequest{}
 }
 
 func TestVMSHDShellHandlesSummarizePersistentShells(t *testing.T) {
@@ -2726,32 +2858,6 @@ func TestVMSHDShellHandlesSummarizePersistentShells(t *testing.T) {
 	}
 	if len(sshShells) != 1 || sshShells[0].Kind != "ssh" || sshShells[0].SSHHost != "app.example" || sshShells[0].User != "me" || sshShells[0].CWD != "/srv" {
 		t.Fatalf("ssh shells = %+v", sshShells)
-	}
-}
-
-func readVMSHDJobUpdate(t *testing.T, updates <-chan []vmshd.JobSummary) []vmshd.JobSummary {
-	t.Helper()
-	select {
-	case jobs := <-updates:
-		return jobs
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for vmshd job update")
-	}
-	return nil
-}
-
-func waitForVMSHDJobStatus(t *testing.T, updates <-chan []vmshd.JobSummary, status string) []vmshd.JobSummary {
-	t.Helper()
-	deadline := time.After(2 * time.Second)
-	for {
-		select {
-		case jobs := <-updates:
-			if len(jobs) > 0 && jobs[0].Status == status {
-				return jobs
-			}
-		case <-deadline:
-			t.Fatalf("timed out waiting for vmshd job status %q", status)
-		}
 	}
 }
 

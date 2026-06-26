@@ -1313,6 +1313,9 @@ func (s *shellState) vmshdJobSummaries() []vmshd.JobSummary {
 	defer s.jobsMu.Unlock()
 	out := make([]vmshd.JobSummary, 0, len(s.jobs))
 	for _, job := range s.jobs {
+		if job.Control == "vmshd" {
+			continue
+		}
 		out = append(out, vmshdJobSummary(job))
 	}
 	return out
@@ -2807,6 +2810,9 @@ func stripBackground(line string) (string, bool, error) {
 }
 
 func (s *shellState) startBackgroundJob(ctx commandContext, line string, stdout, stderr io.Writer) error {
+	if handled, err := s.startVMSHDHostBackgroundJob(ctx, line, stdout); handled || err != nil {
+		return err
+	}
 	bgShell := &shellState{
 		api:              s.api,
 		context:          ctx,
@@ -2860,6 +2866,39 @@ func (s *shellState) startBackgroundJob(ctx commandContext, line string, stdout,
 		_ = stderr
 	}()
 	return nil
+}
+
+func (s *shellState) startVMSHDHostBackgroundJob(ctx commandContext, line string, stdout io.Writer) (bool, error) {
+	if ctx.Mode != modeHost || s.vmshd == nil || s.vmshd.client == nil || strings.TrimSpace(s.vmshd.sessionID) == "" {
+		return false, nil
+	}
+	job, err := s.vmshd.client.StartHostJob(s.vmshd.sessionID, vmshd.StartHostJobRequest{
+		Command: []string{hostShell(), "-lc", line},
+		WorkDir: s.hostCWD,
+		Env:     hostCommandEnv(s.env, nil),
+		Context: "host",
+	})
+	if err != nil {
+		return true, err
+	}
+	contextText := jobContextText(ctx)
+	started := job.StartedAt
+	if started.IsZero() {
+		started = time.Now()
+	}
+	s.jobsMu.Lock()
+	s.jobs = append(s.jobs, shellJob{
+		ID:          job.ID,
+		Context:     ctx,
+		ContextKey:  contextSessionKey(ctx),
+		ContextText: contextText,
+		Command:     line,
+		Started:     started,
+		Control:     "vmshd",
+	})
+	s.jobsMu.Unlock()
+	fmt.Fprintf(stdout, "[%d] running context=%s %s\n    logs: @jobs logs %d\n", job.ID, contextText, line, job.ID)
+	return true, nil
 }
 
 func cloneEnv(env map[string]string) map[string]string {
@@ -8819,6 +8858,7 @@ func printSessionTreeNode(w io.Writer, node *sessionTreeNode, prefix string, las
 }
 
 func (s *shellState) printJobs(w io.Writer) error {
+	s.refreshVMSHDJobs()
 	s.jobsMu.Lock()
 	defer s.jobsMu.Unlock()
 	if len(s.jobs) == 0 {
@@ -8876,6 +8916,16 @@ func (s *shellState) controlJob(command string, w io.Writer) error {
 	if err != nil || id <= 0 {
 		return fmt.Errorf("jobs: invalid job id %q", fields[1])
 	}
+	if fields[0] == "stop" {
+		if handled, err := s.stopVMSHDJob(id, w); handled || err != nil {
+			return err
+		}
+	}
+	if fields[0] == "logs" {
+		if handled, err := s.printVMSHDJobLogs(id, w); handled || err != nil {
+			return err
+		}
+	}
 	s.jobsMu.Lock()
 	defer s.jobsMu.Unlock()
 	for _, job := range s.jobs {
@@ -8905,6 +8955,118 @@ func (s *shellState) controlJob(command string, w io.Writer) error {
 		return fmt.Errorf("jobs: direct job stopping is not supported yet")
 	}
 	return fmt.Errorf("jobs: no such job %d", id)
+}
+
+func (s *shellState) refreshVMSHDJobs() {
+	if s.vmshd == nil || s.vmshd.client == nil || strings.TrimSpace(s.vmshd.sessionID) == "" {
+		return
+	}
+	jobs, err := s.vmshd.client.Jobs()
+	if err != nil {
+		return
+	}
+	s.syncVMSHDJobs(jobs)
+}
+
+func (s *shellState) syncVMSHDJobs(jobs []vmshd.JobSummary) {
+	sessionID := ""
+	if s.vmshd != nil {
+		sessionID = strings.TrimSpace(s.vmshd.sessionID)
+	}
+	byID := map[int]vmshd.JobSummary{}
+	for _, job := range jobs {
+		if job.ID <= 0 || strings.TrimSpace(job.Control) != "vmshd" {
+			continue
+		}
+		if sessionID != "" && strings.TrimSpace(job.SessionID) != "" && strings.TrimSpace(job.SessionID) != sessionID {
+			continue
+		}
+		byID[job.ID] = job
+	}
+	if len(byID) == 0 {
+		return
+	}
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	for i := range s.jobs {
+		if s.jobs[i].Control != "vmshd" {
+			continue
+		}
+		job, ok := byID[s.jobs[i].ID]
+		if !ok {
+			continue
+		}
+		s.jobs[i].Done = vmshdJobDone(job.Status)
+		s.jobs[i].Code = job.ExitCode
+		s.jobs[i].Err = strings.TrimSpace(job.Error)
+		s.jobs[i].Finished = job.FinishedAt
+		s.jobs[i].Log = []byte(job.Logs)
+		s.jobs[i].LogDropped = job.LogDropped
+	}
+}
+
+func vmshdJobDone(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "", "running", "canceling":
+		return false
+	default:
+		return true
+	}
+}
+
+func (s *shellState) stopVMSHDJob(id int, w io.Writer) (bool, error) {
+	if s.vmshd == nil || s.vmshd.client == nil || strings.TrimSpace(s.vmshd.sessionID) == "" {
+		return false, nil
+	}
+	if !s.localJobIsVMSHDOwned(id) {
+		return false, nil
+	}
+	job, err := s.vmshd.client.CancelHostJob(s.vmshd.sessionID, id)
+	if err != nil {
+		return true, err
+	}
+	s.syncVMSHDJobs([]vmshd.JobSummary{job})
+	_, err = fmt.Fprintf(w, "[%d] %s\n", id, emptyText(job.Status, "canceling"))
+	return true, err
+}
+
+func (s *shellState) printVMSHDJobLogs(id int, w io.Writer) (bool, error) {
+	if s.vmshd == nil || s.vmshd.client == nil || !s.localJobIsVMSHDOwned(id) {
+		return false, nil
+	}
+	jobs, err := s.vmshd.client.Jobs()
+	if err != nil {
+		return true, err
+	}
+	s.syncVMSHDJobs(jobs)
+	for _, job := range jobs {
+		if job.ID != id || strings.TrimSpace(job.Control) != "vmshd" {
+			continue
+		}
+		if job.LogDropped {
+			if _, err := fmt.Fprintln(w, "[older log output dropped]"); err != nil {
+				return true, err
+			}
+		}
+		if job.Logs == "" {
+			_, err := fmt.Fprintf(w, "[%d] no log output captured\n", id)
+			return true, err
+		}
+		_, err := io.WriteString(w, job.Logs)
+		return true, err
+	}
+	return true, fmt.Errorf("jobs: no such job %d", id)
+}
+
+func (s *shellState) localJobIsVMSHDOwned(id int) bool {
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	for _, job := range s.jobs {
+		if job.ID == id {
+			return job.Control == "vmshd"
+		}
+	}
+	return false
 }
 
 func (s *shellState) markJobsLostForContext(ctx commandContext, reason string) {
