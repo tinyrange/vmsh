@@ -64,6 +64,13 @@ func (c *HTTPClient) StartHostJob(sessionID string, req StartHostJobRequest) (Jo
 	return job, err
 }
 
+func (c *HTTPClient) CancelHostJob(sessionID string, jobID int) (JobSummary, error) {
+	var job JobSummary
+	path := fmt.Sprintf("/vmsh/sessions/%s/jobs/%d", url.PathEscape(sessionID), jobID)
+	err := c.doJSON(http.MethodDelete, path, nil, &job)
+	return job, err
+}
+
 func (c *HTTPClient) AttachSession(id string, req AttachSessionRequest) (AttachSessionResponse, error) {
 	var resp AttachSessionResponse
 	err := c.doJSON(http.MethodPost, "/vmsh/sessions/"+id+"/attach", req, &resp)

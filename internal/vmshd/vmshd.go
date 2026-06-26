@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,7 @@ type Event struct {
 	Kind       string            `json:"kind"`
 	Session    *Session          `json:"session,omitempty"`
 	Attachment *ClientAttachment `json:"attachment,omitempty"`
+	Job        *JobSummary       `json:"job,omitempty"`
 	At         time.Time         `json:"at"`
 }
 
@@ -397,6 +399,21 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 		s.events.Publish(Event{Kind: "job_started", Session: &session})
 		writeJSON(w, http.StatusOK, job)
 	})
+	mux.HandleFunc("DELETE /vmsh/sessions/{id}/jobs/{job}", func(w http.ResponseWriter, r *http.Request) {
+		jobID, err := parseJobID(r.PathValue("job"))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, client.ErrorResponse{Error: err.Error()})
+			return
+		}
+		job, err := s.cancelHostJob(r.PathValue("id"), jobID)
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		session, _ := s.registry.Get(r.PathValue("id"))
+		s.events.Publish(Event{Kind: "job_canceled", Session: &session, Job: &job})
+		writeJSON(w, http.StatusOK, job)
+	})
 	mux.HandleFunc("POST /vmsh/sessions/{id}/attachments/{attachment}/terminal", func(w http.ResponseWriter, r *http.Request) {
 		var req Terminal
 		if err := decodeRequiredJSON(r, &req); err != nil {
@@ -436,13 +453,26 @@ func (s *Server) startHostJob(sessionID string, req StartHostJobRequest) (JobSum
 		cmd.Dir = strings.TrimSpace(req.WorkDir)
 		cmd.Env = append(os.Environ(), req.Env...)
 		output, runErr := cmd.CombinedOutput()
-		_, ok := s.registry.FinishJob(sessionID, job.ID, summarizeHostJobResult(output, runErr))
+		_, ok := s.registry.FinishJob(sessionID, job.ID, summarizeHostJobResult(output, runErr, ctx.Err() != nil))
 		if !ok {
 			return
 		}
 		session, _ := s.registry.Get(sessionID)
 		s.events.Publish(Event{Kind: "job_finished", Session: &session})
 	}()
+	return job, nil
+}
+
+func (s *Server) cancelHostJob(sessionID string, jobID int) (JobSummary, error) {
+	job, err := s.registry.RequestCancelJob(sessionID, jobID)
+	if err != nil {
+		return JobSummary{}, err
+	}
+	if job.Status == "canceling" {
+		if !s.jobs.CancelOne(job.ID) {
+			return JobSummary{}, sessionError{status: http.StatusConflict, err: "job is not running"}
+		}
+	}
 	return job, nil
 }
 
@@ -473,12 +503,35 @@ func (r *hostJobRunner) Cancel(ids []int) {
 	}
 }
 
-func summarizeHostJobResult(output []byte, err error) JobSummary {
+func (r *hostJobRunner) CancelOne(id int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cancel := r.cancels[id]
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	delete(r.cancels, id)
+	return true
+}
+
+func summarizeHostJobResult(output []byte, err error, canceled bool) JobSummary {
 	job := JobSummary{
 		Status:     "exited",
 		Logs:       boundedJobLogs(output),
 		LogDropped: len(output) > maxJobLogBytes,
 		FinishedAt: time.Now(),
+	}
+	if canceled {
+		job.Status = "canceled"
+		if err != nil {
+			job.Error = err.Error()
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			job.ExitCode = exitErr.ExitCode()
+		}
+		return job
 	}
 	if err == nil {
 		return job
@@ -490,6 +543,14 @@ func summarizeHostJobResult(output []byte, err error) JobSummary {
 		job.ExitCode = exitErr.ExitCode()
 	}
 	return job
+}
+
+func parseJobID(value string) (int, error) {
+	id, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || id <= 0 {
+		return 0, fmt.Errorf("invalid job id %q", value)
+	}
+	return id, nil
 }
 
 func boundedJobLogs(output []byte) string {
@@ -1357,6 +1418,36 @@ func (r *sessionRegistry) FinishJob(sessionID string, jobID int, result JobSumma
 		r.sessions[sessionID] = session
 	}
 	return job, true
+}
+
+func (r *sessionRegistry) RequestCancelJob(sessionID string, jobID int) (JobSummary, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	sessionID = strings.TrimSpace(sessionID)
+	if _, ok := r.sessions[sessionID]; !ok {
+		return JobSummary{}, sessionError{status: http.StatusNotFound, err: "session not found"}
+	}
+	jobs := r.jobs[sessionID]
+	if jobs == nil {
+		return JobSummary{}, sessionError{status: http.StatusNotFound, err: "job not found"}
+	}
+	job, ok := jobs[jobID]
+	if !ok {
+		return JobSummary{}, sessionError{status: http.StatusNotFound, err: "job not found"}
+	}
+	if job.Control != "vmshd" {
+		return JobSummary{}, sessionError{status: http.StatusBadRequest, err: "job is not daemon-owned"}
+	}
+	if job.Status != "running" && job.Status != "canceling" {
+		return job, nil
+	}
+	job.Status = "canceling"
+	jobs[jobID] = job
+	if session, ok := r.sessions[sessionID]; ok {
+		session.UpdatedAt = time.Now()
+		r.sessions[sessionID] = session
+	}
+	return job, nil
 }
 
 func (r *sessionRegistry) SetDaemonHostShell(sessionID string, handle ShellHandle) {

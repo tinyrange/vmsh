@@ -432,11 +432,74 @@ func TestDaemonOwnedHostJobRunsDetachedAndUpdatesSessionState(t *testing.T) {
 	})
 }
 
+func TestDaemonOwnedHostJobCanBeCanceled(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, nil)
+	session := srv.registry.Create("main")
+	httpSrv := httptest.NewServer(srv.Authenticate(mux))
+	defer httpSrv.Close()
+
+	body := fmt.Sprintf(`{"command":[%q,"-test.run=TestDaemonHostJobHelper","--"],"env":["VMSHD_TEST_HOST_JOB=1","VMSHD_TEST_SLEEP=10s"],"context":"host"}`, os.Args[0])
+	req, err := http.NewRequest(http.MethodPost, httpSrv.URL+"/vmsh/sessions/"+session.ID+"/jobs", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("new job request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("start job: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("start job status = %d", resp.StatusCode)
+	}
+	var started JobSummary
+	if err := json.NewDecoder(resp.Body).Decode(&started); err != nil {
+		t.Fatalf("decode started job: %v", err)
+	}
+
+	req, err = http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/vmsh/sessions/%s/jobs/%d", httpSrv.URL, session.ID, started.ID), nil)
+	if err != nil {
+		t.Fatalf("new cancel request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer secret")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("cancel job: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("cancel job status = %d", resp.StatusCode)
+	}
+	var canceling JobSummary
+	if err := json.NewDecoder(resp.Body).Decode(&canceling); err != nil {
+		t.Fatalf("decode canceled job: %v", err)
+	}
+	if canceling.ID != started.ID || canceling.Status != "canceling" || canceling.Control != "vmshd" {
+		t.Fatalf("canceling job = %+v", canceling)
+	}
+
+	requireEventually(t, func() bool {
+		jobs := getJobsFromServer(t, httpSrv.URL, "secret")
+		return len(jobs) == 1 && jobs[0].ID == started.ID && jobs[0].Status == "canceled" && !jobs[0].FinishedAt.IsZero()
+	})
+}
+
 func TestDaemonHostJobHelper(t *testing.T) {
 	if os.Getenv("VMSHD_TEST_HOST_JOB") != "1" {
 		return
 	}
-	time.Sleep(100 * time.Millisecond)
+	sleep := 100 * time.Millisecond
+	if value := os.Getenv("VMSHD_TEST_SLEEP"); value != "" {
+		parsed, err := time.ParseDuration(value)
+		if err != nil {
+			t.Fatalf("parse VMSHD_TEST_SLEEP: %v", err)
+		}
+		sleep = parsed
+	}
+	time.Sleep(sleep)
 	fmt.Fprintf(os.Stdout, "daemon-job:%s\n", os.Getenv("VMSHD_TEST_VALUE"))
 	os.Exit(0)
 }

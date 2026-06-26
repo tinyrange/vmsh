@@ -94,6 +94,13 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 		}
 		writeJSON(w, http.StatusOK, JobSummary{ID: 2, SessionID: "sess_1", Command: "make test", Status: "running", Control: "vmshd"})
 	})
+	mux.HandleFunc("/vmsh/sessions/sess_1/jobs/2", func(w http.ResponseWriter, r *http.Request) {
+		requireBearer(t, r)
+		if r.Method != http.MethodDelete {
+			t.Fatalf("cancel job method = %s", r.Method)
+		}
+		writeJSON(w, http.StatusOK, JobSummary{ID: 2, SessionID: "sess_1", Command: "make test", Status: "canceling", Control: "vmshd"})
+	})
 	mux.HandleFunc("/vmsh/sessions/sess_1/detach", func(w http.ResponseWriter, r *http.Request) {
 		requireBearer(t, r)
 		var req DetachSessionRequest
@@ -167,6 +174,13 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 	}
 	if job.ID != 2 || job.Status != "running" || job.Control != "vmshd" {
 		t.Fatalf("started job = %+v", job)
+	}
+	canceled, err := client.CancelHostJob(session.ID, job.ID)
+	if err != nil {
+		t.Fatalf("cancel host job: %v", err)
+	}
+	if canceled.ID != job.ID || canceled.Status != "canceling" || canceled.Control != "vmshd" {
+		t.Fatalf("canceled job = %+v", canceled)
 	}
 	detached, err := client.DetachSession(session.ID, DetachSessionRequest{AttachmentID: attached.Attachment.ID})
 	if err != nil {

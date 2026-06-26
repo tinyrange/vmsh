@@ -542,6 +542,8 @@ GET /vmsh/status</code></pre>
         <li><code>GET /vmsh/sessions/{id}</code> reads one session.</li>
         <li><code>POST /vmsh/sessions/{id}/attach</code> attaches an interactive client.</li>
         <li><code>POST /vmsh/sessions/{id}/detach</code> detaches a client.</li>
+        <li><code>POST /vmsh/sessions/{id}/jobs</code> starts a daemon-owned host job.</li>
+        <li><code>DELETE /vmsh/sessions/{id}/jobs/{job}</code> requests cancellation for a daemon-owned host job.</li>
         <li><code>DELETE /vmsh/sessions/{id}</code> closes a session and owned resources.</li>
         <li><code>GET /vmsh/events</code> streams daemon-level events.</li>
       </ul>
@@ -610,6 +612,7 @@ GET /vmsh/status</code></pre>
         <li>Define attach protocol for interactive terminal clients.</li>
         <li>Track attached clients and terminal size in session state.</li>
         <li>Support detach without killing daemon-owned shells or jobs.</li>
+        <li>Add structured start and cancel controls for daemon-owned jobs.</li>
         <li>Expose enough state for <code>@status</code> and future UI views.</li>
       </ul>
 
