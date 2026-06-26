@@ -16,6 +16,9 @@ func TestValidateServerHello(t *testing.T) {
 	if err := ValidateServerHello(client.ServerHello{Addr: "127.0.0.1:1234"}, "/tmp/cache"); err != nil {
 		t.Fatalf("valid hello rejected: %v", err)
 	}
+	if err := ValidateServerHello(client.ServerHello{Addr: "127.0.0.1:1234", Kind: "vmshd", TokenPath: "/tmp/token"}, "/tmp/cache"); err != nil {
+		t.Fatalf("valid vmshd hello rejected: %v", err)
+	}
 
 	err := ValidateServerHello(client.ServerHello{Kind: "error", Detail: "boom"}, "/tmp/cache")
 	if err == nil {
@@ -25,6 +28,11 @@ func TestValidateServerHello(t *testing.T) {
 	err = ValidateServerHello(client.ServerHello{}, "/tmp/cache")
 	if err == nil {
 		t.Fatalf("missing address validation = %v", err)
+	}
+
+	err = ValidateServerHello(client.ServerHello{Addr: "127.0.0.1:1234", Kind: "vmshd"}, "/tmp/cache")
+	if err == nil {
+		t.Fatalf("missing vmshd token path validation = %v", err)
 	}
 }
 
@@ -243,6 +251,10 @@ func TestConnectCCVMWithOptionsReusesAuthenticatedDaemon(t *testing.T) {
 	mux.HandleFunc("/vm/start", requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}))
+	mux.HandleFunc("/vmsh/status", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"kind":"vmshd","status":"ok"}`))
+	}))
 	srv := &http.Server{Handler: mux}
 	go func() {
 		_ = srv.Serve(ln)
@@ -277,6 +289,112 @@ func TestConnectCCVMWithOptionsReusesAuthenticatedDaemon(t *testing.T) {
 	}
 	if err := api.HealthCheck(); err != nil {
 		t.Fatalf("authenticated health check: %v", err)
+	}
+}
+
+func TestConnectCCVMWithOptionsRejectsVMSHDWithoutTokenPath(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := &http.Server{Handler: mux}
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+	t.Cleanup(func() {
+		_ = srv.Close()
+	})
+
+	statePath := filepath.Join(t.TempDir(), "vmshd.json")
+	launch := CCVMLaunch{Path: "/missing/ccvm"}
+	state := normalizeDaemonState(DaemonState{Addr: ln.Addr().String(), Kind: "vmshd", LaunchKey: DaemonLaunchKey(launch)})
+	if err := WriteDaemonState(statePath, state); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+
+	var reused bool
+	_, err = ConnectCCVMWithOptions(launch, t.TempDir(), statePath, ConnectOptions{
+		OnReuse: func(DaemonState) {
+			reused = true
+		},
+	})
+	if err == nil {
+		t.Fatalf("connect vmshd without token path error = %v", err)
+	}
+	if reused {
+		t.Fatal("vmshd without token path was reused")
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("state file after vmshd token rejection stat err = %v, want not exist", err)
+	}
+}
+
+func TestConnectCCVMWithOptionsRejectsVMSHDWithoutSessionRoute(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	mux := http.NewServeMux()
+	requireAuth := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "Bearer secret" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			next(w, r)
+		}
+	}
+	mux.HandleFunc("/healthz", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	mux.HandleFunc("/capabilities", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"host":"test","vm_supported":true}`))
+	}))
+	mux.HandleFunc("/watchdog/lease", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	mux.HandleFunc("/vm/start", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	srv := &http.Server{Handler: mux}
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+	t.Cleanup(func() {
+		_ = srv.Close()
+	})
+
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	statePath := filepath.Join(dir, "vmshd.json")
+	launch := CCVMLaunch{Path: "/missing/ccvm"}
+	state := normalizeDaemonState(DaemonState{Addr: ln.Addr().String(), Kind: "vmshd", TokenPath: tokenPath, LaunchKey: DaemonLaunchKey(launch)})
+	if err := WriteDaemonState(statePath, state); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+
+	var reused bool
+	_, err = ConnectCCVMWithOptions(launch, t.TempDir(), statePath, ConnectOptions{
+		OnReuse: func(DaemonState) {
+			reused = true
+		},
+	})
+	if err == nil {
+		t.Fatalf("connect vmshd without session route error = %v", err)
+	}
+	if reused {
+		t.Fatal("vmshd without session route was reused")
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("state file after vmshd route rejection stat err = %v, want not exist", err)
 	}
 }
 

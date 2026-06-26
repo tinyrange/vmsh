@@ -124,7 +124,7 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		api := NewClient(state.Addr)
 		if err := ApplyDaemonStateAuth(api, state); err != nil {
 			_ = os.Remove(statePath)
-		} else if state.LaunchKey == launchKey && api.HealthCheck() == nil && apiCompatible(api) {
+		} else if state.LaunchKey == launchKey && api.HealthCheck() == nil && apiCompatible(api, state) {
 			if opts.OnReuse != nil {
 				opts.OnReuse(state)
 			}
@@ -184,7 +184,7 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 	return api, nil
 }
 
-func apiCompatible(api *client.Client) bool {
+func apiCompatible(api *client.Client, state DaemonState) bool {
 	if api == nil {
 		return false
 	}
@@ -196,6 +196,9 @@ func apiCompatible(api *client.Client) bool {
 		if !api.RouteExists(route) {
 			return false
 		}
+	}
+	if strings.TrimSpace(state.Kind) == "vmshd" && !api.RouteExists("/vmsh/status") {
+		return false
 	}
 	return true
 }
@@ -232,6 +235,9 @@ func ValidateServerHello(hello client.ServerHello, cacheDir string) error {
 	if strings.TrimSpace(hello.Addr) == "" {
 		return fmt.Errorf("ccvm daemon sent a startup banner without an address: %+v", hello)
 	}
+	if strings.TrimSpace(hello.Kind) == "vmshd" && strings.TrimSpace(hello.TokenPath) == "" {
+		return fmt.Errorf("vmshd daemon sent a startup banner without a token path")
+	}
 	return nil
 }
 
@@ -242,7 +248,13 @@ func NewClient(addr string) *client.Client {
 }
 
 func ApplyDaemonStateAuth(api *client.Client, state DaemonState) error {
-	if api == nil || strings.TrimSpace(state.TokenPath) == "" {
+	if api == nil {
+		return nil
+	}
+	if strings.TrimSpace(state.TokenPath) == "" {
+		if strings.TrimSpace(state.Kind) == "vmshd" {
+			return fmt.Errorf("vmshd daemon state has no token path")
+		}
 		return nil
 	}
 	token, err := ReadDaemonToken(state.TokenPath)
