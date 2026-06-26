@@ -69,6 +69,40 @@ func TestAuthenticateRequiresBearerToken(t *testing.T) {
 	}
 }
 
+func TestAuthenticateWrapsRuntimeAndVMSHRoutes(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	srv.RegisterHandlers(mux, fakeRuntimeView{})
+	handler := srv.Authenticate(mux)
+
+	for _, tc := range []struct {
+		name   string
+		target string
+		auth   string
+		status int
+	}{
+		{name: "runtime route missing token", target: "/healthz", status: http.StatusUnauthorized},
+		{name: "vmsh route missing token", target: "/vmsh/status", status: http.StatusUnauthorized},
+		{name: "runtime route accepted token", target: "/healthz", auth: "Bearer secret", status: http.StatusNoContent},
+		{name: "vmsh route accepted token", target: "/vmsh/status", auth: "Bearer secret", status: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.target, nil)
+			if tc.auth != "" {
+				req.Header.Set("Authorization", tc.auth)
+			}
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+			if rr.Code != tc.status {
+				t.Fatalf("status = %d, want %d", rr.Code, tc.status)
+			}
+		})
+	}
+}
+
 func TestStatusRoute(t *testing.T) {
 	srv := NewServer("secret")
 	mux := http.NewServeMux()
