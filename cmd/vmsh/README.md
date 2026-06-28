@@ -7,6 +7,9 @@
 Release builds use a `ccprod` cache/daemon identity by default. Development
 builds use `ccdev`, so a checkout build can run alongside an installed release
 without sharing daemon state. Pass `-cache-dir` to use an explicit cache root.
+By default, a `vmsh` frontend owns its daemon session and the session is cleaned
+up when that frontend exits. Start with `-system-session` or run `@detach` to
+keep the session available after the current frontend closes.
 
 Guest commands receive a TTY, terminal dimensions, and terminal color environment. `vmsh` keeps command execution non-interactive and adds a small color prelude for common commands such as `ls`.
 
@@ -92,6 +95,7 @@ These attention words are reserved:
 @host [command...]
 @jobs
 @sessions
+@detach
 @ps
 @status
 @start

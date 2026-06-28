@@ -33,6 +33,7 @@ const maxJobLogBytes = 64 * 1024
 type Status struct {
 	Kind      string                 `json:"kind"`
 	Status    string                 `json:"status"`
+	Frontends []FrontendSummary      `json:"frontends,omitempty"`
 	Sessions  []SessionSummary       `json:"sessions"`
 	Streams   []StreamSummary        `json:"active_streams"`
 	VMs       []client.InstanceState `json:"vms"`
@@ -42,6 +43,7 @@ type Status struct {
 type Event struct {
 	ID         string            `json:"id"`
 	Kind       string            `json:"kind"`
+	Frontend   *FrontendSummary  `json:"frontend,omitempty"`
 	Session    *Session          `json:"session,omitempty"`
 	Attachment *ClientAttachment `json:"attachment,omitempty"`
 	Job        *JobSummary       `json:"job,omitempty"`
@@ -62,6 +64,9 @@ type Session struct {
 	ID              string             `json:"id"`
 	Name            string             `json:"name"`
 	State           string             `json:"state"`
+	Scope           string             `json:"scope,omitempty"`
+	FrontendID      string             `json:"frontend_id,omitempty"`
+	DetachOnClose   bool               `json:"detach_on_close,omitempty"`
 	HostCWD         string             `json:"host_cwd,omitempty"`
 	SelectedContext *SessionContext    `json:"selected_context,omitempty"`
 	VMRefs          []VMRef            `json:"vm_refs,omitempty"`
@@ -79,6 +84,9 @@ type SessionSummary struct {
 	ID              string             `json:"id"`
 	Name            string             `json:"name"`
 	State           string             `json:"state"`
+	Scope           string             `json:"scope,omitempty"`
+	FrontendID      string             `json:"frontend_id,omitempty"`
+	DetachOnClose   bool               `json:"detach_on_close,omitempty"`
 	HostCWD         string             `json:"host_cwd,omitempty"`
 	SelectedContext *SessionContext    `json:"selected_context,omitempty"`
 	VMRefs          []VMRef            `json:"vm_refs,omitempty"`
@@ -163,10 +171,21 @@ type ShellHandle struct {
 
 type ClientAttachment struct {
 	ID         string    `json:"id"`
+	FrontendID string    `json:"frontend_id,omitempty"`
 	Mode       string    `json:"mode"`
 	Terminal   *Terminal `json:"terminal,omitempty"`
 	AttachedAt time.Time `json:"attached_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+type FrontendSummary struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name,omitempty"`
+	State     string    `json:"state"`
+	Sessions  []string  `json:"sessions,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	ClosedAt  time.Time `json:"closed_at,omitempty"`
 }
 
 type Terminal struct {
@@ -182,7 +201,10 @@ type TerminalStreamMessage struct {
 }
 
 type CreateSessionRequest struct {
-	Name string `json:"name,omitempty"`
+	Name          string `json:"name,omitempty"`
+	FrontendID    string `json:"frontend_id,omitempty"`
+	Scope         string `json:"scope,omitempty"`
+	DetachOnClose *bool  `json:"detach_on_close,omitempty"`
 }
 
 type UpdateSessionRequest struct {
@@ -197,8 +219,9 @@ type UpdateSessionRequest struct {
 }
 
 type AttachSessionRequest struct {
-	Mode     string    `json:"mode,omitempty"`
-	Terminal *Terminal `json:"terminal,omitempty"`
+	FrontendID string    `json:"frontend_id,omitempty"`
+	Mode       string    `json:"mode,omitempty"`
+	Terminal   *Terminal `json:"terminal,omitempty"`
 }
 
 type AttachSessionResponse struct {
@@ -210,14 +233,39 @@ type DetachSessionRequest struct {
 	AttachmentID string `json:"attachment_id"`
 }
 
+type RegisterFrontendRequest struct {
+	Name string `json:"name,omitempty"`
+}
+
+type PersistSessionRequest struct {
+	Scope string `json:"scope,omitempty"`
+}
+
+type frontendRecord struct {
+	ID        string
+	Name      string
+	State     string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	ClosedAt  time.Time
+}
+
+type sessionCleanup struct {
+	Session Session
+	JobIDs  []int
+	VMIDs   []string
+}
+
 type sessionRegistry struct {
-	mu         sync.Mutex
-	next       int
-	nextAttach int
-	nextJob    int
-	sessions   map[string]Session
-	jobs       map[string]map[int]JobSummary
-	hostShells map[string]ShellHandle
+	mu           sync.Mutex
+	next         int
+	nextFrontend int
+	nextAttach   int
+	nextJob      int
+	frontends    map[string]frontendRecord
+	sessions     map[string]Session
+	jobs         map[string]map[int]JobSummary
+	hostShells   map[string]ShellHandle
 }
 
 type eventHub struct {
@@ -326,11 +374,35 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 		writeJSON(w, http.StatusOK, Status{
 			Kind:      Kind,
 			Status:    "ok",
+			Frontends: s.registry.Frontends(),
 			Sessions:  s.registry.List(),
 			Streams:   append(s.events.Streams(), s.streams.List()...),
 			VMs:       runtimeInstanceStatuses(runtime),
 			StartedAt: s.startedAt,
 		})
+	})
+	mux.HandleFunc("GET /vmsh/frontends", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, s.registry.Frontends())
+	})
+	mux.HandleFunc("POST /vmsh/frontends", func(w http.ResponseWriter, r *http.Request) {
+		var req RegisterFrontendRequest
+		if err := decodeOptionalJSON(r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, client.ErrorResponse{Error: err.Error()})
+			return
+		}
+		frontend := s.registry.RegisterFrontend(req)
+		s.events.Publish(Event{Kind: "frontend_registered", Frontend: &frontend})
+		writeJSON(w, http.StatusOK, frontend)
+	})
+	mux.HandleFunc("DELETE /vmsh/frontends/{id}", func(w http.ResponseWriter, r *http.Request) {
+		frontend, cleanups, err := s.registry.CloseFrontend(r.PathValue("id"))
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		s.finishSessionCleanups(cleanups, runtime)
+		s.events.Publish(Event{Kind: "frontend_closed", Frontend: &frontend})
+		writeJSON(w, http.StatusOK, frontend)
 	})
 	mux.HandleFunc("GET /vmsh/sessions", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.registry.List())
@@ -347,7 +419,11 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			writeJSON(w, http.StatusBadRequest, client.ErrorResponse{Error: err.Error()})
 			return
 		}
-		session := s.registry.Create(req.Name)
+		session, err := s.registry.Create(req)
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
 		s.events.Publish(Event{Kind: "session_created", Session: &session})
 		writeJSON(w, http.StatusOK, session)
 	})
@@ -412,6 +488,20 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 		s.events.Publish(Event{Kind: "session_detached", Session: &session})
 		writeJSON(w, http.StatusOK, session)
 	})
+	mux.HandleFunc("POST /vmsh/sessions/{id}/persist", func(w http.ResponseWriter, r *http.Request) {
+		var req PersistSessionRequest
+		if err := decodeOptionalJSON(r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, client.ErrorResponse{Error: err.Error()})
+			return
+		}
+		session, err := s.registry.Persist(r.PathValue("id"), req)
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		s.events.Publish(Event{Kind: "session_persisted", Session: &session})
+		writeJSON(w, http.StatusOK, session)
+	})
 	mux.HandleFunc("POST /vmsh/sessions/{id}/jobs", func(w http.ResponseWriter, r *http.Request) {
 		var req StartHostJobRequest
 		if err := decodeRequiredJSON(r, &req); err != nil {
@@ -462,6 +552,20 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			s.serveTerminalStream(ws)
 		},
 	})
+}
+
+func (s *Server) finishSessionCleanups(cleanups []sessionCleanup, runtime ccvmd.RuntimeView) {
+	for _, cleanup := range cleanups {
+		s.jobs.Cancel(cleanup.JobIDs)
+		s.shells.Close(cleanup.Session.ID)
+		for _, vmID := range cleanup.VMIDs {
+			if err := runtimeShutdownInstance(runtime, vmID); err != nil {
+				continue
+			}
+		}
+		session := cleanup.Session
+		s.events.Publish(Event{Kind: "session_deleted", Session: &session})
+	}
 }
 
 func (s *Server) startJob(sessionID string, req StartHostJobRequest, runtime ccvmd.RuntimeView) (JobSummary, error) {
@@ -1061,6 +1165,16 @@ func runtimeInstanceStatuses(runtime ccvmd.RuntimeView) []client.InstanceState {
 	return statuses
 }
 
+func runtimeShutdownInstance(runtime ccvmd.RuntimeView, id string) error {
+	id = strings.TrimSpace(id)
+	if runtime == nil || id == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return runtime.ShutdownInstance(ctx, id)
+}
+
 func (s *Server) Authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !validBearerToken(r.Header.Get("Authorization"), s.token) {
@@ -1156,7 +1270,12 @@ func newToken() (string, error) {
 }
 
 func newSessionRegistry() *sessionRegistry {
-	return &sessionRegistry{sessions: map[string]Session{}, jobs: map[string]map[int]JobSummary{}, hostShells: map[string]ShellHandle{}}
+	return &sessionRegistry{
+		frontends:  map[string]frontendRecord{},
+		sessions:   map[string]Session{},
+		jobs:       map[string]map[int]JobSummary{},
+		hostShells: map[string]ShellHandle{},
+	}
 }
 
 func newEventHub() *eventHub {
@@ -1291,6 +1410,11 @@ func (h *eventHub) nextEventLocked(event Event) Event {
 		session := cloneSession(*event.Session)
 		event.Session = &session
 	}
+	if event.Frontend != nil {
+		frontend := *event.Frontend
+		frontend.Sessions = append([]string(nil), frontend.Sessions...)
+		event.Frontend = &frontend
+	}
 	if event.Attachment != nil {
 		attachment := *event.Attachment
 		if attachment.Terminal != nil {
@@ -1302,26 +1426,173 @@ func (h *eventHub) nextEventLocked(event Event) Event {
 	return event
 }
 
-func (r *sessionRegistry) Create(name string) Session {
+func (r *sessionRegistry) RegisterFrontend(req RegisterFrontendRequest) FrontendSummary {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.nextFrontend++
+	id := fmt.Sprintf("fe_%08x", r.nextFrontend)
+	now := time.Now()
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = id
+	}
+	frontend := frontendRecord{
+		ID:        id,
+		Name:      name,
+		State:     "open",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	r.frontends[id] = frontend
+	return r.frontendSummaryLocked(frontend)
+}
+
+func (r *sessionRegistry) Frontends() []FrontendSummary {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ids := make([]string, 0, len(r.frontends))
+	for id := range r.frontends {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]FrontendSummary, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, r.frontendSummaryLocked(r.frontends[id]))
+	}
+	return out
+}
+
+func (r *sessionRegistry) CloseFrontend(id string) (FrontendSummary, []sessionCleanup, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id = strings.TrimSpace(id)
+	frontend, ok := r.frontends[id]
+	if !ok {
+		return FrontendSummary{}, nil, sessionError{status: http.StatusNotFound, err: "frontend not found"}
+	}
+	now := time.Now()
+	frontend.State = "closed"
+	frontend.UpdatedAt = now
+	frontend.ClosedAt = now
+	r.frontends[id] = frontend
+	var cleanups []sessionCleanup
+	for sessionID, session := range r.sessions {
+		changed := false
+		if session.FrontendID == id && session.Scope != "system" && !session.DetachOnClose {
+			session.Jobs = r.mergedJobsLocked(sessionID, session.Jobs)
+			markDaemonJobsCanceling(session.Jobs)
+			session.HostShells = r.mergedHostShellsLocked(sessionID, session.HostShells)
+			session.State = "closing"
+			session.UpdatedAt = now
+			cleanups = append(cleanups, sessionCleanup{
+				Session: cloneSession(session),
+				JobIDs:  r.jobIDsLocked(sessionID),
+				VMIDs:   sessionVMIDs(session),
+			})
+			delete(r.sessions, sessionID)
+			delete(r.jobs, sessionID)
+			delete(r.hostShells, sessionID)
+			continue
+		}
+		if session.FrontendID == id {
+			session.FrontendID = ""
+			if session.Scope == "system" {
+				session.DetachOnClose = true
+			}
+			changed = true
+		}
+		if len(session.Attachments) != 0 {
+			next := session.Attachments[:0]
+			for _, attachment := range session.Attachments {
+				if attachment.FrontendID == id {
+					changed = true
+					continue
+				}
+				next = append(next, attachment)
+			}
+			session.Attachments = append([]ClientAttachment(nil), next...)
+		}
+		if changed {
+			if len(session.Attachments) == 0 {
+				session.State = "detached"
+			}
+			session.UpdatedAt = now
+			r.sessions[sessionID] = session
+		}
+	}
+	summary := r.frontendSummaryLocked(frontend)
+	delete(r.frontends, id)
+	return summary, cleanups, nil
+}
+
+func (r *sessionRegistry) frontendSummaryLocked(frontend frontendRecord) FrontendSummary {
+	var sessions []string
+	for _, session := range r.sessions {
+		if session.FrontendID == frontend.ID {
+			sessions = append(sessions, session.ID)
+		}
+	}
+	sort.Strings(sessions)
+	return FrontendSummary{
+		ID:        frontend.ID,
+		Name:      frontend.Name,
+		State:     frontend.State,
+		Sessions:  sessions,
+		CreatedAt: frontend.CreatedAt,
+		UpdatedAt: frontend.UpdatedAt,
+		ClosedAt:  frontend.ClosedAt,
+	}
+}
+
+func (r *sessionRegistry) Create(req CreateSessionRequest) (Session, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.next++
 	id := fmt.Sprintf("sess_%08x", r.next)
-	name = strings.TrimSpace(name)
+	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		name = id
 	}
+	frontendID := strings.TrimSpace(req.FrontendID)
+	if frontendID != "" {
+		frontend, ok := r.frontends[frontendID]
+		if !ok || frontend.State != "open" {
+			return Session{}, sessionError{status: http.StatusNotFound, err: "frontend not found"}
+		}
+	}
+	scope := normalizeSessionScope(req.Scope, frontendID)
+	detachOnClose := scope == "system"
+	if req.DetachOnClose != nil {
+		detachOnClose = *req.DetachOnClose
+	}
 	now := time.Now()
 	session := Session{
-		ID:          id,
-		Name:        name,
-		State:       "detached",
-		Attachments: []ClientAttachment{},
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		ID:            id,
+		Name:          name,
+		State:         "detached",
+		Scope:         scope,
+		FrontendID:    frontendID,
+		DetachOnClose: detachOnClose,
+		Attachments:   []ClientAttachment{},
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}
 	r.sessions[id] = session
-	return cloneSession(session)
+	return cloneSession(session), nil
+}
+
+func normalizeSessionScope(scope, frontendID string) string {
+	switch strings.TrimSpace(scope) {
+	case "frontend":
+		return "frontend"
+	case "system":
+		return "system"
+	default:
+		if strings.TrimSpace(frontendID) != "" {
+			return "frontend"
+		}
+		return "system"
+	}
 }
 
 func (r *sessionRegistry) Get(id string) (Session, bool) {
@@ -1404,6 +1675,21 @@ func markDaemonJobsCanceling(jobs []JobSummary) {
 	}
 }
 
+func sessionVMIDs(session Session) []string {
+	seen := map[string]bool{}
+	var ids []string
+	for _, ref := range session.VMRefs {
+		id := firstNonEmpty(strings.TrimSpace(ref.BackendID), strings.TrimSpace(ref.ID))
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 func (r *sessionRegistry) Attach(id string, req AttachSessionRequest) (Session, ClientAttachment, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1419,6 +1705,13 @@ func (r *sessionRegistry) Attach(id string, req AttachSessionRequest) (Session, 
 	if mode != "interactive" && mode != "observer" {
 		return Session{}, ClientAttachment{}, sessionError{status: http.StatusBadRequest, err: "unsupported attachment mode"}
 	}
+	frontendID := strings.TrimSpace(req.FrontendID)
+	if frontendID != "" {
+		frontend, ok := r.frontends[frontendID]
+		if !ok || frontend.State != "open" {
+			return Session{}, ClientAttachment{}, sessionError{status: http.StatusNotFound, err: "frontend not found"}
+		}
+	}
 	if mode == "interactive" {
 		for _, attachment := range session.Attachments {
 			if attachment.Mode == "interactive" {
@@ -1430,6 +1723,7 @@ func (r *sessionRegistry) Attach(id string, req AttachSessionRequest) (Session, 
 	now := time.Now()
 	attachment := ClientAttachment{
 		ID:         fmt.Sprintf("attach_%08x", r.nextAttach),
+		FrontendID: frontendID,
 		Mode:       mode,
 		Terminal:   normalizeTerminal(req.Terminal),
 		AttachedAt: now,
@@ -1440,6 +1734,31 @@ func (r *sessionRegistry) Attach(id string, req AttachSessionRequest) (Session, 
 	session.UpdatedAt = now
 	r.sessions[id] = session
 	return cloneSession(session), attachment, nil
+}
+
+func (r *sessionRegistry) Persist(id string, req PersistSessionRequest) (Session, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id = strings.TrimSpace(id)
+	session, ok := r.sessions[id]
+	if !ok {
+		return Session{}, sessionError{status: http.StatusNotFound, err: "session not found"}
+	}
+	scope := strings.TrimSpace(req.Scope)
+	if scope == "" {
+		scope = "system"
+	}
+	if scope != "system" && scope != "frontend" {
+		return Session{}, sessionError{status: http.StatusBadRequest, err: "unsupported session scope"}
+	}
+	session.Scope = scope
+	session.DetachOnClose = scope == "system"
+	if scope == "system" {
+		session.FrontendID = ""
+	}
+	session.UpdatedAt = time.Now()
+	r.sessions[id] = session
+	return cloneSession(session), nil
 }
 
 func (r *sessionRegistry) Detach(id, attachmentID string) (Session, error) {
@@ -1519,6 +1838,9 @@ func (r *sessionRegistry) List() []SessionSummary {
 			ID:              session.ID,
 			Name:            session.Name,
 			State:           session.State,
+			Scope:           session.Scope,
+			FrontendID:      session.FrontendID,
+			DetachOnClose:   session.DetachOnClose,
 			HostCWD:         session.HostCWD,
 			SelectedContext: cloneSessionContext(session.SelectedContext),
 			VMRefs:          cloneVMRefs(session.VMRefs),

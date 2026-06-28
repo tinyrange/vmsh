@@ -46,6 +46,18 @@ func (c *HTTPClient) CreateSession(req CreateSessionRequest) (Session, error) {
 	return session, err
 }
 
+func (c *HTTPClient) RegisterFrontend(req RegisterFrontendRequest) (FrontendSummary, error) {
+	var frontend FrontendSummary
+	err := c.doJSON(http.MethodPost, "/vmsh/frontends", req, &frontend)
+	return frontend, err
+}
+
+func (c *HTTPClient) CloseFrontend(id string) (FrontendSummary, error) {
+	var frontend FrontendSummary
+	err := c.doJSON(http.MethodDelete, "/vmsh/frontends/"+url.PathEscape(id), nil, &frontend)
+	return frontend, err
+}
+
 func (c *HTTPClient) Status() (Status, error) {
 	var status Status
 	err := c.doJSON(http.MethodGet, "/vmsh/status", nil, &status)
@@ -175,6 +187,12 @@ func (s *TerminalStream) Close() error {
 func (c *HTTPClient) DetachSession(id string, req DetachSessionRequest) (Session, error) {
 	var session Session
 	err := c.doJSON(http.MethodPost, "/vmsh/sessions/"+url.PathEscape(id)+"/detach", req, &session)
+	return session, err
+}
+
+func (c *HTTPClient) PersistSession(id string, req PersistSessionRequest) (Session, error) {
+	var session Session
+	err := c.doJSON(http.MethodPost, "/vmsh/sessions/"+url.PathEscape(id)+"/persist", req, &session)
 	return session, err
 }
 

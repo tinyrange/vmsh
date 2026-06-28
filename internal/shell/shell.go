@@ -163,10 +163,12 @@ type shellCopy struct {
 
 type vmshdSessionReporter struct {
 	client       *vmshd.HTTPClient
+	frontendID   string
 	sessionID    string
 	attachmentID string
 	hostCWD      string
 	context      commandContext
+	detached     bool
 }
 
 type hostShellInit struct {
@@ -348,7 +350,7 @@ func (c *vmshCompleter) completionContext(prefix string) commandContext {
 		if err == nil {
 			ctx = sshCommandContext(ctx, at.Options, host)
 		}
-	case "help", "ps", "jobs", "sessions", "alias", "exec", "status", "where", "start", "stop", "restart", "forward", "tmux", "agent":
+	case "help", "ps", "jobs", "sessions", "detach", "alias", "exec", "status", "where", "start", "stop", "restart", "forward", "tmux", "agent":
 	default:
 		if sshCtx, ok := c.shellSSHSessionContext(at.Target); ok {
 			ctx = sshCtx
@@ -374,7 +376,7 @@ func pathCompletionReplaceLen(token string) int {
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@agent", "@alias", "@copy", "@exec", "@help", "@host", "@jobs", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux"}
+	words := []string{"@agent", "@alias", "@copy", "@detach", "@exec", "@help", "@host", "@jobs", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux"}
 	if c.shell != nil {
 		for _, name := range c.shell.sshSessionNames() {
 			words = append(words, "@"+name)
@@ -1084,6 +1086,7 @@ func Run(args []string) error {
 	startVM := fs.Bool("start", false, "Start the selected blank VM before entering the shell")
 	script := fs.String("script", "", "Internal test hook: read vmsh commands from this file")
 	recordPath := fs.String("record", "", "Record terminal output to an asciinema v2 .cast file")
+	systemSession := fs.Bool("system-session", false, "Keep the vmshd session after this frontend exits")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1217,7 +1220,7 @@ func Run(args []string) error {
 		return err
 	}
 	if haveDaemonState {
-		reporter, stopVMSHDSession, err := startVMSHDSession(daemonState, os.Stdout, vmshdSessionMetadata(sh.hostCWD, sh.context), sh.context)
+		reporter, stopVMSHDSession, err := startVMSHDSession(daemonState, os.Stdout, vmshdSessionMetadata(sh.hostCWD, sh.context), sh.context, *systemSession)
 		if err != nil {
 			return err
 		}
@@ -1273,7 +1276,7 @@ func daemonDisplayName(state backend.DaemonState, launch backend.CCVMLaunch) str
 	return "ccvm"
 }
 
-func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmshd.UpdateSessionRequest, ctx commandContext) (*vmshdSessionReporter, func(), error) {
+func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmshd.UpdateSessionRequest, ctx commandContext, systemSession bool) (*vmshdSessionReporter, func(), error) {
 	if state.Kind != vmshd.Kind {
 		return nil, func() {}, nil
 	}
@@ -1281,14 +1284,27 @@ func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmsh
 	if err != nil {
 		return nil, nil, err
 	}
-	session, err := client.CreateSession(vmshd.CreateSessionRequest{Name: "main"})
+	frontend, err := client.RegisterFrontend(vmshd.RegisterFrontendRequest{Name: "vmsh"})
 	if err != nil {
 		return nil, nil, err
 	}
-	if _, err := client.UpdateSession(session.ID, metadata); err != nil {
+	closeFrontend := func() {
+		_, _ = client.CloseFrontend(frontend.ID)
+	}
+	scope := "frontend"
+	if systemSession {
+		scope = "system"
+	}
+	session, err := client.CreateSession(vmshd.CreateSessionRequest{Name: "main", FrontendID: frontend.ID, Scope: scope})
+	if err != nil {
+		closeFrontend()
 		return nil, nil, err
 	}
-	attachReq := vmshd.AttachSessionRequest{Mode: "interactive"}
+	if _, err := client.UpdateSession(session.ID, metadata); err != nil {
+		closeFrontend()
+		return nil, nil, err
+	}
+	attachReq := vmshd.AttachSessionRequest{FrontendID: frontend.ID, Mode: "interactive"}
 	if output != nil {
 		_, cols, rows := terminalRequestSize(output)
 		if cols > 0 || rows > 0 {
@@ -1297,17 +1313,20 @@ func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmsh
 	}
 	attached, err := client.AttachSession(session.ID, attachReq)
 	if err != nil {
+		closeFrontend()
 		return nil, nil, err
 	}
 	reporter := &vmshdSessionReporter{
 		client:       client,
+		frontendID:   frontend.ID,
 		sessionID:    session.ID,
 		attachmentID: attached.Attachment.ID,
 		hostCWD:      metadata.HostCWD,
 		context:      ctx,
+		detached:     systemSession,
 	}
 	return reporter, func() {
-		_, _ = client.DetachSession(session.ID, vmshd.DetachSessionRequest{AttachmentID: attached.Attachment.ID})
+		closeFrontend()
 	}, nil
 }
 
@@ -2679,7 +2698,7 @@ func (s *shellState) preparePipelineStage(base commandContext, index int, segmen
 
 func isControlAtTarget(target string) bool {
 	switch target {
-	case "help", "?", "ps", "jobs", "sessions", "alias", "status", "where", "start", "stop", "restart", "save", "rmi", "tmux", "forward", "copy", "cp", "agent", "ssh":
+	case "help", "?", "ps", "jobs", "sessions", "detach", "alias", "status", "where", "start", "stop", "restart", "save", "rmi", "tmux", "forward", "copy", "cp", "agent", "ssh":
 		return true
 	default:
 		return false
@@ -3220,6 +3239,11 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("usage: @sessions")
 		}
 		return s.printSessions(stdout)
+	case "detach":
+		if at.Command != "" || len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @detach")
+		}
+		return s.detachVMSHDSession(stdout)
 	case "alias":
 		if len(at.Options.OptionFields) != 0 {
 			return fmt.Errorf("usage: @alias [name=value] | @alias -d name | @alias expand <line>")
@@ -9166,6 +9190,7 @@ type vmshdSessionRow struct {
 	ID          string
 	Name        string
 	State       string
+	Scope       string
 	Context     string
 	Attachments int
 	Jobs        int
@@ -9179,7 +9204,8 @@ type vmshdSessionRow struct {
 
 func (s *shellState) printSessions(w io.Writer) error {
 	if s.vmshd == nil || s.vmshd.client == nil {
-		return fmt.Errorf("@sessions requires a vmshd session")
+		_, err := fmt.Fprintln(w, "No vmshd session")
+		return err
 	}
 	sessions, err := s.vmshd.client.Sessions()
 	if err != nil {
@@ -9195,6 +9221,7 @@ func (s *shellState) printSessions(w io.Writer) error {
 			row.ID,
 			"name=" + strconv.Quote(emptyText(row.Name, "-")),
 			"state=" + emptyText(row.State, "unknown"),
+			"scope=" + emptyText(row.Scope, "unknown"),
 			"context=" + strconv.Quote(emptyText(row.Context, "-")),
 			fmt.Sprintf("attachments=%d", row.Attachments),
 			fmt.Sprintf("jobs=%d", row.Jobs),
@@ -9226,6 +9253,7 @@ func vmshdSessionRows(sessions []vmshd.SessionSummary, currentID string) []vmshd
 			ID:          session.ID,
 			Name:        session.Name,
 			State:       session.State,
+			Scope:       session.Scope,
 			Context:     context,
 			Attachments: len(session.AttachedClients),
 			Jobs:        len(session.Jobs),
@@ -9238,6 +9266,20 @@ func vmshdSessionRows(sessions []vmshd.SessionSummary, currentID string) []vmshd
 		})
 	}
 	return rows
+}
+
+func (s *shellState) detachVMSHDSession(w io.Writer) error {
+	if s.vmshd == nil || s.vmshd.client == nil || strings.TrimSpace(s.vmshd.sessionID) == "" {
+		_, err := fmt.Fprintln(w, "No vmshd session to detach")
+		return err
+	}
+	session, err := s.vmshd.client.PersistSession(s.vmshd.sessionID, vmshd.PersistSessionRequest{Scope: "system"})
+	if err != nil {
+		return err
+	}
+	s.vmshd.detached = true
+	_, err = fmt.Fprintf(w, "Detached session %s\n", session.ID)
+	return err
 }
 
 func (s *shellState) controlJob(command string, w io.Writer) error {
@@ -9470,6 +9512,7 @@ func (s *shellState) help(w io.Writer) error {
 @ps                      list VMs and SSH sessions
 	@jobs [logs id|stop id]  list background jobs, show captured output, or request stop
 @sessions                list vmshd shell sessions and resource counts
+@detach                  keep the current vmshd session after this frontend exits
 @status                  show vmsh and selected VM state
 @start                   start the current VM
 @stop [name|vm:name|ssh:name]  stop an SSH session or VM

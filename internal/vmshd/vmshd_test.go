@@ -115,7 +115,7 @@ func TestStatusRoute(t *testing.T) {
 	mux := http.NewServeMux()
 	runtime := fakeRuntimeView{statuses: []client.InstanceState{{ID: "vm1", Status: "running"}}}
 	srv.RegisterHandlers(mux, runtime)
-	session := srv.registry.Create("main")
+	session := mustCreateRegistrySession(t, srv.registry, "main")
 	updated, err := srv.registry.Update(session.ID, UpdateSessionRequest{
 		HostCWD:         "/work",
 		SelectedContext: &SessionContext{Mode: "host", Name: "host", Short: "host", Source: "host"},
@@ -324,11 +324,80 @@ func TestSessionRoutesCreateListReadAndDelete(t *testing.T) {
 	}
 }
 
+func TestFrontendCloseCleansEphemeralSessionsAndKeepsPersistedSessions(t *testing.T) {
+	srv := NewServer("secret")
+	frontend := srv.registry.RegisterFrontend(RegisterFrontendRequest{Name: "vmsh"})
+	ephemeral, err := srv.registry.Create(CreateSessionRequest{Name: "ephemeral", FrontendID: frontend.ID, Scope: "frontend"})
+	if err != nil {
+		t.Fatalf("create ephemeral session: %v", err)
+	}
+	persisted, err := srv.registry.Create(CreateSessionRequest{Name: "persisted", FrontendID: frontend.ID, Scope: "frontend"})
+	if err != nil {
+		t.Fatalf("create persisted session: %v", err)
+	}
+	persisted, err = srv.registry.Persist(persisted.ID, PersistSessionRequest{Scope: "system"})
+	if err != nil {
+		t.Fatalf("persist session: %v", err)
+	}
+	if _, _, err := srv.registry.Attach(ephemeral.ID, AttachSessionRequest{FrontendID: frontend.ID, Mode: "interactive"}); err != nil {
+		t.Fatalf("attach ephemeral session: %v", err)
+	}
+	if _, _, err := srv.registry.Attach(persisted.ID, AttachSessionRequest{FrontendID: frontend.ID, Mode: "observer"}); err != nil {
+		t.Fatalf("attach persisted session: %v", err)
+	}
+	if _, err := srv.registry.Update(ephemeral.ID, UpdateSessionRequest{
+		VMRefs: []VMRef{{ID: "dev", BackendID: "dev-isolated", Isolated: true}},
+	}); err != nil {
+		t.Fatalf("update ephemeral session: %v", err)
+	}
+	job, err := srv.registry.StartJob(ephemeral.ID, StartHostJobRequest{Command: []string{"sleep", "1"}})
+	if err != nil {
+		t.Fatalf("start daemon job: %v", err)
+	}
+	_, cancel := context.WithCancel(context.Background())
+	srv.jobs.Track(job.ID, cancel)
+
+	shutdowns := make(chan string, 1)
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, fakeRuntimeView{
+		shutdown: func(_ context.Context, id string) error {
+			shutdowns <- id
+			return nil
+		},
+	})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/vmsh/frontends/"+frontend.ID, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("close frontend status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if _, ok := srv.registry.Get(ephemeral.ID); ok {
+		t.Fatalf("ephemeral session still exists after frontend close")
+	}
+	kept, ok := srv.registry.Get(persisted.ID)
+	if !ok {
+		t.Fatalf("persisted session was removed")
+	}
+	if kept.Scope != "system" || !kept.DetachOnClose || len(kept.Attachments) != 0 {
+		t.Fatalf("persisted session = %+v", kept)
+	}
+	select {
+	case id := <-shutdowns:
+		if id != "dev-isolated" {
+			t.Fatalf("shutdown id = %q", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for runtime shutdown")
+	}
+	if srv.jobs.CancelOne(job.ID) {
+		t.Fatalf("daemon job was not canceled during frontend cleanup")
+	}
+}
+
 func TestSessionAttachDetachRoutes(t *testing.T) {
 	srv := NewServer("secret")
 	mux := http.NewServeMux()
 	srv.RegisterHandlers(mux, nil)
-	session := srv.registry.Create("main")
+	session := mustCreateRegistrySession(t, srv.registry, "main")
 
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/vmsh/sessions/"+session.ID+"/attach", bytes.NewBufferString(`{"terminal":{"cols":120,"rows":40}}`)))
@@ -427,7 +496,7 @@ func TestSessionAttachRejectsBadRequests(t *testing.T) {
 	srv := NewServer("secret")
 	mux := http.NewServeMux()
 	srv.RegisterHandlers(mux, nil)
-	session := srv.registry.Create("main")
+	session := mustCreateRegistrySession(t, srv.registry, "main")
 
 	for _, tc := range []struct {
 		name   string
@@ -455,7 +524,7 @@ func TestSessionTerminalUpdateRejectsBadRequests(t *testing.T) {
 	srv := NewServer("secret")
 	mux := http.NewServeMux()
 	srv.RegisterHandlers(mux, nil)
-	session := srv.registry.Create("main")
+	session := mustCreateRegistrySession(t, srv.registry, "main")
 	_, attachment, err := srv.registry.Attach(session.ID, AttachSessionRequest{})
 	if err != nil {
 		t.Fatalf("attach session: %v", err)
@@ -485,7 +554,7 @@ func TestDaemonOwnedHostJobRunsDetachedAndUpdatesSessionState(t *testing.T) {
 	srv := NewServer("secret")
 	mux := http.NewServeMux()
 	srv.RegisterHandlers(mux, nil)
-	session := srv.registry.Create("main")
+	session := mustCreateRegistrySession(t, srv.registry, "main")
 	httpSrv := httptest.NewServer(srv.Authenticate(mux))
 	defer httpSrv.Close()
 
@@ -531,7 +600,7 @@ func TestDaemonOwnedSSHJobRunsAsHostProcess(t *testing.T) {
 	srv := NewServer("secret")
 	mux := http.NewServeMux()
 	srv.RegisterHandlers(mux, nil)
-	session := srv.registry.Create("main")
+	session := mustCreateRegistrySession(t, srv.registry, "main")
 	httpSrv := httptest.NewServer(srv.Authenticate(mux))
 	defer httpSrv.Close()
 
@@ -568,7 +637,7 @@ func TestDaemonOwnedHostJobCanBeCanceled(t *testing.T) {
 	srv := NewServer("secret")
 	mux := http.NewServeMux()
 	srv.RegisterHandlers(mux, nil)
-	session := srv.registry.Create("main")
+	session := mustCreateRegistrySession(t, srv.registry, "main")
 	httpSrv := httptest.NewServer(srv.Authenticate(mux))
 	defer httpSrv.Close()
 
@@ -636,7 +705,7 @@ func TestDaemonOwnedVMJobRunsThroughRuntime(t *testing.T) {
 	srv := NewServer("secret")
 	mux := http.NewServeMux()
 	srv.RegisterHandlers(mux, runtime)
-	session := srv.registry.Create("main")
+	session := mustCreateRegistrySession(t, srv.registry, "main")
 	httpSrv := httptest.NewServer(srv.Authenticate(mux))
 	defer httpSrv.Close()
 
@@ -701,7 +770,7 @@ func TestTerminalAttachmentStreamTracksActiveStreamAndResize(t *testing.T) {
 	srv := NewServer("secret")
 	mux := http.NewServeMux()
 	srv.RegisterHandlers(mux, nil)
-	session := srv.registry.Create("main")
+	session := mustCreateRegistrySession(t, srv.registry, "main")
 	_, attachment, err := srv.registry.Attach(session.ID, AttachSessionRequest{Terminal: &Terminal{Cols: 80, Rows: 24}})
 	if err != nil {
 		t.Fatalf("attach session: %v", err)
@@ -983,9 +1052,19 @@ func TestCreateSessionRejectsBadJSON(t *testing.T) {
 	}
 }
 
+func mustCreateRegistrySession(t *testing.T, registry *sessionRegistry, name string) Session {
+	t.Helper()
+	session, err := registry.Create(CreateSessionRequest{Name: name})
+	if err != nil {
+		t.Fatalf("create registry session: %v", err)
+	}
+	return session
+}
+
 type fakeRuntimeView struct {
 	statuses  []client.InstanceState
 	runStream func(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+	shutdown  func(context.Context, string) error
 }
 
 func (f fakeRuntimeView) InstanceStatuses() []client.InstanceState {
@@ -997,4 +1076,11 @@ func (f fakeRuntimeView) RunStreamIn(ctx context.Context, id string, req client.
 		return f.runStream(ctx, id, req, inputs, onEvent)
 	}
 	return fmt.Errorf("run stream is not configured")
+}
+
+func (f fakeRuntimeView) ShutdownInstance(ctx context.Context, id string) error {
+	if f.shutdown != nil {
+		return f.shutdown(ctx, id)
+	}
+	return nil
 }

@@ -17,6 +17,32 @@ import (
 
 func TestHTTPClientSessionLifecycle(t *testing.T) {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/frontends", func(w http.ResponseWriter, r *http.Request) {
+		requireBearer(t, r)
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, http.StatusOK, []FrontendSummary{{ID: "fe_1", Name: "vmsh", State: "open"}})
+			return
+		case http.MethodPost:
+		default:
+			t.Fatalf("frontends method = %s", r.Method)
+		}
+		var req RegisterFrontendRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode frontend request: %v", err)
+		}
+		if req.Name != "vmsh" {
+			t.Fatalf("frontend request = %+v", req)
+		}
+		writeJSON(w, http.StatusOK, FrontendSummary{ID: "fe_1", Name: req.Name, State: "open"})
+	})
+	mux.HandleFunc("/vmsh/frontends/fe_1", func(w http.ResponseWriter, r *http.Request) {
+		requireBearer(t, r)
+		if r.Method != http.MethodDelete {
+			t.Fatalf("close frontend method = %s", r.Method)
+		}
+		writeJSON(w, http.StatusOK, FrontendSummary{ID: "fe_1", Name: "vmsh", State: "closed"})
+	})
 	mux.HandleFunc("/vmsh/sessions", func(w http.ResponseWriter, r *http.Request) {
 		requireBearer(t, r)
 		switch r.Method {
@@ -31,10 +57,10 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode create request: %v", err)
 		}
-		if req.Name != "main" {
+		if req.Name != "main" || req.FrontendID != "fe_1" || req.Scope != "frontend" {
 			t.Fatalf("create request = %+v", req)
 		}
-		writeJSON(w, http.StatusOK, Session{ID: "sess_1", Name: req.Name, State: "detached"})
+		writeJSON(w, http.StatusOK, Session{ID: "sess_1", Name: req.Name, State: "detached", Scope: req.Scope, FrontendID: req.FrontendID})
 	})
 	mux.HandleFunc("/vmsh/status", func(w http.ResponseWriter, r *http.Request) {
 		requireBearer(t, r)
@@ -44,7 +70,8 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 		writeJSON(w, http.StatusOK, Status{
 			Kind:      "vmshd",
 			Status:    "running",
-			Sessions:  []SessionSummary{{ID: "sess_1", Name: "main", State: "attached"}},
+			Frontends: []FrontendSummary{{ID: "fe_1", Name: "vmsh", State: "open"}},
+			Sessions:  []SessionSummary{{ID: "sess_1", Name: "main", State: "attached", Scope: "frontend", FrontendID: "fe_1"}},
 			Streams:   []StreamSummary{{ID: "terminal_stream_1", Kind: "terminal", SessionID: "sess_1"}},
 			StartedAt: time.Unix(10, 0),
 		})
@@ -55,12 +82,12 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode attach request: %v", err)
 		}
-		if req.Mode != "interactive" || req.Terminal == nil || req.Terminal.Cols != 80 || req.Terminal.Rows != 24 {
+		if req.FrontendID != "fe_1" || req.Mode != "interactive" || req.Terminal == nil || req.Terminal.Cols != 80 || req.Terminal.Rows != 24 {
 			t.Fatalf("attach request = %+v", req)
 		}
 		writeJSON(w, http.StatusOK, AttachSessionResponse{
 			Session:    Session{ID: "sess_1", Name: "main", State: "attached"},
-			Attachment: ClientAttachment{ID: "attach_1", Mode: "interactive", Terminal: req.Terminal},
+			Attachment: ClientAttachment{ID: "attach_1", FrontendID: req.FrontendID, Mode: "interactive", Terminal: req.Terminal},
 		})
 	})
 	mux.HandleFunc("/vmsh/sessions/sess_1", func(w http.ResponseWriter, r *http.Request) {
@@ -135,6 +162,17 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 		}
 		writeJSON(w, http.StatusOK, Session{ID: "sess_1", Name: "main", State: "detached"})
 	})
+	mux.HandleFunc("/vmsh/sessions/sess_1/persist", func(w http.ResponseWriter, r *http.Request) {
+		requireBearer(t, r)
+		var req PersistSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode persist request: %v", err)
+		}
+		if req.Scope != "system" {
+			t.Fatalf("persist request = %+v", req)
+		}
+		writeJSON(w, http.StatusOK, Session{ID: "sess_1", Name: "main", State: "attached", Scope: "system", DetachOnClose: true})
+	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -149,7 +187,14 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
-	session, err := client.CreateSession(CreateSessionRequest{Name: "main"})
+	frontend, err := client.RegisterFrontend(RegisterFrontendRequest{Name: "vmsh"})
+	if err != nil {
+		t.Fatalf("register frontend: %v", err)
+	}
+	if frontend.ID != "fe_1" || frontend.State != "open" {
+		t.Fatalf("frontend = %+v", frontend)
+	}
+	session, err := client.CreateSession(CreateSessionRequest{Name: "main", FrontendID: frontend.ID, Scope: "frontend"})
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}
@@ -160,7 +205,7 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
-	if status.Kind != "vmshd" || status.Status != "running" || len(status.Sessions) != 1 || len(status.Streams) != 1 {
+	if status.Kind != "vmshd" || status.Status != "running" || len(status.Frontends) != 1 || len(status.Sessions) != 1 || len(status.Streams) != 1 {
 		t.Fatalf("status = %+v", status)
 	}
 	sessions, err := client.Sessions()
@@ -189,8 +234,9 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 		t.Fatalf("updated = %+v", updated)
 	}
 	attached, err := client.AttachSession(session.ID, AttachSessionRequest{
-		Mode:     "interactive",
-		Terminal: &Terminal{Cols: 80, Rows: 24},
+		FrontendID: frontend.ID,
+		Mode:       "interactive",
+		Terminal:   &Terminal{Cols: 80, Rows: 24},
 	})
 	if err != nil {
 		t.Fatalf("attach session: %v", err)
@@ -232,6 +278,20 @@ func TestHTTPClientSessionLifecycle(t *testing.T) {
 	}
 	if detached.State != "detached" {
 		t.Fatalf("detached = %+v", detached)
+	}
+	persisted, err := client.PersistSession(session.ID, PersistSessionRequest{Scope: "system"})
+	if err != nil {
+		t.Fatalf("persist session: %v", err)
+	}
+	if persisted.Scope != "system" || !persisted.DetachOnClose {
+		t.Fatalf("persisted = %+v", persisted)
+	}
+	closed, err := client.CloseFrontend(frontend.ID)
+	if err != nil {
+		t.Fatalf("close frontend: %v", err)
+	}
+	if closed.ID != frontend.ID || closed.State != "closed" {
+		t.Fatalf("closed frontend = %+v", closed)
 	}
 }
 
