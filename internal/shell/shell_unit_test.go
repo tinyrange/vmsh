@@ -105,7 +105,7 @@ func TestShellCommandPassingBuildsGuestRunRequests(t *testing.T) {
 func TestPromptPullConfirmationCtrlCDeclines(t *testing.T) {
 	master, slave, err := pty.Open()
 	if err != nil {
-		t.Fatal(err)
+		t.Skipf("PTY unavailable: %v", err)
 	}
 	defer master.Close()
 	defer slave.Close()
@@ -161,6 +161,9 @@ func TestHostCommandEnvMarksNestedShellAsActive(t *testing.T) {
 }
 
 func TestRunHostMarksScriptModeNestedShellAsActive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host command fixture uses POSIX shell syntax")
+	}
 	api := newRecordingShellAPI("alpine", "alpine@amd64")
 	sh := newUnitShell(t, api)
 
