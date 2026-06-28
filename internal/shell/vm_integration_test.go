@@ -25,6 +25,9 @@ import (
 
 const vmIntegrationTestImage = "vmsh-integration-alpine"
 
+// VMSH_TEST_VM_INTEGRATION enables the small VM smoke suite. Tests that boot
+// extra VMs, move large data, exercise interactive PTYs, or duplicate copy
+// matrix coverage also require VMSH_TEST_VM_INTEGRATION_LONG.
 var vmIntegrationCCVMBuild struct {
 	once     sync.Once
 	path     string
@@ -210,6 +213,7 @@ func TestVMIntegrationCopiesDirectoryMetadataHostToVMToHost(t *testing.T) {
 }
 
 func TestVMIntegrationCopiesLargeFileHostToVM(t *testing.T) {
+	requireLongVMIntegrationTest(t)
 	env := newVMIntegrationTestEnv(t)
 	sh := env.newShell(t)
 	t.Cleanup(func() {
@@ -244,6 +248,7 @@ func TestVMIntegrationCopiesLargeFileHostToVM(t *testing.T) {
 }
 
 func TestVMIntegrationCopiesDirectoryMetadataThroughIsolatedVM(t *testing.T) {
+	requireLongVMIntegrationTest(t)
 	env := newVMIntegrationTestEnv(t)
 	sh := env.newShell(t)
 	t.Cleanup(func() {
@@ -272,6 +277,7 @@ func TestVMIntegrationCopiesDirectoryMetadataThroughIsolatedVM(t *testing.T) {
 }
 
 func TestVMIntegrationCopiesDirectoryMetadataBetweenVMs(t *testing.T) {
+	requireLongVMIntegrationTest(t)
 	env := newVMIntegrationTestEnv(t)
 	sh := env.newShell(t)
 	t.Cleanup(func() {
@@ -305,6 +311,7 @@ func TestVMIntegrationCopiesDirectoryMetadataBetweenVMs(t *testing.T) {
 }
 
 func TestVMIntegrationCopiesWeirdFilenamesThroughVMAndIsolatedVM(t *testing.T) {
+	requireLongVMIntegrationTest(t)
 	env := newVMIntegrationTestEnv(t)
 	sh := env.newShell(t)
 	t.Cleanup(func() {
@@ -335,6 +342,7 @@ func TestVMIntegrationCopiesWeirdFilenamesThroughVMAndIsolatedVM(t *testing.T) {
 }
 
 func TestVMIntegrationPastedCopyDirectoryMetadataHostToVMToHost(t *testing.T) {
+	requireLongVMIntegrationTest(t)
 	env := newVMIntegrationTestEnv(t)
 	sh := env.newShell(t)
 	t.Cleanup(func() {
@@ -364,6 +372,7 @@ func TestVMIntegrationPastedCopyDirectoryMetadataHostToVMToHost(t *testing.T) {
 }
 
 func TestVMIntegrationInteractivePasteCopiesDirectoryMetadataHostToVMToHost(t *testing.T) {
+	requireLongVMIntegrationTest(t)
 	env := newVMIntegrationTestEnv(t)
 	t.Cleanup(func() {
 		_ = env.api.ShutdownInstanceWithID("copy-pty-paste")
@@ -425,6 +434,7 @@ func TestVMIntegrationManagesVMAndImages(t *testing.T) {
 }
 
 func TestVMIntegrationSavesLoadedVMFilesystemFiles(t *testing.T) {
+	requireLongVMIntegrationTest(t)
 	env := newVMIntegrationTestEnv(t)
 	sh := env.newShell(t)
 
@@ -463,6 +473,7 @@ func TestVMIntegrationSavesAfterPersistentTTYGuestShell(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("persistent TTY shell test requires a Unix PTY")
 	}
+	requireLongVMIntegrationTest(t)
 	env := newVMIntegrationTestEnv(t)
 	sh := env.newShell(t)
 
@@ -500,6 +511,7 @@ func TestVMIntegrationPersistentTTYGuestShellState(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("persistent TTY shell test requires a Unix PTY")
 	}
+	requireLongVMIntegrationTest(t)
 	env := newVMIntegrationTestEnv(t)
 	sh := env.newShell(t)
 
@@ -543,6 +555,7 @@ func TestVMIntegrationPersistentTTYSudoSubshell(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("persistent TTY shell test requires a Unix PTY")
 	}
+	requireLongVMIntegrationTest(t)
 	env := newVMIntegrationTestEnv(t)
 	sh := env.newShell(t)
 
@@ -671,6 +684,13 @@ func newVMIntegrationTestEnv(t *testing.T) *vmIntegrationTestEnv {
 		api:      api,
 		cacheDir: cacheDir,
 		image:    vmIntegrationTestImage,
+	}
+}
+
+func requireLongVMIntegrationTest(t *testing.T) {
+	t.Helper()
+	if strings.TrimSpace(os.Getenv("VMSH_TEST_VM_INTEGRATION_LONG")) == "" {
+		t.Skip("set VMSH_TEST_VM_INTEGRATION_LONG=1 to run long VM integration tests")
 	}
 }
 
