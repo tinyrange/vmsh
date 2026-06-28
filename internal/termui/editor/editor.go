@@ -130,13 +130,7 @@ func (e *Editor) ReadLine(ctx context.Context, prompt string) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if idx := indexRune(e.queued, '\n'); idx >= 0 {
-		line := string(e.queued[:idx])
-		e.queued = append([]rune(nil), e.queued[idx+1:]...)
-		if prompt != "" && e.Capabilities().Mode != terminal.ModeNonInteractive {
-			terminal.WriteString(e.out, prompt+line+"\n")
-		}
-		e.history.add(line)
+	if line, ok := e.dequeueCompleteLine(prompt); ok {
 		return line, nil
 	}
 	if e.caps.Mode == terminal.ModeNonInteractive {
@@ -145,13 +139,46 @@ func (e *Editor) ReadLine(ctx context.Context, prompt string) (string, error) {
 	if e.inFile == nil || e.outFile == nil {
 		return "", errors.New("interactive mode requires input and output files")
 	}
-	restoreOut := terminal.PrepareOutput(e.outFile)
-	defer restoreOut()
 	restore, err := terminal.MakeRaw(e.inFile)
 	if err != nil {
 		return "", err
 	}
 	defer restore()
+	return e.readPreparedLine(ctx, prompt)
+}
+
+func (e *Editor) ReadLinePrepared(ctx context.Context, prompt string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if line, ok := e.dequeueCompleteLine(prompt); ok {
+		return line, nil
+	}
+	if e.caps.Mode == terminal.ModeNonInteractive {
+		return e.readPlainLine(ctx, prompt)
+	}
+	if e.inFile == nil || e.outFile == nil {
+		return "", errors.New("interactive mode requires input and output files")
+	}
+	return e.readPreparedLine(ctx, prompt)
+}
+
+func (e *Editor) dequeueCompleteLine(prompt string) (string, bool) {
+	if idx := indexRune(e.queued, '\n'); idx >= 0 {
+		line := string(e.queued[:idx])
+		e.queued = append([]rune(nil), e.queued[idx+1:]...)
+		if prompt != "" && e.Capabilities().Mode != terminal.ModeNonInteractive {
+			terminal.WriteString(e.out, prompt+line+"\n")
+		}
+		e.history.add(line)
+		return line, true
+	}
+	return "", false
+}
+
+func (e *Editor) readPreparedLine(ctx context.Context, prompt string) (string, error) {
+	restoreOut := terminal.PrepareOutput(e.outFile)
+	defer restoreOut()
 	terminal.WriteString(e.out, "\x1b[?2004h")
 	defer terminal.WriteString(e.out, "\x1b[?2004l")
 

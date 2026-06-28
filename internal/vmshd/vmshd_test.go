@@ -834,6 +834,12 @@ func TestTerminalAttachmentStreamTracksActiveStreamAndResize(t *testing.T) {
 func receiveTerminalDataUntil(t *testing.T, ws *websocket.Conn, marker string) string {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
+	if err := ws.SetReadDeadline(deadline); err != nil {
+		t.Fatalf("set terminal read deadline: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = ws.SetReadDeadline(time.Time{})
+	})
 	var out strings.Builder
 	for time.Now().Before(deadline) {
 		var msg TerminalStreamMessage

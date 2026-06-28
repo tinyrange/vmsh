@@ -752,6 +752,7 @@ func codexProxyRootAgentCommandLine(proxyHome string, release codexHostRelease, 
 func codexAgentCommandLine(binary string, args []string) string {
 	fields := []string{
 		"export CODEX_HOME=" + shellQuote(codexGuestHomeMount),
+		codexEnsureGuestStandaloneLinkCommand(codexGuestHomeMount),
 		"export PATH=" + shellQuote(strings.Join(codexAgentPathDirs(binary), ":")) + `:"$PATH"`,
 	}
 	fields = append(fields, "exec "+shellQuote(binary))
@@ -786,10 +787,19 @@ func codexProxyAgentCommandLine(proxyHome, binary string, args []string, proxyPo
 		codexShellStatusCommand("Codex: starting"),
 		codexShellClearStatusCommand(),
 		"export CODEX_HOME="+shellQuote(proxyHome),
+		codexEnsureGuestStandaloneLinkCommand(proxyHome),
 		"export PATH="+shellQuote(strings.Join(codexAgentPathDirs(binary), ":"))+`:"$PATH"`,
 		execLine,
 	)
 	return strings.Join(fields, "\n"), nil
+}
+
+func codexEnsureGuestStandaloneLinkCommand(guestHome string) string {
+	return strings.Join([]string{
+		"mkdir -p -- " + shellQuote(path.Join(guestHome, "packages")),
+		"rm -rf -- " + shellQuote(path.Join(guestHome, codexStandaloneDir)),
+		"ln -s -- " + shellQuote(codexGuestStandaloneMount) + " " + shellQuote(path.Join(guestHome, codexStandaloneDir)),
+	}, "; ")
 }
 
 func codexShellStatusCommand(message string) string {

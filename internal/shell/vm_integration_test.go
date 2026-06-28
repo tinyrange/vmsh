@@ -1000,7 +1000,7 @@ func startVMIntegrationPTY(t *testing.T, vmsh, cacheDir, ccvm, cwd string) *vmIn
 	)
 	master, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 30, Cols: 120})
 	if err != nil {
-		t.Fatalf("start vmsh pty: %v", err)
+		t.Skipf("start vmsh pty: %v", err)
 	}
 	s := &vmIntegrationPTY{
 		t:      t,

@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tinyrange/vmsh/internal/termui/terminal"
 )
@@ -39,6 +40,38 @@ func TestReadLineConsumesQueuedCompleteLine(t *testing.T) {
 	}
 	if got := string(ed.queued); got != "next" {
 		t.Fatalf("queued = %q, want next", got)
+	}
+}
+
+func TestReadLinePreparedPreservesBufferedPromptInput(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	out, err := os.CreateTemp("", "termui-editor-prepared-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(out.Name())
+	defer out.Close()
+	caps := terminal.Capabilities{Mode: terminal.ModeDynamicInteractive, Width: 80, Height: 24}
+	ed := New(Options{In: r, Out: out, Capabilities: &caps})
+	if _, err := w.Write([]byte("ls\n@freebsd\nass\n")); err != nil {
+		t.Fatalf("write input: %v", err)
+	}
+
+	for _, want := range []string{"ls", "@freebsd", "ass"} {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		got, err := ed.ReadLinePrepared(ctx, "> ")
+		cancel()
+		if err != nil {
+			t.Fatalf("ReadLinePrepared(%q): %v", want, err)
+		}
+		if got != want {
+			t.Fatalf("ReadLinePrepared returned %q, want %q", got, want)
+		}
 	}
 }
 

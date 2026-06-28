@@ -37,6 +37,12 @@ type demoOptions struct {
 	vmMemory string
 }
 
+func init() {
+	demoRunner = runDemo
+	demoWantsHelpFunc = demoWantsHelp
+	demoUsageFunc = printDemoUsage
+}
+
 func runDemo(p paths, args []string) error {
 	opts, err := parseDemoArgs(p, args)
 	if err != nil {

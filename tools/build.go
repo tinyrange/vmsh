@@ -32,6 +32,12 @@ type guestInitPayload struct {
 	installRel string
 }
 
+var (
+	demoRunner        func(paths, []string) error
+	demoWantsHelpFunc func([]string) bool
+	demoUsageFunc     func(io.Writer)
+)
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "build.go: %v\n", err)
@@ -82,14 +88,19 @@ func run() error {
 		if len(args) > 0 && args[0] == "--" {
 			args = args[1:]
 		}
-		if demoWantsHelp(args) {
-			printDemoUsage(os.Stderr)
+		if demoRunner == nil {
+			return fmt.Errorf("demo command requires the full tools package; run `go run ./tools demo`")
+		}
+		if demoWantsHelpFunc != nil && demoWantsHelpFunc(args) {
+			if demoUsageFunc != nil {
+				demoUsageFunc(os.Stderr)
+			}
 			return nil
 		}
 		if err := build(p); err != nil {
 			return err
 		}
-		return runDemo(p, args)
+		return demoRunner(p, args)
 	default:
 		return fmt.Errorf("unknown command %q", cmd)
 	}

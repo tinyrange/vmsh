@@ -591,7 +591,7 @@ func sshPersistentShellSidebandScript(ctx commandContext, controlPath, envPrelud
 		"}",
 		"__vmsh_run() {",
 		"  stty echo 2>/dev/null || true",
-		"  command eval \"$1\" 2>&1",
+		"  command eval \" $1\" 2>&1",
 		"  __vmsh_status=$?",
 		"  stty -echo 2>/dev/null || true",
 		"  __vmsh_report done \"$__vmsh_status\"",
@@ -864,6 +864,11 @@ func streamSSHPTYStdin(in *os.File, out io.Writer, done <-chan struct{}, inputCa
 		}
 		n, err := readPTYInput(in, buf[:], done, inputCancel)
 		if n > 0 {
+			select {
+			case <-done:
+				return
+			default:
+			}
 			if recorder != nil {
 				recorder.recordInput(buf[:n])
 			}
