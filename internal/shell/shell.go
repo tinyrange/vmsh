@@ -26,8 +26,8 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/tinyrange/vmsh/internal/backend"
-	"github.com/tinyrange/vmsh/internal/editor"
 	"github.com/tinyrange/vmsh/internal/terminal"
+	"github.com/tinyrange/vmsh/internal/termui/editor"
 	"github.com/tinyrange/vmsh/internal/vmshd"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
@@ -222,16 +222,11 @@ func newVMSHCompleter(shell *shellState) *vmshCompleter {
 }
 
 func (c *vmshCompleter) Do(line []rune, pos int) ([][]rune, int) {
-	candidates, replacementLen, _ := c.CompleteWithKind(line, pos)
+	candidates, replacementLen, _ := c.Complete(line, pos)
 	return stringCompletions(candidates), replacementLen
 }
 
-func (c *vmshCompleter) Complete(line []rune, pos int) ([]string, int) {
-	candidates, replacementLen, _ := c.CompleteWithKind(line, pos)
-	return candidates, replacementLen
-}
-
-func (c *vmshCompleter) CompleteWithKind(line []rune, pos int) ([]string, int, completionKind) {
+func (c *vmshCompleter) Complete(line []rune, pos int) ([]string, int, completionKind) {
 	prefix := currentCompletionSegment(string(line[:pos]))
 	typedTokenStart := lastCompletionTokenStart(prefix)
 	typedToken := prefix[typedTokenStart:]
@@ -1686,10 +1681,6 @@ func (s *shellState) loop(in io.Reader, stdout, stderr io.Writer) error {
 	if !readerIsTerminal(in) || !writerIsTerminal(stdout) {
 		return fmt.Errorf("vmsh requires an interactive terminal")
 	}
-	if outFile, ok := terminalWriterFile(stdout); ok {
-		restoreOutput := terminal.PrepareOutput(outFile)
-		defer restoreOutput()
-	}
 	inCloser, ok := in.(io.ReadCloser)
 	if !ok {
 		return fmt.Errorf("vmsh stdin does not support interactive editing")
@@ -1721,12 +1712,22 @@ func (s *shellState) evalLineEditor(in *os.File, stdout, stderr io.Writer) error
 		s.interruptSignals = previousInterrupts
 	}()
 
-	lineEditor := editor.NewLineEditor(in, stdout, s.history, s.completion)
+	outFile, ok := terminalWriterFile(stdout)
+	if !ok {
+		return fmt.Errorf("vmsh stdout does not support terminal editing")
+	}
+	lineEditor := editor.New(editor.Options{
+		In:          in,
+		Out:         outFile,
+		Writer:      stdout,
+		HistoryPath: s.history,
+		Completer:   s.completion,
+	})
 	for {
 		drainInterruptSignals(s.interruptSignals)
 		s.updateTerminalTitle(stdout)
 		s.drawPromptStatus(stdout)
-		line, err := lineEditor.ReadLine(s.prompt())
+		line, err := lineEditor.ReadLine(context.Background(), s.prompt())
 		s.statusSeq.Add(1)
 		switch {
 		case errors.Is(err, editor.ErrLineInterrupted):
