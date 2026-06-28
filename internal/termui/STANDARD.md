@@ -60,4 +60,3 @@ These requirements apply when the application is directly at fault for the user 
 An implementation must not satisfy these requirements by suppressing input, interruption, rendering, or status updates while potentially unbounded work is in progress.
 
 These requirements are built with the idea that we can’t predict how long an action will take and we don’t know how fast our users' execution environments are. Even a local file read that appears instant on a modern high-end laptop could mean a ¼ second delay for a user with an older machine, a remote filesystem, a hanging VM, or a constrained runtime. Knowing what you're waiting for and having a grounded estimate of how long the wait may continue is always better than sitting at an application that appears frozen.
-

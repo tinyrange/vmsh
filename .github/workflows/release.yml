@@ -72,8 +72,10 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o ../build/release/init-linux-amd64 ./internal/cmd/init
           install -m 644 ../build/release/init-linux-amd64 internal/guestinit/guest-init-linux-amd64
           for bsd in openbsd freebsd netbsd; do
-            CGO_ENABLED=0 GOOS="$bsd" GOARCH="$GOARCH" go build -trimpath -o "../build/release/guest-init-${bsd}-${GOARCH}" "./internal/cmd/${bsd}-init"
-            install -m 644 "../build/release/guest-init-${bsd}-${GOARCH}" "internal/${bsd}/guestinit/guest-init-${bsd}-${GOARCH}"
+            for arch in arm64 amd64; do
+              CGO_ENABLED=0 GOOS="$bsd" GOARCH="$arch" go build -trimpath -o "../build/release/init-${bsd}-${arch}" "./internal/cmd/${bsd}-init"
+              install -m 644 "../build/release/init-${bsd}-${arch}" "internal/${bsd}/guestinit/guest-init-${bsd}-${arch}"
+            done
           done
           cd ..
           GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -tags "embed_ccvm embed_guestinit" -o "dist/${name}" ./cmd/vmsh
@@ -155,8 +157,10 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o ../build/release/init-linux-amd64 ./internal/cmd/init
           install -m 644 ../build/release/init-linux-amd64 internal/guestinit/guest-init-linux-amd64
           for bsd in openbsd freebsd netbsd; do
-            CGO_ENABLED=0 GOOS="$bsd" GOARCH=arm64 go build -trimpath -o "../build/release/guest-init-${bsd}-arm64" "./internal/cmd/${bsd}-init"
-            install -m 644 "../build/release/guest-init-${bsd}-arm64" "internal/${bsd}/guestinit/guest-init-${bsd}-arm64"
+            for arch in arm64 amd64; do
+              CGO_ENABLED=0 GOOS="$bsd" GOARCH="$arch" go build -trimpath -o "../build/release/init-${bsd}-${arch}" "./internal/cmd/${bsd}-init"
+              install -m 644 "../build/release/init-${bsd}-${arch}" "internal/${bsd}/guestinit/guest-init-${bsd}-${arch}"
+            done
           done
           cd ..
           GOOS=darwin GOARCH=arm64 go build -trimpath -tags "embed_ccvm embed_guestinit" -o "dist/${name}" ./cmd/vmsh

@@ -845,38 +845,18 @@ func buildVMIntegrationCCVM(t *testing.T) string {
 		}
 		vmIntegrationCCVMBuild.buildDir = buildDir
 		out := filepath.Join(buildDir, backend.HostExecutableName("ccvm"))
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		for _, goarch := range []string{"arm64", "amd64"} {
-			payload := filepath.Join(root, "cc", "internal", "guestinit", "guest-init-linux-"+goarch)
-			cmd := exec.CommandContext(ctx, "go", "build", "-o", payload, "./internal/cmd/init")
-			cmd.Dir = filepath.Join(root, "cc")
-			cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+goarch)
-			var output bytes.Buffer
-			cmd.Stdout = &output
-			cmd.Stderr = &output
-			if err := cmd.Run(); err != nil {
-				vmIntegrationCCVMBuild.err = fmt.Errorf("go build guest init %s: %w\n%s", goarch, err, output.String())
-				return
-			}
-		}
-		for _, bsd := range []string{"openbsd", "freebsd", "netbsd"} {
-			payload := filepath.Join(root, "cc", "internal", bsd, "guestinit", "guest-init-"+bsd+"-"+runtime.GOARCH)
-			cmd := exec.CommandContext(ctx, "go", "build", "-o", payload, "./internal/cmd/"+bsd+"-init")
-			cmd.Dir = filepath.Join(root, "cc")
-			cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS="+bsd, "GOARCH="+runtime.GOARCH)
-			var output bytes.Buffer
-			cmd.Stdout = &output
-			cmd.Stderr = &output
-			if err := cmd.Run(); err != nil {
-				vmIntegrationCCVMBuild.err = fmt.Errorf("go build %s guest init %s: %w\n%s", bsd, runtime.GOARCH, err, output.String())
-				return
-			}
+		var output bytes.Buffer
+		installed, err := buildVMIntegrationGuestInitPayloads(ctx, root, buildDir, &output)
+		defer cleanupVMIntegrationGuestInitPayloads(installed)
+		if err != nil {
+			vmIntegrationCCVMBuild.err = err
+			return
 		}
 		cmd := exec.CommandContext(ctx, "go", "build", "-tags", "embed_guestinit", "-o", out, "./cmd/ccvm")
 		cmd.Dir = filepath.Join(root, "cc")
 		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
-		var output bytes.Buffer
 		cmd.Stdout = &output
 		cmd.Stderr = &output
 		if err := cmd.Run(); err != nil {
@@ -889,6 +869,86 @@ func buildVMIntegrationCCVM(t *testing.T) string {
 		t.Fatalf("build ccvm for VM integration tests: %v", vmIntegrationCCVMBuild.err)
 	}
 	return vmIntegrationCCVMBuild.path
+}
+
+type vmIntegrationGuestInitPayload struct {
+	name       string
+	goos       string
+	goarch     string
+	pkg        string
+	installRel string
+}
+
+func vmIntegrationGuestInitPayloads() []vmIntegrationGuestInitPayload {
+	payloads := []vmIntegrationGuestInitPayload{
+		{
+			name:       "linux/arm64 guest init",
+			goos:       "linux",
+			goarch:     "arm64",
+			pkg:        "./internal/cmd/init",
+			installRel: filepath.Join("internal", "guestinit", "guest-init-linux-arm64"),
+		},
+		{
+			name:       "linux/amd64 guest init",
+			goos:       "linux",
+			goarch:     "amd64",
+			pkg:        "./internal/cmd/init",
+			installRel: filepath.Join("internal", "guestinit", "guest-init-linux-amd64"),
+		},
+	}
+	for _, bsd := range []string{"openbsd", "freebsd", "netbsd"} {
+		for _, arch := range []string{"arm64", "amd64"} {
+			payloads = append(payloads, vmIntegrationGuestInitPayload{
+				name:       bsd + "/" + arch + " guest init",
+				goos:       bsd,
+				goarch:     arch,
+				pkg:        "./internal/cmd/" + bsd + "-init",
+				installRel: filepath.Join("internal", bsd, "guestinit", "guest-init-"+bsd+"-"+arch),
+			})
+		}
+	}
+	return payloads
+}
+
+func buildVMIntegrationGuestInitPayloads(ctx context.Context, root, buildDir string, output *bytes.Buffer) ([]string, error) {
+	ccDir := filepath.Join(root, "cc")
+	var installed []string
+	for _, payload := range vmIntegrationGuestInitPayloads() {
+		out := filepath.Join(buildDir, strings.ReplaceAll(payload.name, "/", "-"))
+		cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", out, payload.pkg)
+		cmd.Dir = ccDir
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS="+payload.goos, "GOARCH="+payload.goarch)
+		cmd.Stdout = output
+		cmd.Stderr = output
+		if err := cmd.Run(); err != nil {
+			cleanupVMIntegrationGuestInitPayloads(installed)
+			return nil, fmt.Errorf("build %s: %w\n%s", payload.name, err, output.String())
+		}
+		installPath := filepath.Join(ccDir, payload.installRel)
+		if err := copyVMIntegrationFile(out, installPath); err != nil {
+			cleanupVMIntegrationGuestInitPayloads(installed)
+			return nil, fmt.Errorf("install %s: %w", payload.name, err)
+		}
+		installed = append(installed, installPath)
+	}
+	return installed, nil
+}
+
+func cleanupVMIntegrationGuestInitPayloads(paths []string) {
+	for _, path := range paths {
+		_ = os.Remove(path)
+	}
+}
+
+func copyVMIntegrationFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0o644)
 }
 
 func buildVMIntegrationVMSH(t *testing.T) string {
