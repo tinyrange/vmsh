@@ -67,6 +67,7 @@ type resolvedSSHConfig struct {
 	IdentityFiles         []string
 	IdentitiesOnly        bool
 	ProxyJump             string
+	ProxyCommand          string
 	StrictHostKeyChecking string
 	ConnectTimeout        time.Duration
 }
@@ -115,17 +116,35 @@ func (s *shellState) runSSHWithInput(ctx commandContext, line string, stdin io.R
 	return s.runSSHCommand(ctx, line, stdin, stdout, stderr, false, false)
 }
 
+func (s *shellState) runSSHWithInputContext(runCtx context.Context, ctx commandContext, line string, stdin io.Reader, stdout, stderr io.Writer) error {
+	return s.runSSHCommandWithSizeContext(runCtx, ctx, line, stdin, stdout, stderr, false, 0, 0, false)
+}
+
 func (s *shellState) runSSHCommand(ctx commandContext, line string, stdin io.Reader, stdout, stderr io.Writer, tty, setLastCode bool) error {
 	return s.runSSHCommandWithSize(ctx, line, stdin, stdout, stderr, tty, 0, 0, setLastCode)
 }
 
 func (s *shellState) runSSHCommandWithSize(ctx commandContext, line string, stdin io.Reader, stdout, stderr io.Writer, tty bool, cols, rows int, setLastCode bool) error {
+	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+	defer stopInterrupts()
+	err := s.runSSHCommandWithSizeContext(runCtx, ctx, line, stdin, stdout, stderr, tty, cols, rows, setLastCode)
+	if interrupted.Load() && err != nil && sessionLastCode(err) < 0 {
+		err = persistentShellExit{code: 130}
+	}
+	return err
+}
+
+func (s *shellState) runSSHCommandWithSizeContext(runCtx context.Context, ctx commandContext, line string, stdin io.Reader, stdout, stderr io.Writer, tty bool, cols, rows int, setLastCode bool) error {
 	if ctx.CWD == "" {
 		ctx.CWD = s.currentSSHCWD(ctx)
 	}
 	script := sshRemoteCommandScript(ctx, line)
-	err := s.runSSHSession(ctx, "sh -lc "+shellQuote(script), stdin, stdout, stderr, tty, cols, rows)
+	err := s.runSSHSessionContext(runCtx, ctx, sshRemoteUserShellCommand(script, false), stdin, stdout, stderr, tty, cols, rows)
 	code := sshSessionExitCode(err)
+	if runCtx.Err() != nil {
+		code = 130
+		err = persistentShellExit{code: 130}
+	}
 	if setLastCode {
 		s.lastCode = code
 		if err != nil && code < 0 {
@@ -144,25 +163,29 @@ func (s *shellState) runSSHCommandWithSize(ctx commandContext, line string, stdi
 
 func (s *shellState) runSSHSession(ctx commandContext, command string, stdin io.Reader, stdout, stderr io.Writer, tty bool, cols, rows int) error {
 	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
-	client, err := s.sshClientForContext(runCtx, ctx)
-	if interrupted.Load() {
-		stopInterrupts()
+	defer stopInterrupts()
+	err := s.runSSHSessionContext(runCtx, ctx, command, stdin, stdout, stderr, tty, cols, rows)
+	if interrupted.Load() && err != nil && sessionLastCode(err) < 0 {
 		return persistentShellExit{code: 130}
 	}
-	stopInterrupts()
+	return err
+}
+
+func (s *shellState) runSSHSessionContext(runCtx context.Context, ctx commandContext, command string, stdin io.Reader, stdout, stderr io.Writer, tty bool, cols, rows int) error {
+	client, err := s.sshClientForContext(runCtx, ctx)
+	if runCtx.Err() != nil {
+		return persistentShellExit{code: 130}
+	}
 	if err != nil {
 		return err
 	}
 	session, err := client.client.NewSession()
 	if err != nil {
 		s.dropSSHClient(client.key)
-		runCtx, stopInterrupts, interrupted = s.interruptibleCommandContext()
 		client, err = s.sshClientForContext(runCtx, ctx)
-		if interrupted.Load() {
-			stopInterrupts()
+		if runCtx.Err() != nil {
 			return persistentShellExit{code: 130}
 		}
-		stopInterrupts()
 		if err != nil {
 			return err
 		}
@@ -204,20 +227,17 @@ func (s *shellState) runSSHSession(ctx commandContext, command string, stdin io.
 	go func() {
 		done <- session.Run(command)
 	}()
-	interrupts := newCommandInterruptEscalator(command, stderr, func() {
-		_ = session.Signal(ssh.SIGINT)
-	}, func() {
-		_ = session.Close()
-	})
-	stopRunInterrupts, runInterrupted := s.startInterruptWatcher(interrupts.Interrupt)
-	defer stopRunInterrupts()
 	for {
 		select {
 		case err := <-done:
-			if runInterrupted.Load() {
+			if runCtx.Err() != nil {
 				return persistentShellExit{code: 130}
 			}
 			return err
+		case <-runCtx.Done():
+			_ = session.Signal(ssh.SIGINT)
+			_ = session.Close()
+			return persistentShellExit{code: 130}
 		}
 	}
 }
@@ -265,6 +285,7 @@ func (s *shellState) sshPersistentShell(ctx commandContext, output, stderr io.Wr
 	}
 	s.sshShells[key] = shell
 	s.sshMu.Unlock()
+	s.publishVMSHDSessionState()
 	return shell, nil
 }
 
@@ -329,7 +350,11 @@ func (s *shellState) startPersistentSSHShell(runCtx context.Context, ctx command
 		lastCWD:        s.currentSSHCWD(ctx),
 	}
 	setOpenSSHStyleEnv(session)
-	script := sshPersistentShellSidebandScript(ctx, controlPath)
+	envPrelude := ""
+	if env, err := sshRemoteUserEnvSnapshot(runCtx, client); err == nil {
+		envPrelude = sshRemoteEnvExportPrelude(env)
+	}
+	script := sshPersistentShellSidebandScript(ctx, controlPath, envPrelude)
 	if err := session.Start("sh -ic " + shellQuote(script)); err != nil {
 		_ = session.Close()
 		_ = controlSession.Close()
@@ -379,6 +404,7 @@ func setOpenSSHStyleEnv(session *ssh.Session) {
 	if session == nil {
 		return
 	}
+	_ = session.Setenv("VMSH_DISABLE", "1")
 	for _, env := range os.Environ() {
 		name, value, ok := strings.Cut(env, "=")
 		if !ok {
@@ -391,13 +417,49 @@ func setOpenSSHStyleEnv(session *ssh.Session) {
 	}
 }
 
+func sshRemoteUserShellCommand(script string, interactive bool) string {
+	script = strings.TrimSpace(script)
+	if script == "" {
+		script = ":"
+	}
+	posixFlag := "-lc"
+	userFlag := "-lc"
+	if interactive {
+		userFlag = "-ic"
+	}
+	zshFlag := "-ic"
+	quotedScript := shellQuote(script)
+	wrapper := strings.Join([]string{
+		"__vmsh_script=" + quotedScript,
+		"VMSH_DISABLE=1",
+		"export VMSH_DISABLE",
+		"__vmsh_shell=${SHELL:-}",
+		"case ${__vmsh_shell##*/} in",
+		"  zsh) exec \"$__vmsh_shell\" " + zshFlag + " \"$__vmsh_script\" ;;",
+		"  bash|ksh) exec \"$__vmsh_shell\" " + userFlag + " \"$__vmsh_script\" ;;",
+		"  sh|dash) exec \"$__vmsh_shell\" " + posixFlag + " \"$__vmsh_script\" ;;",
+		"esac",
+		"if command -v zsh >/dev/null 2>&1 && [ -r \"${ZDOTDIR:-$HOME}/.zshrc\" ]; then exec zsh " + zshFlag + " \"$__vmsh_script\"; fi",
+		"if command -v bash >/dev/null 2>&1 && [ -r \"$HOME/.bashrc\" ]; then exec bash " + userFlag + " \"$__vmsh_script\"; fi",
+		"exec sh " + posixFlag + " \"$__vmsh_script\"",
+	}, "\n")
+	return "sh -lc " + shellQuote(wrapper)
+}
+
 func persistentSSHShellKey(clientKey string, ctx commandContext) string {
 	name := strings.TrimSpace(ctx.SystemName)
 	if name == "" {
 		name = strings.TrimSpace(ctx.SSHHost)
 	}
 	if name != "" {
-		return clientKey + "\x00system:" + name
+		key := clientKey + "\x00system:" + name
+		if ctx.ParentKey != "" {
+			key += "\x00parent:" + ctx.ParentKey
+		}
+		return key
+	}
+	if ctx.ParentKey != "" {
+		return clientKey + "\x00parent:" + ctx.ParentKey
 	}
 	return clientKey
 }
@@ -506,13 +568,18 @@ func sshPersistentShellMatchesContext(shell *persistentSSHShell, ctx commandCont
 	return shell.key == persistentSSHShellKey(cfg.cacheKey(), ctx)
 }
 
-func sshPersistentShellSidebandScript(ctx commandContext, controlPath string) string {
+func sshPersistentShellSidebandScript(ctx commandContext, controlPath, envPrelude string) string {
 	var lines []string
 	cwd := strings.TrimSpace(ctx.CWD)
 	if cwd != "" && cwd != "~" {
 		lines = append(lines, remoteCDCommand(cwd)+" || exit")
 	}
+	if envPrelude != "" {
+		lines = append(lines, envPrelude)
+	}
 	lines = append(lines,
+		"VMSH_DISABLE=1",
+		"export VMSH_DISABLE",
 		"PS1= PS2= PS4=",
 		"set -m 2>/dev/null || true",
 		"stty -echo 2>/dev/null || true",
@@ -533,6 +600,90 @@ func sshPersistentShellSidebandScript(ctx commandContext, controlPath string) st
 		"while IFS= read -r __vmsh_line; do eval \"$__vmsh_line\"; done",
 	)
 	return strings.Join(lines, "\n")
+}
+
+func sshRemoteUserEnvSnapshot(parent context.Context, client *persistentSSHClient) ([]string, error) {
+	if client == nil || client.client == nil {
+		return nil, fmt.Errorf("missing ssh client")
+	}
+	runCtx, cancel := context.WithTimeout(parent, 2*time.Second)
+	defer cancel()
+	session, err := client.client.NewSession()
+	if err != nil {
+		return nil, err
+	}
+	defer session.Close()
+	setOpenSSHStyleEnv(session)
+	var stdout bytes.Buffer
+	session.Stdout = &stdout
+	session.Stderr = io.Discard
+	done := make(chan error, 1)
+	go func() {
+		done <- session.Run(sshRemoteUserShellCommand("printf '\\034VMSH_ENV\\034\\0'; env -0", false))
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			return nil, err
+		}
+	case <-runCtx.Done():
+		_ = session.Close()
+		return nil, runCtx.Err()
+	}
+	marker := []byte("\x1cVMSH_ENV\x1c\x00")
+	data := stdout.Bytes()
+	idx := bytes.Index(data, marker)
+	if idx < 0 {
+		return nil, fmt.Errorf("remote environment marker not found")
+	}
+	data = data[idx+len(marker):]
+	var env []string
+	for _, field := range bytes.Split(data, []byte{0}) {
+		if len(field) == 0 {
+			continue
+		}
+		name, _, ok := bytes.Cut(field, []byte("="))
+		if !ok || !isShellName(string(name)) {
+			continue
+		}
+		env = append(env, string(field))
+	}
+	return env, nil
+}
+
+func sshRemoteEnvExportPrelude(env []string) string {
+	if len(env) == 0 {
+		return ""
+	}
+	var lines []string
+	for _, entry := range env {
+		name, value, ok := strings.Cut(entry, "=")
+		if !ok || !isShellName(name) {
+			continue
+		}
+		switch name {
+		case "PWD", "OLDPWD", "SHLVL", "_":
+			continue
+		}
+		lines = append(lines, name+"="+shellQuote(value))
+	}
+	sort.Strings(lines)
+	if len(lines) == 0 {
+		return ""
+	}
+	lines = append(lines, "export "+strings.Join(sshEnvExportNames(lines), " "))
+	return strings.Join(lines, "\n")
+}
+
+func sshEnvExportNames(assignments []string) []string {
+	names := make([]string, 0, len(assignments))
+	for _, assignment := range assignments {
+		name, _, ok := strings.Cut(assignment, "=")
+		if ok {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 func sshColorPrelude() string {
@@ -795,6 +946,9 @@ func resizeSSHPTY(p *persistentSSHShell, stdout io.Writer) {
 	if err != nil || cols <= 0 || rows <= 0 {
 		return
 	}
+	if recorder := terminalWriterRecorder(stdout); recorder != nil {
+		recorder.recordResize(cols, rows)
+	}
 	_ = p.session.WindowChange(rows, cols)
 }
 
@@ -874,7 +1028,7 @@ func (s *shellState) sshClientForContext(runCtx context.Context, ctx commandCont
 
 	client, err := s.dialSSHConfigContext(runCtx, cfg)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("connect route=%s: %w", sshRouteTextForConfig(cfg), err)
 	}
 	persistent := &persistentSSHClient{key: key, config: cfg, client: client}
 	s.sshMu.Lock()
@@ -954,10 +1108,11 @@ func (s *shellState) sshSessionContext(name string) (commandContext, bool) {
 }
 
 type sshSessionState struct {
-	Name string
-	User string
-	CWD  string
-	Ctx  commandContext
+	Name  string
+	User  string
+	CWD   string
+	Ctx   commandContext
+	Route string
 }
 
 func (s *shellState) sshSessionStates() []sshSessionState {
@@ -965,10 +1120,11 @@ func (s *shellState) sshSessionStates() []sshSessionState {
 	states := make([]sshSessionState, 0, len(shells))
 	for _, shell := range shells {
 		states = append(states, sshSessionState{
-			Name: shell.name,
-			User: shell.client.config.User,
-			CWD:  shell.cwd(),
-			Ctx:  shell.ctx,
+			Name:  shell.name,
+			User:  shell.client.config.User,
+			CWD:   shell.cwd(),
+			Ctx:   shell.ctx,
+			Route: sshRouteTextForConfig(shell.client.config),
 		})
 	}
 	sort.Slice(states, func(i, j int) bool { return states[i].Name < states[j].Name })
@@ -1004,6 +1160,9 @@ func (s *shellState) sshConnectionStates() []sshConnectionState {
 		if client.config.HostName != "" {
 			details = append(details, "host="+client.config.HostName)
 		}
+		if route := sshRouteTextForConfig(client.config); route != "" {
+			details = append(details, "route="+route)
+		}
 		states = append(states, sshConnectionState{
 			Name:   firstNonEmpty(client.config.Alias, client.config.HostName),
 			Detail: strings.Join(details, ", "),
@@ -1037,31 +1196,34 @@ func (s *shellState) dialSSHConfigContext(ctx context.Context, cfg resolvedSSHCo
 	}
 	defer closeAll(closers)
 	addr := net.JoinHostPort(cfg.HostName, cfg.Port)
+	if cfg.ProxyCommand != "" && cfg.ProxyJump == "" {
+		return nil, fmt.Errorf("ProxyCommand is not supported yet for %s", sshEndpointText(cfg))
+	}
 	if cfg.ProxyJump != "" {
 		jump, err := s.sshClientForContext(ctx, commandContext{Mode: modeSSH, SSHHost: cfg.ProxyJump})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("jump %s: %w", cfg.ProxyJump, err)
 		}
 		conn, err := jump.client.Dial("tcp", addr)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("dial target %s via %s: %w", sshEndpointText(cfg), cfg.ProxyJump, err)
 		}
 		clientConn, chans, reqs, err := ssh.NewClientConn(conn, addr, clientConfig)
 		if err != nil {
 			_ = conn.Close()
-			return nil, err
+			return nil, fmt.Errorf("handshake target %s via %s: %w", sshEndpointText(cfg), cfg.ProxyJump, err)
 		}
 		return ssh.NewClient(clientConn, chans, reqs), nil
 	}
 	dialer := net.Dialer{Timeout: cfg.ConnectTimeout}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dial %s: %w", sshEndpointText(cfg), err)
 	}
 	clientConn, chans, reqs, err := ssh.NewClientConn(conn, addr, clientConfig)
 	if err != nil {
 		_ = conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("handshake %s: %w", sshEndpointText(cfg), err)
 	}
 	return ssh.NewClient(clientConn, chans, reqs), nil
 }
@@ -1171,7 +1333,54 @@ func (s *shellState) closeSSHSessionKey(key string) bool {
 	if client != nil {
 		_ = client.client.Close()
 	}
-	return shell != nil || client != nil
+	closed := shell != nil || client != nil
+	if closed {
+		if shell != nil {
+			s.markJobsLostForContext(shell.ctx, "parent SSH session stopped")
+			s.closeSSHChildrenForParentKey(contextSessionKey(shell.ctx))
+		} else {
+			s.markJobsLostForSSHKey(key, "parent SSH connection stopped")
+		}
+		s.publishVMSHDSessionState()
+	}
+	return closed
+}
+
+func (s *shellState) closeSSHChildrenForStoppedVM(id string) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	for _, shell := range s.sshShellList() {
+		if shell == nil || shell.ctx.ParentKey == "" {
+			continue
+		}
+		if parentKeyNamesVM(shell.ctx.ParentKey, id) {
+			s.closeSSHSessionKey(shell.key)
+		}
+	}
+}
+
+func (s *shellState) closeSSHChildrenForParentKey(parentKey string) {
+	parentKey = strings.TrimSpace(parentKey)
+	if parentKey == "" {
+		return
+	}
+	for _, shell := range s.sshShellList() {
+		if shell == nil || shell.ctx.ParentKey != parentKey {
+			continue
+		}
+		s.closeSSHSessionKey(shell.key)
+	}
+}
+
+func parentKeyNamesVM(parentKey, id string) bool {
+	for _, part := range strings.Split(parentKey, "\x00") {
+		if part == id {
+			return true
+		}
+	}
+	return false
 }
 
 func parseExplicitSSHStopTarget(name string) (bool, string) {
@@ -1207,10 +1416,11 @@ func (s *shellState) sshClientConfig(cfg resolvedSSHConfig) (*ssh.ClientConfig, 
 	}
 	auth, closers := sshAuthMethods(cfg, s.sshPassword, s.sshKeyboardAuth)
 	config := &ssh.ClientConfig{
-		User:            cfg.User,
-		Auth:            auth,
-		HostKeyCallback: callback,
-		Timeout:         cfg.ConnectTimeout,
+		User:              cfg.User,
+		Auth:              auth,
+		HostKeyCallback:   callback,
+		HostKeyAlgorithms: defaultSSHHostKeyAlgorithms(),
+		Timeout:           cfg.ConnectTimeout,
 	}
 	if s.sshBanner != nil {
 		config.BannerCallback = func(message string) error {
@@ -1218,6 +1428,27 @@ func (s *shellState) sshClientConfig(cfg resolvedSSHConfig) (*ssh.ClientConfig, 
 		}
 	}
 	return config, closers, nil
+}
+
+func defaultSSHHostKeyAlgorithms() []string {
+	return []string{
+		ssh.CertAlgoED25519v01,
+		ssh.CertAlgoECDSA256v01,
+		ssh.CertAlgoECDSA384v01,
+		ssh.CertAlgoECDSA521v01,
+		ssh.CertAlgoSKED25519v01,
+		ssh.CertAlgoSKECDSA256v01,
+		ssh.CertAlgoRSASHA512v01,
+		ssh.CertAlgoRSASHA256v01,
+		ssh.KeyAlgoED25519,
+		ssh.KeyAlgoECDSA256,
+		ssh.KeyAlgoECDSA384,
+		ssh.KeyAlgoECDSA521,
+		ssh.KeyAlgoSKED25519,
+		ssh.KeyAlgoSKECDSA256,
+		ssh.KeyAlgoRSASHA512,
+		ssh.KeyAlgoRSASHA256,
+	}
 }
 
 func (s *shellState) sshHostKeyCallback(cfg resolvedSSHConfig) (ssh.HostKeyCallback, error) {
@@ -1386,7 +1617,58 @@ func closeAll(closers []io.Closer) {
 }
 
 func (cfg resolvedSSHConfig) cacheKey() string {
-	return strings.Join([]string{cfg.User, cfg.HostName, cfg.Port, cfg.ProxyJump}, "\x00")
+	return strings.Join([]string{cfg.User, cfg.HostName, cfg.Port, cfg.ProxyJump, cfg.ProxyCommand}, "\x00")
+}
+
+func sshRouteText(ctx commandContext) string {
+	cfg, err := resolveSSHConfig(ctx)
+	if err != nil {
+		return ""
+	}
+	return sshRouteTextForConfig(cfg)
+}
+
+func sshRouteTextForConfig(cfg resolvedSSHConfig) string {
+	return strings.Join(sshRouteHops(cfg, map[string]bool{}), "->")
+}
+
+func sshRouteHops(cfg resolvedSSHConfig, seen map[string]bool) []string {
+	key := cfg.cacheKey()
+	if seen[key] {
+		return []string{sshEndpointText(cfg) + "(cycle)"}
+	}
+	seen[key] = true
+	var hops []string
+	if cfg.ProxyJump != "" {
+		if jump, err := resolveSSHConfig(commandContext{Mode: modeSSH, SSHHost: cfg.ProxyJump}); err == nil {
+			hops = append(hops, sshRouteHops(jump, seen)...)
+		} else {
+			hops = append(hops, cfg.ProxyJump+"(unresolved)")
+		}
+	}
+	hop := sshEndpointText(cfg)
+	if cfg.ProxyCommand != "" {
+		hop += "(proxy-command)"
+	}
+	return append(hops, hop)
+}
+
+func sshEndpointText(cfg resolvedSSHConfig) string {
+	alias := strings.TrimSpace(cfg.Alias)
+	host := strings.TrimSpace(firstNonEmpty(cfg.HostName, alias))
+	port := strings.TrimSpace(firstNonEmpty(cfg.Port, "22"))
+	user := strings.TrimSpace(cfg.User)
+	target := host
+	if user != "" {
+		target = user + "@" + target
+	}
+	if port != "" && port != "22" {
+		target += ":" + port
+	}
+	if alias != "" && alias != host {
+		return alias + "(" + target + ")"
+	}
+	return target
 }
 
 func resolveSSHConfig(ctx commandContext) (resolvedSSHConfig, error) {
@@ -1429,6 +1711,7 @@ func resolveSSHConfig(ctx commandContext) (resolvedSSHConfig, error) {
 	}
 	cfg.HostName = expandSSHConfigValue(cfg.HostName, cfg)
 	cfg.ProxyJump = expandSSHConfigValue(cfg.ProxyJump, cfg)
+	cfg.ProxyCommand = expandSSHConfigValue(cfg.ProxyCommand, cfg)
 	return cfg, nil
 }
 
@@ -1582,6 +1865,10 @@ func applySSHConfigOption(cfg *resolvedSSHConfig, key string, values []string) {
 	case "proxyjump":
 		if cfg.ProxyJump == "" && strings.ToLower(value) != "none" {
 			cfg.ProxyJump = strings.Split(value, ",")[0]
+		}
+	case "proxycommand":
+		if cfg.ProxyCommand == "" && strings.ToLower(value) != "none" {
+			cfg.ProxyCommand = value
 		}
 	case "stricthostkeychecking":
 		if cfg.StrictHostKeyChecking == "" {

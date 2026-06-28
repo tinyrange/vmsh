@@ -16,14 +16,20 @@ import (
 )
 
 type paths struct {
-	root      string
-	ccDir     string
-	build     string
-	ccBin     string
-	ccvm      string
-	vmsh      string
-	initAMD64 string
-	initARM64 string
+	root  string
+	ccDir string
+	build string
+	ccBin string
+	ccvm  string
+	vmsh  string
+}
+
+type guestInitPayload struct {
+	name       string
+	goos       string
+	goarch     string
+	pkg        string
+	installRel string
 }
 
 var (
@@ -111,8 +117,8 @@ func printUsage() {
 
 The default command is build. Outputs are written under build/vmsh unless
 --build-dir or VMSH_BUILD_DIR is set.
-The run command records an asciinema session to build/vmsh/session.cast unless
-vmsh args already include -record/--record.
+The run command records a raw session to build/vmsh/session.raw.jsonl unless
+vmsh args already include -record/--record or -record-raw/--record-raw.
 The demo command drives a real vmsh session through a PTY and writes a redacted
 marketing/demo cast to build/vmsh/demo.cast.
 `)
@@ -128,7 +134,6 @@ func makePaths(buildDirArg string) (paths, error) {
 	if err != nil {
 		return paths{}, err
 	}
-
 	suffix := ""
 	if targetGOOS == "windows" {
 		suffix = ".exe"
@@ -137,14 +142,12 @@ func makePaths(buildDirArg string) (paths, error) {
 	buildDir := resolveBuildDir(root, buildDirArg)
 	ccDir := filepath.Join(root, "cc")
 	return paths{
-		root:      root,
-		ccDir:     ccDir,
-		build:     buildDir,
-		ccBin:     filepath.Join(buildDir, "cc"+suffix),
-		ccvm:      filepath.Join(buildDir, "ccvm"+suffix),
-		vmsh:      filepath.Join(buildDir, "vmsh"+suffix),
-		initAMD64: filepath.Join(buildDir, "init-linux-amd64"),
-		initARM64: filepath.Join(buildDir, "init-linux-arm64"),
+		root:  root,
+		ccDir: ccDir,
+		build: buildDir,
+		ccBin: filepath.Join(buildDir, "cc"+suffix),
+		ccvm:  filepath.Join(buildDir, "ccvm"+suffix),
+		vmsh:  filepath.Join(buildDir, "vmsh"+suffix),
 	}, nil
 }
 
@@ -240,27 +243,11 @@ func build(p paths) error {
 		return err
 	}
 
-	if err := step("build linux/arm64 guest init", func() error {
-		return goBuild(p.ccDir, []string{"CGO_ENABLED=0", "GOOS=linux", "GOARCH=arm64"}, p.initARM64, "./internal/cmd/init")
-	}); err != nil {
+	installedPayloads, err := buildGuestInitPayloads(p)
+	if err != nil {
 		return err
 	}
-	if err := step("install linux/arm64 guest init", func() error {
-		return copyFile(p.initARM64, filepath.Join(p.ccDir, "internal", "guestinit", "guest-init-linux-arm64"), 0o644)
-	}); err != nil {
-		return err
-	}
-
-	if err := step("build linux/amd64 guest init", func() error {
-		return goBuild(p.ccDir, []string{"CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64"}, p.initAMD64, "./internal/cmd/init")
-	}); err != nil {
-		return err
-	}
-	if err := step("install linux/amd64 guest init", func() error {
-		return copyFile(p.initAMD64, filepath.Join(p.ccDir, "internal", "guestinit", "guest-init-linux-amd64"), 0o644)
-	}); err != nil {
-		return err
-	}
+	defer cleanupGuestInitPayloads(installedPayloads)
 
 	if err := step("build ccvm with embedded guest init", func() error {
 		return goBuild(p.ccDir, []string{"CGO_ENABLED=0"}, p.ccvm, "-tags", "embed_guestinit", "./cmd/ccvm")
@@ -295,6 +282,67 @@ func build(p paths) error {
 	logf("built vmsh: %s", p.vmsh)
 
 	return nil
+}
+
+func guestInitPayloads() []guestInitPayload {
+	payloads := []guestInitPayload{
+		{
+			name:       "linux/arm64 guest init",
+			goos:       "linux",
+			goarch:     "arm64",
+			pkg:        "./internal/cmd/init",
+			installRel: filepath.Join("internal", "guestinit", "guest-init-linux-arm64"),
+		},
+		{
+			name:       "linux/amd64 guest init",
+			goos:       "linux",
+			goarch:     "amd64",
+			pkg:        "./internal/cmd/init",
+			installRel: filepath.Join("internal", "guestinit", "guest-init-linux-amd64"),
+		},
+	}
+	for _, bsd := range []string{"openbsd", "freebsd", "netbsd"} {
+		for _, arch := range []string{"arm64", "amd64"} {
+			payloads = append(payloads, guestInitPayload{
+				name:       bsd + "/" + arch + " guest init",
+				goos:       bsd,
+				goarch:     arch,
+				pkg:        "./internal/cmd/" + bsd + "-init",
+				installRel: filepath.Join("internal", bsd, "guestinit", "guest-init-"+bsd+"-"+arch),
+			})
+		}
+	}
+	return payloads
+}
+
+func buildGuestInitPayloads(p paths) ([]string, error) {
+	var installed []string
+	for _, payload := range guestInitPayloads() {
+		out := filepath.Join(p.build, strings.ReplaceAll(payload.name, "/", "-"))
+		if err := step("build "+payload.name, func() error {
+			return goBuild(p.ccDir, []string{"CGO_ENABLED=0", "GOOS=" + payload.goos, "GOARCH=" + payload.goarch}, out, payload.pkg)
+		}); err != nil {
+			cleanupGuestInitPayloads(installed)
+			return nil, err
+		}
+		installPath := filepath.Join(p.ccDir, payload.installRel)
+		if err := step("install "+payload.name, func() error {
+			return copyFile(out, installPath, 0o644)
+		}); err != nil {
+			cleanupGuestInitPayloads(installed)
+			return nil, err
+		}
+		installed = append(installed, installPath)
+	}
+	return installed, nil
+}
+
+func cleanupGuestInitPayloads(paths []string) {
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			logf("warning: remove generated guest init %s: %v", path, err)
+		}
+	}
 }
 
 func step(name string, fn func() error) error {
@@ -375,7 +423,7 @@ func copyFile(src, dst string, mode os.FileMode) error {
 func runVMSH(p paths, args []string) error {
 	vmshArgs := append([]string{"-ccvm", p.ccvm}, args...)
 	if !hasRecordArg(args) {
-		vmshArgs = append([]string{"-ccvm", p.ccvm, "-record", filepath.Join(p.build, "session.cast")}, args...)
+		vmshArgs = append([]string{"-ccvm", p.ccvm, "-record-raw", filepath.Join(p.build, "session.raw.jsonl")}, args...)
 	}
 	logf("run: %s %s", p.vmsh, strings.Join(vmshArgs, " "))
 	cmd := exec.Command(p.vmsh, vmshArgs...)
@@ -401,10 +449,10 @@ func hasRecordArg(args []string) bool {
 		if arg == "--" {
 			return false
 		}
-		if arg == "-record" || arg == "--record" || arg == "-recording" || arg == "--recording" {
+		if arg == "-record" || arg == "--record" || arg == "-record-raw" || arg == "--record-raw" || arg == "-recording" || arg == "--recording" {
 			return true
 		}
-		if strings.HasPrefix(arg, "-record=") || strings.HasPrefix(arg, "--record=") {
+		if strings.HasPrefix(arg, "-record=") || strings.HasPrefix(arg, "--record=") || strings.HasPrefix(arg, "-record-raw=") || strings.HasPrefix(arg, "--record-raw=") {
 			return true
 		}
 		if strings.HasPrefix(arg, "-recording=") || strings.HasPrefix(arg, "--recording=") {

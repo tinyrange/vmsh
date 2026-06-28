@@ -26,8 +26,9 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/tinyrange/vmsh/internal/backend"
-	"github.com/tinyrange/vmsh/internal/editor"
 	"github.com/tinyrange/vmsh/internal/terminal"
+	"github.com/tinyrange/vmsh/internal/termui/editor"
+	"github.com/tinyrange/vmsh/internal/vmshd"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
 	"j5.nz/cc/client"
@@ -40,6 +41,7 @@ const defaultVMSHBootTimeoutSeconds = 60
 const defaultBuiltInBSDBootTimeoutSeconds = 180
 const defaultGuestShellReadyTimeout = 30 * time.Second
 const maxEmbeddedHostInitPreludeBytes = 64 * 1024
+const maxBackgroundJobLogBytes = 1024 * 1024
 const ubuntuCloudRootFSBaseURL = "https://cloud-images.ubuntu.com/releases/noble/release"
 const (
 	colorReset   = "\x1b[0m"
@@ -49,6 +51,9 @@ const (
 	colorMagenta = "\x1b[35m"
 	colorYellow  = "\x1b[33m"
 )
+
+var userCacheDir = os.UserCacheDir
+var execProcess = syscall.Exec
 
 type shellMode string
 
@@ -77,7 +82,9 @@ type shellState struct {
 	promptOut        io.Writer
 	history          string
 	env              map[string]string
+	contextEnv       map[string]map[string]string
 	aliases          map[string]string
+	vmshd            *vmshdSessionReporter
 	confirmPull      func(string, io.Writer) (bool, error)
 	confirmVMRestart func(string, io.Writer) (bool, error)
 	confirmSSHHost   func(resolvedSSHConfig, string, net.Addr, ssh.PublicKey) (bool, error)
@@ -88,6 +95,9 @@ type shellState struct {
 	jobs             []shellJob
 	nextJobID        int
 	jobsMu           sync.Mutex
+	copies           []shellCopy
+	nextCopyID       int
+	copiesMu         sync.Mutex
 	contextCWD       map[string]string
 	guestHomeCache   map[string]string
 	contextStack     []commandContext
@@ -96,6 +106,19 @@ type shellState struct {
 	tmuxExec         func([]string) error
 	interruptSignals <-chan os.Signal
 	evaluatingPaste  bool
+}
+
+type shellExecRequest struct {
+	path string
+	argv []string
+	env  []string
+}
+
+func (e shellExecRequest) Error() string {
+	if len(e.argv) == 0 {
+		return "exec"
+	}
+	return "exec " + strings.Join(e.argv, " ")
 }
 
 type imagePullContextAPI interface {
@@ -111,12 +134,41 @@ type execStreamContextAPI interface {
 }
 
 type shellJob struct {
-	ID      int
-	Context commandContext
-	Command string
-	Done    bool
-	Code    int
-	Err     string
+	ID          int
+	Context     commandContext
+	ContextKey  string
+	ContextText string
+	Command     string
+	Started     time.Time
+	Finished    time.Time
+	Done        bool
+	Code        int
+	Err         string
+	Lost        bool
+	Control     string
+	Log         []byte
+	LogDropped  bool
+}
+
+type shellCopy struct {
+	ID       int
+	Source   string
+	Dest     string
+	Started  time.Time
+	Finished time.Time
+	Done     bool
+	Bytes    int64
+	Err      string
+}
+
+type vmshdSessionReporter struct {
+	client       *vmshd.HTTPClient
+	frontendID   string
+	sessionID    string
+	attachmentID string
+	hostCWD      string
+	context      commandContext
+	detached     bool
 }
 
 type hostShellInit struct {
@@ -171,16 +223,11 @@ func newVMSHCompleter(shell *shellState) *vmshCompleter {
 }
 
 func (c *vmshCompleter) Do(line []rune, pos int) ([][]rune, int) {
-	candidates, replacementLen, _ := c.CompleteWithKind(line, pos)
+	candidates, replacementLen, _ := c.Complete(line, pos)
 	return stringCompletions(candidates), replacementLen
 }
 
-func (c *vmshCompleter) Complete(line []rune, pos int) ([]string, int) {
-	candidates, replacementLen, _ := c.CompleteWithKind(line, pos)
-	return candidates, replacementLen
-}
-
-func (c *vmshCompleter) CompleteWithKind(line []rune, pos int) ([]string, int, completionKind) {
+func (c *vmshCompleter) Complete(line []rune, pos int) ([]string, int, completionKind) {
 	prefix := currentCompletionSegment(string(line[:pos]))
 	typedTokenStart := lastCompletionTokenStart(prefix)
 	typedToken := prefix[typedTokenStart:]
@@ -299,7 +346,7 @@ func (c *vmshCompleter) completionContext(prefix string) commandContext {
 		if err == nil {
 			ctx = sshCommandContext(ctx, at.Options, host)
 		}
-	case "help", "ps", "jobs", "alias", "status", "where", "start", "stop", "restart", "forward", "tmux", "agent":
+	case "help", "ps", "jobs", "sessions", "detach", "alias", "exec", "status", "where", "start", "stop", "restart", "forward", "tmux", "agent":
 	default:
 		if sshCtx, ok := c.shellSSHSessionContext(at.Target); ok {
 			ctx = sshCtx
@@ -325,7 +372,7 @@ func pathCompletionReplaceLen(token string) int {
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@agent", "@alias", "@copy", "@help", "@host", "@jobs", "@ps", "@restart", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux"}
+	words := []string{"@agent", "@alias", "@copy", "@detach", "@exec", "@help", "@host", "@jobs", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux"}
 	if c.shell != nil {
 		for _, name := range c.shell.sshSessionNames() {
 			words = append(words, "@"+name)
@@ -402,7 +449,6 @@ func (c *vmshCompleter) cachedImageNames() []string {
 
 func vmshOptionWords(prefix string) []string {
 	words := []string{
-		"--vm",
 		"--from",
 		"--cwd",
 		"--user",
@@ -641,7 +687,9 @@ func (c *vmshCompleter) sshCommandNames(ctx commandContext, token string) []stri
 		return nil
 	}
 	var stdout strings.Builder
-	if err := c.shell.runSSHCommand(ctx, guestCommandCompletionScript(token), nil, &stdout, io.Discard, false, false); err != nil {
+	runCtx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	defer cancel()
+	if err := c.shell.runSSHCommandWithSizeContext(runCtx, ctx, guestCommandCompletionScript(token), nil, &stdout, io.Discard, false, 0, 0, false); err != nil {
 		return nil
 	}
 	var names []string
@@ -735,7 +783,9 @@ func (c *vmshCompleter) sshPathCandidates(token string, ctx commandContext) ([]s
 		remoteDir = path.Clean(path.Join(current, dirPart))
 	}
 	var stdout strings.Builder
-	if err := c.shell.runSSHCommand(ctx, guestCompletionScript(remoteDir, base), nil, &stdout, io.Discard, false, false); err != nil {
+	runCtx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	defer cancel()
+	if err := c.shell.runSSHCommandWithSizeContext(runCtx, ctx, guestCompletionScript(remoteDir, base), nil, &stdout, io.Discard, false, 0, 0, false); err != nil {
 		return nil, true
 	}
 	var out []string
@@ -989,6 +1039,8 @@ type commandContext struct {
 	Network    bool      `json:"network,omitempty"`
 	NestedVirt bool      `json:"nested_virtualization,omitempty"`
 	Isolated   bool      `json:"isolated,omitempty"`
+	ParentKey  string    `json:"parent_key,omitempty"`
+	ParentText string    `json:"parent_text,omitempty"`
 }
 
 type atLine struct {
@@ -1030,6 +1082,8 @@ func Run(args []string) error {
 	startVM := fs.Bool("start", false, "Start the selected blank VM before entering the shell")
 	script := fs.String("script", "", "Internal test hook: read vmsh commands from this file")
 	recordPath := fs.String("record", "", "Record terminal output to an asciinema v2 .cast file")
+	recordRawPath := fs.String("record-raw", "", "Record lossless raw terminal input/output events to a JSONL file")
+	systemSession := fs.Bool("system-session", false, "Keep the vmshd session after this frontend exits")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1037,15 +1091,15 @@ func Run(args []string) error {
 		return fmt.Errorf("usage: vmsh [flags]")
 	}
 
-	rootCache, err := resolveCacheDir(*cacheDir)
+	rootCache, err := resolveShellCacheDir(*cacheDir, defaultDaemonIdentity(), nestedVMSHActive())
 	if err != nil {
 		return err
 	}
-	statePath := filepath.Join(rootCache, "ccvm.json")
 	ccvmLaunch, err := backend.ResolveCCVMPath(*ccvmPath, bundledCCVMAvailable())
 	if err != nil {
 		return err
 	}
+	statePath := filepath.Join(rootCache, daemonStateFilename(ccvmLaunch))
 	vmshPath, err := os.Executable()
 	if err != nil {
 		return err
@@ -1060,7 +1114,7 @@ func Run(args []string) error {
 	stdout := io.Writer(os.Stdout)
 	stderr := io.Writer(os.Stderr)
 	var recorder *asciinemaRecorder
-	if strings.TrimSpace(*recordPath) != "" {
+	if strings.TrimSpace(*recordPath) != "" || strings.TrimSpace(*recordRawPath) != "" {
 		_, cols, rows := terminalRequestSize(os.Stdout)
 		if cols <= 0 {
 			cols = 80
@@ -1068,7 +1122,7 @@ func Run(args []string) error {
 		if rows <= 0 {
 			rows = 24
 		}
-		rec, err := newAsciinemaRecorder(strings.TrimSpace(*recordPath), cols, rows)
+		rec, err := newAsciinemaRecorder(strings.TrimSpace(*recordPath), strings.TrimSpace(*recordRawPath), cols, rows)
 		if err != nil {
 			return err
 		}
@@ -1077,13 +1131,27 @@ func Run(args []string) error {
 		stdout = newRecordingTerminalWriter(os.Stdout, recorder)
 		stderr = newRecordingTerminalWriter(os.Stderr, recorder)
 	}
+	var daemonState backend.DaemonState
+	var haveDaemonState bool
 	api, err := backend.ConnectCCVMWithOptions(ccvmLaunch, rootCache, statePath, backend.ConnectOptions{
 		OnReuse: func(state backend.DaemonState) {
-			fmt.Fprintf(stderr, "vmsh: reusing ccvm daemon at %s\n", state.Addr)
+			daemonState = state
+			haveDaemonState = true
+		},
+		OnStart: func(state backend.DaemonState) {
+			daemonState = state
+			haveDaemonState = true
+			fmt.Fprintf(stderr, "vmsh: warning: using new %s daemon at %s\n", daemonDisplayName(state, ccvmLaunch), state.Addr)
 		},
 	})
 	if err != nil {
 		return err
+	}
+	if !haveDaemonState {
+		if state, err := backend.ReadDaemonState(statePath); err == nil {
+			daemonState = state
+			haveDaemonState = true
+		}
 	}
 	caps, _ := api.Capabilities()
 	stopLease, err := backend.StartDaemonLease(api)
@@ -1095,9 +1163,10 @@ func Run(args []string) error {
 	if err != nil {
 		return err
 	}
+	initialContext := defaultContext(strings.TrimSpace(*vmID), strings.TrimSpace(*image), caps.SupportsNestedVirt)
 	sh := &shellState{
 		api:        api,
-		context:    defaultContext(strings.TrimSpace(*vmID), strings.TrimSpace(*image), caps.SupportsNestedVirt),
+		context:    initialContext,
 		hostCWD:    cwd,
 		rootCache:  rootCache,
 		vmshPath:   vmshPath,
@@ -1105,6 +1174,7 @@ func Run(args []string) error {
 		imageCache: map[string]bool{},
 		vmRunning:  map[string]bool{},
 		contextCWD: map[string]string{},
+		contextEnv: map[string]map[string]string{},
 		promptOut:  stdout,
 		history:    filepath.Join(rootCache, "vmsh_history"),
 		env:        map[string]string{},
@@ -1134,8 +1204,25 @@ func Run(args []string) error {
 	}
 	sh.completion = newVMSHCompleter(sh)
 	defer sh.closeSessions()
+	execRequested := func(err error) (shellExecRequest, bool) {
+		var execReq shellExecRequest
+		if errors.As(err, &execReq) {
+			sh.closeSessions()
+			stopLease()
+			return execReq, true
+		}
+		return shellExecRequest{}, false
+	}
 	if err := sh.loadVMSHRC(defaultVMSHRCPath()); err != nil {
 		return err
+	}
+	if haveDaemonState {
+		reporter, stopVMSHDSession, err := startVMSHDSession(daemonState, os.Stdout, vmshdSessionMetadata(sh.hostCWD, sh.context), sh.context, *systemSession)
+		if err != nil {
+			return err
+		}
+		sh.vmshd = reporter
+		defer stopVMSHDSession()
 	}
 	if *startVM {
 		if err := sh.startVM(sh.context.VMID, sh.context, stderr); err != nil {
@@ -1148,9 +1235,436 @@ func Run(args []string) error {
 			return err
 		}
 		defer f.Close()
-		return sh.runScript(f, stdout, stderr)
+		err = sh.runScript(f, stdout, stderr)
+		if execReq, ok := execRequested(err); ok {
+			return execProcess(execReq.path, execReq.argv, execReq.env)
+		}
+		return err
 	}
-	return sh.loop(os.Stdin, stdout, stderr)
+	err = sh.loop(os.Stdin, stdout, stderr)
+	if execReq, ok := execRequested(err); ok {
+		return execProcess(execReq.path, execReq.argv, execReq.env)
+	}
+	return err
+}
+
+func daemonStateFilename(launch backend.CCVMLaunch) string {
+	for _, env := range launch.Env {
+		if env == backend.InternalVMSHDEnv+"=1" {
+			return "vmshd.json"
+		}
+	}
+	return "ccvm.json"
+}
+
+func daemonDisplayName(state backend.DaemonState, launch backend.CCVMLaunch) string {
+	switch strings.TrimSpace(state.Kind) {
+	case vmshd.Kind:
+		return "vmshd"
+	case "":
+	default:
+		return strings.TrimSpace(state.Kind)
+	}
+	for _, env := range launch.Env {
+		if env == backend.InternalVMSHDEnv+"=1" {
+			return "vmshd"
+		}
+	}
+	return "ccvm"
+}
+
+func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmshd.UpdateSessionRequest, ctx commandContext, systemSession bool) (*vmshdSessionReporter, func(), error) {
+	if state.Kind != vmshd.Kind {
+		return nil, func() {}, nil
+	}
+	client, err := vmshd.NewHTTPClient(state)
+	if err != nil {
+		return nil, nil, err
+	}
+	frontend, err := client.RegisterFrontend(vmshd.RegisterFrontendRequest{Name: "vmsh"})
+	if err != nil {
+		return nil, nil, err
+	}
+	closeFrontend := func() {
+		_, _ = client.CloseFrontend(frontend.ID)
+	}
+	scope := "frontend"
+	if systemSession {
+		scope = "system"
+	}
+	session, err := client.CreateSession(vmshd.CreateSessionRequest{Name: "main", FrontendID: frontend.ID, Scope: scope})
+	if err != nil {
+		closeFrontend()
+		return nil, nil, err
+	}
+	if _, err := client.UpdateSession(session.ID, metadata); err != nil {
+		closeFrontend()
+		return nil, nil, err
+	}
+	attachReq := vmshd.AttachSessionRequest{FrontendID: frontend.ID, Mode: "interactive"}
+	if output != nil {
+		_, cols, rows := terminalRequestSize(output)
+		if cols > 0 || rows > 0 {
+			attachReq.Terminal = &vmshd.Terminal{Cols: cols, Rows: rows}
+		}
+	}
+	attached, err := client.AttachSession(session.ID, attachReq)
+	if err != nil {
+		closeFrontend()
+		return nil, nil, err
+	}
+	reporter := &vmshdSessionReporter{
+		client:       client,
+		frontendID:   frontend.ID,
+		sessionID:    session.ID,
+		attachmentID: attached.Attachment.ID,
+		hostCWD:      metadata.HostCWD,
+		context:      ctx,
+		detached:     systemSession,
+	}
+	return reporter, func() {
+		closeFrontend()
+	}, nil
+}
+
+func vmshdSessionMetadata(hostCWD string, ctx commandContext) vmshd.UpdateSessionRequest {
+	return vmshd.UpdateSessionRequest{
+		HostCWD: strings.TrimSpace(hostCWD),
+		SelectedContext: &vmshd.SessionContext{
+			Mode:     string(ctx.Mode),
+			Name:     visibleContextName(ctx),
+			Short:    contextShortText(ctx),
+			Source:   contextSourceText(ctx),
+			VMID:     strings.TrimSpace(ctx.VMID),
+			Image:    contextImageText(ctx),
+			SSHHost:  strings.TrimSpace(ctx.SSHHost),
+			CWD:      strings.TrimSpace(ctx.CWD),
+			User:     strings.TrimSpace(ctx.User),
+			Isolated: ctx.Isolated,
+		},
+		VMRefs: vmshdVMRefs(ctx),
+	}
+}
+
+func (s *shellState) publishVMSHDSessionState() {
+	if s.vmshd == nil {
+		return
+	}
+	s.vmshd.hostCWD = s.hostCWD
+	s.vmshd.context = s.context
+	jobs := s.vmshdJobSummaries()
+	copies := s.vmshdCopySummaries()
+	hostShells, guestShells, sshShells := s.vmshdShellHandles()
+	s.vmshd.publish(jobs, copies, hostShells, guestShells, sshShells)
+}
+
+func vmshdVMRefs(ctx commandContext) []vmshd.VMRef {
+	if ctx.Mode != modeVM {
+		return nil
+	}
+	id := strings.TrimSpace(ctx.VMID)
+	backendID := backendVMID(ctx)
+	if id == "" && backendID == "" {
+		return nil
+	}
+	return []vmshd.VMRef{{
+		ID:        firstNonEmpty(id, backendID),
+		BackendID: backendID,
+		Context:   contextShortText(ctx),
+		Image:     contextImageText(ctx),
+		Isolated:  ctx.Isolated,
+	}}
+}
+
+func (s *shellState) vmshdJobSummaries() []vmshd.JobSummary {
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	out := make([]vmshd.JobSummary, 0, len(s.jobs))
+	for _, job := range s.jobs {
+		if job.Control == "vmshd" {
+			continue
+		}
+		out = append(out, vmshdJobSummary(job))
+	}
+	return out
+}
+
+func vmshdJobSummary(job shellJob) vmshd.JobSummary {
+	return vmshd.JobSummary{
+		ID:         job.ID,
+		Context:    emptyText(job.ContextText, jobContextText(job.Context)),
+		Command:    job.Command,
+		Status:     jobStatus(job),
+		ExitCode:   job.Code,
+		Error:      job.Err,
+		Control:    job.Control,
+		Logs:       fmt.Sprintf("@jobs logs %d", job.ID),
+		LogDropped: job.LogDropped,
+		StartedAt:  job.Started,
+		FinishedAt: job.Finished,
+	}
+}
+
+func (s *shellState) vmshdCopySummaries() []vmshd.CopySummary {
+	s.copiesMu.Lock()
+	defer s.copiesMu.Unlock()
+	out := make([]vmshd.CopySummary, 0, len(s.copies))
+	for _, copyOp := range s.copies {
+		out = append(out, vmshdCopySummary(copyOp))
+	}
+	return out
+}
+
+func vmshdCopySummary(copyOp shellCopy) vmshd.CopySummary {
+	status := "running"
+	if copyOp.Done {
+		status = "done"
+		if copyOp.Err != "" {
+			status = "error"
+		}
+	}
+	return vmshd.CopySummary{
+		ID:         copyOp.ID,
+		Source:     copyOp.Source,
+		Dest:       copyOp.Dest,
+		Status:     status,
+		Bytes:      copyOp.Bytes,
+		Error:      copyOp.Err,
+		StartedAt:  copyOp.Started,
+		FinishedAt: copyOp.Finished,
+	}
+}
+
+func (s *shellState) vmshdShellHandles() ([]vmshd.ShellHandle, []vmshd.ShellHandle, []vmshd.ShellHandle) {
+	var hostShells []vmshd.ShellHandle
+	if s.hostShell != nil {
+		hostShells = append(hostShells, vmshd.ShellHandle{
+			ID:      "host",
+			Kind:    "host",
+			Name:    "host",
+			Context: "host",
+			CWD:     s.hostShell.cwd(),
+			State:   "open",
+		})
+	}
+	var guestShells []vmshd.ShellHandle
+	if s.guestShell != nil {
+		parts := strings.Split(s.guestShell.key, "\x00")
+		vmID := ""
+		image := ""
+		user := ""
+		if len(parts) > 0 {
+			vmID = parts[0]
+		}
+		if len(parts) > 1 {
+			image = parts[1]
+		}
+		if len(parts) > 2 {
+			user = parts[2]
+		}
+		name := emptyText(vmID, "vm")
+		guestShells = append(guestShells, vmshd.ShellHandle{
+			ID:      s.guestShell.key,
+			Kind:    "guest",
+			Name:    name,
+			Context: "vm:" + name,
+			CWD:     s.guestShell.cwd(),
+			VMID:    vmID,
+			User:    user,
+			State:   "open",
+		})
+		if image != "" {
+			guestShells[0].Name = name + " " + image
+		}
+	}
+	var sshShells []vmshd.ShellHandle
+	for _, shell := range s.sshShellList() {
+		if shell == nil {
+			continue
+		}
+		ctx := shell.ctx
+		sshShells = append(sshShells, vmshd.ShellHandle{
+			ID:      shell.key,
+			Kind:    "ssh",
+			Name:    shell.name,
+			Context: contextShortText(ctx),
+			CWD:     shell.cwd(),
+			SSHHost: ctx.SSHHost,
+			User:    ctx.User,
+			State:   "open",
+		})
+	}
+	return hostShells, guestShells, sshShells
+}
+
+func jobStatus(job shellJob) string {
+	if !job.Done {
+		return "running"
+	}
+	if job.Lost {
+		return "lost"
+	}
+	if job.Err != "" {
+		return "error"
+	}
+	return "done"
+}
+
+func (r *vmshdSessionReporter) publish(jobs []vmshd.JobSummary, copies []vmshd.CopySummary, hostShells, guestShells, sshShells []vmshd.ShellHandle) {
+	if r == nil || r.client == nil || strings.TrimSpace(r.sessionID) == "" {
+		return
+	}
+	req := vmshdSessionMetadata(r.hostCWD, r.context)
+	req.HostShells = hostShells
+	req.GuestShells = guestShells
+	req.SSHShells = sshShells
+	req.Jobs = jobs
+	req.Copies = copies
+	_, _ = r.client.UpdateSession(r.sessionID, req)
+}
+
+func (r *vmshdSessionReporter) bridgeTerminalStream(ctx context.Context, in *os.File, stdout, stderr io.Writer) error {
+	if r == nil || r.client == nil || strings.TrimSpace(r.sessionID) == "" || strings.TrimSpace(r.attachmentID) == "" {
+		return fmt.Errorf("vmshd terminal attachment is not available")
+	}
+	stream, err := r.client.DialTerminalStream(ctx, r.sessionID, r.attachmentID)
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+
+	_, cols, rows := terminalRequestSize(stdout)
+	if cols > 0 || rows > 0 {
+		_ = stream.Resize(vmshd.Terminal{Cols: cols, Rows: rows})
+	}
+
+	restore := func() {}
+	cancelRead := func() {}
+	var inputCancel *ptyInputCanceller
+	done := make(chan struct{})
+	if in != nil && terminal.IsTerminalFD(int(in.Fd())) {
+		if terminalRestore, err := terminal.MakeAttachedRaw(in); err == nil {
+			restore = terminalRestore
+			inputCancel, err = newPTYInputCanceller(in)
+			if err != nil {
+				restore()
+				return err
+			}
+			cancelRead = inputCancel.cancel
+			defer inputCancel.close()
+		} else {
+			return err
+		}
+	}
+	defer restore()
+
+	errCh := make(chan error, 3)
+	go func() {
+		for {
+			msg, err := stream.Receive()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			switch strings.TrimSpace(msg.Kind) {
+			case "data":
+				if len(msg.Data) > 0 {
+					if _, err := stdout.Write(msg.Data); err != nil {
+						errCh <- err
+						return
+					}
+				}
+			case "error":
+				errCh <- fmt.Errorf("vmshd terminal stream reported an error")
+				return
+			}
+		}
+	}()
+	go func() {
+		if in == nil {
+			return
+		}
+		var buf [4096]byte
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			n, err := readPTYInput(in, buf[:], done, inputCancel)
+			if n > 0 {
+				if err := stream.Write(append([]byte(nil), buf[:n]...)); err != nil {
+					errCh <- err
+					return
+				}
+			}
+			if err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
+					return
+				}
+				errCh <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		signals := terminal.HostSignals(true)
+		sigCh := make(chan os.Signal, 8)
+		signal.Notify(sigCh, signals...)
+		defer signal.Stop(sigCh)
+		for {
+			select {
+			case <-done:
+				errCh <- nil
+				return
+			case sig := <-sigCh:
+				if sig == nil {
+					continue
+				}
+				if terminal.IsResizeSignal(sig) {
+					_, cols, rows := terminalRequestSize(stdout)
+					if cols > 0 || rows > 0 {
+						_ = stream.Resize(vmshd.Terminal{Cols: cols, Rows: rows})
+					}
+					continue
+				}
+				name, ok := terminal.SignalName(sig)
+				if !ok {
+					continue
+				}
+				switch name {
+				case "INT":
+					if _, err := fmt.Fprintln(stderr); err != nil {
+						errCh <- err
+						return
+					}
+					if err := stream.Write([]byte{0x03}); err != nil {
+						errCh <- err
+						return
+					}
+				case "QUIT":
+					if err := stream.Write([]byte{0x1c}); err != nil {
+						errCh <- err
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	var errOut error
+	select {
+	case <-ctx.Done():
+		errOut = ctx.Err()
+	case errOut = <-errCh:
+	}
+	close(done)
+	cancelRead()
+	_ = stream.Close()
+	if errors.Is(errOut, io.EOF) || errors.Is(errOut, os.ErrClosed) || errors.Is(errOut, context.Canceled) {
+		return nil
+	}
+	return errOut
 }
 
 func defaultContext(vmID, image string, nestedVirt bool) commandContext {
@@ -1168,10 +1682,6 @@ func defaultContext(vmID, image string, nestedVirt bool) commandContext {
 func (s *shellState) loop(in io.Reader, stdout, stderr io.Writer) error {
 	if !readerIsTerminal(in) || !writerIsTerminal(stdout) {
 		return fmt.Errorf("vmsh requires an interactive terminal")
-	}
-	if outFile, ok := terminalWriterFile(stdout); ok {
-		restoreOutput := terminal.PrepareOutput(outFile)
-		defer restoreOutput()
 	}
 	inCloser, ok := in.(io.ReadCloser)
 	if !ok {
@@ -1204,7 +1714,17 @@ func (s *shellState) evalLineEditor(in *os.File, stdout, stderr io.Writer) error
 		s.interruptSignals = previousInterrupts
 	}()
 
-	lineEditor := editor.NewLineEditor(in, stdout, s.history, s.completion)
+	outFile, ok := terminalWriterFile(stdout)
+	if !ok {
+		return fmt.Errorf("vmsh stdout does not support terminal editing")
+	}
+	lineEditor := editor.New(editor.Options{
+		In:          in,
+		Out:         outFile,
+		Writer:      stdout,
+		HistoryPath: s.history,
+		Completer:   s.completion,
+	})
 	readLine := lineEditor.ReadLine
 	if runtime.GOOS == "windows" {
 		restoreInput, err := terminal.MakeRaw(in)
@@ -1216,8 +1736,9 @@ func (s *shellState) evalLineEditor(in *os.File, stdout, stderr io.Writer) error
 	}
 	for {
 		drainInterruptSignals(s.interruptSignals)
+		s.updateTerminalTitle(stdout)
 		s.drawPromptStatus(stdout)
-		line, err := readLine(s.prompt())
+		line, err := readLine(context.Background(), s.prompt())
 		s.statusSeq.Add(1)
 		switch {
 		case errors.Is(err, editor.ErrLineInterrupted):
@@ -1236,6 +1757,10 @@ func (s *shellState) evalLineEditor(in *os.File, stdout, stderr io.Writer) error
 		if err := evalErr; err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
+			}
+			var execReq shellExecRequest
+			if errors.As(err, &execReq) {
+				return err
 			}
 			if code := sessionLastCode(err); code >= 0 {
 				s.lastCode = code
@@ -1321,6 +1846,7 @@ func (s *shellState) evalPastedLines(text string, stdout, stderr io.Writer) erro
 		s.evaluatingPaste = previous
 	}()
 	return s.evalScriptLinesWithEcho(strings.NewReader(text), stdout, stderr, func(block string) error {
+		s.updateTerminalTitle(stdout)
 		s.drawPromptStatus(stdout)
 		lines := strings.Split(block, "\n")
 		if len(lines) == 0 {
@@ -1688,7 +2214,11 @@ func (s *shellState) runInContext(ctx commandContext, line string, stdout, stder
 	if err != nil {
 		return contextBoundaryError(ctx, "select context", err)
 	}
-	return contextBoundaryError(ctx, "run", target.Run(line, stdout, stderr))
+	err = contextBoundaryError(ctx, "run", target.Run(line, stdout, stderr))
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *shellState) runMaybeBackground(ctx commandContext, line string, stdout, stderr io.Writer) error {
@@ -1903,7 +2433,31 @@ func (s *shellState) runCommandListPart(base commandContext, command string, std
 }
 
 type pipelineStage struct {
+	index   int
+	line    string
+	ctx     commandContext
 	command preparedTargetCommand
+}
+
+type pipelineStageResult struct {
+	err error
+}
+
+type pipelineRun struct {
+	started chan struct{}
+	host    *hostPipelineGroup
+}
+
+func newPipelineRun() *pipelineRun {
+	started := make(chan struct{})
+	return &pipelineRun{started: started, host: newHostPipelineGroup(os.Stdin, started)}
+}
+
+func (p *pipelineRun) restore() {
+	if p == nil || p.host == nil {
+		return
+	}
+	p.host.restore()
 }
 
 func splitPipelineLine(line string) ([]string, bool, error) {
@@ -1973,8 +2527,8 @@ func (s *shellState) runPipeline(base commandContext, segments []string, stdout,
 		return fmt.Errorf("pipeline requires at least two commands")
 	}
 	stages := make([]pipelineStage, 0, len(segments))
-	for _, segment := range segments {
-		stage, err := s.preparePipelineStage(base, segment, stderr)
+	for i, segment := range segments {
+		stage, err := s.preparePipelineStage(base, i, segment, stderr)
 		if err != nil {
 			return err
 		}
@@ -1987,7 +2541,23 @@ func (s *shellState) runPipeline(base commandContext, segments []string, stdout,
 		readers[i], writers[i] = io.Pipe()
 	}
 
-	errs := make([]error, len(stages))
+	results := make([]pipelineStageResult, len(stages))
+	runCtx, cancel := context.WithCancel(context.Background())
+	stopInterrupts, interrupted := s.startInterruptWatcher(cancel)
+	pipeline := newPipelineRun()
+	defer func() {
+		pipeline.restore()
+		stopInterrupts()
+		cancel()
+	}()
+	closePipes := func() {
+		for _, reader := range readers {
+			_ = reader.Close()
+		}
+		for _, writer := range writers {
+			_ = writer.Close()
+		}
+	}
 	var wg sync.WaitGroup
 	for i := range stages {
 		i := i
@@ -2002,8 +2572,8 @@ func (s *shellState) runPipeline(base commandContext, segments []string, stdout,
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err := s.runPipelineStage(stages[i], stdin, stageStdout, stderr)
-			errs[i] = err
+			err := s.runPipelineStage(runCtx, pipeline, stages[i], stdin, stageStdout, stderr)
+			results[i] = pipelineStageResult{err: err}
 			if reader, ok := stdin.(*io.PipeReader); ok {
 				_ = reader.Close()
 			}
@@ -2016,32 +2586,63 @@ func (s *shellState) runPipeline(base commandContext, segments []string, stdout,
 			}
 		}()
 	}
+	close(pipeline.started)
 	wg.Wait()
-	for _, reader := range readers {
-		_ = reader.Close()
+	closePipes()
+
+	if interrupted.Load() {
+		s.lastCode = 130
+		return nil
 	}
 
-	lastErr := errs[len(errs)-1]
+	lastErr := results[len(results)-1].err
 	s.lastCode = sessionLastCode(lastErr)
 	if lastErr != nil {
 		if s.lastCode >= 0 {
+			s.reportPipelineFailures(stages, results, stderr, len(results)-1)
 			return nil
 		}
-		return lastErr
+		return pipelineStageError(stages[len(stages)-1], lastErr)
 	}
-	for _, err := range errs[:len(errs)-1] {
-		if sessionLastCode(err) == 130 {
-			s.lastCode = 130
-			return nil
+	s.reportPipelineFailures(stages, results, stderr, -1)
+	for i, result := range results[:len(results)-1] {
+		err := result.err
+		if isClosedPipeError(err) {
+			continue
 		}
 		if err != nil && sessionLastCode(err) < 0 {
-			return err
+			return pipelineStageError(stages[i], err)
 		}
 	}
 	return nil
 }
 
-func (s *shellState) preparePipelineStage(base commandContext, segment string, stderr io.Writer) (pipelineStage, error) {
+func (s *shellState) reportPipelineFailures(stages []pipelineStage, results []pipelineStageResult, stderr io.Writer, skip int) {
+	for i, result := range results {
+		if i == skip {
+			continue
+		}
+		code := sessionLastCode(result.err)
+		if result.err == nil || code == 0 || isClosedPipeError(result.err) {
+			continue
+		}
+		if code >= 0 {
+			fmt.Fprintf(stderr, "vmsh: pipeline stage %d (%s) exited with status %d: %s\n", i+1, contextErrorLabel(stages[i].ctx), code, compactCommandForMessage(stages[i].line))
+		}
+	}
+}
+
+func pipelineStageError(stage pipelineStage, err error) error {
+	if err == nil {
+		return nil
+	}
+	if sessionLastCode(err) >= 0 {
+		return err
+	}
+	return fmt.Errorf("pipeline stage %d (%s): %s: %w", stage.index+1, contextErrorLabel(stage.ctx), compactCommandForMessage(stage.line), err)
+}
+
+func (s *shellState) preparePipelineStage(base commandContext, index int, segment string, stderr io.Writer) (pipelineStage, error) {
 	ctx := base
 	line := segment
 	if strings.HasPrefix(segment, "@") {
@@ -2104,20 +2705,48 @@ func (s *shellState) preparePipelineStage(base commandContext, segment string, s
 	if err != nil {
 		return pipelineStage{}, err
 	}
-	return pipelineStage{command: command}, nil
+	return pipelineStage{index: index, line: line, ctx: ctx, command: command}, nil
 }
 
 func isControlAtTarget(target string) bool {
 	switch target {
-	case "help", "?", "ps", "jobs", "alias", "status", "where", "start", "stop", "restart", "save", "rmi", "tmux", "forward", "copy", "cp", "agent", "ssh":
+	case "help", "?", "ps", "jobs", "sessions", "detach", "alias", "status", "where", "start", "stop", "restart", "save", "rmi", "tmux", "forward", "copy", "cp", "agent", "ssh":
 		return true
 	default:
 		return false
 	}
 }
 
-func (s *shellState) runPipelineStage(stage pipelineStage, stdin io.Reader, stdout, stderr io.Writer) error {
-	return stage.command.RunWithInput(stdin, stdout, stderr)
+func (s *shellState) runPipelineStage(ctx context.Context, pipeline *pipelineRun, stage pipelineStage, stdin io.Reader, stdout, stderr io.Writer) error {
+	done := make(chan error, 1)
+	go func() {
+		if command, ok := stage.command.(pipelinePreparedTargetCommand); ok {
+			done <- command.RunPipelineStage(ctx, pipeline, stdin, stdout, stderr)
+			return
+		}
+		if command, ok := stage.command.(contextPreparedTargetCommand); ok {
+			done <- command.RunWithInputContext(ctx, stdin, stdout, stderr)
+			return
+		}
+		done <- stage.command.RunWithInput(stdin, stdout, stderr)
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		closePipelineReader(stdin)
+		if closer, ok := stdout.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+		select {
+		case err := <-done:
+			if sessionLastCode(err) >= 0 {
+				return err
+			}
+		default:
+		}
+		return persistentShellExit{code: 130}
+	}
 }
 
 func (s *shellState) evalExport(line string) (bool, error) {
@@ -2141,6 +2770,7 @@ func (s *shellState) evalExport(line string) (bool, error) {
 		}
 		s.env[key] = value
 	}
+	s.rememberContextEnv(s.context)
 	s.closeSessions()
 	return true, nil
 }
@@ -2149,6 +2779,13 @@ func (s *shellState) evalAlias(command string, stdout io.Writer) error {
 	command = strings.TrimSpace(command)
 	if command == "" {
 		return s.printAliases(stdout)
+	}
+	if expanded, ok, err := s.expandAliasPreview(command); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(stdout, expanded)
+		return err
 	}
 	fields, err := splitShellFields(command)
 	if err != nil {
@@ -2160,7 +2797,7 @@ func (s *shellState) evalAlias(command string, stdout io.Writer) error {
 	}
 	name, value, ok := parseAliasAssignment(command)
 	if !ok {
-		return fmt.Errorf("usage: @alias [name=value] | @alias -d name")
+		return fmt.Errorf("usage: @alias [name=value] | @alias -d name | @alias expand <line>")
 	}
 	if !isAliasName(name) {
 		return fmt.Errorf("alias: invalid name %q", name)
@@ -2175,6 +2812,25 @@ func (s *shellState) evalAlias(command string, stdout io.Writer) error {
 	}
 	s.aliases[name] = value
 	return nil
+}
+
+func (s *shellState) expandAliasPreview(command string) (string, bool, error) {
+	tokens, err := lexShellTokens(command)
+	if err != nil {
+		return "", false, err
+	}
+	if len(tokens) == 0 || tokens[0].Value != "expand" {
+		return "", false, nil
+	}
+	line := strings.TrimSpace(command[tokens[0].End:])
+	if line == "" {
+		return "", true, fmt.Errorf("usage: @alias expand <line>")
+	}
+	expanded, err := s.expandAliasLine(line)
+	if err != nil {
+		return "", true, err
+	}
+	return expanded, true, nil
 }
 
 func (s *shellState) printAliases(w io.Writer) error {
@@ -2258,6 +2914,9 @@ func stripBackground(line string) (string, bool, error) {
 }
 
 func (s *shellState) startBackgroundJob(ctx commandContext, line string, stdout, stderr io.Writer) error {
+	if handled, err := s.startVMSHDBackgroundJob(ctx, line, stdout, stderr); handled || err != nil {
+		return err
+	}
 	bgShell := &shellState{
 		api:              s.api,
 		context:          ctx,
@@ -2272,27 +2931,161 @@ func (s *shellState) startBackgroundJob(ctx commandContext, line string, stdout,
 		sshKeyboardAuth:  s.sshKeyboardAuth,
 		sshBanner:        s.sshBanner,
 		contextCWD:       cloneEnv(s.contextCWD),
+		contextEnv:       cloneContextEnv(s.contextEnv),
 	}
 	s.jobsMu.Lock()
 	s.nextJobID++
 	id := s.nextJobID
-	s.jobs = append(s.jobs, shellJob{ID: id, Context: ctx, Command: line})
+	contextText := jobContextText(ctx)
+	s.jobs = append(s.jobs, shellJob{
+		ID:          id,
+		Context:     ctx,
+		ContextKey:  contextSessionKey(ctx),
+		ContextText: contextText,
+		Command:     line,
+		Started:     time.Now(),
+		Control:     jobControlText(ctx),
+	})
 	idx := len(s.jobs) - 1
 	s.jobsMu.Unlock()
-	fmt.Fprintf(stdout, "[%d] running %s\n", id, line)
+	s.publishVMSHDSessionState()
+	fmt.Fprintf(stdout, "[%d] running context=%s %s\n    logs: @jobs logs %d\n", id, contextText, line, id)
 	go func() {
-		err := bgShell.runInContext(ctx, line, io.Discard, io.Discard)
+		logs := jobLogWriter{shell: s, index: idx}
+		err := bgShell.runInContext(ctx, line, logs, logs)
 		code := bgShell.lastCode
 		s.jobsMu.Lock()
+		if s.jobs[idx].Lost {
+			s.jobsMu.Unlock()
+			return
+		}
 		s.jobs[idx].Done = true
 		s.jobs[idx].Code = code
+		s.jobs[idx].Finished = time.Now()
 		if err != nil {
 			s.jobs[idx].Err = err.Error()
 		}
 		s.jobsMu.Unlock()
+		s.publishVMSHDSessionState()
 		_ = stderr
 	}()
 	return nil
+}
+
+func (s *shellState) startVMSHDBackgroundJob(ctx commandContext, line string, stdout, stderr io.Writer) (bool, error) {
+	if s.vmshd == nil || s.vmshd.client == nil || strings.TrimSpace(s.vmshd.sessionID) == "" {
+		return false, nil
+	}
+	switch ctx.Mode {
+	case modeHost:
+		return s.startVMSHDHostBackgroundJob(ctx, line, stdout)
+	case modeVM:
+		return s.startVMSHDGuestBackgroundJob(ctx, line, stdout, stderr)
+	case modeSSH:
+		return s.startVMSHDSSHBackgroundJob(ctx, line, stdout)
+	default:
+		return false, nil
+	}
+}
+
+func (s *shellState) startVMSHDHostBackgroundJob(ctx commandContext, line string, stdout io.Writer) (bool, error) {
+	job, err := s.vmshd.client.StartHostJob(s.vmshd.sessionID, vmshd.StartHostJobRequest{
+		Command: []string{hostShell(), "-lc", line},
+		WorkDir: s.hostCWD,
+		Env:     hostCommandEnv(s.env, nil),
+		Context: "host",
+	})
+	if err != nil {
+		return true, err
+	}
+	contextText := jobContextText(ctx)
+	started := job.StartedAt
+	if started.IsZero() {
+		started = time.Now()
+	}
+	s.jobsMu.Lock()
+	s.jobs = append(s.jobs, shellJob{
+		ID:          job.ID,
+		Context:     ctx,
+		ContextKey:  contextSessionKey(ctx),
+		ContextText: contextText,
+		Command:     line,
+		Started:     started,
+		Control:     "vmshd",
+	})
+	s.jobsMu.Unlock()
+	fmt.Fprintf(stdout, "[%d] running context=%s %s\n    logs: @jobs logs %d\n", job.ID, contextText, line, job.ID)
+	return true, nil
+}
+
+func (s *shellState) startVMSHDGuestBackgroundJob(ctx commandContext, line string, stdout, stderr io.Writer) (bool, error) {
+	req, err := s.prepareGuestRunRequest(ctx, line, false, 0, 0, stderr)
+	if err != nil {
+		return true, err
+	}
+	vmID := backendVMID(ctx)
+	contextText := jobContextText(ctx)
+	job, err := s.vmshd.client.StartHostJob(s.vmshd.sessionID, vmshd.StartHostJobRequest{
+		Kind:    "vm",
+		VMID:    vmID,
+		Context: contextText,
+		Run:     &req,
+	})
+	if err != nil {
+		return true, err
+	}
+	started := job.StartedAt
+	if started.IsZero() {
+		started = time.Now()
+	}
+	s.jobsMu.Lock()
+	s.jobs = append(s.jobs, shellJob{
+		ID:          job.ID,
+		Context:     ctx,
+		ContextKey:  contextSessionKey(ctx),
+		ContextText: contextText,
+		Command:     line,
+		Started:     started,
+		Control:     "vmshd",
+	})
+	s.jobsMu.Unlock()
+	fmt.Fprintf(stdout, "[%d] running context=%s %s\n    logs: @jobs logs %d\n", job.ID, contextText, line, job.ID)
+	return true, nil
+}
+
+func (s *shellState) startVMSHDSSHBackgroundJob(ctx commandContext, line string, stdout io.Writer) (bool, error) {
+	if strings.TrimSpace(ctx.ParentKey) != "" {
+		return false, nil
+	}
+	command := sshCLICommand(ctx, sshRemoteCommandScript(ctx, line))
+	contextText := jobContextText(ctx)
+	job, err := s.vmshd.client.StartHostJob(s.vmshd.sessionID, vmshd.StartHostJobRequest{
+		Kind:    "ssh",
+		Command: []string{hostShell(), "-lc", command},
+		WorkDir: s.hostCWD,
+		Env:     hostCommandEnv(s.env, nil),
+		Context: contextText,
+	})
+	if err != nil {
+		return true, err
+	}
+	started := job.StartedAt
+	if started.IsZero() {
+		started = time.Now()
+	}
+	s.jobsMu.Lock()
+	s.jobs = append(s.jobs, shellJob{
+		ID:          job.ID,
+		Context:     ctx,
+		ContextKey:  contextSessionKey(ctx),
+		ContextText: contextText,
+		Command:     line,
+		Started:     started,
+		Control:     "vmshd",
+	})
+	s.jobsMu.Unlock()
+	fmt.Fprintf(stdout, "[%d] running context=%s %s\n    logs: @jobs logs %d\n", job.ID, contextText, line, job.ID)
+	return true, nil
 }
 
 func cloneEnv(env map[string]string) map[string]string {
@@ -2304,6 +3097,60 @@ func cloneEnv(env map[string]string) map[string]string {
 		out[key] = value
 	}
 	return out
+}
+
+func cloneContextEnv(env map[string]map[string]string) map[string]map[string]string {
+	if len(env) == 0 {
+		return nil
+	}
+	out := make(map[string]map[string]string, len(env))
+	for key, value := range env {
+		out[key] = cloneEnv(value)
+	}
+	return out
+}
+
+func jobContextText(ctx commandContext) string {
+	text := contextShortText(ctx)
+	if ctx.Mode == modeSSH && strings.TrimSpace(ctx.ParentText) != "" {
+		text += " origin=" + strings.TrimSpace(ctx.ParentText)
+	}
+	return text
+}
+
+func jobControlText(ctx commandContext) string {
+	switch ctx.Mode {
+	case modeHost:
+		return "wait for completion"
+	case modeVM, modeSSH:
+		return "stop parent context to terminate"
+	default:
+		return "wait for completion"
+	}
+}
+
+type jobLogWriter struct {
+	shell *shellState
+	index int
+}
+
+func (w jobLogWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 || w.shell == nil {
+		return len(p), nil
+	}
+	w.shell.jobsMu.Lock()
+	defer w.shell.jobsMu.Unlock()
+	if w.index < 0 || w.index >= len(w.shell.jobs) {
+		return len(p), nil
+	}
+	job := &w.shell.jobs[w.index]
+	job.Log = append(job.Log, p...)
+	if len(job.Log) > maxBackgroundJobLogBytes {
+		drop := len(job.Log) - maxBackgroundJobLogBytes
+		job.Log = append([]byte(nil), job.Log[drop:]...)
+		job.LogDropped = true
+	}
+	return len(p), nil
 }
 
 func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
@@ -2349,6 +3196,15 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return nil
 		}
 		return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
+	case "exec":
+		if len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @exec [cmd]")
+		}
+		req, err := s.execRequest(at.Command)
+		if err != nil {
+			return err
+		}
+		return req
 	case "ssh":
 		host, command, err := parseSSHAtCommand(at.Command)
 		if err != nil {
@@ -2357,7 +3213,14 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		if err := s.validateSSHSystemName(host); err != nil {
 			return err
 		}
-		ctx := sshCommandContext(s.context, at.Options, host)
+		origin, err := s.sshOriginContext(at.Options.From)
+		if err != nil {
+			return err
+		}
+		ctx := sshCommandContext(origin, at.Options, host)
+		if origin.Mode != modeHost {
+			return s.runMaybeBackground(origin, sshCLICommand(ctx, command), stdout, stderr)
+		}
 		if command == "" {
 			session, err := s.sshPersistentShell(ctx, stdout, stderr)
 			if err != nil {
@@ -2376,13 +3239,26 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		}
 		return s.printVMs(stdout)
 	case "jobs":
-		if at.Command != "" || len(at.Options.OptionFields) != 0 {
-			return fmt.Errorf("usage: @jobs")
+		if len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @jobs [logs id|stop id]")
+		}
+		if strings.TrimSpace(at.Command) != "" {
+			return s.controlJob(at.Command, stdout)
 		}
 		return s.printJobs(stdout)
+	case "sessions":
+		if at.Command != "" || len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @sessions")
+		}
+		return s.printSessions(stdout)
+	case "detach":
+		if at.Command != "" || len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @detach")
+		}
+		return s.detachVMSHDSession(stdout)
 	case "alias":
 		if len(at.Options.OptionFields) != 0 {
-			return fmt.Errorf("usage: @alias [name=value] | @alias -d name")
+			return fmt.Errorf("usage: @alias [name=value] | @alias -d name | @alias expand <line>")
 		}
 		return s.evalAlias(at.Command, stdout)
 	case "status", "where":
@@ -2399,7 +3275,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		return s.runMaybeBackground(ctx, command, stdout, stderr)
 	case "start":
 		if at.Command != "" {
-			return fmt.Errorf("usage: @start [--vm id]")
+			return fmt.Errorf("usage: @start")
 		}
 		ctx := s.context.withOptions(at.Options)
 		return s.ensureVMRunning(ctx, stderr)
@@ -2552,12 +3428,11 @@ func (s *shellState) prepareActivatedVMContext(ctx *commandContext, stdout, stde
 
 func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 	tty, cols, rows := terminalRequestSize(stdout)
-	env := []string(nil)
+	termEnv := []string(nil)
 	if tty {
-		env = hostCommandEnv(s.env, terminalEnv(cols, rows))
-	} else if len(s.env) > 0 {
-		env = mergedEnv(os.Environ(), shellEnv(s.env))
+		termEnv = terminalEnv(cols, rows)
 	}
+	env := hostCommandEnv(s.env, termEnv)
 	if persistentHostCommandAllowed(line) {
 		session, err := s.hostPersistentShell(env, cols, rows, stdout, stderr, true)
 		if err == nil {
@@ -2623,13 +3498,37 @@ func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 }
 
 func (s *shellState) runHostWithInput(line string, stdin io.Reader, stdout, stderr io.Writer) error {
-	args := hostShellCommand(line, false, s.hostCommandPrelude(false))
 	cmdCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
 	defer stopInterrupts()
-	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
+	err := s.runHostWithInputContext(cmdCtx, line, stdin, stdout, stderr)
+	if interrupted.Load() {
+		return persistentShellExit{code: 130}
+	}
+	return err
+}
+
+func (s *shellState) runHostWithInputContext(ctx context.Context, line string, stdin io.Reader, stdout, stderr io.Writer) error {
+	return s.runHostWithInputCommand(ctx, line, stdin, stdout, stderr, false, nil)
+}
+
+func (s *shellState) runHostPipelineStage(ctx context.Context, pipeline *pipelineRun, line string, stdin io.Reader, stdout, stderr io.Writer) error {
+	var runner hostCommandRunner
+	if pipeline != nil {
+		runner = pipeline.host
+	}
+	return s.runHostWithInputCommand(ctx, line, stdin, stdout, stderr, true, runner)
+}
+
+func (s *shellState) runHostWithInputCommand(ctx context.Context, line string, stdin io.Reader, stdout, stderr io.Writer, inheritStdin bool, runner hostCommandRunner) error {
+	args := hostShellCommand(line, false, s.hostCommandPrelude(false))
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Dir = s.hostCWD
 	if stdin == nil {
-		cmd.Stdin = nil
+		if inheritStdin {
+			cmd.Stdin = os.Stdin
+		} else {
+			cmd.Stdin = nil
+		}
 	} else {
 		cmd.Stdin = stdin
 	}
@@ -2638,8 +3537,13 @@ func (s *shellState) runHostWithInput(line string, stdin io.Reader, stdout, stde
 	if len(s.env) > 0 {
 		cmd.Env = mergedEnv(os.Environ(), shellEnv(s.env))
 	}
-	err := cmd.Run()
-	if interrupted.Load() {
+	var err error
+	if runner != nil {
+		err = runner.runHostCommand(cmd)
+	} else {
+		err = cmd.Run()
+	}
+	if ctx.Err() != nil {
 		return persistentShellExit{code: 130}
 	}
 	code := exitCode(err)
@@ -2681,7 +3585,7 @@ func (e copyEndpoint) targetPath() copyTargetPath {
 	return copyTargetPath{path: e.path, directory: e.directory}
 }
 
-func (s *shellState) copyPath(command string, stdout, stderr io.Writer) error {
+func (s *shellState) copyPath(command string, stdout, stderr io.Writer) (err error) {
 	fields, err := splitShellFields(command)
 	if err != nil {
 		return err
@@ -2697,20 +3601,68 @@ func (s *shellState) copyPath(command string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	progress := newCopyProgress(stderr, copyEndpointLabel(src), copyEndpointLabel(dst))
-	defer progress.Close()
+	srcLabel := copyEndpointLabel(src)
+	dstLabel := copyEndpointLabel(dst)
+	copyID := s.startVMSHDCopy(srcLabel, dstLabel)
+	progress := newCopyProgress(stderr, srcLabel, dstLabel)
+	defer func() {
+		progress.Close()
+		if copyID != 0 {
+			s.finishVMSHDCopy(copyID, progress.Bytes(), err)
+		}
+	}()
 	srcHost, srcOK := src.target.LocalPath(src.path)
 	dstHost, dstOK := dst.target.LocalPath(dst.path)
 	if srcOK && dstOK {
-		return wrapCopyPathError(fields[0], fields[1], copyHostPath(srcHost, copyTargetPath{path: dstHost, directory: dst.directory}, progress))
+		err = wrapCopyPathError(fields[0], fields[1], copyHostPath(srcHost, copyTargetPath{path: dstHost, directory: dst.directory}, progress))
+		return err
 	}
 	if srcOK {
-		return wrapCopyPathError(fields[0], fields[1], dst.target.CopyFromLocal(srcHost, dst.targetPath(), stderr, progress))
+		err = wrapCopyPathError(fields[0], fields[1], dst.target.CopyFromLocal(srcHost, dst.targetPath(), stderr, progress))
+		return err
 	}
 	if dstOK {
-		return wrapCopyPathError(fields[0], fields[1], src.target.CopyToLocal(src.targetPath(), copyTargetPath{path: dstHost, directory: dst.directory}, stderr, progress))
+		err = wrapCopyPathError(fields[0], fields[1], src.target.CopyToLocal(src.targetPath(), copyTargetPath{path: dstHost, directory: dst.directory}, stderr, progress))
+		return err
 	}
-	return wrapCopyPathError(fields[0], fields[1], copyRemoteToRemote(src, dst, stderr, progress))
+	err = wrapCopyPathError(fields[0], fields[1], copyRemoteToRemote(src, dst, stderr, progress))
+	return err
+}
+
+func (s *shellState) startVMSHDCopy(src, dst string) int {
+	if s.vmshd == nil {
+		return 0
+	}
+	s.copiesMu.Lock()
+	s.nextCopyID++
+	id := s.nextCopyID
+	s.copies = append(s.copies, shellCopy{
+		ID:      id,
+		Source:  src,
+		Dest:    dst,
+		Started: time.Now(),
+	})
+	s.copiesMu.Unlock()
+	s.publishVMSHDSessionState()
+	return id
+}
+
+func (s *shellState) finishVMSHDCopy(id int, bytesCopied int64, runErr error) {
+	s.copiesMu.Lock()
+	for i := range s.copies {
+		if s.copies[i].ID != id {
+			continue
+		}
+		s.copies[i].Done = true
+		s.copies[i].Bytes = bytesCopied
+		s.copies[i].Finished = time.Now()
+		if runErr != nil {
+			s.copies[i].Err = runErr.Error()
+		}
+		break
+	}
+	s.copiesMu.Unlock()
+	s.publishVMSHDSessionState()
 }
 
 func wrapCopyPathError(src, dst string, err error) error {
@@ -2804,6 +3756,15 @@ func (p *copyProgress) AddBytes(n int) {
 	p.bytes += int64(n)
 	p.updateLocked(time.Now())
 	p.mu.Unlock()
+}
+
+func (p *copyProgress) Bytes() int64 {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.bytes
 }
 
 func (p *copyProgress) updateLocked(now time.Time) {
@@ -3811,6 +4772,7 @@ func copyHostFile(src, dst string, mode os.FileMode) error {
 
 func (s *shellState) activateContext(ctx commandContext) {
 	s.rememberContextCWD(s.context)
+	s.rememberContextEnv(s.context)
 	if (ctx.Mode == modeVM || ctx.Mode == modeSSH) && ctx.CWD == "" {
 		if cwd := s.contextCWD[contextCWDKey(ctx)]; cwd != "" {
 			ctx.CWD = cwd
@@ -3823,6 +4785,7 @@ func (s *shellState) activateContext(ctx commandContext) {
 			}
 		}
 	}
+	s.env = s.savedContextEnv(ctx)
 	s.context = ctx
 }
 
@@ -3894,6 +4857,9 @@ func (s *shellState) activeExitResources() ([]exitResource, error) {
 	if s.api != nil {
 		states, err := s.api.InstanceStatuses()
 		if err != nil {
+			if errors.Is(err, syscall.ECONNREFUSED) {
+				return resources, nil
+			}
 			return nil, err
 		}
 		for _, state := range states {
@@ -3970,6 +4936,54 @@ func (s *shellState) rememberContextCWD(ctx commandContext) {
 	s.contextCWD[contextCWDKey(ctx)] = ctx.CWD
 }
 
+func (s *shellState) rememberContextEnv(ctx commandContext) {
+	key := contextStateKey(ctx)
+	if key == "" {
+		return
+	}
+	if s.contextEnv == nil {
+		s.contextEnv = map[string]map[string]string{}
+	}
+	s.contextEnv[key] = cloneEnv(s.env)
+}
+
+func (s *shellState) savedContextEnv(ctx commandContext) map[string]string {
+	key := contextStateKey(ctx)
+	if key == "" {
+		return cloneEnv(s.env)
+	}
+	if s.contextEnv == nil {
+		s.contextEnv = map[string]map[string]string{}
+	}
+	if env, ok := s.contextEnv[key]; ok {
+		return cloneEnv(env)
+	}
+	env := map[string]string{}
+	s.contextEnv[key] = cloneEnv(env)
+	return env
+}
+
+func (s *shellState) contextEnvCount(ctx commandContext) int {
+	if contextSessionKey(ctx) == contextSessionKey(s.context) {
+		return len(s.env)
+	}
+	if env := s.contextEnv[contextStateKey(ctx)]; len(env) > 0 {
+		return len(env)
+	}
+	return 0
+}
+
+func contextStateKey(ctx commandContext) string {
+	switch ctx.Mode {
+	case modeHost:
+		return string(modeHost)
+	case modeVM, modeSSH:
+		return contextCWDKey(ctx)
+	default:
+		return string(ctx.Mode)
+	}
+}
+
 func contextCWDKey(ctx commandContext) string {
 	return strings.Join([]string{
 		string(ctx.Mode),
@@ -3978,6 +4992,7 @@ func contextCWDKey(ctx commandContext) string {
 		ctx.SSHHost,
 		strconv.FormatBool(ctx.Isolated),
 		contextUserKey(ctx),
+		ctx.ParentKey,
 	}, "\x00")
 }
 
@@ -4059,6 +5074,7 @@ func (s *shellState) hostPersistentShell(env []string, cols, rows int, stdout, s
 		return nil, err
 	}
 	s.hostShell = session
+	s.publishVMSHDSessionState()
 	return session, nil
 }
 
@@ -4296,6 +5312,7 @@ func (p *persistentHostShell) cwd() string {
 }
 
 func (s *shellState) closeSessions() {
+	changed := s.guestShell != nil || s.hostShell != nil || len(s.sshShells) > 0
 	if s.guestShell != nil {
 		s.guestShell.close()
 		s.guestShell = nil
@@ -4305,6 +5322,9 @@ func (s *shellState) closeSessions() {
 		s.hostShell = nil
 	}
 	s.closeSSHClients()
+	if changed {
+		s.publishVMSHDSessionState()
+	}
 }
 
 func (s *shellState) closeGuestSession() {
@@ -4317,9 +5337,18 @@ func (s *shellState) closeGuestSession() {
 	}
 	s.guestShell.close()
 	s.guestShell = nil
+	s.publishVMSHDSessionState()
 }
 
 func (p *persistentHostShell) close() {
+	if p.stdin != nil {
+		_, _ = fmt.Fprintln(p.stdin, "exit")
+		select {
+		case <-p.done:
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 	if p.tty != nil {
 		_ = p.tty.Close()
 	} else if p.stdin != nil {
@@ -4330,7 +5359,7 @@ func (p *persistentHostShell) close() {
 	}
 	select {
 	case <-p.done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(500 * time.Millisecond):
 		if p.cmd != nil && p.cmd.Process != nil {
 			_ = p.cmd.Process.Kill()
 			<-p.done
@@ -4368,6 +5397,22 @@ func hostShellCommand(line string, tty bool, prelude string) []string {
 		command = prelude + hostShellPrelude() + "eval " + shellQuote(line)
 	}
 	return []string{hostShell(), "-lc", command}
+}
+
+func (s *shellState) execRequest(command string) (shellExecRequest, error) {
+	if runtime.GOOS == "windows" {
+		return shellExecRequest{}, fmt.Errorf("@exec is not supported on Windows")
+	}
+	shellPath := hostShell()
+	env := hostCommandEnv(s.env, nil)
+	env = mergedEnv(env, []string{"VMSH_DISABLE=1"})
+	env = withoutEnv(env, "VMSH_ACTIVE")
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return shellExecRequest{path: shellPath, argv: []string{shellPath, "-i"}, env: env}, nil
+	}
+	script := "exec " + command
+	return shellExecRequest{path: shellPath, argv: []string{shellPath, "-lc", script}, env: env}, nil
 }
 
 func captureHostShellPrelude() (string, error) {
@@ -4476,6 +5521,25 @@ func mergedEnv(base, overrides []string) []string {
 	return out
 }
 
+func withoutEnv(env []string, names ...string) []string {
+	if len(names) == 0 {
+		return append([]string(nil), env...)
+	}
+	drop := map[string]bool{}
+	for _, name := range names {
+		drop[name] = true
+	}
+	out := env[:0]
+	for _, entry := range env {
+		key, _, ok := strings.Cut(entry, "=")
+		if ok && drop[key] {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
 func shellEnv(vars map[string]string) []string {
 	if len(vars) == 0 {
 		return nil
@@ -4489,7 +5553,7 @@ func shellEnv(vars map[string]string) []string {
 }
 
 func hostCommandEnv(vars map[string]string, terminal []string) []string {
-	return mergedEnv(mergedEnv(os.Environ(), terminal), shellEnv(vars))
+	return mergedEnv(mergedEnv(mergedEnv(os.Environ(), []string{"VMSH_ACTIVE=1"}), terminal), shellEnv(vars))
 }
 
 func guestCommandEnv(ctx commandContext, vars map[string]string, terminal []string) []string {
@@ -4620,6 +5684,10 @@ func guestUsesHostShare(ctx commandContext) bool {
 	return !guestFilesystemIsolated(ctx)
 }
 
+func startMountsHostShare(ctx commandContext) bool {
+	return guestUsesHostShare(ctx) && isBuiltInGuestImage(ctx.Image)
+}
+
 func guestPathIsHostShare(value string) bool {
 	value = path.Clean(strings.TrimSpace(value))
 	return value == guestHostMount || strings.HasPrefix(value, guestHostMount+"/")
@@ -4638,6 +5706,10 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 	if tty && persistentGuestCommandAllowed(line) {
 		session, err := s.guestPersistentShell(ctx, req, stdout, stderr)
 		if err != nil {
+			if handled, stoppedErr := s.handleStoppedVMRunError(ctx, err); handled {
+				s.lastCode = 1
+				return stoppedErr
+			}
 			s.lastCode = 1
 			return err
 		}
@@ -4676,9 +5748,48 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 		if err == nil || s.lastCode >= 0 {
 			return nil
 		}
+		if handled, stoppedErr := s.handleStoppedVMRunError(ctx, err); handled {
+			s.lastCode = 1
+			return stoppedErr
+		}
 		return err
 	}
-	return s.streamGuestRun(backendVMID(ctx), req, stdout, stderr)
+	err = s.streamGuestRun(backendVMID(ctx), req, stdout, stderr)
+	if handled, stoppedErr := s.handleStoppedVMRunError(ctx, err); handled {
+		s.lastCode = 1
+		return stoppedErr
+	}
+	return err
+}
+
+func (s *shellState) handleStoppedVMRunError(ctx commandContext, err error) (bool, error) {
+	if err == nil || ctx.Mode != modeVM || s.api == nil {
+		return false, nil
+	}
+	id := backendVMID(ctx)
+	if isStoppedVMError(err, id) {
+		s.leaveStoppedVMRunContext(ctx, id)
+		return true, fmt.Errorf("VM %s stopped", emptyText(visibleContextName(ctx), id))
+	}
+	state, statusErr := s.api.InstanceStatusOf(id)
+	if statusErr != nil || state.Status == "running" || state.Status == "starting" {
+		return false, nil
+	}
+	s.leaveStoppedVMRunContext(ctx, id)
+	return true, fmt.Errorf("VM %s stopped", emptyText(visibleContextName(ctx), id))
+}
+
+func (s *shellState) leaveStoppedVMRunContext(ctx commandContext, id string) {
+	s.closeGuestSessionForBackendID(id)
+	delete(s.vmRunning, id)
+	s.leaveStoppedContext(ctx)
+}
+
+func isStoppedVMError(err error, id string) bool {
+	if err == nil {
+		return false
+	}
+	return err.Error() == fmt.Sprintf("VM %q stopped", id)
 }
 
 func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty bool, cols, rows int, stderr io.Writer) (client.RunRequest, error) {
@@ -4723,15 +5834,7 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 			return client.RunRequest{}, err
 		}
 		req.WorkDir = firstNonEmpty(req.WorkDir, hostGuestCWD)
-		req.Shares = []client.ShareMount{{
-			Source:   hostRoot,
-			Mount:    guestHostMount,
-			Writable: true,
-			MapOwner: true,
-			OwnerUID: defaultGuestUID,
-			OwnerGID: defaultGuestGID,
-			Cache:    "strict",
-		}}
+		req.Shares = []client.ShareMount{hostShareMount(hostRoot)}
 	}
 	if tty {
 		req.TTY = true
@@ -4749,11 +5852,32 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 	return req, nil
 }
 
+func hostShareMount(hostRoot string) client.ShareMount {
+	return client.ShareMount{
+		Source:   hostRoot,
+		Mount:    guestHostMount,
+		Writable: true,
+		MapOwner: true,
+		OwnerUID: defaultGuestUID,
+		OwnerGID: defaultGuestGID,
+		Cache:    "strict",
+	}
+}
+
 func guestSupportsHostShares(ctx commandContext) bool {
+	return guestSupportsHostSharesOn(runtime.GOOS, runtime.GOARCH, ctx)
+}
+
+func guestSupportsHostSharesOn(goos, goarch string, ctx commandContext) bool {
 	if !isBuiltInGuestImage(ctx.Image) {
 		return true
 	}
-	return runtime.GOOS == "linux" && runtime.GOARCH == "amd64"
+	switch goos + "/" + goarch {
+	case "linux/amd64", "linux/arm64", "darwin/arm64":
+		return true
+	default:
+		return false
+	}
 }
 
 func persistentGuestCommandAllowed(line string) bool {
@@ -4805,6 +5929,7 @@ func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequ
 		return nil, err
 	}
 	s.guestShell = session
+	s.publishVMSHDSessionState()
 	return session, nil
 }
 
@@ -5159,14 +6284,23 @@ func (s *shellState) execStreamInContext(ctx context.Context, id string, req cli
 }
 
 func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, stdin io.Reader, stdout, stderr io.Writer) error {
+	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+	defer stopInterrupts()
+	err := s.streamGuestRunWithInputContext(runCtx, id, req, stdin, stdout, stderr)
+	if interrupted.Load() {
+		return persistentShellExit{code: 130}
+	}
+	return err
+}
+
+func (s *shellState) streamGuestRunWithInputContext(ctx context.Context, id string, req client.RunRequest, stdin io.Reader, stdout, stderr io.Writer) error {
 	req.TTY = false
 	req.Cols = 0
 	req.Rows = 0
+	pipelineStdin := isPipelineReader(stdin)
 	runStream := func(req client.RunRequest) error {
 		exitCode := 0
-		runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
-		defer stopInterrupts()
-		if err := s.api.RunStreamInContext(runCtx, id, req, func(event client.ExecEvent) error {
+		if err := s.api.RunStreamInContext(ctx, id, req, func(event client.ExecEvent) error {
 			switch event.Kind {
 			case "stdout", "output":
 				writeExecEventOutput(stdout, event)
@@ -5182,12 +6316,12 @@ func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, s
 			}
 			return nil
 		}); err != nil {
-			if interrupted.Load() {
+			if ctx.Err() != nil {
 				return persistentShellExit{code: 130}
 			}
 			return err
 		}
-		if interrupted.Load() {
+		if ctx.Err() != nil {
 			return persistentShellExit{code: 130}
 		}
 		if exitCode != 0 {
@@ -5202,8 +6336,6 @@ func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, s
 	inputs := make(chan client.ExecInput, 8)
 	inputErr := make(chan error, 1)
 	done := make(chan struct{})
-	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
-	defer stopInterrupts()
 	var closeDoneOnce sync.Once
 	closeDone := func() {
 		closeDoneOnce.Do(func() {
@@ -5215,11 +6347,11 @@ func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, s
 		close(inputs)
 	}()
 	go func() {
-		<-runCtx.Done()
+		<-ctx.Done()
 		closeDone()
 	}()
 	exitCode := 0
-	err := s.api.RunInteractiveStreamInContext(runCtx, id, req, inputs, func(event client.ExecEvent) error {
+	err := s.api.RunInteractiveStreamInContext(ctx, id, req, inputs, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stdout", "output":
 			writeExecEventOutput(stdout, event)
@@ -5235,11 +6367,15 @@ func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, s
 		}
 		return nil
 	})
+	if pipelineStdin && isClosedPipeError(err) {
+		err = nil
+	}
 	closeDone()
-	if inErr := <-inputErr; err == nil && inErr != nil {
+	closePipelineReader(stdin)
+	if inErr := <-inputErr; err == nil && inErr != nil && !(pipelineStdin && isClosedPipeError(inErr)) {
 		err = inErr
 	}
-	if interrupted.Load() {
+	if ctx.Err() != nil {
 		return persistentShellExit{code: 130}
 	}
 	if err != nil {
@@ -5249,6 +6385,21 @@ func (s *shellState) streamGuestRunWithInput(id string, req client.RunRequest, s
 		return persistentShellExit{code: exitCode}
 	}
 	return nil
+}
+
+func isPipelineReader(r io.Reader) bool {
+	_, ok := r.(*io.PipeReader)
+	return ok
+}
+
+func isClosedPipeError(err error) bool {
+	return errors.Is(err, io.ErrClosedPipe) || (err != nil && err.Error() == io.ErrClosedPipe.Error())
+}
+
+func closePipelineReader(r io.Reader) {
+	if pipe, ok := r.(*io.PipeReader); ok {
+		_ = pipe.Close()
+	}
 }
 
 func streamReaderToGuestInput(r io.Reader, out chan<- client.ExecInput, done <-chan struct{}) error {
@@ -5386,6 +6537,9 @@ func forwardGuestSignals(out chan<- client.ExecInput, done <-chan struct{}, tty 
 				cols, rows, err := terminal.Size(file)
 				if err != nil {
 					continue
+				}
+				if recorder := terminalWriterRecorder(stdout); recorder != nil {
+					recorder.recordResize(cols, rows)
 				}
 				sendGuestInput(out, done, client.ExecInput{Kind: "resize", Cols: cols, Rows: rows})
 				continue
@@ -5576,6 +6730,9 @@ func resizeHostPTY(out *os.File, stdout io.Writer) {
 	cols, rows, err := terminal.Size(file)
 	if err != nil || cols <= 0 || rows <= 0 {
 		return
+	}
+	if recorder := terminalWriterRecorder(stdout); recorder != nil {
+		recorder.recordResize(cols, rows)
 	}
 	_ = pty.Setsize(out, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
 }
@@ -5798,8 +6955,10 @@ func promptPullConfirmation(in *os.File, stderr io.Writer, source string) (bool,
 		return false, nil
 	}
 	fmt.Fprintf(stderr, "do you want to pull %s (y/n) [n]: ", source)
-	reader := bufio.NewReader(in)
-	answer, err := reader.ReadString('\n')
+	answer, err := readPromptLine(in, stderr)
+	if errors.Is(err, editor.ErrLineInterrupted) {
+		return false, nil
+	}
 	if err != nil && !errors.Is(err, io.EOF) {
 		return false, err
 	}
@@ -5812,8 +6971,10 @@ func promptVMRestartConfirmation(in *os.File, stderr io.Writer, id string) (bool
 		return false, nil
 	}
 	fmt.Fprintf(stderr, "restart VM %s (y/n) [n]: ", emptyText(id, "default"))
-	reader := bufio.NewReader(in)
-	answer, err := reader.ReadString('\n')
+	answer, err := readPromptLine(in, stderr)
+	if errors.Is(err, editor.ErrLineInterrupted) {
+		return false, nil
+	}
 	if err != nil && !errors.Is(err, io.EOF) {
 		return false, err
 	}
@@ -5834,8 +6995,10 @@ func promptExitConfirmation(in *os.File, stderr io.Writer, resources []exitResou
 		fmt.Fprintln(stderr, line)
 	}
 	fmt.Fprint(stderr, "Exit anyway? (yes/no) [no]: ")
-	reader := bufio.NewReader(in)
-	answer, err := reader.ReadString('\n')
+	answer, err := readPromptLine(in, stderr)
+	if errors.Is(err, editor.ErrLineInterrupted) {
+		return false, nil
+	}
 	if err != nil && !errors.Is(err, io.EOF) {
 		return false, err
 	}
@@ -5920,13 +7083,61 @@ func promptSSHHostKeyConfirmation(in *os.File, stderr io.Writer, cfg resolvedSSH
 	fmt.Fprintf(stderr, "The authenticity of host %q can't be established.\n", display)
 	fmt.Fprintf(stderr, "%s key fingerprint is %s.\n", key.Type(), ssh.FingerprintSHA256(key))
 	fmt.Fprint(stderr, "Trust this host and add it to known_hosts? (yes/no) [no]: ")
-	reader := bufio.NewReader(in)
-	answer, err := reader.ReadString('\n')
+	answer, err := readPromptLine(in, stderr)
+	if errors.Is(err, editor.ErrLineInterrupted) {
+		return false, nil
+	}
 	if err != nil && !errors.Is(err, io.EOF) {
 		return false, err
 	}
 	answer = strings.ToLower(strings.TrimSpace(answer))
 	return answer == "yes", nil
+}
+
+func readPromptLine(in *os.File, out io.Writer) (string, error) {
+	restore, err := terminal.MakeRaw(in)
+	if err != nil {
+		return "", err
+	}
+	defer restore()
+
+	var line []byte
+	var buf [1]byte
+	for {
+		n, err := in.Read(buf[:])
+		if n > 0 {
+			switch b := buf[0]; b {
+			case 0x03:
+				fmt.Fprint(out, "^C\r\n")
+				return "", editor.ErrLineInterrupted
+			case 0x04:
+				fmt.Fprint(out, "\r\n")
+				return "", io.EOF
+			case '\r', '\n':
+				fmt.Fprint(out, "\r\n")
+				return string(line), nil
+			case 0x7f, 0x08:
+				if len(line) > 0 {
+					line = line[:len(line)-1]
+					fmt.Fprint(out, "\b \b")
+				}
+			default:
+				if b >= 0x20 && b != 0x7f {
+					line = append(line, b)
+					_, _ = out.Write([]byte{b})
+				}
+			}
+			continue
+		}
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
+		return "", err
+	}
 }
 
 func displayPullSource(source string) string {
@@ -6315,6 +7526,13 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 		NestedVirt:     ctx.NestedVirt,
 		TimeoutSeconds: vmshBootTimeoutSeconds(ctx.Image),
 	}
+	if startMountsHostShare(ctx) {
+		hostRoot, _, err := guestHostPaths(s.hostCWD)
+		if err != nil {
+			return err
+		}
+		req.Shares = []client.ShareMount{hostShareMount(hostRoot)}
+	}
 	if ctx.Network {
 		req.Network = networkConfigForContext(ctx)
 	}
@@ -6523,6 +7741,8 @@ func (s *shellState) stopVM(id string) error {
 		return err
 	}
 	delete(s.vmRunning, id)
+	s.markJobsLostForVMBackendID(id, "parent VM stopped")
+	s.closeSSHChildrenForStoppedVM(id)
 	return nil
 }
 
@@ -6541,19 +7761,10 @@ func (s *shellState) stopSession(at atLine, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if len(fields) > 1 || (at.Options.VMID != "" && len(fields) != 0) {
+	if len(fields) > 1 {
 		return fmt.Errorf("usage: @stop [name|vm:name|ssh:name]")
 	}
 	if len(fields) == 0 {
-		if at.Options.VMID != "" {
-			ctx := s.context.withOptions(at.Options)
-			id := backendVMID(ctx)
-			if err := s.stopVMAndReport(id, stdout); err != nil {
-				return err
-			}
-			s.leaveStoppedVM(id)
-			return nil
-		}
 		if s.context.Mode == modeSSH {
 			host := s.context.SSHHost
 			if key, ok := s.sshSessionKeyForContext(s.context); ok && s.closeSSHSessionKey(key) {
@@ -6566,6 +7777,10 @@ func (s *shellState) stopSession(at atLine, stdout io.Writer) error {
 		ctx := s.context.withOptions(at.Options)
 		id := backendVMID(ctx)
 		if err := s.stopVMAndReport(id, stdout); err != nil {
+			if isNoRunningVMError(err, id) {
+				s.leaveStoppedContext(ctx)
+				return nil
+			}
 			return err
 		}
 		s.leaveStoppedContext(ctx)
@@ -6618,6 +7833,13 @@ func (s *shellState) stopSession(at atLine, stdout io.Writer) error {
 	}
 }
 
+func isNoRunningVMError(err error, id string) bool {
+	if err == nil {
+		return false
+	}
+	return err.Error() == fmt.Sprintf("no VM %q is running", id)
+}
+
 func (s *shellState) stopVMAndReport(id string, stdout io.Writer) error {
 	if err := s.stopVM(id); err != nil {
 		return err
@@ -6631,8 +7853,8 @@ func (s *shellState) restartSession(at atLine, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if len(fields) > 1 || (at.Options.VMID != "" && len(fields) != 0) {
-		return fmt.Errorf("usage: @restart [name|vm:name|--vm id]")
+	if len(fields) > 1 {
+		return fmt.Errorf("usage: @restart [name|vm:name]")
 	}
 	if len(fields) == 0 {
 		ctx := s.context.withOptions(at.Options)
@@ -6761,7 +7983,7 @@ func (s *shellState) resolveVMStopTarget(name string) (stopTargetMatch, error) {
 	}
 	switch {
 	case len(vmMatches) > 1:
-		return stopTargetMatch{}, fmt.Errorf("stop target %q is ambiguous because both shared and isolated VMs are running with that name; this should only happen for sessions started by older vmsh builds, use @stop --vm %s or @stop --vm %s", name, name, backendVMIDFor(name, true))
+		return stopTargetMatch{}, fmt.Errorf("stop target %q is ambiguous because both shared and isolated VMs are running with that name; this should only happen for sessions started by older vmsh builds, use @stop vm:%s or @stop vm:%s", name, name, backendVMIDFor(name, true))
 	case len(vmMatches) == 1:
 		return stopTargetMatch{kind: stopTargetVM, id: vmMatches[0]}, nil
 	default:
@@ -6909,14 +8131,14 @@ func (s *shellState) saveVM(at atLine, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if len(fields) < 1 || len(fields) > 2 || hasSaveOnlyUnsupportedOptions(at.Options) || (at.Options.VMID != "" && len(fields) == 2) {
-		return fmt.Errorf("usage: @save [name|--vm id] tag")
+	if len(fields) < 1 || len(fields) > 2 || len(at.Options.OptionFields) != 0 {
+		return fmt.Errorf("usage: @save [name] tag")
 	}
 	var ctx commandContext
 	var id string
 	name := strings.TrimSpace(fields[len(fields)-1])
 	if name == "" || strings.HasPrefix(name, "-") {
-		return fmt.Errorf("usage: @save [name|--vm id] tag")
+		return fmt.Errorf("usage: @save [name] tag")
 	}
 	if len(fields) == 2 {
 		match, err := s.resolveVMStopTarget(fields[0])
@@ -6954,15 +8176,6 @@ func (s *shellState) saveVM(at atLine, stdout io.Writer) error {
 		return err
 	}
 	return nil
-}
-
-func hasSaveOnlyUnsupportedOptions(opts commandOptions) bool {
-	for _, field := range opts.OptionFields {
-		if strings.TrimSpace(field) != "--vm" {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *shellState) removeImage(at atLine, stdout io.Writer) error {
@@ -7327,6 +8540,48 @@ func displayPathLeaf(value string, mode shellMode) string {
 	return leaf
 }
 
+func (s *shellState) terminalTitle() string {
+	cwd := s.hostCWD
+	if target, err := s.targetFor(s.context); err == nil {
+		cwd = target.CurrentCWD()
+	}
+	leaf := displayPathLeaf(cwd, s.context.Mode)
+	switch s.context.Mode {
+	case modeVM:
+		label := "vm"
+		if s.context.Isolated {
+			label = "isolated-vm"
+		}
+		if isRootGuestContext(s.context) {
+			label = "root-" + label
+		}
+		return "vmsh " + label + ":" + emptyText(visibleContextName(s.context), normalizedVMID(s.context.VMID)) + " " + leaf
+	case modeSSH:
+		return "vmsh ssh:" + emptyText(visibleContextName(s.context), "-") + " " + leaf
+	default:
+		return "vmsh host:" + leaf
+	}
+}
+
+func (s *shellState) updateTerminalTitle(stdout io.Writer) {
+	file, ok := terminalWriterFile(stdout)
+	if !ok || !terminal.IsTerminalFD(int(file.Fd())) {
+		return
+	}
+	fmt.Fprintf(file, "\x1b]0;%s\a", sanitizeTerminalTitle(s.terminalTitle()))
+}
+
+func sanitizeTerminalTitle(title string) string {
+	var b strings.Builder
+	for _, r := range title {
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(b.String())
+}
+
 func contextImageText(ctx commandContext) string {
 	if ctx.Image == "" || ctx.Arch == "" {
 		return ctx.Image
@@ -7448,7 +8703,10 @@ func (s *shellState) printStatus(w io.Writer) error {
 	if _, err := fmt.Fprintf(w, "current: %s\n", current); err != nil {
 		return err
 	}
-	return s.printCurrentStatusDetails(w)
+	if err := s.printCurrentStatusDetails(w); err != nil {
+		return err
+	}
+	return s.printVMSHDStatus(w)
 }
 
 func (s *shellState) activeContextChain() []commandContext {
@@ -7504,8 +8762,17 @@ func (s *shellState) contextStatusLine(ctx commandContext, current bool) (string
 			"cwd=" + emptyText(s.currentSSHCWD(ctx), "-"),
 			"session=" + session,
 		}
+		if route := sshRouteText(ctx); route != "" {
+			parts = append(parts, "route="+route)
+		}
+		if origin := contextOriginText(ctx); origin != "" && origin != "host" {
+			parts = append(parts, "origin="+origin)
+		}
 	default:
 		parts = []string{string(ctx.Mode)}
+	}
+	if envCount := s.contextEnvCount(ctx); envCount > 0 {
+		parts = append(parts, "env="+strconv.Itoa(envCount))
 	}
 	if current {
 		parts = append(parts, "[current]")
@@ -7576,6 +8843,48 @@ func (s *shellState) printCurrentStatusDetails(w io.Writer) error {
 	}
 }
 
+func (s *shellState) printVMSHDStatus(w io.Writer) error {
+	if s.vmshd == nil || s.vmshd.client == nil {
+		return nil
+	}
+	status, err := s.vmshd.client.Status()
+	if err != nil {
+		_, writeErr := fmt.Fprintf(w, "vmshd: unavailable: %v\n", err)
+		return writeErr
+	}
+	if _, err := fmt.Fprintf(w, "vmshd:\n  daemon: %s sessions=%d streams=%d vms=%d\n",
+		emptyText(status.Status, "unknown"),
+		len(status.Sessions),
+		len(status.Streams),
+		len(status.VMs),
+	); err != nil {
+		return err
+	}
+	sessionID := strings.TrimSpace(s.vmshd.sessionID)
+	if sessionID == "" {
+		return nil
+	}
+	for _, session := range status.Sessions {
+		if session.ID != sessionID {
+			continue
+		}
+		_, err := fmt.Fprintf(w, "  session: %s state=%s attachments=%d jobs=%d copies=%d host_shells=%d guest_shells=%d ssh_shells=%d vm_refs=%d\n",
+			session.ID,
+			emptyText(session.State, "unknown"),
+			len(session.AttachedClients),
+			len(session.Jobs),
+			len(session.Copies),
+			len(session.HostShells),
+			len(session.GuestShells),
+			len(session.SSHShells),
+			len(session.VMRefs),
+		)
+		return err
+	}
+	_, err = fmt.Fprintf(w, "  session: %s state=missing\n", sessionID)
+	return err
+}
+
 func contextBoundaryError(ctx commandContext, op string, err error) error {
 	if err == nil {
 		return nil
@@ -7634,6 +8943,16 @@ func contextSourceText(ctx commandContext) string {
 	default:
 		return string(ctx.Mode)
 	}
+}
+
+func contextOriginText(ctx commandContext) string {
+	if strings.TrimSpace(ctx.ParentText) != "" {
+		return strings.TrimSpace(ctx.ParentText)
+	}
+	if ctx.Mode == modeSSH {
+		return "host"
+	}
+	return ""
 }
 
 func sourceTextForImage(image string) string {
@@ -7732,11 +9051,15 @@ func (s *shellState) printSessionTree(w io.Writer, states []client.InstanceState
 		root.children = append(root.children, node)
 		vmNodes[id] = node
 	}
+	sessionNodes := map[string]*sessionTreeNode{}
 	for _, session := range sshSessions {
 		source := contextSourceText(session.Ctx)
 		parts := []string{session.Name, "ssh"}
 		if source != "" {
 			parts = append(parts, "from="+source)
+		}
+		if origin := contextOriginText(session.Ctx); origin != "" && origin != "host" {
+			parts = append(parts, "origin="+origin)
 		}
 		if session.User != "" {
 			parts = append(parts, "user="+session.User)
@@ -7744,11 +9067,19 @@ func (s *shellState) printSessionTree(w io.Writer, states []client.InstanceState
 		if session.CWD != "" {
 			parts = append(parts, "cwd="+session.CWD)
 		}
+		if session.Route != "" {
+			parts = append(parts, "route="+session.Route)
+		}
 		node := &sessionTreeNode{
 			label:   strings.Join(parts, " "),
 			current: s.context.Mode == modeSSH && contextSessionKey(s.context) == contextSessionKey(session.Ctx),
 		}
-		root.children = append(root.children, node)
+		sessionNodes[contextSessionKey(session.Ctx)] = node
+		if parent := parentSessionTreeNode(session.Ctx, root, vmNodes, sessionNodes); parent != nil {
+			parent.children = append(parent.children, node)
+		} else {
+			root.children = append(root.children, node)
+		}
 	}
 	for _, conn := range sshConnections {
 		parts := []string{"ssh connection", conn.Name}
@@ -7758,6 +9089,21 @@ func (s *shellState) printSessionTree(w io.Writer, states []client.InstanceState
 		root.children = append(root.children, &sessionTreeNode{label: strings.Join(parts, " ")})
 	}
 	return printSessionTreeNode(w, root, "", true, true)
+}
+
+func parentSessionTreeNode(ctx commandContext, root *sessionTreeNode, vmNodes map[string]*sessionTreeNode, sessionNodes map[string]*sessionTreeNode) *sessionTreeNode {
+	if ctx.ParentKey == "" {
+		return root
+	}
+	if node := sessionNodes[ctx.ParentKey]; node != nil {
+		return node
+	}
+	for id, node := range vmNodes {
+		if strings.Contains(ctx.ParentKey, id) {
+			return node
+		}
+	}
+	return nil
 }
 
 func instanceStateIsLive(state client.InstanceState) bool {
@@ -7773,6 +9119,7 @@ func contextSessionKey(ctx commandContext) string {
 		localImageName(ctx.Image, ctx.Arch),
 		ctx.SSHHost,
 		contextUserKey(ctx),
+		ctx.ParentKey,
 	}, "\x00")
 }
 
@@ -7815,6 +9162,7 @@ func printSessionTreeNode(w io.Writer, node *sessionTreeNode, prefix string, las
 }
 
 func (s *shellState) printJobs(w io.Writer) error {
+	s.refreshVMSHDJobs()
 	s.jobsMu.Lock()
 	defer s.jobsMu.Unlock()
 	if len(s.jobs) == 0 {
@@ -7828,18 +9176,347 @@ func (s *shellState) printJobs(w io.Writer) error {
 			if job.Err != "" {
 				status = "error"
 			}
+			if job.Lost {
+				status = "lost"
+			}
+		}
+		parts := []string{
+			fmt.Sprintf("[%d]", job.ID),
+			status,
+			"context=" + emptyText(job.ContextText, jobContextText(job.Context)),
+			"cmd=" + strconv.Quote(job.Command),
+			fmt.Sprintf("logs=@jobs logs %d", job.ID),
+		}
+		if !job.Started.IsZero() {
+			parts = append(parts, "started="+job.Started.Format(time.RFC3339))
 		}
 		if job.Done {
-			if _, err := fmt.Fprintf(w, "[%d] %s exit=%d %s\n", job.ID, status, job.Code, job.Command); err != nil {
-				return err
+			parts = append(parts, "exit="+strconv.Itoa(job.Code))
+			if !job.Finished.IsZero() {
+				parts = append(parts, "finished="+job.Finished.Format(time.RFC3339))
 			}
-		} else {
-			if _, err := fmt.Fprintf(w, "[%d] %s %s\n", job.ID, status, job.Command); err != nil {
-				return err
+			if job.Err != "" {
+				parts = append(parts, "error="+strconv.Quote(job.Err))
 			}
+		} else if job.Control != "" {
+			parts = append(parts, "control="+strconv.Quote(job.Control))
+		}
+		if _, err := fmt.Fprintln(w, strings.Join(parts, " ")); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+type vmshdSessionRow struct {
+	ID          string
+	Name        string
+	State       string
+	Scope       string
+	Context     string
+	Attachments int
+	Jobs        int
+	Copies      int
+	HostShells  int
+	GuestShells int
+	SSHShells   int
+	VMRefs      int
+	Current     bool
+}
+
+func (s *shellState) printSessions(w io.Writer) error {
+	if s.vmshd == nil || s.vmshd.client == nil {
+		_, err := fmt.Fprintln(w, "No vmshd session")
+		return err
+	}
+	sessions, err := s.vmshd.client.Sessions()
+	if err != nil {
+		return err
+	}
+	rows := vmshdSessionRows(sessions, s.vmshd.sessionID)
+	if len(rows) == 0 {
+		_, err := fmt.Fprintln(w, "No vmshd sessions")
+		return err
+	}
+	for _, row := range rows {
+		parts := []string{
+			row.ID,
+			"name=" + strconv.Quote(emptyText(row.Name, "-")),
+			"state=" + emptyText(row.State, "unknown"),
+			"scope=" + emptyText(row.Scope, "unknown"),
+			"context=" + strconv.Quote(emptyText(row.Context, "-")),
+			fmt.Sprintf("attachments=%d", row.Attachments),
+			fmt.Sprintf("jobs=%d", row.Jobs),
+			fmt.Sprintf("copies=%d", row.Copies),
+			fmt.Sprintf("host_shells=%d", row.HostShells),
+			fmt.Sprintf("guest_shells=%d", row.GuestShells),
+			fmt.Sprintf("ssh_shells=%d", row.SSHShells),
+			fmt.Sprintf("vm_refs=%d", row.VMRefs),
+		}
+		if row.Current {
+			parts = append(parts, "[current]")
+		}
+		if _, err := fmt.Fprintln(w, strings.Join(parts, " ")); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func vmshdSessionRows(sessions []vmshd.SessionSummary, currentID string) []vmshdSessionRow {
+	rows := make([]vmshdSessionRow, 0, len(sessions))
+	currentID = strings.TrimSpace(currentID)
+	for _, session := range sessions {
+		context := ""
+		if session.SelectedContext != nil {
+			context = emptyText(session.SelectedContext.Short, session.SelectedContext.Name)
+		}
+		rows = append(rows, vmshdSessionRow{
+			ID:          session.ID,
+			Name:        session.Name,
+			State:       session.State,
+			Scope:       session.Scope,
+			Context:     context,
+			Attachments: len(session.AttachedClients),
+			Jobs:        len(session.Jobs),
+			Copies:      len(session.Copies),
+			HostShells:  len(session.HostShells),
+			GuestShells: len(session.GuestShells),
+			SSHShells:   len(session.SSHShells),
+			VMRefs:      len(session.VMRefs),
+			Current:     currentID != "" && session.ID == currentID,
+		})
+	}
+	return rows
+}
+
+func (s *shellState) detachVMSHDSession(w io.Writer) error {
+	if s.vmshd == nil || s.vmshd.client == nil || strings.TrimSpace(s.vmshd.sessionID) == "" {
+		_, err := fmt.Fprintln(w, "No vmshd session to detach")
+		return err
+	}
+	session, err := s.vmshd.client.PersistSession(s.vmshd.sessionID, vmshd.PersistSessionRequest{Scope: "system"})
+	if err != nil {
+		return err
+	}
+	s.vmshd.detached = true
+	_, err = fmt.Fprintf(w, "Detached session %s\n", session.ID)
+	return err
+}
+
+func (s *shellState) controlJob(command string, w io.Writer) error {
+	fields, err := splitShellFields(command)
+	if err != nil {
+		return err
+	}
+	if len(fields) != 2 || (fields[0] != "stop" && fields[0] != "logs") {
+		return fmt.Errorf("usage: @jobs [logs id|stop id]")
+	}
+	id, err := strconv.Atoi(fields[1])
+	if err != nil || id <= 0 {
+		return fmt.Errorf("jobs: invalid job id %q", fields[1])
+	}
+	if fields[0] == "stop" {
+		if handled, err := s.stopVMSHDJob(id, w); handled || err != nil {
+			return err
+		}
+	}
+	if fields[0] == "logs" {
+		if handled, err := s.printVMSHDJobLogs(id, w); handled || err != nil {
+			return err
+		}
+	}
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	for _, job := range s.jobs {
+		if job.ID != id {
+			continue
+		}
+		if fields[0] == "logs" {
+			if job.LogDropped {
+				if _, err := fmt.Fprintln(w, "[older log output dropped]"); err != nil {
+					return err
+				}
+			}
+			if len(job.Log) == 0 {
+				_, err := fmt.Fprintf(w, "[%d] no log output captured\n", id)
+				return err
+			}
+			_, err := w.Write(job.Log)
+			return err
+		}
+		if job.Done {
+			_, err := fmt.Fprintf(w, "[%d] already finished\n", id)
+			return err
+		}
+		if job.Context.Mode == modeVM || job.Context.Mode == modeSSH {
+			return fmt.Errorf("jobs: cannot stop job %d directly; stop parent context %s", id, emptyText(job.ContextText, jobContextText(job.Context)))
+		}
+		return fmt.Errorf("jobs: direct job stopping is not supported yet")
+	}
+	return fmt.Errorf("jobs: no such job %d", id)
+}
+
+func (s *shellState) refreshVMSHDJobs() {
+	if s.vmshd == nil || s.vmshd.client == nil || strings.TrimSpace(s.vmshd.sessionID) == "" {
+		return
+	}
+	jobs, err := s.vmshd.client.Jobs()
+	if err != nil {
+		return
+	}
+	s.syncVMSHDJobs(jobs)
+}
+
+func (s *shellState) syncVMSHDJobs(jobs []vmshd.JobSummary) {
+	sessionID := ""
+	if s.vmshd != nil {
+		sessionID = strings.TrimSpace(s.vmshd.sessionID)
+	}
+	byID := map[int]vmshd.JobSummary{}
+	for _, job := range jobs {
+		if job.ID <= 0 || strings.TrimSpace(job.Control) != "vmshd" {
+			continue
+		}
+		if sessionID != "" && strings.TrimSpace(job.SessionID) != "" && strings.TrimSpace(job.SessionID) != sessionID {
+			continue
+		}
+		byID[job.ID] = job
+	}
+	if len(byID) == 0 {
+		return
+	}
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	for i := range s.jobs {
+		if s.jobs[i].Control != "vmshd" {
+			continue
+		}
+		job, ok := byID[s.jobs[i].ID]
+		if !ok {
+			continue
+		}
+		s.jobs[i].Done = vmshdJobDone(job.Status)
+		s.jobs[i].Code = job.ExitCode
+		s.jobs[i].Err = strings.TrimSpace(job.Error)
+		s.jobs[i].Finished = job.FinishedAt
+		s.jobs[i].Log = []byte(job.Logs)
+		s.jobs[i].LogDropped = job.LogDropped
+	}
+}
+
+func vmshdJobDone(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "", "running", "canceling":
+		return false
+	default:
+		return true
+	}
+}
+
+func (s *shellState) stopVMSHDJob(id int, w io.Writer) (bool, error) {
+	if s.vmshd == nil || s.vmshd.client == nil || strings.TrimSpace(s.vmshd.sessionID) == "" {
+		return false, nil
+	}
+	if !s.localJobIsVMSHDOwned(id) {
+		return false, nil
+	}
+	job, err := s.vmshd.client.CancelHostJob(s.vmshd.sessionID, id)
+	if err != nil {
+		return true, err
+	}
+	s.syncVMSHDJobs([]vmshd.JobSummary{job})
+	_, err = fmt.Fprintf(w, "[%d] %s\n", id, emptyText(job.Status, "canceling"))
+	return true, err
+}
+
+func (s *shellState) printVMSHDJobLogs(id int, w io.Writer) (bool, error) {
+	if s.vmshd == nil || s.vmshd.client == nil || !s.localJobIsVMSHDOwned(id) {
+		return false, nil
+	}
+	jobs, err := s.vmshd.client.Jobs()
+	if err != nil {
+		return true, err
+	}
+	s.syncVMSHDJobs(jobs)
+	for _, job := range jobs {
+		if job.ID != id || strings.TrimSpace(job.Control) != "vmshd" {
+			continue
+		}
+		if job.LogDropped {
+			if _, err := fmt.Fprintln(w, "[older log output dropped]"); err != nil {
+				return true, err
+			}
+		}
+		if job.Logs == "" {
+			_, err := fmt.Fprintf(w, "[%d] no log output captured\n", id)
+			return true, err
+		}
+		_, err := io.WriteString(w, job.Logs)
+		return true, err
+	}
+	return true, fmt.Errorf("jobs: no such job %d", id)
+}
+
+func (s *shellState) localJobIsVMSHDOwned(id int) bool {
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	for _, job := range s.jobs {
+		if job.ID == id {
+			return job.Control == "vmshd"
+		}
+	}
+	return false
+}
+
+func (s *shellState) markJobsLostForContext(ctx commandContext, reason string) {
+	key := contextSessionKey(ctx)
+	s.markJobsLost(func(job shellJob) bool {
+		return job.ContextKey == key || contextSessionKey(job.Context) == key
+	}, reason)
+}
+
+func (s *shellState) markJobsLostForVMBackendID(id string, reason string) {
+	id = strings.TrimSpace(id)
+	s.markJobsLost(func(job shellJob) bool {
+		return job.Context.Mode == modeVM && backendVMID(job.Context) == id
+	}, reason)
+}
+
+func (s *shellState) markJobsLostForSSHKey(key string, reason string) {
+	s.markJobsLost(func(job shellJob) bool {
+		jobKey := job.ContextKey
+		if jobKey == "" {
+			jobKey = contextSessionKey(job.Context)
+		}
+		if strings.Contains(jobKey, key) || strings.Contains(job.Context.ParentKey, key) {
+			return true
+		}
+		if sessionKey, ok := s.sshSessionKeyForContext(job.Context); ok && sessionKey == key {
+			return true
+		}
+		return false
+	}, reason)
+}
+
+func (s *shellState) markJobsLost(match func(shellJob) bool, reason string) {
+	s.jobsMu.Lock()
+	changed := false
+	for i := range s.jobs {
+		if s.jobs[i].Done || !match(s.jobs[i]) {
+			continue
+		}
+		s.jobs[i].Done = true
+		s.jobs[i].Lost = true
+		s.jobs[i].Code = -1
+		s.jobs[i].Finished = time.Now()
+		s.jobs[i].Err = reason
+		changed = true
+	}
+	s.jobsMu.Unlock()
+	if changed {
+		s.publishVMSHDSessionState()
+	}
 }
 
 func (s *shellState) help(w io.Writer) error {
@@ -7847,18 +9524,22 @@ func (s *shellState) help(w io.Writer) error {
 @<image> [opts] [cmd]    select/create the default system for an image, or run cmd in it
 @<name> --from SOURCE    create/select a named system from image, library/image, or ssh:host
 @host [cmd]              run cmd on the host, or make host current if cmd is omitted
-@ssh HOST [cmd]          sugar for @HOST --from ssh:HOST when HOST is available
+	@ssh [--from origin] HOST [cmd]  connect from host by default; origin may be @host, current, a VM, or an SSH session
 @ [opts] [cmd]           update or use the current context
 @sudo [cmd]              open a root VM subshell, or run cmd as root in the current VM
+@exec [cmd]              replace vmsh with your normal shell, or exec cmd on the host
 @alias [name=value]      list aliases, or set one (example: @alias clear=@host clear)
 @alias -d name           delete an alias
+@alias expand line       print alias-expanded line without running it
 @ps                      list VMs and SSH sessions
-@jobs                    list background jobs
+	@jobs [logs id|stop id]  list background jobs, show captured output, or request stop
+@sessions                list vmshd shell sessions and resource counts
+@detach                  keep the current vmshd session after this frontend exits
 @status                  show vmsh and selected VM state
-@start [--vm id]         start a blank VM
+@start                   start the current VM
 @stop [name|vm:name|ssh:name]  stop an SSH session or VM
-@restart [name|vm:name|--vm id]  restart a VM after confirmation
-@save [name|--vm id] tag save a VM root filesystem as a local image
+@restart [name|vm:name]  restart a VM after confirmation
+@save [name] tag         save a VM root filesystem as a local image
 @rmi image               remove a locally cached image
 @copy SRC DST            copy between @:path, @host:path, @name:path, @vm:id:path, @ssh:host:path, and @image:name:path
                          files overwrite files; existing directory destinations merge; directory/non-directory conflicts fail
@@ -7866,7 +9547,7 @@ func (s *shellState) help(w io.Writer) error {
 @agent --proxy codex     run Codex through a host auth proxy without mounting ~/.codex
 @tmux [session]          open tmux with vmsh as the default pane command
 @forward H:G             forward host port H to guest port G
-opts: --from source --vm id --cwd path --user user --sudo --init --no-init --kernel default|ubuntu --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
+opts: --from source --cwd path --user user --sudo --init --no-init --kernel default|ubuntu --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
 keys: Ctrl+R reverse history search; Esc/Ctrl+G cancel search
 cd <dir>                 change the current host, VM, or SSH working directory
 exit [--force]           leave the current subshell, or vmsh at top level
@@ -7922,6 +9603,63 @@ func parseSSHAtCommand(command string) (string, string, error) {
 	return tokens[0].Value, rest, nil
 }
 
+func (s *shellState) sshOriginContext(from string) (commandContext, error) {
+	from = strings.TrimSpace(from)
+	switch from {
+	case "", "host", "@host":
+		return hostCommandContext(s.context, commandOptions{}), nil
+	case "@", "current":
+		return s.context, nil
+	}
+	if forced, name := parseExplicitVMStopTarget(from); forced {
+		match, err := s.resolveVMStopTarget(name)
+		if err != nil {
+			return commandContext{}, err
+		}
+		if match.kind != stopTargetVM {
+			return commandContext{}, fmt.Errorf("ssh origin VM %q is not running", name)
+		}
+		return s.vmContextForBackendID(match.id)
+	}
+	if forced, name := parseExplicitSSHStopTarget(from); forced {
+		if ctx, ok := s.sshSessionContext(name); ok {
+			return ctx, nil
+		}
+		return commandContext{}, fmt.Errorf("ssh origin session %q is not open", name)
+	}
+	name := strings.TrimPrefix(from, "@")
+	if ctx, ok := s.sshSessionContext(name); ok {
+		return ctx, nil
+	}
+	match, err := s.resolveStopTarget(name)
+	if err != nil {
+		return commandContext{}, err
+	}
+	switch match.kind {
+	case stopTargetVM:
+		return s.vmContextForBackendID(match.id)
+	case stopTargetSSH:
+		if ctx, ok := s.sshSessionContext(name); ok {
+			return ctx, nil
+		}
+		return commandContext{}, fmt.Errorf("ssh origin session %q is not open", name)
+	default:
+		return commandContext{}, fmt.Errorf("ssh origin %q is not a running VM, open SSH session, or @host", from)
+	}
+}
+
+func sshCLICommand(ctx commandContext, command string) string {
+	target := strings.TrimSpace(ctx.SSHHost)
+	if user := strings.TrimSpace(ctx.User); user != "" {
+		target = user + "@" + target
+	}
+	args := []string{"ssh", "--", shellQuote(target)}
+	if strings.TrimSpace(command) != "" {
+		args = append(args, command)
+	}
+	return strings.Join(args, " ")
+}
+
 func parseCommandOptions(tokens []shellToken, start int, target string) (commandOptions, int, error) {
 	var opts commandOptions
 	i := start
@@ -7946,12 +9684,6 @@ func parseCommandOptions(tokens []shellToken, start int, target string) (command
 		}
 		opts.OptionFields = append(opts.OptionFields, field)
 		switch name {
-		case "--vm":
-			v, err := readValue()
-			if err != nil {
-				return opts, i, err
-			}
-			opts.VMID = v
 		case "--from":
 			v, err := readValue()
 			if err != nil {
@@ -8140,6 +9872,8 @@ func hostCommandContext(base commandContext, opts commandOptions) commandContext
 	ctx.SystemName = "host"
 	ctx.SSHHost = ""
 	ctx.CWD = ""
+	ctx.ParentKey = ""
+	ctx.ParentText = ""
 	return ctx
 }
 
@@ -8415,6 +10149,12 @@ func sshCommandContext(base commandContext, opts commandOptions, host string) co
 	ctx.VMID = ""
 	ctx.Arch = ""
 	ctx.Isolated = false
+	ctx.ParentKey = ""
+	ctx.ParentText = ""
+	if base.Mode != modeHost {
+		ctx.ParentKey = contextSessionKey(base)
+		ctx.ParentText = contextShortText(base)
+	}
 	if opts.User == "" && !sameHost {
 		ctx.User = ""
 	}
@@ -8422,6 +10162,23 @@ func sshCommandContext(base commandContext, opts commandOptions, host string) co
 		ctx.CWD = ""
 	}
 	return ctx
+}
+
+func contextShortText(ctx commandContext) string {
+	switch ctx.Mode {
+	case modeHost:
+		return "host"
+	case modeVM:
+		prefix := "vm:"
+		if ctx.Isolated {
+			prefix = "isolated-vm:"
+		}
+		return prefix + emptyText(visibleContextName(ctx), normalizedVMID(ctx.VMID))
+	case modeSSH:
+		return "ssh:" + emptyText(visibleContextName(ctx), "-")
+	default:
+		return string(ctx.Mode)
+	}
 }
 
 const (
@@ -8746,16 +10503,50 @@ func formatBootEvent(event client.BootEvent) string {
 	return ""
 }
 
-func resolveCacheDir(arg string) (string, error) {
+func resolveCacheDir(arg, identity string) (string, error) {
 	if arg != "" {
-		return arg, os.MkdirAll(arg, 0o755)
+		return arg, ensurePrivateCacheDir(arg)
 	}
-	userCacheDir, err := os.UserCacheDir()
+	cacheRoot, err := userCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve user cache dir: %w", err)
 	}
-	dir := filepath.Join(userCacheDir, "ccx3")
-	return dir, os.MkdirAll(dir, 0o755)
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		identity = "ccdev"
+	}
+	dir := filepath.Join(cacheRoot, identity)
+	return dir, ensurePrivateCacheDir(dir)
+}
+
+func resolveShellCacheDir(arg, identity string, nested bool) (string, error) {
+	if arg != "" || !nested {
+		return resolveCacheDir(arg, identity)
+	}
+	cacheRoot, err := userCacheDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user cache dir: %w", err)
+	}
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		identity = "ccdev"
+	}
+	dir := filepath.Join(cacheRoot, identity+"-nested", strconv.Itoa(os.Getpid()))
+	return dir, ensurePrivateCacheDir(dir)
+}
+
+func ensurePrivateCacheDir(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	if runtime.GOOS != "windows" {
+		return os.Chmod(path, 0o700)
+	}
+	return nil
+}
+
+func nestedVMSHActive() bool {
+	return strings.TrimSpace(os.Getenv("VMSH_ACTIVE")) == "1"
 }
 
 func firstNonEmpty(values ...string) string {

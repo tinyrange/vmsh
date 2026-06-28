@@ -1,6 +1,7 @@
 package shell
 
 import (
+	"context"
 	"fmt"
 	"io"
 
@@ -28,6 +29,14 @@ type copyTargetPath struct {
 
 type preparedTargetCommand interface {
 	RunWithInput(stdin io.Reader, stdout, stderr io.Writer) error
+}
+
+type contextPreparedTargetCommand interface {
+	RunWithInputContext(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error
+}
+
+type pipelinePreparedTargetCommand interface {
+	RunPipelineStage(ctx context.Context, pipeline *pipelineRun, stdin io.Reader, stdout, stderr io.Writer) error
 }
 
 type hostShellTarget struct {
@@ -76,6 +85,14 @@ type hostPreparedCommand struct {
 
 func (c hostPreparedCommand) RunWithInput(stdin io.Reader, stdout, stderr io.Writer) error {
 	return c.target.RunWithInput(c.line, stdin, stdout, stderr)
+}
+
+func (c hostPreparedCommand) RunWithInputContext(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error {
+	return c.target.shell.runHostWithInputContext(ctx, c.line, stdin, stdout, stderr)
+}
+
+func (c hostPreparedCommand) RunPipelineStage(ctx context.Context, pipeline *pipelineRun, stdin io.Reader, stdout, stderr io.Writer) error {
+	return c.target.shell.runHostPipelineStage(ctx, pipeline, c.line, stdin, stdout, stderr)
 }
 
 type guestShellTarget struct {
@@ -182,6 +199,10 @@ func (c sshPreparedCommand) RunWithInput(stdin io.Reader, stdout, stderr io.Writ
 	return contextBoundaryError(c.target.ctx, "run pipeline stage", c.target.shell.runSSHWithInput(c.target.ctx, c.line, stdin, stdout, stderr))
 }
 
+func (c sshPreparedCommand) RunWithInputContext(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error {
+	return contextBoundaryError(c.target.ctx, "run pipeline stage", c.target.shell.runSSHWithInputContext(ctx, c.target.ctx, c.line, stdin, stdout, stderr))
+}
+
 type guestPreparedCommand struct {
 	shell *shellState
 	ctx   commandContext
@@ -190,6 +211,10 @@ type guestPreparedCommand struct {
 
 func (c guestPreparedCommand) RunWithInput(stdin io.Reader, stdout, stderr io.Writer) error {
 	return contextBoundaryError(c.ctx, "run pipeline stage", c.shell.streamGuestRunWithInput(backendVMID(c.ctx), c.req, stdin, stdout, stderr))
+}
+
+func (c guestPreparedCommand) RunWithInputContext(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error {
+	return contextBoundaryError(c.ctx, "run pipeline stage", c.shell.streamGuestRunWithInputContext(ctx, backendVMID(c.ctx), c.req, stdin, stdout, stderr))
 }
 
 func (s *shellState) targetFor(ctx commandContext) (shellTarget, error) {

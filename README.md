@@ -35,7 +35,7 @@ Example session:
 @alpine
 cat /etc/alpine-release
 
-@ubuntu:24.04 --vm work --memory 2g --cpus 4
+@work --from ubuntu:24.04 --memory 2g --cpus 4
 python3 --version
 
 @host git status
@@ -119,7 +119,7 @@ Run a non-interactive script:
 ./build/vmsh/cc -ccvm ./build/vmsh/ccvm pull alpine ./cc/fixtures/alpine.simg
 
 cat > /tmp/vmsh-smoke <<'EOF'
-@alpine --vm smoke --memory 256 --no-network sh -lc 'whoami; uname -m'
+@smoke --from alpine --memory 256 --no-network sh -lc 'whoami; uname -m'
 EOF
 
 ./build/vmsh/vmsh -ccvm ./build/vmsh/ccvm -script /tmp/vmsh-smoke
@@ -140,12 +140,20 @@ Common forms:
 @alpine                         # select an image; VM starts lazily
 @alpine uname -a                # run one command in alpine
 @host pwd                       # run one command on the host
-@ --vm work --memory 4g         # update the current VM context
+@work --from alpine --memory 4g # create or switch to a named VM system
 @ --sudo whoami                 # run as root in the current VM
+@alias ll=@host ls -la          # create an alias
+@alias expand ll /tmp           # preview the expanded command
 @jobs                           # list background jobs
 @status                         # show selected context and VM status
-@stop --vm work                 # stop a named VM
+@stop work                      # stop a named VM
 ```
+
+Pipelines can mix host, VM, and SSH stages. `vmsh` follows normal POSIX shell
+status semantics: the pipeline status is the final command's status. When an
+earlier mixed-context stage exits non-zero, `vmsh` also prints a diagnostic that
+names the stage number, context, exit status, and command so the final stage does
+not hide the failure.
 
 Copy endpoints use explicit context prefixes so accidental names fail early:
 
@@ -160,12 +168,15 @@ Copy endpoints use explicit context prefixes so accidental names fail early:
 endpoints: files overwrite files, existing directory destinations receive the
 source by name and merge with existing contents, and directory/non-directory
 type conflicts fail instead of replacing the destination. Copy errors include
-both source and destination endpoints.
+both source and destination endpoints. Interactive copies show lightweight
+progress on the terminal; non-interactive copies stay quiet for scripts. Remote
+to remote copies stream through a temporary host staging directory and remove it
+when the transfer finishes or fails.
 
 Supported options:
 
 ```sh
---vm <id>
+--from <source>
 --cwd <guest-path>
 --user <user>
 --sudo
@@ -202,10 +213,12 @@ The workflow builds one standalone `vmsh` binary per target:
 - `darwin/arm64`
 
 Release binaries are built with `embed_ccvm` and `embed_guestinit`. That compiles
-the `ccvm` daemon entrypoint into the same Go executable as `vmsh` and embeds
-the static Linux guest init payloads for amd64 and arm64 guests. At runtime,
-`vmsh` re-execs itself with `VMSH_INTERNAL_CCVM=1` when it needs to start the
-daemon, so release assets do not need a `ccvm` sidecar.
+the `ccvm` daemon entrypoint into the same Go executable as `vmsh`, embeds the
+static Linux guest init payloads for amd64 and arm64 guests, and embeds the
+native OpenBSD, FreeBSD, and NetBSD guest init payloads for the release target
+architecture. At runtime, `vmsh` re-execs itself with `VMSH_INTERNAL_VMSHD=1`
+when it needs to start the authenticated local daemon, so release assets do not
+need a `ccvm` sidecar or a Go toolchain to build guest init helpers.
 
 The release workflow also supports manual dry runs from GitHub Actions. Use
 `workflow_dispatch`, provide a version string for artifact names, and leave
