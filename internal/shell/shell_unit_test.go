@@ -2585,7 +2585,7 @@ func TestCompletionsUseCachedImagesOptionsAndHostMappedPaths(t *testing.T) {
 	}
 
 	c := newVMSHCompleter(sh)
-	candidates, replaceLen, kind := c.CompleteWithKind([]rune("@al"), len("@al"))
+	candidates, replaceLen, kind := c.Complete([]rune("@al"), len("@al"))
 	if kind != completionAt || replaceLen != len("@al") || !hasString(candidates, "pine") {
 		t.Fatalf("@ image completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
@@ -2593,41 +2593,41 @@ func TestCompletionsUseCachedImagesOptionsAndHostMappedPaths(t *testing.T) {
 		t.Fatalf("internal image cache dir completed: %q", candidates)
 	}
 
-	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@alpine --n"), len("@alpine --n"))
+	candidates, replaceLen, kind = c.Complete([]rune("@alpine --n"), len("@alpine --n"))
 	if kind != completionOption || replaceLen != len("--n") || !hasString(candidates, "etwork") || !hasString(candidates, "ested") {
 		t.Fatalf("option completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
-	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@hello --from ub"), len("@hello --from ub"))
+	candidates, replaceLen, kind = c.Complete([]rune("@hello --from ub"), len("@hello --from ub"))
 	if kind != completionAt || replaceLen != len("ub") || !hasString(candidates, "untu") {
 		t.Fatalf("--from source completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
-	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@hello --from library/al"), len("@hello --from library/al"))
+	candidates, replaceLen, kind = c.Complete([]rune("@hello --from library/al"), len("@hello --from library/al"))
 	if kind != completionAt || replaceLen != len("library/al") || !hasString(candidates, "pine") {
 		t.Fatalf("--from library source completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
-	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@agent --pr"), len("@agent --pr"))
+	candidates, replaceLen, kind = c.Complete([]rune("@agent --pr"), len("@agent --pr"))
 	if kind != completionOption || replaceLen != len("--pr") || !hasString(candidates, "oxy") {
 		t.Fatalf("agent option completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
-	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@ss"), len("@ss"))
+	candidates, replaceLen, kind = c.Complete([]rune("@ss"), len("@ss"))
 	if kind != completionAt || replaceLen != len("@ss") || !hasString(candidates, "h") {
 		t.Fatalf("ssh target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
-	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@sta"), len("@sta"))
+	candidates, replaceLen, kind = c.Complete([]rune("@sta"), len("@sta"))
 	if kind != completionAt || replaceLen != len("@sta") || !hasString(candidates, "tus") || !hasString(candidates, "rt") {
 		t.Fatalf("status/start target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
-	candidates, _, _ = c.CompleteWithKind([]rune("@alpine --pr"), len("@alpine --pr"))
+	candidates, _, _ = c.Complete([]rune("@alpine --pr"), len("@alpine --pr"))
 	if hasString(candidates, "oxy") {
 		t.Fatalf("non-agent option completion included proxy: %q", candidates)
 	}
 
-	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@rmi al"), len("@rmi al"))
+	candidates, replaceLen, kind = c.Complete([]rune("@rmi al"), len("@rmi al"))
 	if kind != completionAt || replaceLen != len("al") || !reflect.DeepEqual(candidates, []string{"pine"}) {
 		t.Fatalf("@rmi completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
-	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@restart wo"), len("@restart wo"))
+	candidates, replaceLen, kind = c.Complete([]rune("@restart wo"), len("@restart wo"))
 	if kind != completionAt || replaceLen != len("wo") || !hasString(candidates, "rk") {
 		t.Fatalf("@restart target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
@@ -2637,7 +2637,7 @@ func TestCompletionsUseCachedImagesOptionsAndHostMappedPaths(t *testing.T) {
 		t.Fatalf("guest host paths: %v", err)
 	}
 	sh.context = commandContext{Mode: modeVM, VMID: "vm", Image: "alpine", CWD: guestCWD}
-	candidates, replaceLen, kind = c.CompleteWithKind([]rune("cat a"), len("cat a"))
+	candidates, replaceLen, kind = c.Complete([]rune("cat a"), len("cat a"))
 	if kind != completionPath || replaceLen != len("a") || !hasString(candidates, "lpha\\ dir/") {
 		t.Fatalf("host-mapped path completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
@@ -2661,7 +2661,7 @@ func TestCompletionsUseCurrentCommandSegmentAndGuestCommands(t *testing.T) {
 	c := newVMSHCompleter(sh)
 
 	line := []rune("echo ok && vm")
-	candidates, replaceLen, kind := c.CompleteWithKind(line, len(line))
+	candidates, replaceLen, kind := c.Complete(line, len(line))
 	if kind != completionCommand || replaceLen != len("vm") || !hasString(candidates, "tool") {
 		t.Fatalf("guest command completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
@@ -2671,14 +2671,14 @@ func TestCompletionsUseCurrentCommandSegmentAndGuestCommands(t *testing.T) {
 
 	sh.context = commandContext{Mode: modeSSH, SSHHost: "test-ssh-a"}
 	line = []rune("cat ./")
-	candidates, _, kind = c.CompleteWithKind(line, len(line))
+	candidates, _, kind = c.Complete(line, len(line))
 	if kind != completionPath || len(candidates) != 0 {
 		t.Fatalf("ssh path completion candidates=%q kind=%q, want none", candidates, kind)
 	}
 
 	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "alpine"}
 	line = []rune("printf x | @host ec")
-	candidates, replaceLen, kind = c.CompleteWithKind(line, len(line))
+	candidates, replaceLen, kind = c.Complete(line, len(line))
 	if kind != completionCommand || replaceLen != len("ec") || !hasString(candidates, "ho") {
 		t.Fatalf("host command completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
@@ -6311,7 +6311,7 @@ func TestSSHCompletionUsesConfigAndRemotePath(t *testing.T) {
 
 	sh := newUnitShell(t, newRecordingShellAPI())
 	c := newVMSHCompleter(sh)
-	candidates, replaceLen, kind := c.CompleteWithKind([]rune("@ssh test-ssh-"), len("@ssh test-ssh-"))
+	candidates, replaceLen, kind := c.Complete([]rune("@ssh test-ssh-"), len("@ssh test-ssh-"))
 	if kind != completionAt || replaceLen != len("test-ssh-") || !hasString(candidates, "a") {
 		t.Fatalf("ssh host completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
@@ -6320,15 +6320,15 @@ func TestSSHCompletionUsesConfigAndRemotePath(t *testing.T) {
 	if err := sh.eval("@ssh test-ssh-a", &stdout, &stderr); err != nil {
 		t.Fatalf("enter ssh context: %v\nstderr:\n%s", err, stderr.String())
 	}
-	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@test-ssh-"), len("@test-ssh-"))
+	candidates, replaceLen, kind = c.Complete([]rune("@test-ssh-"), len("@test-ssh-"))
 	if kind != completionAt || replaceLen != len("@test-ssh-") || !hasString(candidates, "a") {
 		t.Fatalf("ssh session target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
-	candidates, replaceLen, kind = c.CompleteWithKind([]rune("@stop test-ssh-"), len("@stop test-ssh-"))
+	candidates, replaceLen, kind = c.Complete([]rune("@stop test-ssh-"), len("@stop test-ssh-"))
 	if kind != completionAt || replaceLen != len("test-ssh-") || !hasString(candidates, "a") {
 		t.Fatalf("stop completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
-	candidates, replaceLen, kind = c.CompleteWithKind([]rune("cat /tmp/fi"), len("cat /tmp/fi"))
+	candidates, replaceLen, kind = c.Complete([]rune("cat /tmp/fi"), len("cat /tmp/fi"))
 	if kind != completionPath || replaceLen != len("fi") || !hasString(candidates, "le") || !hasString(candidates, "folder/") {
 		t.Fatalf("ssh path completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
