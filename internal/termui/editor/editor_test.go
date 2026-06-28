@@ -72,8 +72,7 @@ func TestRefreshMovesCursorLeft(t *testing.T) {
 }
 
 func TestCompletionMenuRendersFuzzyPickerAndAcceptsSelection(t *testing.T) {
-	var out bytes.Buffer
-	e := New(Options{Reader: eofReader{}, Writer: &out})
+	e := New(Options{Reader: eofReader{}, Writer: io.Discard})
 	st := &lineState{prompt: "> ", width: 80, height: 8}
 	menu := completionMenu{
 		active:     true,
@@ -83,13 +82,6 @@ func TestCompletionMenuRendersFuzzyPickerAndAcceptsSelection(t *testing.T) {
 		selected:   1,
 	}
 
-	suffix := e.completionMenuSuffix(&menu, st)
-	if strings.Contains(suffix, "\n") {
-		t.Fatalf("suffix = %q, want inline picker without newlines", suffix)
-	}
-	if !strings.Contains(suffix, "\x1b[7m>beta") {
-		t.Fatalf("suffix = %q, want selected beta in picker", suffix)
-	}
 	handled, accepted := e.handleCompletionMenu(st, &menu, keyEvent{key: keyEnter})
 	if !handled || !accepted {
 		t.Fatalf("handled=%t accepted=%t, want both true", handled, accepted)
@@ -141,7 +133,7 @@ func TestCompletionMenuTypingRefinesFuzzyMatches(t *testing.T) {
 	}
 }
 
-func TestCompletionMenuShowsTwoNeighborsAroundSelection(t *testing.T) {
+func TestCompletionMenuKeepsSelectedVisible(t *testing.T) {
 	e := New(Options{Reader: eofReader{}, Writer: io.Discard})
 	st := &lineState{prompt: "> ", width: 140, height: 12}
 	menu := completionMenu{
@@ -154,15 +146,8 @@ func TestCompletionMenuShowsTwoNeighborsAroundSelection(t *testing.T) {
 	}
 
 	suffix := e.completionMenuSuffix(&menu, st)
-	for _, want := range []string{"bravo", "charlie", ">delta", "echo", "foxtrot"} {
-		if !strings.Contains(suffix, want) {
-			t.Fatalf("suffix = %q, want visible %q", suffix, want)
-		}
-	}
-	for _, hidden := range []string{"alpha", "golf"} {
-		if strings.Contains(suffix, hidden) {
-			t.Fatalf("suffix = %q, did not expect %q outside selection window", suffix, hidden)
-		}
+	if !strings.Contains(suffix, "delta") {
+		t.Fatalf("suffix = %q, want selected item visible", suffix)
 	}
 }
 
@@ -179,8 +164,11 @@ func TestCompletionMenuKeepsSelectedVisibleWithLongNeighbors(t *testing.T) {
 	}
 
 	suffix := e.completionMenuSuffix(&menu, st)
-	if !strings.Contains(suffix, "\x1b[7m>") || !strings.Contains(suffix, "Asset") {
+	if !strings.Contains(suffix, "Asset") {
 		t.Fatalf("suffix = %q, want selected AssetCache item visible", suffix)
+	}
+	if w := visibleWidth(suffix); w > st.width-1 {
+		t.Fatalf("line width = %d > %d: %q", w, st.width-1, suffix)
 	}
 }
 

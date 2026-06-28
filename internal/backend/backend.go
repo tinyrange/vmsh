@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -132,6 +133,55 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		_ = os.Remove(statePath)
 	}
 
+	started, err := startDaemonProcess(launch, cacheDir)
+	if err != nil {
+		return nil, fmt.Errorf("start ccvm daemon %s with cache %s: %w", CCVMLaunchName(launch), cacheDir, err)
+	}
+
+	var hello client.ServerHello
+	if err := json.NewDecoder(started.stdout).Decode(&hello); err != nil {
+		started.stop()
+		return nil, fmt.Errorf("ccvm daemon did not send a startup banner from %s: %w", CCVMLaunchName(launch), err)
+	}
+	if err := ValidateServerHello(hello, cacheDir); err != nil {
+		started.stop()
+		return nil, err
+	}
+	state := normalizeDaemonState(DaemonState{Addr: hello.Addr, Kind: hello.Kind, TokenPath: hello.TokenPath, LaunchKey: launchKey})
+	if err := WriteDaemonState(statePath, state); err != nil {
+		started.stop()
+		return nil, fmt.Errorf("write daemon state %s for %s: %w", statePath, hello.Addr, err)
+	}
+	api := NewClient(hello.Addr)
+	if err := ApplyDaemonStateAuth(api, state); err != nil {
+		_ = os.Remove(statePath)
+		started.stop()
+		return nil, fmt.Errorf("read daemon auth token: %w", err)
+	}
+	if err := api.HealthCheck(); err != nil {
+		_ = os.Remove(statePath)
+		started.stop()
+		return nil, fmt.Errorf("ccvm daemon started at %s but health check failed: %w", hello.Addr, err)
+	}
+	if strings.TrimSpace(state.Kind) == "vmshd" && !apiCompatible(api, state) {
+		_ = os.Remove(statePath)
+		started.stop()
+		return nil, fmt.Errorf("vmshd daemon started at %s but required routes are unavailable", hello.Addr)
+	}
+	if opts.OnStart != nil {
+		opts.OnStart(state)
+	}
+	return api, nil
+}
+
+type startedDaemonProcess struct {
+	stdout io.ReadCloser
+	stop   func()
+}
+
+var startDaemonProcess = startDaemonCommand
+
+func startDaemonCommand(launch CCVMLaunch, cacheDir string) (*startedDaemonProcess, error) {
 	args := append([]string{}, launch.Args...)
 	args = append(args, "-cache-dir", cacheDir)
 	proc := exec.Command(launch.Path, args...)
@@ -145,48 +195,17 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		return nil, fmt.Errorf("prepare ccvm stdout pipe for %s: %w", CCVMLaunchName(launch), err)
 	}
 	if err := proc.Start(); err != nil {
-		return nil, fmt.Errorf("start ccvm daemon %s with cache %s: %w", CCVMLaunchName(launch), cacheDir, err)
-	}
-
-	var hello client.ServerHello
-	if err := json.NewDecoder(stdout).Decode(&hello); err != nil {
-		_ = proc.Wait()
-		return nil, fmt.Errorf("ccvm daemon did not send a startup banner from %s: %w", CCVMLaunchName(launch), err)
-	}
-	if err := ValidateServerHello(hello, cacheDir); err != nil {
-		_ = proc.Process.Kill()
-		_ = proc.Wait()
 		return nil, err
 	}
-	state := normalizeDaemonState(DaemonState{Addr: hello.Addr, Kind: hello.Kind, TokenPath: hello.TokenPath, LaunchKey: launchKey})
-	if err := WriteDaemonState(statePath, state); err != nil {
-		_ = proc.Process.Kill()
-		_ = proc.Wait()
-		return nil, fmt.Errorf("write daemon state %s for %s: %w", statePath, hello.Addr, err)
-	}
-	api := NewClient(hello.Addr)
-	if err := ApplyDaemonStateAuth(api, state); err != nil {
-		_ = os.Remove(statePath)
-		_ = proc.Process.Kill()
-		_ = proc.Wait()
-		return nil, fmt.Errorf("read daemon auth token: %w", err)
-	}
-	if err := api.HealthCheck(); err != nil {
-		_ = os.Remove(statePath)
-		_ = proc.Process.Kill()
-		_ = proc.Wait()
-		return nil, fmt.Errorf("ccvm daemon started at %s but health check failed: %w", hello.Addr, err)
-	}
-	if strings.TrimSpace(state.Kind) == "vmshd" && !apiCompatible(api, state) {
-		_ = os.Remove(statePath)
-		_ = proc.Process.Kill()
-		_ = proc.Wait()
-		return nil, fmt.Errorf("vmshd daemon started at %s but required routes are unavailable", hello.Addr)
-	}
-	if opts.OnStart != nil {
-		opts.OnStart(state)
-	}
-	return api, nil
+	return &startedDaemonProcess{
+		stdout: stdout,
+		stop: func() {
+			if proc.Process != nil {
+				_ = proc.Process.Kill()
+			}
+			_ = proc.Wait()
+		},
+	}, nil
 }
 
 func apiCompatible(api *client.Client, state DaemonState) bool {
