@@ -46,6 +46,12 @@ func TestHasRecordArg(t *testing.T) {
 	if !hasRecordArg([]string{"--record=session.cast"}) {
 		t.Fatalf("--record= was not detected")
 	}
+	if !hasRecordArg([]string{"-record-raw", "session.raw.jsonl"}) {
+		t.Fatalf("-record-raw was not detected")
+	}
+	if !hasRecordArg([]string{"--record-raw=session.raw.jsonl"}) {
+		t.Fatalf("--record-raw= was not detected")
+	}
 	if hasRecordArg([]string{"--", "-record", "script-arg"}) {
 		t.Fatalf("-record after -- should not be treated as a build wrapper vmsh flag")
 	}

@@ -101,8 +101,8 @@ func printUsage() {
 
 The default command is build. Outputs are written under build/vmsh unless
 --build-dir or VMSH_BUILD_DIR is set.
-The run command records an asciinema session to build/vmsh/session.cast unless
-vmsh args already include -record/--record.
+The run command records a raw session to build/vmsh/session.raw.jsonl unless
+vmsh args already include -record/--record or -record-raw/--record-raw.
 The demo command drives a real vmsh session through a PTY and writes a redacted
 marketing/demo cast to build/vmsh/demo.cast.
 `)
@@ -385,7 +385,7 @@ func copyFile(src, dst string, mode os.FileMode) error {
 func runVMSH(p paths, args []string) error {
 	vmshArgs := append([]string{"-ccvm", p.ccvm}, args...)
 	if !hasRecordArg(args) {
-		vmshArgs = append([]string{"-ccvm", p.ccvm, "-record", filepath.Join(p.build, "session.cast")}, args...)
+		vmshArgs = append([]string{"-ccvm", p.ccvm, "-record-raw", filepath.Join(p.build, "session.raw.jsonl")}, args...)
 	}
 	logf("run: %s %s", p.vmsh, strings.Join(vmshArgs, " "))
 	cmd := exec.Command(p.vmsh, vmshArgs...)
@@ -411,10 +411,10 @@ func hasRecordArg(args []string) bool {
 		if arg == "--" {
 			return false
 		}
-		if arg == "-record" || arg == "--record" || arg == "-recording" || arg == "--recording" {
+		if arg == "-record" || arg == "--record" || arg == "-record-raw" || arg == "--record-raw" || arg == "-recording" || arg == "--recording" {
 			return true
 		}
-		if strings.HasPrefix(arg, "-record=") || strings.HasPrefix(arg, "--record=") {
+		if strings.HasPrefix(arg, "-record=") || strings.HasPrefix(arg, "--record=") || strings.HasPrefix(arg, "-record-raw=") || strings.HasPrefix(arg, "--record-raw=") {
 			return true
 		}
 		if strings.HasPrefix(arg, "-recording=") || strings.HasPrefix(arg, "--recording=") {
