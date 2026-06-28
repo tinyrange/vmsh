@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -38,11 +39,18 @@ func TestCommandCompleterCompletesBuiltins(t *testing.T) {
 
 func TestCommandCompleterEmptyTokenIncludesPathCommands(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "zz-termui-test-command")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o700); err != nil {
+	command := "zz-termui-test-command"
+	data := []byte("#!/bin/sh\n")
+	t.Setenv("PATH", dir)
+	if runtime.GOOS == "windows" {
+		command += ".cmd"
+		data = []byte("@echo off\r\n")
+		t.Setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+	}
+	path := filepath.Join(dir, command)
+	if err := os.WriteFile(path, data, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", dir)
 
 	items, replaceLen, kind := shell.CommandCompleter{}.Complete(nil, 0)
 	if kind != editor.CompletionCommand {
@@ -51,7 +59,7 @@ func TestCommandCompleterEmptyTokenIncludesPathCommands(t *testing.T) {
 	if replaceLen != 0 {
 		t.Fatalf("replaceLen = %d, want 0", replaceLen)
 	}
-	if !contains(items, "zz-termui-test-command") {
+	if !contains(items, command) {
 		t.Fatalf("items = %#v, want PATH command", items)
 	}
 }

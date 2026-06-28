@@ -443,7 +443,7 @@ func pathCommands() []string {
 				continue
 			}
 			info, err := entry.Info()
-			if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+			if err != nil || info.IsDir() || !isExecutableCommand(name, info.Mode()) {
 				continue
 			}
 			seen[name] = true
@@ -451,6 +451,26 @@ func pathCommands() []string {
 		}
 	}
 	return out
+}
+
+func isExecutableCommand(name string, mode os.FileMode) bool {
+	if runtime.GOOS != "windows" {
+		return mode&0o111 != 0
+	}
+	ext := strings.ToUpper(filepath.Ext(name))
+	if ext == "" {
+		return false
+	}
+	pathext := os.Getenv("PATHEXT")
+	if pathext == "" {
+		pathext = ".COM;.EXE;.BAT;.CMD"
+	}
+	for _, allowed := range strings.Split(pathext, ";") {
+		if strings.EqualFold(ext, strings.TrimSpace(allowed)) {
+			return true
+		}
+	}
+	return false
 }
 
 func completePath(token string) []string {
