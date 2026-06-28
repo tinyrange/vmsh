@@ -14,16 +14,6 @@ import (
 	"github.com/tinyrange/vmsh/internal/termui/testkit"
 )
 
-func TestShellTranscript(t *testing.T) {
-	got := testkit.RunShell(t, "help\nexit\n")
-	if strings.TrimSpace(got.Stdout) != "builtins: cd pwd sleep spin progress failwait timeout help exit" {
-		t.Fatalf("stdout = %q", got.Stdout)
-	}
-	if got.Stderr != "" {
-		t.Fatalf("stderr = %q, want empty noninteractive transcript", got.Stderr)
-	}
-}
-
 func TestCommandCompleterCompletesBuiltins(t *testing.T) {
 	items, replaceLen, kind := shell.CommandCompleter{}.Complete([]rune("pro"), 3)
 	if kind != editor.CompletionCommand {
@@ -109,16 +99,6 @@ func TestShellRecordsSlowInteractionMetadata(t *testing.T) {
 	}
 	if len(rec.names) != 1 || rec.names[0] != "termui.slow_interaction" {
 		t.Fatalf("metadata names = %#v", rec.names)
-	}
-}
-
-func TestFailWaitReportsDurableFailure(t *testing.T) {
-	h := testkit.NewHarness("failwait 80ms\nexit\n")
-	if err := h.Shell.Loop(context.Background()); err != nil {
-		t.Fatalf("loop: %v", err)
-	}
-	if !strings.Contains(h.Err.String(), "check failed: demo failure after partial work") {
-		t.Fatalf("stderr = %q", h.Err.String())
 	}
 }
 

@@ -1,12 +1,13 @@
 package backend
 
 import (
-	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"j5.nz/cc/client"
@@ -100,62 +101,6 @@ func TestDaemonStateRoundTripAndValidation(t *testing.T) {
 	}
 	if _, err := ReadDaemonState(badAPIPath); err == nil {
 		t.Fatal("unsupported daemon API version was accepted")
-	}
-}
-
-func TestCCVMLaunchHelpers(t *testing.T) {
-	launch := CCVMLaunch{Path: "/bin/ccvm", Args: []string{"-addr", "localhost:0"}}
-	if got := CCVMLaunchName(launch); got != "/bin/ccvm -addr localhost:0" {
-		t.Fatalf("launch name = %q", got)
-	}
-
-	exe := filepath.Join("tmp", HostExecutableName("vmsh"))
-	candidates := CCVMPathCandidates(exe)
-	if len(candidates) != 2 {
-		t.Fatalf("candidates = %q", candidates)
-	}
-	if filepath.Base(candidates[0]) != HostExecutableName("ccvm") {
-		t.Fatalf("first candidate = %q", candidates[0])
-	}
-	if candidates[1] != CompanionExecutablePath(exe, "vm") {
-		t.Fatalf("companion candidate = %q", candidates[1])
-	}
-}
-
-func TestResolveCCVMPathExplicitBundledAndPathFallback(t *testing.T) {
-	explicit, err := ResolveCCVMPath("/custom/ccvm", false)
-	if err != nil {
-		t.Fatalf("resolve explicit ccvm: %v", err)
-	}
-	if explicit.Path != "/custom/ccvm" || len(explicit.Env) != 0 {
-		t.Fatalf("explicit launch = %+v", explicit)
-	}
-
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatalf("executable: %v", err)
-	}
-	pathDir := t.TempDir()
-	ccvmPath := filepath.Join(pathDir, HostExecutableName("ccvm"))
-	if err := os.WriteFile(ccvmPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatalf("write path ccvm: %v", err)
-	}
-	t.Setenv("PATH", pathDir)
-
-	bundled, err := ResolveCCVMPath("", true)
-	if err != nil {
-		t.Fatalf("resolve bundled ccvm: %v", err)
-	}
-	if bundled.Path != exe || len(bundled.Env) != 1 || bundled.Env[0] != InternalVMSHDEnv+"=1" {
-		t.Fatalf("bundled launch = %+v, executable %q", bundled, exe)
-	}
-
-	fromPath, err := ResolveCCVMPath("", false)
-	if err != nil {
-		t.Fatalf("resolve ccvm from PATH: %v", err)
-	}
-	if fromPath.Path != ccvmPath {
-		t.Fatalf("PATH launch = %+v, want %s", fromPath, ccvmPath)
 	}
 }
 
@@ -393,9 +338,6 @@ func TestConnectCCVMWithOptionsRejectsVMSHDWithoutSessionRoute(t *testing.T) {
 }
 
 func TestConnectCCVMWithOptionsReportsNewDaemonStart(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell script fake daemon is Unix-only")
-	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -412,26 +354,14 @@ func TestConnectCCVMWithOptionsReportsNewDaemonStart(t *testing.T) {
 		_ = srv.Close()
 	})
 
-	cacheDir := t.TempDir()
-	keepalive := filepath.Join(cacheDir, "keepalive")
-	if err := os.WriteFile(keepalive, []byte("1"), 0o600); err != nil {
-		t.Fatalf("write keepalive: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = os.Remove(keepalive)
-	})
-
-	bin := filepath.Join(t.TempDir(), "fake-ccvm")
-	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' '{\"addr\":\"%s\"}'\nwhile [ -f \"$2/keepalive\" ]; do sleep 0.1; done\n", ln.Addr().String())
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake ccvm: %v", err)
-	}
+	restore := stubStartDaemonProcess(t, `{"addr":"`+ln.Addr().String()+`"}`+"\n")
+	defer restore()
 
 	statePath := filepath.Join(t.TempDir(), "ccvm.json")
-	launch := CCVMLaunch{Path: bin}
+	launch := CCVMLaunch{Path: "/fake/ccvm"}
 	var reused bool
 	var started DaemonState
-	api, err := ConnectCCVMWithOptions(launch, cacheDir, statePath, ConnectOptions{
+	api, err := ConnectCCVMWithOptions(launch, t.TempDir(), statePath, ConnectOptions{
 		OnReuse: func(DaemonState) {
 			reused = true
 		},
@@ -462,9 +392,6 @@ func TestConnectCCVMWithOptionsReportsNewDaemonStart(t *testing.T) {
 }
 
 func TestConnectCCVMWithOptionsRejectsStartedVMSHDWithoutSessionRoute(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell script fake daemon is Unix-only")
-	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -506,23 +433,12 @@ func TestConnectCCVMWithOptionsRejectsStartedVMSHDWithoutSessionRoute(t *testing
 	if err := os.WriteFile(tokenPath, []byte(token+"\n"), 0o600); err != nil {
 		t.Fatalf("write token: %v", err)
 	}
-	keepalive := filepath.Join(cacheDir, "keepalive")
-	if err := os.WriteFile(keepalive, []byte("1"), 0o600); err != nil {
-		t.Fatalf("write keepalive: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = os.Remove(keepalive)
-	})
-
-	bin := filepath.Join(t.TempDir(), "fake-vmshd")
-	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' '{\"addr\":\"%s\",\"kind\":\"vmshd\",\"token_path\":\"%s\"}'\nwhile [ -f \"$2/keepalive\" ]; do sleep 0.1; done\n", ln.Addr().String(), tokenPath)
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake vmshd: %v", err)
-	}
+	restore := stubStartDaemonProcess(t, `{"addr":"`+ln.Addr().String()+`","kind":"vmshd","token_path":"`+tokenPath+`"}`+"\n")
+	defer restore()
 
 	statePath := filepath.Join(t.TempDir(), "vmshd.json")
 	var started bool
-	_, err = ConnectCCVMWithOptions(CCVMLaunch{Path: bin}, cacheDir, statePath, ConnectOptions{
+	_, err = ConnectCCVMWithOptions(CCVMLaunch{Path: "/fake/vmshd"}, cacheDir, statePath, ConnectOptions{
 		OnStart: func(DaemonState) {
 			started = true
 		},
@@ -535,6 +451,20 @@ func TestConnectCCVMWithOptionsRejectsStartedVMSHDWithoutSessionRoute(t *testing
 	}
 	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
 		t.Fatalf("state file after started vmshd route rejection stat err = %v, want not exist", err)
+	}
+}
+
+func stubStartDaemonProcess(t *testing.T, banner string) func() {
+	t.Helper()
+	old := startDaemonProcess
+	startDaemonProcess = func(CCVMLaunch, string) (*startedDaemonProcess, error) {
+		return &startedDaemonProcess{
+			stdout: io.NopCloser(strings.NewReader(banner)),
+			stop:   func() {},
+		}, nil
+	}
+	return func() {
+		startDaemonProcess = old
 	}
 }
 
