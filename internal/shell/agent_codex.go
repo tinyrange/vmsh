@@ -421,7 +421,13 @@ func codexReleaseBinaryRelPath(releaseDir string) string {
 
 func isExecutable(file string) bool {
 	info, err := os.Stat(file)
-	return err == nil && !info.IsDir() && info.Mode().Perm()&0o111 != 0
+	if err != nil || info.IsDir() {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	return info.Mode().Perm()&0o111 != 0
 }
 
 func codexGuestBinaryPath(release codexHostRelease) string {

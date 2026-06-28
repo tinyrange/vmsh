@@ -1141,6 +1141,7 @@ func requireOutputLine(t *testing.T, text, want string) {
 
 func createMetadataCopyFixture(t *testing.T, src string) {
 	t.Helper()
+	requireHostSymlinkSupport(t)
 	fileMtime := time.Date(2024, 1, 2, 3, 4, 5, 0, time.Local)
 	mustWriteTestFile(t, filepath.Join(src, "script.sh"), "#!/bin/sh\necho hi\n")
 	mustWriteTestFile(t, filepath.Join(src, "nested", "file.txt"), "nested\n")
@@ -1171,7 +1172,8 @@ func assertCopiedMetadataTree(t *testing.T, src, dst string) {
 	if err != nil {
 		t.Fatalf("stat copied script: %v", err)
 	}
-	if got := info.Mode().Perm(); got != 0o755 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o755 {
+		got := info.Mode().Perm()
 		t.Fatalf("copied script mode = %#o, want 0755", got)
 	}
 	if got, want := info.ModTime().Unix(), mustStat(t, filepath.Join(src, "script.sh")).ModTime().Unix(); got != want {
