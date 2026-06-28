@@ -46,6 +46,10 @@ func MakeRaw(file *os.File) (func(), error) {
 	}, nil
 }
 
+func MakeAttachedRaw(file *os.File) (func(), error) {
+	return MakeRaw(file)
+}
+
 func InterruptRead(file *os.File) {
 	if file == nil {
 		return

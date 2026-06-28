@@ -1,0 +1,129 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-test:
+    name: Go tests (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-24.04
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+          - name: macos-amd64
+            runner: macos-15-intel
+          - name: macos-arm64
+            runner: macos-15
+          - name: windows-amd64
+            runner: windows-2025
+          - name: windows-arm64
+            runner: windows-11-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            cc/go.sum
+
+      - name: Run tests
+        if: runner.os != 'Windows'
+        run: go test -short ./... -count=1 -timeout 20m
+
+      - name: Run Windows tests
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages="$(go list ./... | grep -v 'github.com/tinyrange/vmsh/internal/shell$')"
+          go test -short ${packages} -count=1 -timeout 20m
+          go test -run '^$' ./internal/shell -count=1
+
+  build:
+    name: Build vmsh payload
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            cc/go.sum
+
+      - name: Build
+        run: ./tools/build.go build
+
+  kvm-integration:
+    name: KVM integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            cc/go.sum
+
+      - name: Enable KVM for the runner user
+        run: |
+          set -euo pipefail
+          test -e /dev/kvm
+          sudo chmod 666 /dev/kvm
+          test -r /dev/kvm -a -w /dev/kvm
+
+      - name: Cache runtime artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/ccx3
+            ~/.cache/vmsh
+          key: vmsh-runtime-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'cc/go.sum') }}
+          restore-keys: |
+            vmsh-runtime-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build vmsh and ccvm
+        run: ./tools/build.go build
+
+      - name: Run VM shell integration tests
+        env:
+          VMSH_TEST_CCVM: ${{ github.workspace }}/build/vmsh/ccvm
+          VMSH_TEST_VMSH: ${{ github.workspace }}/build/vmsh/vmsh
+          VMSH_TEST_VM_INTEGRATION: "1"
+          VMSH_TEST_FREEBSD: "1"
+          VMSH_VM_INTEGRATION_TIMEOUT_SECONDS: "180"
+        run: go test ./internal/shell -run 'TestVMIntegration(ScriptCommandsStartVMAndUseShellFeatures|FreeBSDBuiltinRunsCommandsAndCopiesFiles)$' -count=1 -timeout 4m

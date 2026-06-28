@@ -4,7 +4,16 @@
 
 `vmsh` must be run from an interactive terminal. Interactive sessions use the native `vmsh` line editor, persistent history stored in the `ccvm` cache directory, and autocomplete support for `@` builtins, cached image names, `vmsh` options, command names, and host paths.
 
+Release builds use a `ccprod` cache/daemon identity by default. Development
+builds use `ccdev`, so a checkout build can run alongside an installed release
+without sharing daemon state. Pass `-cache-dir` to use an explicit cache root.
+By default, a `vmsh` frontend owns its daemon session and the session is cleaned
+up when that frontend exits. Start with `-system-session` or run `@detach` to
+keep the session available after the current frontend closes.
+
 Guest commands receive a TTY, terminal dimensions, and terminal color environment. `vmsh` keeps command execution non-interactive and adds a small color prelude for common commands such as `ls`.
+
+Use `-record session.cast` to write asciinema v2 output. Use `-record-raw session.raw.jsonl` to write a lossless JSONL event stream with base64 terminal input/output bytes and resize events for rendering/debugging investigations.
 
 Interactive host and guest commands run through persistent shell sessions when possible, so shell state such as aliases, functions, `cd`, and exported variables can survive across commands. Commands that need full foreground terminal control fall back to a one-shot shell path.
 
@@ -24,9 +33,9 @@ python --version
 
 @node:22 npm test
 
-@alpine --vm scratch --memory 2g --cpus 4 sh -lc 'cat /etc/os-release'
+@scratch --from alpine --memory 2g --cpus 4 sh -lc 'cat /etc/os-release'
 
-@ --vm work --memory-mb 4096
+@work --from ubuntu --memory-mb 4096
 make -j4
 ```
 
@@ -47,10 +56,10 @@ Commands after a target are one-shot:
 @alpine uname -a
 ```
 
-Bare options update the current context:
+Named systems can be created from an image source:
 
 ```sh
-@ --vm work --cpus 8 --memory 12g
+@work --from ubuntu --cpus 8 --memory 12g
 ```
 
 Options followed by a command apply to that command:
@@ -59,7 +68,7 @@ Options followed by a command apply to that command:
 @ --cpus 2 pytest -q
 ```
 
-The host root is mounted writable into guest commands at `/host`, and the guest workdir defaults to the mirrored host cwd, such as `/host/Users/alice/project`. In host mode, `cd` changes the host directory. In VM mode, `cd /tmp` changes the guest workdir, while `cd /host/...` moves the host directory and returns guest commands to the mirrored host path.
+The host root is mounted writable into guest commands at `/host`, and the guest workdir defaults to the mirrored host cwd, such as `/host/Users/alice/project`. Linux guests use the fastest available host-share backend, while built-in BSD guests use vmsh/cc's NFS host-share path on supported hosts. In host mode, `cd` changes the host directory. In VM mode, `cd /tmp` changes the guest workdir, while `cd /host/...` moves the host directory and returns guest commands to the mirrored host path.
 
 `export NAME=value` is tracked by `vmsh` and applied to later host and guest commands.
 
@@ -70,6 +79,15 @@ sleep 10 &
 @jobs
 ```
 
+Aliases can include vmsh context prefixes and pipelines. Use `@alias expand`
+to inspect the exact expanded line without running it:
+
+```sh
+@alias deploy=@ssh prod make deploy
+@alias logs=@vm:app journalctl -f
+@alias expand deploy && logs | @host cat
+```
+
 ## Builtins
 
 These attention words are reserved:
@@ -78,11 +96,16 @@ These attention words are reserved:
 @help
 @host [command...]
 @jobs
+@sessions
+@detach
 @ps
 @status
-@start [--vm id]
-@stop [--vm id]
+@start
+@stop [name|vm:name|ssh:name]
 @forward <host-port:guest-port>
+@copy SRC DST
+@alias [name=value]
+@alias expand line
 ```
 
 `@host` with no command switches the current context to the host. `@host <command>` runs a one-shot host command.
@@ -92,7 +115,7 @@ These attention words are reserved:
 `vmsh` options are parsed before the command:
 
 ```sh
---vm <id>
+--from <source>
 --cwd <guest-path>
 --user <user>
 --sudo

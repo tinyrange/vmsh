@@ -9,7 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -22,9 +25,13 @@ import (
 
 const vmIntegrationTestImage = "vmsh-integration-alpine"
 
+// VMSH_TEST_VM_INTEGRATION enables the small VM smoke suite. Tests that boot
+// extra VMs, move large data, exercise interactive PTYs, or duplicate copy
+// matrix coverage also require VMSH_TEST_VM_INTEGRATION_LONG.
 var vmIntegrationCCVMBuild struct {
 	once     sync.Once
 	path     string
+	vmshPath string
 	buildDir string
 	err      error
 }
@@ -43,9 +50,8 @@ func TestVMIntegrationScriptCommandsStartVMAndUseShellFeatures(t *testing.T) {
 
 	mustWriteTestFile(t, filepath.Join(sh.hostCWD, "host-input.txt"), "from-host-copy\n")
 	script := strings.Join([]string{
-		"@" + env.image + " --vm script --memory 768 --cpus 1 --no-network",
+		"@script --from " + env.image + " --memory 768 --cpus 1 --no-network",
 		"printf 'guest-start:%s:%s\\n' \"$(uname -s)\" \"$(id -u)\"",
-		"@status",
 		"export VMSH_REALVM_EXPORT=from-vmsh",
 		"printf 'guest-env:%s\\n' \"$VMSH_REALVM_EXPORT\"",
 		"printf guest-host-file > vmsh-host-file.txt",
@@ -53,37 +59,36 @@ func TestVMIntegrationScriptCommandsStartVMAndUseShellFeatures(t *testing.T) {
 		"@copy @host:host-input.txt @host:host-copy.txt",
 		"cd /tmp",
 		"pwd",
-		"printf guest-cwd-file > vmsh-script.txt",
+		"printf 'guest-cwd-file\\n' > vmsh-script.txt",
 		"cat vmsh-script.txt",
 		"@host echo host-ok",
 		"@alias sayhost=@host echo alias-host-ok",
 		"sayhost",
-		"@" + env.image + " --vm script --no-network printf 'direct:%s\\n' \"$(cat /tmp/vmsh-script.txt)\"",
+		"@script --no-network printf 'direct:%s\\n' \"$(cat /tmp/vmsh-script.txt)\"",
 		"printf 'alpha\\nbeta\\n' | grep beta",
 		"@sudo sh -lc 'echo sudo:$(id -u)'",
-		"@jobs",
-		"@stop --vm script",
-		"@ps",
+		"@sudo",
+		"printf 'sudo-shell:%s\\n' \"$(id -u)\"",
+		"exit",
+		"printf 'after-sudo-shell:%s\\n' \"$(id -u)\"",
+		"@stop script",
 	}, "\n")
 
 	stdout, stderr, err := sh.runTestScript(script)
 	if err != nil {
 		t.Fatalf("run vmsh script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
-	requireContains(t, stdout, "context: vm")
-	requireContains(t, stdout, "image: "+env.image)
-	requireContains(t, stdout, "vm: script")
-	requireContains(t, stdout, "vm status: running")
-	requireContains(t, stdout, "guest-start:Linux:1000")
-	requireContains(t, stdout, "guest-env:from-vmsh")
-	requireContains(t, stdout, "/tmp")
-	requireContains(t, stdout, "guest-cwd-file")
-	requireContains(t, stdout, "host-ok")
-	requireContains(t, stdout, "alias-host-ok")
-	requireContains(t, stdout, "direct:guest-cwd-file")
-	requireContains(t, stdout, "beta")
-	requireContains(t, stdout, "sudo:0")
-	requireContains(t, stdout, "No jobs")
+	requireOutputLine(t, stdout, "guest-start:Linux:1000")
+	requireOutputLine(t, stdout, "guest-env:from-vmsh")
+	requireOutputLine(t, stdout, "/tmp")
+	requireOutputLine(t, stdout, "guest-cwd-file")
+	requireOutputLine(t, stdout, "host-ok")
+	requireOutputLine(t, stdout, "alias-host-ok")
+	requireOutputLine(t, stdout, "direct:guest-cwd-file")
+	requireOutputLine(t, stdout, "beta")
+	requireOutputLine(t, stdout, "sudo:0")
+	requireOutputLine(t, stdout, "sudo-shell:0")
+	requireOutputLine(t, stdout, "after-sudo-shell:1000")
 
 	copied, err := os.ReadFile(filepath.Join(sh.hostCWD, "guest-from-script.txt"))
 	if err != nil {
@@ -109,42 +114,408 @@ func TestVMIntegrationScriptCommandsStartVMAndUseShellFeatures(t *testing.T) {
 	}
 }
 
+func TestVMIntegrationFreeBSDBuiltinRunsCommandsAndCopiesFiles(t *testing.T) {
+	if os.Getenv("VMSH_TEST_FREEBSD") == "" {
+		t.Skip("set VMSH_TEST_FREEBSD=1 to run FreeBSD vmsh integration test")
+	}
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+	t.Cleanup(func() {
+		_ = env.api.ShutdownInstanceWithID("freebsd")
+	})
+
+	mustWriteTestFile(t, filepath.Join(sh.hostCWD, "host-input.txt"), "from-host\n")
+	script := strings.Join([]string{
+		"@freebsd --memory 1024 --cpus 1",
+		"printf 'guest:%s:%s\\n' \"$(uname -s)\" \"$(id -u)\"",
+		"pwd",
+		"printf 'root-workdir\\n' > root-workdir.txt",
+		"cat root-workdir.txt",
+		"@copy @host:host-input.txt @:/tmp/vmsh-freebsd-input.txt",
+		"cat /tmp/vmsh-freebsd-input.txt",
+		"printf freebsd-output > /tmp/vmsh-freebsd-output.txt",
+		"@copy @:/tmp/vmsh-freebsd-output.txt @host:guest-output.txt",
+		"@vm:freebsd printf 'direct:%s\\n' \"$(cat /tmp/vmsh-freebsd-input.txt)\"",
+		"@stop freebsd",
+	}, "\n")
+
+	stdout, stderr, err := sh.runTestScriptWithTimeout(script, vmIntegrationLongTimeout())
+	if err != nil {
+		t.Fatalf("run FreeBSD vmsh script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	requireOutputLine(t, stdout, "guest:FreeBSD:0")
+	requireOutputLine(t, stdout, "/host"+sh.hostCWD)
+	requireOutputLine(t, stdout, "root-workdir")
+	requireOutputLine(t, stdout, "from-host")
+	requireOutputLine(t, stdout, "direct:from-host")
+	copied, err := os.ReadFile(filepath.Join(sh.hostCWD, "guest-output.txt"))
+	if err != nil {
+		t.Fatalf("read copied FreeBSD file: %v", err)
+	}
+	if string(copied) != "freebsd-output" {
+		t.Fatalf("copied FreeBSD file = %q, want freebsd-output", string(copied))
+	}
+	state, err := env.api.InstanceStatusOf("freebsd")
+	if err != nil {
+		t.Fatalf("status after FreeBSD stop: %v", err)
+	}
+	if state.Status != "stopped" {
+		t.Fatalf("FreeBSD VM status after @stop = %q, want stopped", state.Status)
+	}
+}
+
+func TestVMIntegrationCopiesDirectoryMetadataHostToVMToHost(t *testing.T) {
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+	t.Cleanup(func() {
+		_ = env.api.ShutdownInstanceWithID("copy-meta")
+	})
+
+	src := filepath.Join(sh.hostCWD, "meta-src")
+	dst := filepath.Join(sh.hostCWD, "meta-back")
+	fileMtime := time.Date(2024, 1, 2, 3, 4, 5, 0, time.Local)
+	mustWriteTestFile(t, filepath.Join(src, "script.sh"), "#!/bin/sh\necho hi\n")
+	mustWriteTestFile(t, filepath.Join(src, "nested", "file.txt"), "nested\n")
+	if err := os.MkdirAll(filepath.Join(src, "empty"), 0o755); err != nil {
+		t.Fatalf("create empty dir: %v", err)
+	}
+	if err := os.Chmod(filepath.Join(src, "script.sh"), 0o755); err != nil {
+		t.Fatalf("chmod script: %v", err)
+	}
+	if err := os.Symlink("script.sh", filepath.Join(src, "script-link")); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
+	for _, path := range []string{
+		filepath.Join(src, "script.sh"),
+		filepath.Join(src, "nested", "file.txt"),
+		filepath.Join(src, "empty"),
+	} {
+		if err := os.Chtimes(path, fileMtime, fileMtime); err != nil {
+			t.Fatalf("set mtime %s: %v", path, err)
+		}
+	}
+
+	script := strings.Join([]string{
+		"@copy-meta --from " + env.image + " --memory 768 --cpus 1 --no-network",
+		"@copy @host:meta-src @vm:copy-meta:/tmp/vmsh-meta-vm",
+		"@vm:copy-meta test -x /tmp/vmsh-meta-vm/script.sh",
+		"@vm:copy-meta test -L /tmp/vmsh-meta-vm/script-link",
+		"@vm:copy-meta test \"$(readlink /tmp/vmsh-meta-vm/script-link)\" = script.sh",
+		"@copy @vm:copy-meta:/tmp/vmsh-meta-vm @host:meta-back",
+		"@stop copy-meta",
+	}, "\n")
+
+	stdout, stderr, err := sh.runTestScriptWithTimeout(script, 45*time.Second)
+	if err != nil {
+		t.Fatalf("run metadata copy script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	assertCopiedMetadataTree(t, src, dst)
+}
+
+func TestVMIntegrationCopiesLargeFileHostToVM(t *testing.T) {
+	requireLongVMIntegrationTest(t)
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+	t.Cleanup(func() {
+		_ = env.api.ShutdownInstanceWithID("copy-large")
+	})
+
+	const largeSize = 128 * 1024 * 1024
+	src := filepath.Join(sh.hostCWD, "large.bin")
+	file, err := os.Create(src)
+	if err != nil {
+		t.Fatalf("create large source: %v", err)
+	}
+	if err := file.Truncate(largeSize); err != nil {
+		_ = file.Close()
+		t.Fatalf("size large source: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close large source: %v", err)
+	}
+
+	script := strings.Join([]string{
+		"@copy-large --from " + env.image + " --memory 768 --cpus 1 --no-network",
+		"@copy @host:large.bin @vm:copy-large:/root/large.bin",
+		fmt.Sprintf("@vm:copy-large sh -lc 'test \"$(wc -c < /root/large.bin)\" = %d'", largeSize),
+		"@stop copy-large",
+	}, "\n")
+
+	stdout, stderr, err := sh.runTestScriptWithTimeout(script, 45*time.Second)
+	if err != nil {
+		t.Fatalf("run large copy script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+}
+
+func TestVMIntegrationCopiesDirectoryMetadataThroughIsolatedVM(t *testing.T) {
+	requireLongVMIntegrationTest(t)
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+	t.Cleanup(func() {
+		_ = env.api.ShutdownInstanceWithID("copy-iso-isolated")
+	})
+
+	src := filepath.Join(sh.hostCWD, "meta-src")
+	dst := filepath.Join(sh.hostCWD, "meta-back")
+	createMetadataCopyFixture(t, src)
+
+	script := strings.Join([]string{
+		"@copy-iso --from " + env.image + " --isolated --memory 768 --cpus 1 --no-network",
+		"@copy @host:meta-src @:/tmp/vmsh-meta-vm",
+		"test -x /tmp/vmsh-meta-vm/script.sh",
+		"test -d /tmp/vmsh-meta-vm/empty",
+		"test -L /tmp/vmsh-meta-vm/script-link",
+		"test \"$(readlink /tmp/vmsh-meta-vm/script-link)\" = script.sh",
+		"@copy @:/tmp/vmsh-meta-vm @host:meta-back",
+	}, "\n")
+
+	stdout, stderr, err := sh.runTestScriptWithTimeout(script, 60*time.Second)
+	if err != nil {
+		t.Fatalf("run isolated metadata copy script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	assertCopiedMetadataTree(t, src, dst)
+}
+
+func TestVMIntegrationCopiesDirectoryMetadataBetweenVMs(t *testing.T) {
+	requireLongVMIntegrationTest(t)
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+	t.Cleanup(func() {
+		_ = env.api.ShutdownInstanceWithID("copy-src")
+		_ = env.api.ShutdownInstanceWithID("copy-dst")
+	})
+
+	src := filepath.Join(sh.hostCWD, "meta-src")
+	dst := filepath.Join(sh.hostCWD, "meta-back")
+	createMetadataCopyFixture(t, src)
+
+	script := strings.Join([]string{
+		"@copy-src --from " + env.image + " --memory 768 --cpus 1 --no-network",
+		"@copy-dst --from " + env.image + " --memory 768 --cpus 1 --no-network",
+		"@copy @host:meta-src @vm:copy-src:/tmp/vmsh-meta-src",
+		"@copy @vm:copy-src:/tmp/vmsh-meta-src @vm:copy-dst:/tmp/vmsh-meta-dst",
+		"@vm:copy-dst test -x /tmp/vmsh-meta-dst/script.sh",
+		"@vm:copy-dst test -d /tmp/vmsh-meta-dst/empty",
+		"@vm:copy-dst test -L /tmp/vmsh-meta-dst/script-link",
+		"@vm:copy-dst test \"$(readlink /tmp/vmsh-meta-dst/script-link)\" = script.sh",
+		"@copy @vm:copy-dst:/tmp/vmsh-meta-dst @host:meta-back",
+		"@stop copy-src",
+		"@stop copy-dst",
+	}, "\n")
+
+	stdout, stderr, err := sh.runTestScriptWithTimeout(script, vmIntegrationLongTimeout())
+	if err != nil {
+		t.Fatalf("run VM-to-VM metadata copy script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	assertCopiedMetadataTree(t, src, dst)
+}
+
+func TestVMIntegrationCopiesWeirdFilenamesThroughVMAndIsolatedVM(t *testing.T) {
+	requireLongVMIntegrationTest(t)
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+	t.Cleanup(func() {
+		_ = env.api.ShutdownInstanceWithID("copy-weird")
+		_ = env.api.ShutdownInstanceWithID("copy-weird-iso-isolated")
+	})
+
+	src := filepath.Join(sh.hostCWD, "weird-src")
+	vmBack := filepath.Join(sh.hostCWD, "vm-back")
+	isoBack := filepath.Join(sh.hostCWD, "iso-back")
+	names := createWeirdNameCopyFixture(t, src)
+
+	script := strings.Join([]string{
+		"@copy-weird --from " + env.image + " --memory 768 --cpus 1 --no-network",
+		"@copy @host:weird-src @vm:copy-weird:/tmp/weird-vm",
+		"@copy @vm:copy-weird:/tmp/weird-vm @host:vm-back",
+		"@copy-weird-iso --from " + env.image + " --isolated --memory 768 --cpus 1 --no-network",
+		"@copy @host:weird-src @:/tmp/weird-iso",
+		"@copy @:/tmp/weird-iso @host:iso-back",
+	}, "\n")
+
+	stdout, stderr, err := sh.runTestScriptWithTimeout(script, 75*time.Second)
+	if err != nil {
+		t.Fatalf("run weird filename VM copy script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	assertWeirdNameCopyTree(t, vmBack, names)
+	assertWeirdNameCopyTree(t, isoBack, names)
+}
+
+func TestVMIntegrationPastedCopyDirectoryMetadataHostToVMToHost(t *testing.T) {
+	requireLongVMIntegrationTest(t)
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+	t.Cleanup(func() {
+		_ = env.api.ShutdownInstanceWithID("copy-paste")
+	})
+
+	root := t.TempDir()
+	src := filepath.Join(root, "meta-src")
+	dst := filepath.Join(root, "meta-back")
+	createMetadataCopyFixture(t, src)
+
+	paste := strings.Join([]string{
+		"@copy-paste --from " + env.image + " --memory 768 --cpus 1 --no-network",
+		"@copy @host:" + src + " @vm:copy-paste:/tmp/vmsh-meta-vm",
+		"@vm:copy-paste test -x /tmp/vmsh-meta-vm/script.sh",
+		"@vm:copy-paste test -L /tmp/vmsh-meta-vm/script-link",
+		"@vm:copy-paste test \"$(readlink /tmp/vmsh-meta-vm/script-link)\" = script.sh",
+		"@copy @vm:copy-paste:/tmp/vmsh-meta-vm @host:" + dst,
+		"@stop copy-paste",
+	}, "\n")
+
+	stdout, stderr, err := sh.runPastedLinesWithTimeout(paste, 45*time.Second)
+	if err != nil {
+		t.Fatalf("run pasted metadata copy: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	assertCopiedMetadataTree(t, src, dst)
+}
+
+func TestVMIntegrationInteractivePasteCopiesDirectoryMetadataHostToVMToHost(t *testing.T) {
+	requireLongVMIntegrationTest(t)
+	env := newVMIntegrationTestEnv(t)
+	t.Cleanup(func() {
+		_ = env.api.ShutdownInstanceWithID("copy-pty-paste")
+	})
+
+	vmsh := buildVMIntegrationVMSH(t)
+	hostCWD := t.TempDir()
+	src := filepath.Join(hostCWD, "meta-src")
+	dst := filepath.Join(hostCWD, "meta-back")
+	createMetadataCopyFixture(t, src)
+
+	session := startVMIntegrationPTY(t, vmsh, env.cacheDir, buildVMIntegrationCCVM(t), hostCWD)
+	defer session.close()
+	session.expect("\x1b[?2004h", 10*time.Second)
+
+	paste := strings.Join([]string{
+		"@copy-pty-paste --from " + env.image + " --memory 768 --cpus 1 --no-network",
+		"@copy @host:meta-src @vm:copy-pty-paste:/tmp/vmsh-meta-vm",
+		"@vm:copy-pty-paste test -x /tmp/vmsh-meta-vm/script.sh",
+		"@vm:copy-pty-paste test -L /tmp/vmsh-meta-vm/script-link",
+		"@vm:copy-pty-paste test \"$(readlink /tmp/vmsh-meta-vm/script-link)\" = script.sh",
+		"@copy @vm:copy-pty-paste:/tmp/vmsh-meta-vm @host:meta-back",
+		"@stop copy-pty-paste",
+		"@host echo VM_COPY_PASTE_DONE",
+	}, "\n")
+	session.write("\x1b[200~" + paste + "\x1b[201~")
+	session.expectOccurrences("VM_COPY_PASTE_DONE", 2, 60*time.Second)
+	waitForPath(t, filepath.Join(dst, "script.sh"), 60*time.Second, func() string {
+		return session.snapshot()
+	})
+
+	assertCopiedMetadataTree(t, src, dst)
+}
+
 func TestVMIntegrationManagesVMAndImages(t *testing.T) {
 	env := newVMIntegrationTestEnv(t)
 	sh := env.newShell(t)
 
 	savedImage := "vmsh-integration-saved"
 	script := strings.Join([]string{
-		"@" + env.image + " --vm manage --memory 768 --cpus 1 --no-network",
-		"@start --vm manage",
+		"@manage --from " + env.image + " --memory 768 --cpus 1 --no-network",
+		"@start",
 		"printf warm-root > /tmp/vmsh-manage.txt",
-		"@restart --vm manage",
+		"@restart manage",
 		"if test -e /tmp/vmsh-manage.txt; then printf 'restart-kept\\n'; else printf 'restart-cleared\\n'; fi",
-		"@save --vm manage " + savedImage,
+		"@save manage " + savedImage,
 		"@rmi " + savedImage,
-		"@stop --vm manage",
+		"@stop manage",
 	}, "\n")
 
 	stdout, stderr, err := sh.runTestScript(script)
 	if err != nil {
 		t.Fatalf("run vmsh management script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
-	requireContains(t, stdout, "restart-cleared")
-	requireContains(t, stdout, "Saved manage as "+savedImage)
-	requireContains(t, stdout, "Removed "+savedImage)
+	requireOutputLine(t, stdout, "restart-cleared")
 	if _, err := env.api.GetImage(savedImage); err == nil {
 		t.Fatalf("saved image %q still exists after @rmi", savedImage)
 	}
+}
+
+func TestVMIntegrationSavesLoadedVMFilesystemFiles(t *testing.T) {
+	requireLongVMIntegrationTest(t)
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+
+	savedImage := "vmsh-integration-loaded-save"
+	t.Cleanup(func() {
+		_ = env.api.DeleteImage(savedImage)
+	})
+
+	mustWriteTestFile(t, filepath.Join(sh.hostCWD, "seed", "root.txt"), "loaded-root\n")
+	mustWriteTestFile(t, filepath.Join(sh.hostCWD, "seed", "nested", "child.txt"), "loaded-child\n")
+	script := strings.Join([]string{
+		"@save-load --from " + env.image + " --memory 768 --cpus 1 --no-network",
+		"@copy @host:seed/root.txt @:~/loaded/root.txt",
+		"@copy @host:seed/nested/child.txt @:~/loaded/nested/child.txt",
+		"printf 'before-save:%s:%s\\n' \"$(cat ~/loaded/root.txt)\" \"$(cat ~/loaded/nested/child.txt)\"",
+		"@save save-load " + savedImage,
+		"@stop save-load",
+		"@saved-load --from " + savedImage + " --memory 768 --cpus 1 --no-network",
+		"printf 'after-save:%s:%s\\n' \"$(cat ~/loaded/root.txt)\" \"$(cat ~/loaded/nested/child.txt)\"",
+		"@rmi " + savedImage,
+		"@stop saved-load",
+	}, "\n")
+
+	stdout, stderr, err := sh.runTestScript(script)
+	if err != nil {
+		t.Fatalf("run vmsh save loaded filesystem script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	requireOutputLine(t, stdout, "before-save:loaded-root:loaded-child")
+	requireOutputLine(t, stdout, "after-save:loaded-root:loaded-child")
+	if _, err := env.api.GetImage(savedImage); err == nil {
+		t.Fatalf("saved image %q still exists after @rmi", savedImage)
+	}
+}
+
+func TestVMIntegrationSavesAfterPersistentTTYGuestShell(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("persistent TTY shell test requires a Unix PTY")
+	}
+	requireLongVMIntegrationTest(t)
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+
+	savedImage := "vmsh-integration-tty-save"
+	t.Cleanup(func() {
+		_ = env.api.DeleteImage(savedImage)
+	})
+
+	stdout, stderr, err := sh.runTestScript("@tty-save --from " + env.image + " --memory 768 --cpus 1 --no-network\n")
+	if err != nil {
+		t.Fatalf("select VM context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+
+	out, err := sh.evalOnTestPTY("mkdir -p ~/saved && printf tty-persist > ~/saved/value.txt")
+	if err != nil {
+		t.Fatalf("write persistent TTY shell file: %v\noutput:\n%s", err, out)
+	}
+
+	script := strings.Join([]string{
+		"@save tty-save " + savedImage,
+		"@stop tty-save",
+		"@tty-saved --from " + savedImage + " --memory 768 --cpus 1 --no-network",
+		"printf 'saved-tty:%s\\n' \"$(cat ~/saved/value.txt)\"",
+		"@rmi " + savedImage,
+		"@stop tty-saved",
+	}, "\n")
+	stdout, stderr, err = sh.runTestScript(script)
+	if err != nil {
+		t.Fatalf("run vmsh TTY save script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	requireOutputLine(t, stdout, "saved-tty:tty-persist")
 }
 
 func TestVMIntegrationPersistentTTYGuestShellState(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("persistent TTY shell test requires a Unix PTY")
 	}
+	requireLongVMIntegrationTest(t)
 	env := newVMIntegrationTestEnv(t)
 	sh := env.newShell(t)
 
-	stdout, stderr, err := sh.runTestScript("@" + env.image + " --vm tty --memory 768 --cpus 1 --no-network\n")
+	stdout, stderr, err := sh.runTestScript("@tty --from " + env.image + " --memory 768 --cpus 1 --no-network\n")
 	if err != nil {
 		t.Fatalf("select VM context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
@@ -164,13 +535,13 @@ func TestVMIntegrationPersistentTTYGuestShellState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run persisted alias: %v\noutput:\n%s", err, out)
 	}
-	requireContains(t, out, "alias:warm")
+	requireOutputLine(t, out, "alias:warm")
 
 	out, err = sh.evalOnTestPTY("vm_func")
 	if err != nil {
 		t.Fatalf("run persisted function: %v\noutput:\n%s", err, out)
 	}
-	requireContains(t, out, "func:warm:/tmp")
+	requireOutputLine(t, out, "func:warm:/tmp")
 	if sh.context.CWD != "/tmp" {
 		t.Fatalf("guest context cwd = %q, want /tmp", sh.context.CWD)
 	}
@@ -180,25 +551,106 @@ func TestVMIntegrationPersistentTTYGuestShellState(t *testing.T) {
 	}
 }
 
+func TestVMIntegrationPersistentTTYSudoSubshell(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("persistent TTY shell test requires a Unix PTY")
+	}
+	requireLongVMIntegrationTest(t)
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+
+	stdout, stderr, err := sh.runTestScript("@sudo-tty --from " + env.image + " --memory 768 --cpus 1 --no-network\n")
+	if err != nil {
+		t.Fatalf("select VM context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+
+	out, err := sh.evalOnTestPTY("id -u")
+	if err != nil {
+		t.Fatalf("run id before sudo subshell: %v\noutput:\n%s", err, out)
+	}
+	requireOutputLine(t, out, "1000")
+
+	out, err = sh.evalOnTestPTY("@sudo")
+	if err != nil {
+		t.Fatalf("enter sudo subshell: %v\noutput:\n%s", err, out)
+	}
+	if sh.context.User != "root" {
+		t.Fatalf("sudo context user = %q, want root", sh.context.User)
+	}
+
+	out, err = sh.evalOnTestPTY("id -u")
+	if err != nil {
+		t.Fatalf("run id in sudo subshell: %v\noutput:\n%s", err, out)
+	}
+	requireOutputLine(t, out, "0")
+
+	out, err = sh.evalOnTestPTY("exit")
+	if err != nil {
+		t.Fatalf("exit sudo subshell: %v\noutput:\n%s", err, out)
+	}
+	if sh.context.User == "root" {
+		t.Fatalf("sudo context did not restore: %+v", sh.context)
+	}
+
+	out, err = sh.evalOnTestPTY("id -u")
+	if err != nil {
+		t.Fatalf("run id after sudo subshell: %v\noutput:\n%s", err, out)
+	}
+	requireOutputLine(t, out, "1000")
+
+	if err := sh.stopVM("sudo-tty"); err != nil {
+		t.Fatalf("stop sudo-tty VM: %v", err)
+	}
+}
+
 type vmIntegrationTestEnv struct {
 	api      *client.Client
 	cacheDir string
 	image    string
 }
 
+type vmIntegrationPTY struct {
+	t      *testing.T
+	cmd    *exec.Cmd
+	master *os.File
+	done   chan error
+	mu     sync.Mutex
+	output bytes.Buffer
+}
+
 func newVMIntegrationTestEnv(t *testing.T) *vmIntegrationTestEnv {
 	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping VM integration test in short mode")
+	}
+	if strings.TrimSpace(os.Getenv("VMSH_TEST_VM_INTEGRATION")) == "" {
+		t.Skip("set VMSH_TEST_VM_INTEGRATION=1 to run VM integration tests")
+	}
 	skipUnsupportedVMIntegrationPlatform(t)
+	bootTimeout := vmIntegrationTimeoutSeconds()
+	t.Setenv("CCX3_VM_BOOT_TIMEOUT", bootTimeout)
+	t.Setenv("VMSH_VM_BOOT_TIMEOUT", bootTimeout)
 
-	cacheDir := filepath.Join(t.TempDir(), "cache")
+	cacheBase := os.TempDir()
+	if runtime.GOOS == "darwin" {
+		cacheBase = "/tmp"
+	}
+	cacheParent, err := os.MkdirTemp(cacheBase, "vmsh-it-*")
+	if err != nil {
+		t.Fatalf("create VM integration cache dir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(cacheParent)
+	})
+	cacheDir := filepath.Join(cacheParent, "cache")
 	statePath := filepath.Join(cacheDir, "ccvm.json")
 	ccvm := buildVMIntegrationCCVM(t)
 	api, err := backend.ConnectCCVM(backend.CCVMLaunch{
 		Path: ccvm,
 		Env: []string{
 			"CCX3_OCI_SHARED_CACHE_DIR=" + filepath.Join(cacheDir, "oci-shared"),
-			"CCX3_VM_BOOT_TIMEOUT=" + vmIntegrationTimeoutSeconds(),
-			"VMSH_VM_BOOT_TIMEOUT=" + vmIntegrationTimeoutSeconds(),
+			"CCX3_VM_BOOT_TIMEOUT=" + bootTimeout,
+			"VMSH_VM_BOOT_TIMEOUT=" + bootTimeout,
 		},
 	}, cacheDir, statePath)
 	if err != nil {
@@ -235,6 +687,13 @@ func newVMIntegrationTestEnv(t *testing.T) *vmIntegrationTestEnv {
 	}
 }
 
+func requireLongVMIntegrationTest(t *testing.T) {
+	t.Helper()
+	if strings.TrimSpace(os.Getenv("VMSH_TEST_VM_INTEGRATION_LONG")) == "" {
+		t.Skip("set VMSH_TEST_VM_INTEGRATION_LONG=1 to run long VM integration tests")
+	}
+}
+
 func (e *vmIntegrationTestEnv) newShell(t *testing.T) *shellState {
 	t.Helper()
 	caps, err := e.api.Capabilities()
@@ -263,7 +722,7 @@ func (e *vmIntegrationTestEnv) newShell(t *testing.T) *shellState {
 	sh.completion = newVMSHCompleter(sh)
 	t.Cleanup(sh.closeSessions)
 	t.Cleanup(func() {
-		for _, id := range []string{"default", "script", "manage", "tty"} {
+		for _, id := range []string{"default", "script", "freebsd", "manage", "save-load", "saved-load", "tty-save", "tty-saved", "tty", "sudo-tty"} {
 			_ = e.api.ShutdownInstanceWithID(id)
 		}
 	})
@@ -274,6 +733,65 @@ func (s *shellState) runTestScript(script string) (string, string, error) {
 	var stdout, stderr bytes.Buffer
 	err := s.evalScriptLines(strings.NewReader(script), &stdout, &stderr)
 	return stdout.String(), stderr.String(), err
+}
+
+func (s *shellState) runTestScriptWithTimeout(script string, timeout time.Duration) (string, string, error) {
+	type result struct {
+		stdout string
+		stderr string
+		err    error
+	}
+	ch := make(chan result, 1)
+	var stdout, stderr lockedBuffer
+	go func() {
+		err := s.evalScriptLines(strings.NewReader(script), &stdout, &stderr)
+		ch <- result{stdout: stdout.String(), stderr: stderr.String(), err: err}
+	}()
+	select {
+	case res := <-ch:
+		return res.stdout, res.stderr, res.err
+	case <-time.After(timeout):
+		s.closeSessions()
+		return stdout.String(), stderr.String(), fmt.Errorf("script timed out after %s", timeout)
+	}
+}
+
+func (s *shellState) runPastedLinesWithTimeout(paste string, timeout time.Duration) (string, string, error) {
+	type result struct {
+		stdout string
+		stderr string
+		err    error
+	}
+	ch := make(chan result, 1)
+	var stdout, stderr lockedBuffer
+	go func() {
+		err := s.evalPastedLines(paste, &stdout, &stderr)
+		ch <- result{stdout: stdout.String(), stderr: stderr.String(), err: err}
+	}()
+	select {
+	case res := <-ch:
+		return res.stdout, res.stderr, res.err
+	case <-time.After(timeout):
+		s.closeSessions()
+		return stdout.String(), stderr.String(), fmt.Errorf("pasted script timed out after %s", timeout)
+	}
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func (s *shellState) evalOnTestPTY(line string) (string, error) {
@@ -433,6 +951,126 @@ func copyVMIntegrationFile(src, dst string) error {
 	return os.WriteFile(dst, data, 0o644)
 }
 
+func buildVMIntegrationVMSH(t *testing.T) string {
+	t.Helper()
+	if vmsh := strings.TrimSpace(os.Getenv("VMSH_TEST_VMSH")); vmsh != "" {
+		return vmsh
+	}
+	_ = buildVMIntegrationCCVM(t)
+	vmIntegrationCCVMBuild.once.Do(func() {})
+	if vmIntegrationCCVMBuild.err != nil {
+		t.Fatalf("build ccvm for VM integration tests: %v", vmIntegrationCCVMBuild.err)
+	}
+	if vmIntegrationCCVMBuild.vmshPath != "" {
+		return vmIntegrationCCVMBuild.vmshPath
+	}
+	root := vmIntegrationRepoRoot(t)
+	buildDir := vmIntegrationCCVMBuild.buildDir
+	if buildDir == "" {
+		var err error
+		buildDir, err = os.MkdirTemp("", "vmsh-integration-build-*")
+		if err != nil {
+			t.Fatalf("create vmsh integration build dir: %v", err)
+		}
+		vmIntegrationCCVMBuild.buildDir = buildDir
+	}
+	out := filepath.Join(buildDir, backend.HostExecutableName("vmsh"))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "build", "-o", out, "./cmd/vmsh")
+	cmd.Dir = root
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("go build vmsh: %v\n%s", err, output.String())
+	}
+	vmIntegrationCCVMBuild.vmshPath = out
+	return out
+}
+
+func startVMIntegrationPTY(t *testing.T, vmsh, cacheDir, ccvm, cwd string) *vmIntegrationPTY {
+	t.Helper()
+	cmd := exec.Command(vmsh, "-ccvm", ccvm, "-cache-dir", cacheDir)
+	cmd.Dir = cwd
+	cmd.Env = append(os.Environ(),
+		"TERM=xterm-256color",
+		"CCX3_VM_BOOT_TIMEOUT="+vmIntegrationTimeoutSeconds(),
+		"VMSH_VM_BOOT_TIMEOUT="+vmIntegrationTimeoutSeconds(),
+	)
+	master, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 30, Cols: 120})
+	if err != nil {
+		t.Fatalf("start vmsh pty: %v", err)
+	}
+	s := &vmIntegrationPTY{
+		t:      t,
+		cmd:    cmd,
+		master: master,
+		done:   make(chan error, 1),
+	}
+	go func() {
+		var buf [4096]byte
+		for {
+			n, err := master.Read(buf[:])
+			if n > 0 {
+				s.mu.Lock()
+				_, _ = s.output.Write(buf[:n])
+				s.mu.Unlock()
+			}
+			if err != nil {
+				break
+			}
+		}
+		s.done <- cmd.Wait()
+	}()
+	return s
+}
+
+func (s *vmIntegrationPTY) write(text string) {
+	s.t.Helper()
+	if _, err := io.WriteString(s.master, text); err != nil {
+		s.t.Fatalf("write to vmsh pty: %v\noutput:\n%s", err, s.snapshot())
+	}
+}
+
+func (s *vmIntegrationPTY) expect(want string, timeout time.Duration) {
+	s.t.Helper()
+	s.expectOccurrences(want, 1, timeout)
+}
+
+func (s *vmIntegrationPTY) expectOccurrences(want string, count int, timeout time.Duration) {
+	s.t.Helper()
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if strings.Count(s.snapshot(), want) >= count {
+			return
+		}
+		select {
+		case err := <-s.done:
+			s.t.Fatalf("vmsh exited before %d occurrences of %q: %v\noutput:\n%s", count, want, err, s.snapshot())
+		case <-ticker.C:
+			if time.Now().After(deadline) {
+				s.t.Fatalf("timed out waiting for %d occurrences of %q\noutput:\n%s", count, want, s.snapshot())
+			}
+		}
+	}
+}
+
+func (s *vmIntegrationPTY) close() {
+	_ = s.master.Close()
+	if s.cmd != nil && s.cmd.Process != nil {
+		_ = s.cmd.Process.Kill()
+	}
+}
+
+func (s *vmIntegrationPTY) snapshot() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.ReplaceAll(s.output.String(), "\r\n", "\n")
+}
+
 func vmIntegrationRepoRoot(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
@@ -459,11 +1097,23 @@ func vmIntegrationTimeoutSeconds() string {
 	return "180"
 }
 
+func vmIntegrationLongTimeout() time.Duration {
+	if value := strings.TrimSpace(os.Getenv("VMSH_VM_INTEGRATION_TIMEOUT_SECONDS")); value != "" {
+		seconds, err := strconv.Atoi(value)
+		if err == nil && seconds > 0 {
+			return time.Duration(seconds) * time.Second
+		}
+	}
+	return 6 * time.Minute
+}
+
 func isPTYClosedError(err error) bool {
 	if err == nil || errors.Is(err, os.ErrClosed) {
 		return true
 	}
 	text := strings.ToLower(err.Error())
+	// PTY close errors come from OS/runtime boundaries and are not exposed as
+	// portable typed errors, so flexible matching is the useful assertion here.
 	return strings.Contains(text, "input/output error") ||
 		strings.Contains(text, "file already closed") ||
 		strings.Contains(text, "bad file descriptor")
@@ -479,9 +1129,150 @@ func mustWriteTestFile(t *testing.T, path, contents string) {
 	}
 }
 
-func requireContains(t *testing.T, text, want string) {
+func requireOutputLine(t *testing.T, text, want string) {
 	t.Helper()
-	if !strings.Contains(text, want) {
-		t.Fatalf("output does not contain %q\noutput:\n%s", want, text)
+	for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+		if line == want {
+			return
+		}
 	}
+	t.Fatalf("output missing line %q\noutput:\n%s", want, text)
+}
+
+func createMetadataCopyFixture(t *testing.T, src string) {
+	t.Helper()
+	fileMtime := time.Date(2024, 1, 2, 3, 4, 5, 0, time.Local)
+	mustWriteTestFile(t, filepath.Join(src, "script.sh"), "#!/bin/sh\necho hi\n")
+	mustWriteTestFile(t, filepath.Join(src, "nested", "file.txt"), "nested\n")
+	if err := os.MkdirAll(filepath.Join(src, "empty"), 0o755); err != nil {
+		t.Fatalf("create empty dir: %v", err)
+	}
+	if err := os.Chmod(filepath.Join(src, "script.sh"), 0o755); err != nil {
+		t.Fatalf("chmod script: %v", err)
+	}
+	if err := os.Symlink("script.sh", filepath.Join(src, "script-link")); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
+	for _, path := range []string{
+		filepath.Join(src, "script.sh"),
+		filepath.Join(src, "nested", "file.txt"),
+		filepath.Join(src, "empty"),
+	} {
+		if err := os.Chtimes(path, fileMtime, fileMtime); err != nil {
+			t.Fatalf("set mtime %s: %v", path, err)
+		}
+	}
+}
+
+func assertCopiedMetadataTree(t *testing.T, src, dst string) {
+	t.Helper()
+	script := filepath.Join(dst, "script.sh")
+	info, err := os.Stat(script)
+	if err != nil {
+		t.Fatalf("stat copied script: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("copied script mode = %#o, want 0755", got)
+	}
+	if got, want := info.ModTime().Unix(), mustStat(t, filepath.Join(src, "script.sh")).ModTime().Unix(); got != want {
+		t.Fatalf("copied script mtime = %d, want %d", got, want)
+	}
+	linkInfo, err := os.Lstat(filepath.Join(dst, "script-link"))
+	if err != nil {
+		t.Fatalf("lstat copied symlink: %v", err)
+	}
+	if linkInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("copied link mode = %s, want symlink", linkInfo.Mode())
+	}
+	if target, err := os.Readlink(filepath.Join(dst, "script-link")); err != nil || target != "script.sh" {
+		t.Fatalf("copied symlink target = %q err=%v, want script.sh", target, err)
+	}
+	nested := filepath.Join(dst, "nested", "file.txt")
+	if got, err := os.ReadFile(nested); err != nil || string(got) != "nested\n" {
+		t.Fatalf("copied nested file = %q err=%v, want nested", string(got), err)
+	}
+	if got, want := mustStat(t, nested).ModTime().Unix(), mustStat(t, filepath.Join(src, "nested", "file.txt")).ModTime().Unix(); got != want {
+		t.Fatalf("copied nested mtime = %d, want %d", got, want)
+	}
+	if info, err := os.Stat(filepath.Join(dst, "empty")); err != nil || !info.IsDir() {
+		t.Fatalf("copied empty dir info = %v err=%v, want directory", info, err)
+	}
+}
+
+func waitForPath(t *testing.T, path string, timeout time.Duration, debug func() string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			msg := ""
+			if debug != nil {
+				msg = "\noutput:\n" + debug()
+			}
+			t.Fatalf("timed out waiting for %s%s", path, msg)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func createWeirdNameCopyFixture(t *testing.T, src string) []string {
+	t.Helper()
+	names := []string{
+		"two words.txt",
+		"quote'file",
+		"dash - file",
+		"-leading",
+	}
+	if runtime.GOOS != "windows" {
+		names = append(names, "colon:file", "line\nbreak")
+	}
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatalf("create weird source dir: %v", err)
+	}
+	for _, name := range names {
+		payload := "payload:" + name + "\n"
+		if err := os.WriteFile(filepath.Join(src, name), []byte(payload), 0o644); err != nil {
+			t.Fatalf("write weird file %q: %v", name, err)
+		}
+	}
+	return names
+}
+
+func assertWeirdNameCopyTree(t *testing.T, dst string, names []string) {
+	t.Helper()
+	entries, err := os.ReadDir(dst)
+	if err != nil {
+		t.Fatalf("read weird copy dir %s: %v", dst, err)
+	}
+	gotNames := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		gotNames = append(gotNames, entry.Name())
+	}
+	sort.Strings(gotNames)
+	wantNames := append([]string(nil), names...)
+	sort.Strings(wantNames)
+	if !reflect.DeepEqual(gotNames, wantNames) {
+		t.Fatalf("copied weird names = %#v, want %#v", gotNames, wantNames)
+	}
+	for _, name := range names {
+		path := filepath.Join(dst, name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read weird copied file %q: %v", name, err)
+		}
+		if want := "payload:" + name + "\n"; string(data) != want {
+			t.Fatalf("weird copied file %q = %q, want %q", name, string(data), want)
+		}
+	}
+}
+
+func mustStat(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return info
 }
