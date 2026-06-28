@@ -372,15 +372,46 @@ func TestDaemonDisplayNameUsesStructuredKind(t *testing.T) {
 	}
 }
 
-func TestStartVMSHDSessionCreatesAttachesAndDetaches(t *testing.T) {
+func TestStartVMSHDSessionCreatesFrontendSessionAndClosesFrontend(t *testing.T) {
 	var calls []string
 	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/frontends", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("frontend Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var req vmshd.RegisterFrontendRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode frontend request: %v", err)
+		}
+		if req.Name != "vmsh" {
+			t.Fatalf("frontend request = %+v", req)
+		}
+		calls = append(calls, "frontend")
+		writeJSONForShellTest(w, vmshd.FrontendSummary{ID: "fe_1", Name: "vmsh", State: "open"})
+	})
+	mux.HandleFunc("/vmsh/frontends/fe_1", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("close frontend Authorization = %q", r.Header.Get("Authorization"))
+		}
+		if r.Method != http.MethodDelete {
+			t.Fatalf("close frontend method = %s", r.Method)
+		}
+		calls = append(calls, "close_frontend")
+		writeJSONForShellTest(w, vmshd.FrontendSummary{ID: "fe_1", Name: "vmsh", State: "closed"})
+	})
 	mux.HandleFunc("/vmsh/sessions", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer secret" {
 			t.Fatalf("create Authorization = %q", r.Header.Get("Authorization"))
 		}
+		var req vmshd.CreateSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode create request: %v", err)
+		}
+		if req.Name != "main" || req.FrontendID != "fe_1" || req.Scope != "frontend" {
+			t.Fatalf("create request = %+v", req)
+		}
 		calls = append(calls, "create")
-		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "detached"})
+		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "detached", Scope: "frontend", FrontendID: "fe_1"})
 	})
 	mux.HandleFunc("/vmsh/sessions/sess_1", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPatch {
@@ -410,7 +441,7 @@ func TestStartVMSHDSessionCreatesAttachesAndDetaches(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode attach request: %v", err)
 		}
-		if req.Mode != "interactive" {
+		if req.FrontendID != "fe_1" || req.Mode != "interactive" {
 			t.Fatalf("attach request = %+v", req)
 		}
 		calls = append(calls, "attach")
@@ -418,20 +449,6 @@ func TestStartVMSHDSessionCreatesAttachesAndDetaches(t *testing.T) {
 			Session:    vmshd.Session{ID: "sess_1", Name: "main", State: "attached"},
 			Attachment: vmshd.ClientAttachment{ID: "attach_1", Mode: "interactive"},
 		})
-	})
-	mux.HandleFunc("/vmsh/sessions/sess_1/detach", func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer secret" {
-			t.Fatalf("detach Authorization = %q", r.Header.Get("Authorization"))
-		}
-		var req vmshd.DetachSessionRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode detach request: %v", err)
-		}
-		if req.AttachmentID != "attach_1" {
-			t.Fatalf("detach request = %+v", req)
-		}
-		calls = append(calls, "detach")
-		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "detached"})
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -444,7 +461,7 @@ func TestStartVMSHDSessionCreatesAttachesAndDetaches(t *testing.T) {
 		Kind:      vmshd.Kind,
 		Addr:      strings.TrimPrefix(srv.URL, "http://"),
 		TokenPath: tokenPath,
-	}, nil, vmshdSessionMetadata("/work", commandContext{Mode: modeVM, VMID: "dev", Image: "debian", Isolated: true}), commandContext{Mode: modeVM, VMID: "dev", Image: "debian", Isolated: true})
+	}, nil, vmshdSessionMetadata("/work", commandContext{Mode: modeVM, VMID: "dev", Image: "debian", Isolated: true}), commandContext{Mode: modeVM, VMID: "dev", Image: "debian", Isolated: true}, false)
 	if err != nil {
 		t.Fatalf("start vmshd session: %v", err)
 	}
@@ -452,8 +469,80 @@ func TestStartVMSHDSessionCreatesAttachesAndDetaches(t *testing.T) {
 		t.Fatalf("reporter = %+v", reporter)
 	}
 	stop()
-	if !reflect.DeepEqual(calls, []string{"create", "metadata", "attach", "detach"}) {
+	if !reflect.DeepEqual(calls, []string{"frontend", "create", "metadata", "attach", "close_frontend"}) {
 		t.Fatalf("calls = %q", calls)
+	}
+}
+
+func TestVMSHDDetachCommandPersistsCurrentSession(t *testing.T) {
+	persisted := make(chan vmshd.PersistSessionRequest, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/sessions/sess_1/persist", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s", r.Method)
+		}
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var req vmshd.PersistSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode persist request: %v", err)
+		}
+		persisted <- req
+		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "attached", Scope: "system", DetachOnClose: true})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.vmshd = &vmshdSessionReporter{client: httpClient, sessionID: "sess_1"}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@detach", &stdout, &stderr); err != nil {
+		t.Fatalf("@detach: %v", err)
+	}
+	select {
+	case req := <-persisted:
+		if req.Scope != "system" {
+			t.Fatalf("persist request = %+v", req)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for persist request")
+	}
+	if !sh.vmshd.detached {
+		t.Fatal("reporter was not marked detached")
+	}
+	if stdout.Len() == 0 {
+		t.Fatal("@detach wrote no output")
+	}
+}
+
+func TestVMSHDCommandsDegradeWithoutDaemonSession(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+
+	for _, command := range []string{"@sessions", "@detach"} {
+		t.Run(command, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if err := sh.eval(command, &stdout, &stderr); err != nil {
+				t.Fatalf("%s returned error: %v", command, err)
+			}
+			if stdout.Len() == 0 {
+				t.Fatalf("%s wrote no degraded status", command)
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("%s stderr = %q", command, stderr.String())
+			}
+		})
 	}
 }
 
@@ -613,6 +702,7 @@ func TestVMSHDSessionRowsExposeStructuredResourceCounts(t *testing.T) {
 		ID:          "sess_1",
 		Name:        "main",
 		State:       "attached",
+		Scope:       "",
 		Context:     "vm:dev",
 		Attachments: 1,
 		Jobs:        2,
