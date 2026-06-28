@@ -1172,7 +1172,8 @@ func assertCopiedMetadataTree(t *testing.T, src, dst string) {
 	if err != nil {
 		t.Fatalf("stat copied script: %v", err)
 	}
-	if got := info.Mode().Perm(); got != 0o755 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o755 {
+		got := info.Mode().Perm()
 		t.Fatalf("copied script mode = %#o, want 0755", got)
 	}
 	if got, want := info.ModTime().Unix(), mustStat(t, filepath.Join(src, "script.sh")).ModTime().Unix(); got != want {

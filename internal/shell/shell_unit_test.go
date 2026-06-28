@@ -105,7 +105,7 @@ func TestShellCommandPassingBuildsGuestRunRequests(t *testing.T) {
 func TestPromptPullConfirmationCtrlCDeclines(t *testing.T) {
 	master, slave, err := pty.Open()
 	if err != nil {
-		t.Fatal(err)
+		t.Skipf("PTY unavailable: %v", err)
 	}
 	defer master.Close()
 	defer slave.Close()
@@ -161,6 +161,9 @@ func TestHostCommandEnvMarksNestedShellAsActive(t *testing.T) {
 }
 
 func TestRunHostMarksScriptModeNestedShellAsActive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host command fixture uses POSIX shell syntax")
+	}
 	api := newRecordingShellAPI("alpine", "alpine@amd64")
 	sh := newUnitShell(t, api)
 
@@ -2542,7 +2545,7 @@ func TestPrepareCodexAgentHomeSeedsOnlySafeCodexData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read standalone symlink: %v", err)
 	}
-	if link != codexGuestStandaloneMount {
+	if filepath.ToSlash(link) != codexGuestStandaloneMount {
 		t.Fatalf("standalone symlink = %q, want %q", link, codexGuestStandaloneMount)
 	}
 }
@@ -6800,7 +6803,8 @@ func TestHostCopyPreservesMetadataAndSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat copied script: %v", err)
 	}
-	if got := info.Mode().Perm(); got != 0o755 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o755 {
+		got := info.Mode().Perm()
 		t.Fatalf("copied script mode = %#o, want 0755", got)
 	}
 	if got := info.ModTime().Unix(); got != fileMtime.Unix() {
