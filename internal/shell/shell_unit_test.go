@@ -4910,7 +4910,7 @@ func TestGuestPipelineStreamsLargeInputInChunks(t *testing.T) {
 
 func TestAsciinemaRecorderWritesV2OutputEvents(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.cast")
-	rec, err := newAsciinemaRecorder(path, 120, 40)
+	rec, err := newAsciinemaRecorder(path, "", 120, 40)
 	if err != nil {
 		t.Fatalf("create recorder: %v", err)
 	}
@@ -4956,7 +4956,7 @@ func TestAsciinemaRecorderWritesV2OutputEvents(t *testing.T) {
 
 func TestAsciinemaRecorderWritesInputEvents(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.cast")
-	rec, err := newAsciinemaRecorder(path, 80, 24)
+	rec, err := newAsciinemaRecorder(path, "", 80, 24)
 	if err != nil {
 		t.Fatalf("create recorder: %v", err)
 	}
@@ -4978,6 +4978,119 @@ func TestAsciinemaRecorderWritesInputEvents(t *testing.T) {
 	}
 	if len(event) != 3 || event[1] != "i" || event[2] != "\x1b[6;10R" {
 		t.Fatalf("event = %#v", event)
+	}
+}
+
+func TestRawSessionRecorderPreservesBytesAndResizeEvents(t *testing.T) {
+	dir := t.TempDir()
+	castPath := filepath.Join(dir, "session.cast")
+	rawPath := filepath.Join(dir, "session.raw.jsonl")
+	rec, err := newAsciinemaRecorder(castPath, rawPath, 80, 24)
+	if err != nil {
+		t.Fatalf("create recorder: %v", err)
+	}
+	terminalOut, err := os.Create(filepath.Join(dir, "terminal.out"))
+	if err != nil {
+		t.Fatalf("create terminal output: %v", err)
+	}
+	defer terminalOut.Close()
+
+	writer := newRecordingTerminalWriter(terminalOut, rec)
+	outputBytes := []byte{'o', 0xff, 0x00, '\x1b', '[', 'm'}
+	inputBytes := []byte{'i', 0xfe, 0x03}
+	if _, err := writer.Write(outputBytes); err != nil {
+		t.Fatalf("write recorded output: %v", err)
+	}
+	rec.recordInput(inputBytes)
+	rec.recordResize(132, 43)
+	if err := rec.Close(); err != nil {
+		t.Fatalf("close recorder: %v", err)
+	}
+
+	lines := readJSONLines(t, rawPath)
+	if len(lines) != 4 {
+		t.Fatalf("raw lines = %d, want 4: %#v", len(lines), lines)
+	}
+	if lines[0]["kind"] != "vmsh.raw_session" || lines[0]["version"] != float64(1) || lines[0]["cols"] != float64(80) || lines[0]["rows"] != float64(24) {
+		t.Fatalf("raw header = %#v", lines[0])
+	}
+	assertRawByteEvent(t, lines[1], "output", outputBytes)
+	assertRawByteEvent(t, lines[2], "input", inputBytes)
+	if lines[3]["kind"] != "resize" || lines[3]["cols"] != float64(132) || lines[3]["rows"] != float64(43) {
+		t.Fatalf("resize event = %#v", lines[3])
+	}
+
+	castData, err := os.ReadFile(castPath)
+	if err != nil {
+		t.Fatalf("read cast: %v", err)
+	}
+	castLines := strings.Split(strings.TrimSpace(string(castData)), "\n")
+	if len(castLines) != 3 {
+		t.Fatalf("cast lines = %d, want 3: %s", len(castLines), string(castData))
+	}
+	var castHeader struct {
+		Version int `json:"version"`
+		Width   int `json:"width"`
+		Height  int `json:"height"`
+	}
+	if err := json.Unmarshal([]byte(castLines[0]), &castHeader); err != nil {
+		t.Fatalf("parse cast header: %v", err)
+	}
+	if castHeader.Version != 2 || castHeader.Width != 80 || castHeader.Height != 24 {
+		t.Fatalf("cast header = %+v", castHeader)
+	}
+}
+
+func TestRawSessionRecorderCanRunWithoutAsciinemaFile(t *testing.T) {
+	rawPath := filepath.Join(t.TempDir(), "session.raw.jsonl")
+	rec, err := newAsciinemaRecorder("", rawPath, 100, 30)
+	if err != nil {
+		t.Fatalf("create raw recorder: %v", err)
+	}
+	rec.recordOutput([]byte{0xff, 'x'})
+	if err := rec.Close(); err != nil {
+		t.Fatalf("close recorder: %v", err)
+	}
+
+	lines := readJSONLines(t, rawPath)
+	if len(lines) != 2 {
+		t.Fatalf("raw lines = %d, want 2: %#v", len(lines), lines)
+	}
+	assertRawByteEvent(t, lines[1], "output", []byte{0xff, 'x'})
+}
+
+func readJSONLines(t *testing.T, path string) []map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var out []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var value map[string]any
+		if err := json.Unmarshal([]byte(line), &value); err != nil {
+			t.Fatalf("parse JSON line %q: %v", line, err)
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
+func assertRawByteEvent(t *testing.T, event map[string]any, kind string, want []byte) {
+	t.Helper()
+	if event["kind"] != kind {
+		t.Fatalf("event kind = %#v, want %q: %#v", event["kind"], kind, event)
+	}
+	encoded, ok := event["data"].(string)
+	if !ok {
+		t.Fatalf("event data = %#v", event["data"])
+	}
+	got, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("decode event data: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("event data = %v, want %v", got, want)
 	}
 }
 

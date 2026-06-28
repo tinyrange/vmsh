@@ -1081,6 +1081,7 @@ func Run(args []string) error {
 	startVM := fs.Bool("start", false, "Start the selected blank VM before entering the shell")
 	script := fs.String("script", "", "Internal test hook: read vmsh commands from this file")
 	recordPath := fs.String("record", "", "Record terminal output to an asciinema v2 .cast file")
+	recordRawPath := fs.String("record-raw", "", "Record lossless raw terminal input/output events to a JSONL file")
 	systemSession := fs.Bool("system-session", false, "Keep the vmshd session after this frontend exits")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1112,7 +1113,7 @@ func Run(args []string) error {
 	stdout := io.Writer(os.Stdout)
 	stderr := io.Writer(os.Stderr)
 	var recorder *asciinemaRecorder
-	if strings.TrimSpace(*recordPath) != "" {
+	if strings.TrimSpace(*recordPath) != "" || strings.TrimSpace(*recordRawPath) != "" {
 		_, cols, rows := terminalRequestSize(os.Stdout)
 		if cols <= 0 {
 			cols = 80
@@ -1120,7 +1121,7 @@ func Run(args []string) error {
 		if rows <= 0 {
 			rows = 24
 		}
-		rec, err := newAsciinemaRecorder(strings.TrimSpace(*recordPath), cols, rows)
+		rec, err := newAsciinemaRecorder(strings.TrimSpace(*recordPath), strings.TrimSpace(*recordRawPath), cols, rows)
 		if err != nil {
 			return err
 		}
@@ -6528,6 +6529,9 @@ func forwardGuestSignals(out chan<- client.ExecInput, done <-chan struct{}, tty 
 				if err != nil {
 					continue
 				}
+				if recorder := terminalWriterRecorder(stdout); recorder != nil {
+					recorder.recordResize(cols, rows)
+				}
 				sendGuestInput(out, done, client.ExecInput{Kind: "resize", Cols: cols, Rows: rows})
 				continue
 			}
@@ -6712,6 +6716,9 @@ func resizeHostPTY(out *os.File, stdout io.Writer) {
 	cols, rows, err := terminal.Size(file)
 	if err != nil || cols <= 0 || rows <= 0 {
 		return
+	}
+	if recorder := terminalWriterRecorder(stdout); recorder != nil {
+		recorder.recordResize(cols, rows)
 	}
 	_ = pty.Setsize(out, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
 }

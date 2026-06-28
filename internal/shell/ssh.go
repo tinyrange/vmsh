@@ -941,6 +941,9 @@ func resizeSSHPTY(p *persistentSSHShell, stdout io.Writer) {
 	if err != nil || cols <= 0 || rows <= 0 {
 		return
 	}
+	if recorder := terminalWriterRecorder(stdout); recorder != nil {
+		recorder.recordResize(cols, rows)
+	}
 	_ = p.session.WindowChange(rows, cols)
 }
 

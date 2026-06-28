@@ -13,6 +13,8 @@ keep the session available after the current frontend closes.
 
 Guest commands receive a TTY, terminal dimensions, and terminal color environment. `vmsh` keeps command execution non-interactive and adds a small color prelude for common commands such as `ls`.
 
+Use `-record session.cast` to write asciinema v2 output. Use `-record-raw session.raw.jsonl` to write a lossless JSONL event stream with base64 terminal input/output bytes and resize events for rendering/debugging investigations.
+
 Interactive host and guest commands run through persistent shell sessions when possible, so shell state such as aliases, functions, `cd`, and exported variables can survive across commands. Commands that need full foreground terminal control fall back to a one-shot shell path.
 
 The core syntax is:
