@@ -60,6 +60,7 @@ type Editor struct {
 	history   *history
 	completer Completer
 	queued    []rune
+	pending   []byte
 }
 
 type historySearch struct {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -73,6 +74,65 @@ func TestReadLinePreparedPreservesBufferedPromptInput(t *testing.T) {
 			t.Fatalf("ReadLinePrepared returned %q, want %q", got, want)
 		}
 	}
+}
+
+func TestReadLinePreparedWaitsForBracketedPasteEnd(t *testing.T) {
+	out, err := os.CreateTemp("", "termui-editor-paste-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(out.Name())
+	defer out.Close()
+	caps := terminal.Capabilities{Mode: terminal.ModeDynamicInteractive, Width: 80, Height: 24}
+	ed := New(Options{
+		In:           os.Stdin,
+		Out:          out,
+		Reader:       newDelayedReader("\x1b[200~stealth", "\x1b[201~\n", 25*time.Millisecond),
+		Capabilities: &caps,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := ed.ReadLinePrepared(ctx, "> ")
+	if err != nil {
+		t.Fatalf("ReadLinePrepared: %v", err)
+	}
+	if got != "stealth" {
+		t.Fatalf("line = %q, want stealth", got)
+	}
+}
+
+type delayedReader struct {
+	first     []byte
+	second    []byte
+	delay     time.Duration
+	startedAt time.Time
+}
+
+func newDelayedReader(first, second string, delay time.Duration) *delayedReader {
+	return &delayedReader{
+		first:     []byte(first),
+		second:    []byte(second),
+		delay:     delay,
+		startedAt: time.Now(),
+	}
+}
+
+func (r *delayedReader) Read(p []byte) (int, error) {
+	if len(r.first) > 0 {
+		p[0] = r.first[0]
+		r.first = r.first[1:]
+		return 1, nil
+	}
+	if time.Since(r.startedAt) < r.delay {
+		return 0, syscall.EAGAIN
+	}
+	if len(r.second) > 0 {
+		p[0] = r.second[0]
+		r.second = r.second[1:]
+		return 1, nil
+	}
+	return 0, syscall.EAGAIN
 }
 
 func TestRefreshMovesCursorLeft(t *testing.T) {

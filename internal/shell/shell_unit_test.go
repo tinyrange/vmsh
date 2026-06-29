@@ -3002,6 +3002,20 @@ func TestCompletionsUseCachedImagesOptionsAndHostMappedPaths(t *testing.T) {
 	}
 }
 
+func TestPathCompletionAfterTrailingSlashAppendsChild(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	if err := os.MkdirAll(filepath.Join(sh.hostCWD, "dprojects", "vmsh"), 0o755); err != nil {
+		t.Fatalf("create completion fixture: %v", err)
+	}
+
+	c := newVMSHCompleter(sh)
+	line := []rune("cd dprojects/")
+	candidates, replaceLen, kind := c.Complete(line, len(line))
+	if kind != completionPath || replaceLen != 0 || !hasString(candidates, "vmsh/") {
+		t.Fatalf("trailing slash path completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
+	}
+}
+
 func TestCompletionsUseCurrentCommandSegmentAndGuestCommands(t *testing.T) {
 	api := newRecordingShellAPI("alpine")
 	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}

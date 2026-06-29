@@ -371,6 +371,9 @@ func pathCompletionReplaceLen(token string) int {
 	if token == "" {
 		return 0
 	}
+	if strings.HasSuffix(token, "/") || strings.HasSuffix(token, `\`) {
+		return 0
+	}
 	return len([]rune(filepath.Base(token)))
 }
 
