@@ -1403,6 +1403,10 @@ func TestStartVMUsesStartupSnapshotCacheForCompatibleAlpine(t *testing.T) {
 	if req.RestoreSnapshot != "" {
 		t.Fatalf("restore snapshot = %q, want empty on first compatible boot", req.RestoreSnapshot)
 	}
+	wantShare := startupSnapshotTestShare(t, sh)
+	if len(req.Shares) != 1 || req.Shares[0] != wantShare {
+		t.Fatalf("startup snapshot shares = %+v, want %+v", req.Shares, []client.ShareMount{wantShare})
+	}
 	if _, err := os.Stat(req.SnapshotDir); err != nil {
 		t.Fatalf("snapshot dir was not created: %v", err)
 	}
@@ -1411,7 +1415,7 @@ func TestStartVMUsesStartupSnapshotCacheForCompatibleAlpine(t *testing.T) {
 func TestStartVMRestoresNewestStartupSnapshotForCompatibleAlpine(t *testing.T) {
 	api := newRecordingShellAPI("alpine")
 	sh := newUnitShell(t, api)
-	baseReq := client.StartInstanceRequest{Image: "alpine", MemoryMB: 512, CPUs: 1}
+	baseReq := startupSnapshotTestRequest(t, sh)
 	root, err := startupSnapshotRoot(sh.rootCache, baseReq)
 	if err != nil {
 		t.Fatalf("snapshot root: %v", err)
@@ -1468,7 +1472,7 @@ func TestStartVMSkipsStartupSnapshotForNestedVirt(t *testing.T) {
 func TestStartVMFallsBackWhenStartupSnapshotRestoreFails(t *testing.T) {
 	api := newRecordingShellAPI("alpine")
 	sh := newUnitShell(t, api)
-	baseReq := client.StartInstanceRequest{Image: "alpine", MemoryMB: 512, CPUs: 1}
+	baseReq := startupSnapshotTestRequest(t, sh)
 	root, err := startupSnapshotRoot(sh.rootCache, baseReq)
 	if err != nil {
 		t.Fatalf("snapshot root: %v", err)
@@ -1503,6 +1507,25 @@ func TestStartVMFallsBackWhenStartupSnapshotRestoreFails(t *testing.T) {
 	if _, err := os.Stat(snapshot); !os.IsNotExist(err) {
 		t.Fatalf("snapshot dir after fallback stat error = %v, want not exist", err)
 	}
+}
+
+func startupSnapshotTestRequest(t *testing.T, sh *shellState) client.StartInstanceRequest {
+	t.Helper()
+	return client.StartInstanceRequest{
+		Image:    "alpine",
+		MemoryMB: 512,
+		CPUs:     1,
+		Shares:   []client.ShareMount{startupSnapshotTestShare(t, sh)},
+	}
+}
+
+func startupSnapshotTestShare(t *testing.T, sh *shellState) client.ShareMount {
+	t.Helper()
+	hostRoot, _, err := guestHostPaths(sh.hostCWD)
+	if err != nil {
+		t.Fatalf("host share paths: %v", err)
+	}
+	return hostShareMount(hostRoot)
 }
 
 func TestBareImageTargetUsesImageNameAsSystemName(t *testing.T) {

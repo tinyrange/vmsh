@@ -7535,6 +7535,13 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 		}
 		req.Shares = []client.ShareMount{hostShareMount(hostRoot)}
 	}
+	if len(req.Shares) == 0 && guestUsesHostShare(ctx) && startupSnapshotCompatible(req) {
+		hostRoot, _, err := guestHostPaths(s.hostCWD)
+		if err != nil {
+			return err
+		}
+		req.Shares = []client.ShareMount{hostShareMount(hostRoot)}
+	}
 	if ctx.Network {
 		req.Network = networkConfigForContext(ctx)
 	}
