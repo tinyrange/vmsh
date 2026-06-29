@@ -1386,6 +1386,125 @@ func TestBareVMTargetStartsVMWhenActivated(t *testing.T) {
 	}
 }
 
+func TestStartVMUsesStartupSnapshotCacheForCompatibleAlpine(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	sh := newUnitShell(t, api)
+
+	if err := sh.startVM("work", commandContext{Image: "alpine", MemoryMB: 512, CPUs: 1}, io.Discard); err != nil {
+		t.Fatalf("start VM: %v", err)
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	req := api.starts[0].req
+	if req.SnapshotDir == "" {
+		t.Fatalf("snapshot dir is empty in request %+v", req)
+	}
+	if req.RestoreSnapshot != "" {
+		t.Fatalf("restore snapshot = %q, want empty on first compatible boot", req.RestoreSnapshot)
+	}
+	if _, err := os.Stat(req.SnapshotDir); err != nil {
+		t.Fatalf("snapshot dir was not created: %v", err)
+	}
+}
+
+func TestStartVMRestoresNewestStartupSnapshotForCompatibleAlpine(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	sh := newUnitShell(t, api)
+	baseReq := client.StartInstanceRequest{Image: "alpine", MemoryMB: 512, CPUs: 1}
+	root, err := startupSnapshotRoot(sh.rootCache, baseReq)
+	if err != nil {
+		t.Fatalf("snapshot root: %v", err)
+	}
+	oldSnapshot := filepath.Join(root, "snapshot-20260101T000000.000000000Z")
+	newSnapshot := filepath.Join(root, "snapshot-20260102T000000.000000000Z")
+	for _, dir := range []string{oldSnapshot, newSnapshot} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("create snapshot dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte("{}"), 0o644); err != nil {
+			t.Fatalf("write snapshot manifest: %v", err)
+		}
+	}
+
+	if err := sh.startVM("work", commandContext{Image: "alpine", MemoryMB: 512, CPUs: 1}, io.Discard); err != nil {
+		t.Fatalf("start VM: %v", err)
+	}
+	req := api.starts[0].req
+	if req.SnapshotDir != root {
+		t.Fatalf("snapshot dir = %q, want %q", req.SnapshotDir, root)
+	}
+	if req.RestoreSnapshot != newSnapshot {
+		t.Fatalf("restore snapshot = %q, want %q", req.RestoreSnapshot, newSnapshot)
+	}
+}
+
+func TestStartVMSkipsStartupSnapshotForCustomHardware(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	sh := newUnitShell(t, api)
+
+	if err := sh.startVM("work", commandContext{Image: "alpine", MemoryMB: 768, CPUs: 1}, io.Discard); err != nil {
+		t.Fatalf("start VM: %v", err)
+	}
+	req := api.starts[0].req
+	if req.SnapshotDir != "" || req.RestoreSnapshot != "" {
+		t.Fatalf("snapshot fields = %q, %q; want empty", req.SnapshotDir, req.RestoreSnapshot)
+	}
+}
+
+func TestStartVMSkipsStartupSnapshotForNestedVirt(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	sh := newUnitShell(t, api)
+
+	if err := sh.startVM("work", commandContext{Image: "alpine", MemoryMB: 512, CPUs: 1, NestedVirt: true}, io.Discard); err != nil {
+		t.Fatalf("start VM: %v", err)
+	}
+	req := api.starts[0].req
+	if req.SnapshotDir != "" || req.RestoreSnapshot != "" {
+		t.Fatalf("snapshot fields = %q, %q; want empty", req.SnapshotDir, req.RestoreSnapshot)
+	}
+}
+
+func TestStartVMFallsBackWhenStartupSnapshotRestoreFails(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	sh := newUnitShell(t, api)
+	baseReq := client.StartInstanceRequest{Image: "alpine", MemoryMB: 512, CPUs: 1}
+	root, err := startupSnapshotRoot(sh.rootCache, baseReq)
+	if err != nil {
+		t.Fatalf("snapshot root: %v", err)
+	}
+	snapshot := filepath.Join(root, "snapshot-20260101T000000.000000000Z")
+	if err := os.MkdirAll(snapshot, 0o755); err != nil {
+		t.Fatalf("create snapshot dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(snapshot, "manifest.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write snapshot manifest: %v", err)
+	}
+	api.startStream = func(ctx context.Context, id string, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
+		api.starts = append(api.starts, recordedStart{id: id, req: req})
+		if req.RestoreSnapshot != "" {
+			return client.InstanceState{}, errors.New("restore failed")
+		}
+		return client.InstanceState{ID: id, Status: "running"}, nil
+	}
+
+	if err := sh.startVM("work", commandContext{Image: "alpine", MemoryMB: 512, CPUs: 1}, io.Discard); err != nil {
+		t.Fatalf("start VM: %v", err)
+	}
+	if len(api.starts) != 2 {
+		t.Fatalf("starts = %d, want restore attempt and cold fallback", len(api.starts))
+	}
+	if api.starts[0].req.RestoreSnapshot != snapshot {
+		t.Fatalf("first restore snapshot = %q, want %q", api.starts[0].req.RestoreSnapshot, snapshot)
+	}
+	if api.starts[1].req.RestoreSnapshot != "" || api.starts[1].req.SnapshotDir != root {
+		t.Fatalf("fallback request = %+v", api.starts[1].req)
+	}
+	if _, err := os.Stat(snapshot); !os.IsNotExist(err) {
+		t.Fatalf("snapshot dir after fallback stat error = %v, want not exist", err)
+	}
+}
+
 func TestBareImageTargetUsesImageNameAsSystemName(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	sh := newUnitShell(t, api)

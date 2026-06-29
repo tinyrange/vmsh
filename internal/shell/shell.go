@@ -5,6 +5,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -1675,7 +1678,6 @@ func defaultContext(vmID, image string, nestedVirt bool) commandContext {
 		InitSystem: defaultInitSystemForImage(image),
 		Kernel:     defaultKernelForImage(image),
 		Network:    true,
-		NestedVirt: nestedVirt,
 	}
 }
 
@@ -7536,6 +7538,7 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 	if ctx.Network {
 		req.Network = networkConfigForContext(ctx)
 	}
+	s.applyStartupSnapshotDefaults(&req)
 	boot := newBootStatus(stderr)
 	defer boot.Close()
 	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
@@ -7546,11 +7549,7 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 		boot.Update(event)
 		return nil
 	}
-	if api, ok := s.api.(instanceStartContextAPI); ok {
-		state, err = api.StartInstanceStreamWithIDContext(runCtx, id, req, onEvent)
-	} else {
-		state, err = s.api.StartInstanceStreamWithID(id, req, onEvent)
-	}
+	state, err = s.startInstanceWithSnapshotFallback(runCtx, id, req, onEvent)
 	if interrupted.Load() {
 		return persistentShellExit{code: 130}
 	}
@@ -7563,6 +7562,113 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 	}
 	s.vmRunning[startedID] = true
 	return nil
+}
+
+func (s *shellState) startInstanceWithSnapshotFallback(ctx context.Context, id string, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
+	start := func(req client.StartInstanceRequest) (client.InstanceState, error) {
+		if api, ok := s.api.(instanceStartContextAPI); ok {
+			return api.StartInstanceStreamWithIDContext(ctx, id, req, onEvent)
+		}
+		return s.api.StartInstanceStreamWithID(id, req, onEvent)
+	}
+	state, err := start(req)
+	if err == nil || ctx.Err() != nil || strings.TrimSpace(req.RestoreSnapshot) == "" || strings.TrimSpace(req.SnapshotDir) == "" {
+		return state, err
+	}
+	_ = os.RemoveAll(req.RestoreSnapshot)
+	req.RestoreSnapshot = ""
+	return start(req)
+}
+
+const (
+	startupSnapshotMemoryMB = 512
+	startupSnapshotCPUs     = 1
+)
+
+func (s *shellState) applyStartupSnapshotDefaults(req *client.StartInstanceRequest) {
+	if s.rootCache == "" || !startupSnapshotCompatible(*req) {
+		return
+	}
+	root, err := startupSnapshotRoot(s.rootCache, *req)
+	if err != nil {
+		return
+	}
+	req.SnapshotDir = root
+	if snapshot := latestStartupSnapshot(root); snapshot != "" {
+		req.RestoreSnapshot = snapshot
+		return
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		req.SnapshotDir = ""
+	}
+}
+
+func startupSnapshotCompatible(req client.StartInstanceRequest) bool {
+	if !kernelStateIsDefault(req.Kernel) || strings.TrimSpace(req.InitSystem) != "" {
+		return false
+	}
+	if strings.TrimSpace(req.Image) == "" || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(req.Image)), "alpine") {
+		return false
+	}
+	if req.NestedVirt || req.Dmesg || len(req.KernelModules) > 0 {
+		return false
+	}
+	memoryMB := req.MemoryMB
+	if memoryMB == 0 {
+		memoryMB = startupSnapshotMemoryMB
+	}
+	cpus := req.CPUs
+	if cpus == 0 {
+		cpus = startupSnapshotCPUs
+	}
+	return memoryMB == startupSnapshotMemoryMB && cpus == startupSnapshotCPUs
+}
+
+func startupSnapshotRoot(rootCache string, req client.StartInstanceRequest) (string, error) {
+	keyReq := req
+	keyReq.ID = ""
+	keyReq.TimeoutSeconds = 0
+	keyReq.SnapshotDir = ""
+	keyReq.RestoreSnapshot = ""
+	if keyReq.MemoryMB == 0 {
+		keyReq.MemoryMB = startupSnapshotMemoryMB
+	}
+	if keyReq.CPUs == 0 {
+		keyReq.CPUs = startupSnapshotCPUs
+	}
+	data, err := json.Marshal(keyReq)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return filepath.Join(rootCache, "snapshots", "startup", hex.EncodeToString(sum[:16])), nil
+}
+
+func latestStartupSnapshot(root string) string {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+	var latest string
+	var latestTime time.Time
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		if _, err := os.Stat(filepath.Join(path, "manifest.json")); err != nil {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if latest == "" || info.ModTime().After(latestTime) || (info.ModTime().Equal(latestTime) && entry.Name() > filepath.Base(latest)) {
+			latest = path
+			latestTime = info.ModTime()
+		}
+	}
+	return latest
 }
 
 func vmshBootTimeoutSeconds(image string) float64 {
