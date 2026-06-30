@@ -1829,6 +1829,7 @@ func TestGuestSupportsHostSharesForBuiltInBSDHostMatrix(t *testing.T) {
 		{goos: "darwin", goarch: "arm64", want: true},
 		{goos: "darwin", goarch: "amd64", want: false},
 		{goos: "windows", goarch: "amd64", want: false},
+		{goos: "windows", goarch: "arm64", want: false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.goos+"/"+tc.goarch, func(t *testing.T) {
@@ -1839,6 +1840,9 @@ func TestGuestSupportsHostSharesForBuiltInBSDHostMatrix(t *testing.T) {
 	}
 	if !guestSupportsHostSharesOn("windows", "amd64", commandContext{Image: "alpine"}) {
 		t.Fatalf("non-built-in images should keep host share support")
+	}
+	if !guestSupportsHostSharesOn("windows", "arm64", commandContext{Image: "alpine"}) {
+		t.Fatalf("non-built-in images should keep host share support on windows/arm64")
 	}
 }
 
