@@ -1083,7 +1083,7 @@ func vmIntegrationRepoRoot(t *testing.T) string {
 func skipUnsupportedVMIntegrationPlatform(t *testing.T) {
 	t.Helper()
 	switch runtime.GOOS + "/" + runtime.GOARCH {
-	case "linux/amd64", "linux/arm64", "darwin/arm64", "windows/amd64":
+	case "linux/amd64", "linux/arm64", "darwin/arm64", "windows/amd64", "windows/arm64":
 		return
 	default:
 		t.Skipf("VM integration tests require KVM/HVF/WHP; unsupported platform %s/%s", runtime.GOOS, runtime.GOARCH)

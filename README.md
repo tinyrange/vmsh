@@ -49,7 +49,7 @@ python3 --version
 - A checked-out `cc` submodule.
 - A supported virtualization host when running VM commands:
   - `linux/amd64` with KVM and user access to `/dev/kvm`.
-  - `windows/amd64` with Windows Hypervisor Platform enabled.
+  - `windows/amd64` or `windows/arm64` with Windows Hypervisor Platform enabled.
   - `darwin/arm64` with Hypervisor.framework.
   - `linux/arm64` with KVM.
 - Network access when downloading kernels or pulling OCI images.
@@ -210,6 +210,7 @@ The workflow builds one standalone `vmsh` binary per target:
 - `linux/amd64`
 - `linux/arm64`
 - `windows/amd64`
+- `windows/arm64`
 - `darwin/arm64`
 
 Release binaries are built with `embed_ccvm` and `embed_guestinit`. That compiles
