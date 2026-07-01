@@ -46,7 +46,7 @@ type keyEvent struct {
 
 func (e *Editor) readKey(ctx context.Context) (keyEvent, error) {
 	for {
-		ev, ok, err := e.pollKey()
+		ev, ok, err := e.pollKeyContext(ctx)
 		if ok || err != nil && !isAgain(err) {
 			return ev, err
 		}
@@ -59,8 +59,11 @@ func (e *Editor) readKey(ctx context.Context) (keyEvent, error) {
 }
 
 func (e *Editor) pollKey() (keyEvent, bool, error) {
-	var b [1]byte
-	n, err := e.in.Read(b[:])
+	return e.pollKeyContext(context.Background())
+}
+
+func (e *Editor) pollKeyContext(ctx context.Context) (keyEvent, bool, error) {
+	b, n, err := e.readByte()
 	if n == 0 {
 		if err == nil {
 			return keyEvent{}, false, syscall.EAGAIN
@@ -73,10 +76,10 @@ func (e *Editor) pollKey() (keyEvent, bool, error) {
 		}
 		return keyEvent{}, false, err
 	}
-	return e.parseFirstByte(b[0])
+	return e.parseFirstByte(ctx, b)
 }
 
-func (e *Editor) parseFirstByte(b byte) (keyEvent, bool, error) {
+func (e *Editor) parseFirstByte(ctx context.Context, b byte) (keyEvent, bool, error) {
 	switch b {
 	case '\r', '\n':
 		return keyEvent{key: keyEnter}, true, nil
@@ -95,7 +98,7 @@ func (e *Editor) parseFirstByte(b byte) (keyEvent, bool, error) {
 	case 0x7f, 0x08:
 		return keyEvent{key: keyBackspace}, true, nil
 	case 0x1b:
-		return e.readEscape()
+		return e.readEscape(ctx)
 	default:
 		if b < 0x20 {
 			return keyEvent{key: keyUnknown}, true, nil
@@ -110,10 +113,9 @@ func (e *Editor) readRune(first byte) (keyEvent, bool, error) {
 		return keyEvent{key: keyRune, r: rune(first)}, true, nil
 	}
 	for len(buf) < utf8.UTFMax && !utf8.FullRune(buf) {
-		var b [1]byte
-		n, err := e.in.Read(b[:])
+		b, n, err := e.readByte()
 		if n == 1 {
-			buf = append(buf, b[0])
+			buf = append(buf, b)
 			continue
 		}
 		if err != nil && !isAgain(err) {
@@ -128,7 +130,7 @@ func (e *Editor) readRune(first byte) (keyEvent, bool, error) {
 	return keyEvent{key: keyRune, r: r}, true, nil
 }
 
-func (e *Editor) readEscape() (keyEvent, bool, error) {
+func (e *Editor) readEscape(ctx context.Context) (keyEvent, bool, error) {
 	seq := e.readAvailable(32, 2*time.Millisecond)
 	switch {
 	case seq == "[D" || seq == "OD":
@@ -150,8 +152,10 @@ func (e *Editor) readEscape() (keyEvent, bool, error) {
 	case seq == "[6~":
 		return keyEvent{key: keyPageDown}, true, nil
 	case strings.HasPrefix(seq, "[200~"):
-		text := e.readUntilPasteEnd(strings.TrimPrefix(seq, "[200~"))
-		return keyEvent{key: keyPaste, text: text}, true, nil
+		text, err := e.readUntilPasteEnd(ctx, strings.TrimPrefix(seq, "[200~"))
+		return keyEvent{key: keyPaste, text: text}, true, err
+	case seq == "[201~":
+		return keyEvent{key: keyUnknown}, true, nil
 	default:
 		return keyEvent{key: keyEscape}, true, nil
 	}
@@ -161,10 +165,9 @@ func (e *Editor) readAvailable(max int, quiet time.Duration) string {
 	var out strings.Builder
 	deadline := time.Now().Add(quiet)
 	for out.Len() < max && time.Now().Before(deadline) {
-		var b [1]byte
-		n, err := e.in.Read(b[:])
+		b, n, err := e.readByte()
 		if n == 1 {
-			out.WriteByte(b[0])
+			out.WriteByte(b)
 			deadline = time.Now().Add(quiet)
 			continue
 		}
@@ -176,20 +179,53 @@ func (e *Editor) readAvailable(max int, quiet time.Duration) string {
 	return out.String()
 }
 
-func (e *Editor) readUntilPasteEnd(initial string) string {
+func (e *Editor) readUntilPasteEnd(ctx context.Context, initial string) (string, error) {
 	var out strings.Builder
 	out.WriteString(initial)
 	for {
-		chunk := e.readAvailable(4096, 8*time.Millisecond)
-		if chunk == "" {
-			return out.String()
-		}
-		out.WriteString(chunk)
 		s := out.String()
 		if idx := strings.Index(s, "\x1b[201~"); idx >= 0 {
-			return s[:idx]
+			if tail := s[idx+len("\x1b[201~"):]; tail != "" {
+				e.unreadBytes([]byte(tail))
+			}
+			return s[:idx], nil
+		}
+		b, n, err := e.readByte()
+		if n == 1 {
+			out.WriteByte(b)
+			continue
+		}
+		if err != nil && !isAgain(err) {
+			return out.String(), err
+		}
+		select {
+		case <-ctx.Done():
+			return out.String(), ctx.Err()
+		case <-time.After(time.Millisecond):
 		}
 	}
+}
+
+func (e *Editor) readByte() (byte, int, error) {
+	if len(e.pending) > 0 {
+		b := e.pending[0]
+		e.pending = e.pending[1:]
+		return b, 1, nil
+	}
+	var buf [1]byte
+	n, err := e.in.Read(buf[:])
+	if n == 1 {
+		return buf[0], 1, err
+	}
+	return 0, n, err
+}
+
+func (e *Editor) unreadBytes(bs []byte) {
+	if len(bs) == 0 {
+		return
+	}
+	next := append([]byte(nil), bs...)
+	e.pending = append(next, e.pending...)
 }
 
 func (e *Editor) queueEvent(ev keyEvent) {
