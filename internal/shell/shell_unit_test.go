@@ -4142,6 +4142,42 @@ func TestGuestInputSendIgnoresClosedChannel(t *testing.T) {
 	sendGuestInputNonBlocking(inputs, client.ExecInput{Kind: "stdin_close"})
 }
 
+func TestStopPTYForwardingDoesNotWaitForeverForBlockedProducer(t *testing.T) {
+	cancelled := make(chan struct{})
+	restored := make(chan struct{})
+	stop := stopPTYForwarding(func() {
+		close(restored)
+	}, func() {
+		close(cancelled)
+	}, func() {
+		select {}
+	})
+
+	done := make(chan struct{})
+	go func() {
+		stop()
+		close(done)
+	}()
+
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop did not cancel producers")
+	}
+	select {
+	case <-restored:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop did not restore terminal")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop waited forever for blocked producer")
+	}
+
+	stop()
+}
+
 func TestPersistentGuestShellCloseIsIdempotent(t *testing.T) {
 	session := &persistentGuestShell{
 		inputs: make(chan client.ExecInput, 1),
