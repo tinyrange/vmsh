@@ -43,6 +43,7 @@ const defaultGuestUser = "1000:1000"
 const defaultVMSHBootTimeoutSeconds = 60
 const defaultBuiltInBSDBootTimeoutSeconds = 180
 const defaultGuestShellReadyTimeout = 30 * time.Second
+const defaultCCVMGuestMemoryMB = 512
 const maxEmbeddedHostInitPreludeBytes = 64 * 1024
 const maxBackgroundJobLogBytes = 1024 * 1024
 const ubuntuCloudRootFSBaseURL = "https://cloud-images.ubuntu.com/releases/noble/release"
@@ -172,6 +173,8 @@ type vmshdSessionReporter struct {
 	hostCWD      string
 	context      commandContext
 	detached     bool
+	startedAt    time.Time
+	startedKnown bool
 }
 
 type hostShellInit struct {
@@ -1328,6 +1331,10 @@ func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmsh
 		hostCWD:      metadata.HostCWD,
 		context:      ctx,
 		detached:     systemSession,
+	}
+	if status, err := client.Status(); err == nil && !status.StartedAt.IsZero() {
+		reporter.startedAt = status.StartedAt
+		reporter.startedKnown = true
 	}
 	return reporter, func() {
 		closeFrontend()
@@ -7567,6 +7574,7 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 	if err != nil {
 		return err
 	}
+	s.noteStartupSnapshotStart(req)
 	startedID := firstNonEmpty(state.ID, id)
 	if s.vmRunning == nil {
 		s.vmRunning = map[string]bool{}
@@ -7596,6 +7604,8 @@ const (
 	startupSnapshotCPUs     = 1
 )
 
+const startupSnapshotDaemonMarker = ".vmshd-started-at"
+
 func (s *shellState) applyStartupSnapshotDefaults(req *client.StartInstanceRequest) {
 	if s.rootCache == "" || !startupSnapshotCompatible(*req) {
 		return
@@ -7605,6 +7615,12 @@ func (s *shellState) applyStartupSnapshotDefaults(req *client.StartInstanceReque
 		return
 	}
 	req.SnapshotDir = root
+	if generation, _, ok := s.startupSnapshotGeneration(); ok && !startupSnapshotMarkerMatches(root, generation) {
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			req.SnapshotDir = ""
+		}
+		return
+	}
 	if snapshot := latestStartupSnapshot(root); snapshot != "" {
 		req.RestoreSnapshot = snapshot
 		return
@@ -7612,6 +7628,56 @@ func (s *shellState) applyStartupSnapshotDefaults(req *client.StartInstanceReque
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		req.SnapshotDir = ""
 	}
+}
+
+func (s *shellState) startupSnapshotGeneration() (string, time.Time, bool) {
+	if s == nil || s.vmshd == nil {
+		return "", time.Time{}, false
+	}
+	startedAt, ok := s.vmshd.daemonStartedAt()
+	if !ok || startedAt.IsZero() {
+		return "", time.Time{}, false
+	}
+	startedAt = startedAt.UTC()
+	return startedAt.Format(time.RFC3339Nano), startedAt, true
+}
+
+func (r *vmshdSessionReporter) daemonStartedAt() (time.Time, bool) {
+	if r == nil {
+		return time.Time{}, false
+	}
+	if r.startedKnown {
+		return r.startedAt, !r.startedAt.IsZero()
+	}
+	if r.client == nil {
+		return time.Time{}, false
+	}
+	status, err := r.client.Status()
+	if err != nil || status.StartedAt.IsZero() {
+		return time.Time{}, false
+	}
+	r.startedAt = status.StartedAt
+	r.startedKnown = true
+	return r.startedAt, true
+}
+
+func (s *shellState) noteStartupSnapshotStart(req client.StartInstanceRequest) {
+	if strings.TrimSpace(req.SnapshotDir) == "" || strings.TrimSpace(req.RestoreSnapshot) != "" {
+		return
+	}
+	generation, startedAt, ok := s.startupSnapshotGeneration()
+	if !ok {
+		return
+	}
+	snapshot := latestStartupSnapshot(req.SnapshotDir)
+	if snapshot == "" {
+		return
+	}
+	modTime, ok := startupSnapshotModTime(snapshot)
+	if !ok || modTime.Before(startedAt) {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(req.SnapshotDir, startupSnapshotDaemonMarker), []byte(generation+"\n"), 0o644)
 }
 
 func startupSnapshotCompatible(req client.StartInstanceRequest) bool {
@@ -7624,15 +7690,14 @@ func startupSnapshotCompatible(req client.StartInstanceRequest) bool {
 	if req.NestedVirt || req.Dmesg || len(req.KernelModules) > 0 {
 		return false
 	}
-	memoryMB := req.MemoryMB
-	if memoryMB == 0 {
-		memoryMB = startupSnapshotMemoryMB
+	if req.MemoryMB != 0 && req.MemoryMB != startupSnapshotMemoryMB {
+		return false
 	}
 	cpus := req.CPUs
 	if cpus == 0 {
 		cpus = startupSnapshotCPUs
 	}
-	return memoryMB == startupSnapshotMemoryMB && cpus == startupSnapshotCPUs
+	return cpus == startupSnapshotCPUs
 }
 
 func startupSnapshotRoot(rootCache string, req client.StartInstanceRequest) (string, error) {
@@ -7641,9 +7706,6 @@ func startupSnapshotRoot(rootCache string, req client.StartInstanceRequest) (str
 	keyReq.TimeoutSeconds = 0
 	keyReq.SnapshotDir = ""
 	keyReq.RestoreSnapshot = ""
-	if keyReq.MemoryMB == 0 {
-		keyReq.MemoryMB = startupSnapshotMemoryMB
-	}
 	if keyReq.CPUs == 0 {
 		keyReq.CPUs = startupSnapshotCPUs
 	}
@@ -7680,6 +7742,25 @@ func latestStartupSnapshot(root string) string {
 		}
 	}
 	return latest
+}
+
+func startupSnapshotMarkerMatches(root, generation string) bool {
+	data, err := os.ReadFile(filepath.Join(root, startupSnapshotDaemonMarker))
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(data)) == strings.TrimSpace(generation)
+}
+
+func startupSnapshotModTime(snapshot string) (time.Time, bool) {
+	info, err := os.Stat(filepath.Join(snapshot, "manifest.json"))
+	if err != nil {
+		info, err = os.Stat(snapshot)
+	}
+	if err != nil {
+		return time.Time{}, false
+	}
+	return info.ModTime(), true
 }
 
 func vmshBootTimeoutSeconds(image string) float64 {
@@ -8950,6 +9031,20 @@ func (s *shellState) printCurrentStatusDetails(w io.Writer) error {
 		if err != nil {
 			return err
 		}
+		if state.MemoryMB != 0 && state.BalloonMB != 0 {
+			_, err = fmt.Fprintf(w, "vm memory: %s configured, %s balloon, %s effective\n",
+				formatMemoryMB(state.MemoryMB),
+				formatMemoryMB(state.BalloonMB),
+				formatMemoryMB(saturatingSub(state.MemoryMB, state.BalloonMB)),
+			)
+		} else if state.MemoryMB != 0 {
+			_, err = fmt.Fprintf(w, "vm memory: %s\n", formatMemoryMB(state.MemoryMB))
+		} else {
+			_, err = fmt.Fprintf(w, "vm memory: %s default (not reported by daemon)\n", formatMemoryMB(defaultCCVMGuestMemoryMB))
+		}
+		if err != nil {
+			return err
+		}
 		if state.NetworkIPv4 != "" {
 			_, err = fmt.Fprintf(w, "vm address: %s\n", state.NetworkIPv4)
 		}
@@ -8958,6 +9053,23 @@ func (s *shellState) printCurrentStatusDetails(w io.Writer) error {
 		_, err := fmt.Fprintf(w, "context: %s\n", s.context.Mode)
 		return err
 	}
+}
+
+func formatMemoryMB(mb uint64) string {
+	if mb == 0 {
+		return "0 MB"
+	}
+	if mb%1024 == 0 {
+		return fmt.Sprintf("%d GB", mb/1024)
+	}
+	return fmt.Sprintf("%d MB", mb)
+}
+
+func saturatingSub(a, b uint64) uint64 {
+	if b >= a {
+		return 0
+	}
+	return a - b
 }
 
 func (s *shellState) printVMSHDStatus(w io.Writer) error {
