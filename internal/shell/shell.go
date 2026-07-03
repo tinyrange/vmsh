@@ -7359,7 +7359,7 @@ func (s *shellState) ensureBuiltInGuestSupported(ctx commandContext) error {
 func builtInGuestHostSupported(image, host string) bool {
 	switch canonicalBuiltInGuestImage(image) {
 	case "@openbsd", "@freebsd", "@netbsd":
-		return host == "linux/amd64" || host == "linux/arm64" || host == "darwin/arm64" || host == "windows/amd64"
+		return host == "linux/amd64" || host == "linux/arm64" || host == "darwin/arm64" || host == "windows/amd64" || host == "windows/arm64"
 	default:
 		return true
 	}
@@ -7368,7 +7368,7 @@ func builtInGuestHostSupported(image, host string) bool {
 func supportedBuiltInGuestHostsText(image string) string {
 	switch canonicalBuiltInGuestImage(image) {
 	case "@openbsd", "@freebsd", "@netbsd":
-		return "linux/amd64, linux/arm64, darwin/arm64, or windows/amd64"
+		return "linux/amd64, linux/arm64, darwin/arm64, windows/amd64, or windows/arm64"
 	default:
 		return "a supported host"
 	}
