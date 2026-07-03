@@ -1,5 +1,3 @@
-//go:build embed_ccvm
-
 package main
 
 import (

@@ -4,9 +4,8 @@
 
 `vmsh` must be run from an interactive terminal. Interactive sessions use the native `vmsh` line editor, persistent history stored in the `ccvm` cache directory, and autocomplete support for `@` builtins, cached image names, `vmsh` options, command names, and host paths.
 
-Release builds use a `ccprod` cache/daemon identity by default. Development
-builds use `ccdev`, so a checkout build can run alongside an installed release
-without sharing daemon state. Pass `-cache-dir` to use an explicit cache root.
+`vmsh` uses a `vmshd` cache/daemon identity by default. Pass `-cache-dir` to use
+an explicit cache root.
 By default, a `vmsh` frontend owns its daemon session and the session is cleaned
 up when that frontend exits. Start with `-system-session` or run `@detach` to
 keep the session available after the current frontend closes.

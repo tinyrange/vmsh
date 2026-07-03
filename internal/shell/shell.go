@@ -10632,7 +10632,7 @@ func resolveCacheDir(arg, identity string) (string, error) {
 	}
 	identity = strings.TrimSpace(identity)
 	if identity == "" {
-		identity = "ccdev"
+		identity = "vmshd"
 	}
 	dir := filepath.Join(cacheRoot, identity)
 	return dir, ensurePrivateCacheDir(dir)
@@ -10648,7 +10648,7 @@ func resolveShellCacheDir(arg, identity string, nested bool) (string, error) {
 	}
 	identity = strings.TrimSpace(identity)
 	if identity == "" {
-		identity = "ccdev"
+		identity = "vmshd"
 	}
 	dir := filepath.Join(cacheRoot, identity+"-nested", strconv.Itoa(os.Getpid()))
 	return dir, ensurePrivateCacheDir(dir)

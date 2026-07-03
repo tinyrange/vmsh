@@ -24,14 +24,6 @@ type paths struct {
 	vmsh  string
 }
 
-type guestInitPayload struct {
-	name       string
-	goos       string
-	goarch     string
-	pkg        string
-	installRel string
-}
-
 var (
 	demoRunner        func(paths, []string) error
 	demoWantsHelpFunc func([]string) bool
@@ -243,14 +235,8 @@ func build(p paths) error {
 		return err
 	}
 
-	installedPayloads, err := buildGuestInitPayloads(p)
-	if err != nil {
-		return err
-	}
-	defer cleanupGuestInitPayloads(installedPayloads)
-
-	if err := step("build ccvm with embedded guest init", func() error {
-		return goBuild(p.ccDir, []string{"CGO_ENABLED=0"}, p.ccvm, "-tags", "embed_guestinit", "./cmd/ccvm")
+	if err := step("build ccvm", func() error {
+		return goBuild(p.ccDir, []string{"CGO_ENABLED=0"}, p.ccvm, "./cmd/ccvm")
 	}); err != nil {
 		return err
 	}
@@ -260,7 +246,7 @@ func build(p paths) error {
 		return err
 	}
 	if err := step("build vmsh", func() error {
-		return goBuild(p.root, nil, p.vmsh, "-tags", vmshBuildTags(), "./cmd/vmsh")
+		return goBuild(p.root, nil, p.vmsh, "./cmd/vmsh")
 	}); err != nil {
 		return err
 	}
@@ -282,71 +268,6 @@ func build(p paths) error {
 	logf("built vmsh: %s", p.vmsh)
 
 	return nil
-}
-
-func guestInitPayloads() []guestInitPayload {
-	payloads := []guestInitPayload{
-		{
-			name:       "linux/arm64 guest init",
-			goos:       "linux",
-			goarch:     "arm64",
-			pkg:        "./internal/cmd/init",
-			installRel: filepath.Join("internal", "guestinit", "guest-init-linux-arm64"),
-		},
-		{
-			name:       "linux/amd64 guest init",
-			goos:       "linux",
-			goarch:     "amd64",
-			pkg:        "./internal/cmd/init",
-			installRel: filepath.Join("internal", "guestinit", "guest-init-linux-amd64"),
-		},
-	}
-	for _, bsd := range []string{"openbsd", "freebsd", "netbsd"} {
-		for _, arch := range []string{"arm64", "amd64"} {
-			payloads = append(payloads, guestInitPayload{
-				name:       bsd + "/" + arch + " guest init",
-				goos:       bsd,
-				goarch:     arch,
-				pkg:        "./internal/cmd/" + bsd + "-init",
-				installRel: filepath.Join("internal", bsd, "guestinit", "guest-init-"+bsd+"-"+arch),
-			})
-		}
-	}
-	return payloads
-}
-
-func vmshBuildTags() string {
-	return "embed_ccvm embed_guestinit"
-}
-
-func buildGuestInitPayloads(p paths) ([]string, error) {
-	var installed []string
-	for _, payload := range guestInitPayloads() {
-		out := filepath.Join(p.build, strings.ReplaceAll(payload.name, "/", "-"))
-		if err := step("build "+payload.name, func() error {
-			return goBuild(p.ccDir, []string{"CGO_ENABLED=0", "GOOS=" + payload.goos, "GOARCH=" + payload.goarch}, out, payload.pkg)
-		}); err != nil {
-			cleanupGuestInitPayloads(installed)
-			return nil, err
-		}
-		installPath := filepath.Join(p.ccDir, payload.installRel)
-		if err := step("install "+payload.name, func() error {
-			return copyFile(out, installPath, 0o644)
-		}); err != nil {
-			cleanupGuestInitPayloads(installed)
-			return nil, err
-		}
-		installed = append(installed, installPath)
-	}
-	return installed, nil
-}
-
-func cleanupGuestInitPayloads(paths []string) {
-	for _, path := range paths {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			logf("warning: remove generated guest init %s: %v", path, err)
-		}
-	}
 }
 
 func step(name string, fn func() error) error {

@@ -335,8 +335,9 @@ func TestResolveCacheDirUsesDaemonIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve fallback cache: %v", err)
 	}
-	if fallbackDir != devDir {
-		t.Fatalf("fallback cache dir = %q, want %q", fallbackDir, devDir)
+	wantFallback := filepath.Join(userCache, "vmshd")
+	if fallbackDir != wantFallback {
+		t.Fatalf("fallback cache dir = %q, want %q", fallbackDir, wantFallback)
 	}
 }
 
