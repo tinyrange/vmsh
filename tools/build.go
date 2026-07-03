@@ -346,10 +346,7 @@ func copyFile(src, dst string, mode os.FileMode) error {
 }
 
 func runVMSH(p paths, args []string) error {
-	vmshArgs := append([]string{"-ccvm", p.ccvm}, args...)
-	if !hasRecordArg(args) {
-		vmshArgs = append([]string{"-ccvm", p.ccvm, "-record-raw", filepath.Join(p.build, "session.raw.jsonl")}, args...)
-	}
+	vmshArgs := vmshRunArgs(p.build, args)
 	logf("run: %s %s", p.vmsh, strings.Join(vmshArgs, " "))
 	cmd := exec.Command(p.vmsh, vmshArgs...)
 	cmd.Dir = p.root
@@ -367,6 +364,14 @@ func runVMSH(p paths, args []string) error {
 		return err
 	}
 	return nil
+}
+
+func vmshRunArgs(buildDir string, args []string) []string {
+	vmshArgs := append([]string{}, args...)
+	if !hasRecordArg(args) {
+		vmshArgs = append([]string{"-record-raw", filepath.Join(buildDir, "session.raw.jsonl")}, args...)
+	}
+	return vmshArgs
 }
 
 func hasRecordArg(args []string) bool {

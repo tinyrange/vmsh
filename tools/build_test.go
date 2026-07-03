@@ -58,6 +58,25 @@ func TestParseSSHExecPayload(t *testing.T) {
 	}
 }
 
+func TestRunArgsUseBuiltInDaemonByDefault(t *testing.T) {
+	args := vmshRunArgs("/tmp/build", nil)
+	if strings.Join(args, " ") != "-record-raw /tmp/build/session.raw.jsonl" {
+		t.Fatalf("run args = %#v", args)
+	}
+	for _, arg := range args {
+		if arg == "-ccvm" {
+			t.Fatalf("run args included explicit ccvm: %#v", args)
+		}
+	}
+}
+
+func TestRunArgsPreserveExplicitRecordArgs(t *testing.T) {
+	args := vmshRunArgs("/tmp/build", []string{"-record-raw", "/tmp/raw.jsonl"})
+	if strings.Join(args, " ") != "-record-raw /tmp/raw.jsonl" {
+		t.Fatalf("run args = %#v", args)
+	}
+}
+
 func splitCastLines(text string) []string {
 	var lines []string
 	for _, line := range strings.Split(text, "\n") {

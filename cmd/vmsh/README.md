@@ -143,8 +143,8 @@ context or a one-shot command.
 
 ## Building
 
-For local development, `tools/build.go run` builds `ccvm` and `vmsh`
-separately and runs `vmsh -ccvm build/vmsh/ccvm`.
+For local development, `tools/build.go run` builds `ccvm` and `vmsh`, then runs
+the built `vmsh` with its built-in vmshd daemon path.
 
 `vmsh` keeps `cc` as a submodule. After cloning, initialize it with:
 
@@ -164,8 +164,8 @@ On Windows, run the same helper with:
 go run .\tools\build.go run
 ```
 
-The runner builds the Linux guest init payloads and `ccvm` inside the `cc`
-submodule, then builds this repository's `vmsh` binary.
+The runner builds `ccvm` inside the `cc` submodule as a sidecar artifact for
+explicit compatibility testing, then builds this repository's `vmsh` binary.
 
 You can also build `vmsh` directly and point it at a `ccvm` binary:
 
