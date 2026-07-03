@@ -244,7 +244,7 @@ func (c *vmshCompleter) Complete(line []rune, pos int) ([]string, int, completio
 	if strings.HasPrefix(prefix, "@") && isFirstToken {
 		for _, word := range c.atTargetWords() {
 			if strings.HasPrefix(word, token) {
-				candidates = append(candidates, word[len(token):])
+				candidates = append(candidates, word)
 			}
 		}
 		return candidates, len([]rune(token)), completionAt
@@ -275,7 +275,7 @@ func (c *vmshCompleter) Complete(line []rune, pos int) ([]string, int, completio
 	}
 	if !isFirstToken || token == "" || strings.Contains(token, "/") || token == "." || token == ".." || strings.HasPrefix(token, "~") {
 		candidates = c.pathCandidates(token, completionCtx)
-		return candidates, pathCompletionReplaceLen(typedToken), completionPath
+		return candidates, len([]rune(typedToken)), completionPath
 	}
 	return nil, 0, completionNone
 }
@@ -365,16 +365,6 @@ func (c *vmshCompleter) shellSSHSessionContext(name string) (commandContext, boo
 		return commandContext{}, false
 	}
 	return c.shell.sshSessionContext(name)
-}
-
-func pathCompletionReplaceLen(token string) int {
-	if token == "" {
-		return 0
-	}
-	if strings.HasSuffix(token, "/") || strings.HasSuffix(token, `\`) {
-		return 0
-	}
-	return len([]rune(filepath.Base(token)))
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
@@ -481,7 +471,7 @@ func suffixCompletions(words []string, token string) []string {
 	var out []string
 	for _, word := range words {
 		if strings.HasPrefix(word, token) {
-			out = append(out, word[len(token):])
+			out = append(out, word)
 		}
 	}
 	sort.Strings(out)
@@ -605,7 +595,7 @@ func (c *vmshCompleter) commandCandidates(token string, ctx commandContext) []st
 			return
 		}
 		seen[name] = true
-		out = append(out, shellEscapeCompletion(name[len(token):]))
+		out = append(out, shellEscapeCompletion(name))
 	}
 	for _, name := range []string{"cd", "exit", "export", "pwd", "echo", "env", "ls", "cat", "grep", "find", "git", "make", "go", "python", "python3", "sh"} {
 		add(name)
@@ -800,7 +790,7 @@ func (c *vmshCompleter) sshPathCandidates(token string, ctx commandContext) ([]s
 		if line == "" {
 			continue
 		}
-		out = append(out, shellEscapeCompletion(line))
+		out = append(out, shellEscapeCompletion(dirPart+base+line))
 	}
 	sortCompletionItems(out)
 	return out, true
@@ -838,11 +828,11 @@ func (c *vmshCompleter) hostPathCandidates(token string, ctx commandContext) []s
 		if !strings.HasPrefix(name, base) {
 			continue
 		}
-		suffix := name[len(base):]
+		completion := dirPart + name
 		if entry.IsDir() {
-			suffix += "/"
+			completion += "/"
 		}
-		out = append(out, shellEscapeCompletion(suffix))
+		out = append(out, shellEscapeCompletion(completion))
 	}
 	sortCompletionItems(out)
 	return out
@@ -875,7 +865,7 @@ func (c *vmshCompleter) guestPathCandidates(token string, ctx commandContext) ([
 	if err != nil {
 		return nil, true
 	}
-	return out, true
+	return pathCompletionsWithDir(dirPart, base, out), true
 }
 
 func (c *vmshCompleter) guestPathCandidatesInDir(ctx commandContext, guestDir, base string) ([]string, error) {
@@ -919,6 +909,17 @@ func (c *vmshCompleter) guestPathCandidatesInDir(ctx commandContext, guestDir, b
 	}
 	sortCompletionItems(out)
 	return out, nil
+}
+
+func pathCompletionsWithDir(dirPart, base string, suffixes []string) []string {
+	if dirPart == "" && base == "" {
+		return suffixes
+	}
+	out := make([]string, 0, len(suffixes))
+	for _, suffix := range suffixes {
+		out = append(out, shellEscapeCompletion(dirPart+base+suffix))
+	}
+	return out
 }
 
 func guestCompletionScript(guestDir, base string) string {
@@ -10466,8 +10467,10 @@ func hostShell() string {
 		}
 		return "cmd.exe"
 	}
-	if shell := strings.TrimSpace(os.Getenv("SHELL")); shell != "" {
-		return shell
+	for _, name := range []string{"zsh", "bash", "sh"} {
+		if path, err := exec.LookPath(name); err == nil {
+			return path
+		}
 	}
 	return "/bin/sh"
 }

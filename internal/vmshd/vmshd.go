@@ -1005,7 +1005,12 @@ func hostShellCommand() string {
 	if runtime.GOOS == "windows" {
 		return firstNonEmpty(os.Getenv("COMSPEC"), "cmd.exe")
 	}
-	return firstNonEmpty(os.Getenv("SHELL"), "/bin/sh")
+	for _, name := range []string{"zsh", "bash", "sh"} {
+		if path, err := exec.LookPath(name); err == nil {
+			return path
+		}
+	}
+	return "/bin/sh"
 }
 
 func currentWorkingDirectory() string {
