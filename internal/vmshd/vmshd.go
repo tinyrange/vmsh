@@ -294,6 +294,7 @@ type Server struct {
 	streams  *streamRegistry
 	jobs     *hostJobRunner
 	shells   *hostShellManager
+	balloon  *balloonController
 
 	startedAt time.Time
 }
@@ -353,6 +354,18 @@ func Run(args []string) (bool, error) {
 		RegisterHandlers: func(mux *http.ServeMux, runtime ccvmd.RuntimeView) {
 			srv.RegisterHandlers(mux, runtime)
 		},
+		NormalizeCreateRequest: func(req *client.CreateInstanceRequest, runtime ccvmd.RuntimeView) error {
+			srv.normalizeCreateRequest(req, runtime)
+			return nil
+		},
+		NormalizeStartRequest: func(req *client.StartInstanceRequest, runtime ccvmd.RuntimeView) error {
+			srv.normalizeStartRequest(req, runtime)
+			return nil
+		},
+		NormalizeRunRequest: func(req *client.RunRequest, runtime ccvmd.RuntimeView) error {
+			srv.normalizeRunRequest(req, runtime)
+			return nil
+		},
 		WrapHandler: srv.Authenticate,
 	})
 }
@@ -365,6 +378,7 @@ func NewServer(token string) *Server {
 		streams:   newStreamRegistry(),
 		jobs:      newHostJobRunner(),
 		shells:    newHostShellManager(),
+		balloon:   newBalloonController(systemMemoryObserver{}),
 		startedAt: time.Now(),
 	}
 }

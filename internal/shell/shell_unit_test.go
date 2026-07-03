@@ -1436,6 +1436,37 @@ func TestStartVMUsesStartupSnapshotCacheForCompatibleAlpine(t *testing.T) {
 	}
 }
 
+func TestStartVMUsesSeparateStartupSnapshotCacheForDefaultMemory(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	sh := newUnitShell(t, api)
+
+	if err := sh.startVM("work", commandContext{Image: "alpine", CPUs: 1}, io.Discard); err != nil {
+		t.Fatalf("start VM: %v", err)
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	req := api.starts[0].req
+	explicitRoot, err := startupSnapshotRoot(sh.rootCache, client.StartInstanceRequest{
+		Image:    "alpine",
+		MemoryMB: startupSnapshotMemoryMB,
+		CPUs:     startupSnapshotCPUs,
+		Shares:   []client.ShareMount{startupSnapshotTestShare(t, sh)},
+	})
+	if err != nil {
+		t.Fatalf("explicit snapshot root: %v", err)
+	}
+	if req.SnapshotDir == "" {
+		t.Fatalf("snapshot dir is empty in request %+v", req)
+	}
+	if req.SnapshotDir == explicitRoot {
+		t.Fatalf("default-memory snapshot dir reused explicit 512 MB cache %q", req.SnapshotDir)
+	}
+	if req.MemoryMB != 0 {
+		t.Fatalf("memory_mb = %d, want daemon default to remain unspecified", req.MemoryMB)
+	}
+}
+
 func TestStartVMRestoresNewestStartupSnapshotForCompatibleAlpine(t *testing.T) {
 	api := newRecordingShellAPI("alpine")
 	sh := newUnitShell(t, api)
@@ -1464,6 +1495,70 @@ func TestStartVMRestoresNewestStartupSnapshotForCompatibleAlpine(t *testing.T) {
 	}
 	if req.RestoreSnapshot != newSnapshot {
 		t.Fatalf("restore snapshot = %q, want %q", req.RestoreSnapshot, newSnapshot)
+	}
+}
+
+func TestStartVMSkipsPersistedStartupSnapshotUntilDaemonRefresh(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	sh := newUnitShell(t, api)
+	sh.vmshd = &vmshdSessionReporter{startedAt: time.Unix(20, 0), startedKnown: true}
+	baseReq := startupSnapshotTestRequest(t, sh)
+	root, err := startupSnapshotRoot(sh.rootCache, baseReq)
+	if err != nil {
+		t.Fatalf("snapshot root: %v", err)
+	}
+	oldSnapshot := filepath.Join(root, "snapshot-20260101T000000.000000000Z")
+	writeStartupSnapshotManifest(t, oldSnapshot, time.Unix(10, 0))
+
+	if err := sh.startVM("work", commandContext{Image: "alpine", MemoryMB: 512, CPUs: 1}, io.Discard); err != nil {
+		t.Fatalf("start VM: %v", err)
+	}
+	req := api.starts[0].req
+	if req.SnapshotDir != root {
+		t.Fatalf("snapshot dir = %q, want %q", req.SnapshotDir, root)
+	}
+	if req.RestoreSnapshot != "" {
+		t.Fatalf("restore snapshot = %q, want cold boot before daemon refresh", req.RestoreSnapshot)
+	}
+	if startupSnapshotMarkerMatches(root, sh.vmshd.startedAt.UTC().Format(time.RFC3339Nano)) {
+		t.Fatalf("daemon marker was written without a fresh snapshot")
+	}
+}
+
+func TestStartVMRestoresStartupSnapshotAfterDaemonRefresh(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	sh := newUnitShell(t, api)
+	sh.vmshd = &vmshdSessionReporter{startedAt: time.Unix(20, 0), startedKnown: true}
+	baseReq := startupSnapshotTestRequest(t, sh)
+	root, err := startupSnapshotRoot(sh.rootCache, baseReq)
+	if err != nil {
+		t.Fatalf("snapshot root: %v", err)
+	}
+	oldSnapshot := filepath.Join(root, "snapshot-20260101T000000.000000000Z")
+	writeStartupSnapshotManifest(t, oldSnapshot, time.Unix(10, 0))
+	freshSnapshot := filepath.Join(root, "snapshot-20260102T000000.000000000Z")
+	api.startStream = func(ctx context.Context, id string, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
+		api.starts = append(api.starts, recordedStart{id: id, req: req})
+		if req.RestoreSnapshot == "" {
+			writeStartupSnapshotManifest(t, freshSnapshot, time.Unix(30, 0))
+		}
+		return client.InstanceState{ID: id, Status: "running"}, nil
+	}
+
+	if err := sh.startVM("work", commandContext{Image: "alpine", MemoryMB: 512, CPUs: 1}, io.Discard); err != nil {
+		t.Fatalf("first start VM: %v", err)
+	}
+	if api.starts[0].req.RestoreSnapshot != "" {
+		t.Fatalf("first restore snapshot = %q, want cold boot", api.starts[0].req.RestoreSnapshot)
+	}
+	if !startupSnapshotMarkerMatches(root, sh.vmshd.startedAt.UTC().Format(time.RFC3339Nano)) {
+		t.Fatalf("daemon marker was not written after fresh snapshot")
+	}
+	if err := sh.startVM("work", commandContext{Image: "alpine", MemoryMB: 512, CPUs: 1}, io.Discard); err != nil {
+		t.Fatalf("second start VM: %v", err)
+	}
+	if api.starts[1].req.RestoreSnapshot != freshSnapshot {
+		t.Fatalf("second restore snapshot = %q, want %q", api.starts[1].req.RestoreSnapshot, freshSnapshot)
 	}
 }
 
@@ -1550,6 +1645,25 @@ func startupSnapshotTestShare(t *testing.T, sh *shellState) client.ShareMount {
 		t.Fatalf("host share paths: %v", err)
 	}
 	return hostShareMount(hostRoot)
+}
+
+func writeStartupSnapshotManifest(t *testing.T, snapshot string, modTime time.Time) {
+	t.Helper()
+	if err := os.MkdirAll(snapshot, 0o755); err != nil {
+		t.Fatalf("create snapshot dir: %v", err)
+	}
+	manifest := filepath.Join(snapshot, "manifest.json")
+	if err := os.WriteFile(manifest, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write snapshot manifest: %v", err)
+	}
+	if !modTime.IsZero() {
+		if err := os.Chtimes(snapshot, modTime, modTime); err != nil {
+			t.Fatalf("set snapshot dir modtime: %v", err)
+		}
+		if err := os.Chtimes(manifest, modTime, modTime); err != nil {
+			t.Fatalf("set snapshot manifest modtime: %v", err)
+		}
+	}
 }
 
 func TestBareImageTargetUsesImageNameAsSystemName(t *testing.T) {
