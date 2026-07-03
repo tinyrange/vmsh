@@ -60,8 +60,14 @@ func TestParseSSHExecPayload(t *testing.T) {
 
 func TestRunArgsUseBuiltInDaemonByDefault(t *testing.T) {
 	args := vmshRunArgs("/tmp/build", nil)
-	if strings.Join(args, " ") != "-record-raw /tmp/build/session.raw.jsonl" {
+	want := []string{"-record-raw", filepath.Join("/tmp/build", "session.raw.jsonl")}
+	if len(args) != len(want) {
 		t.Fatalf("run args = %#v", args)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Fatalf("run args = %#v", args)
+		}
 	}
 	for _, arg := range args {
 		if arg == "-ccvm" {
