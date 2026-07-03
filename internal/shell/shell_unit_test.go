@@ -3043,6 +3043,7 @@ func TestTildePathCompletionPreservesTypedBase(t *testing.T) {
 	sh := newUnitShell(t, newRecordingShellAPI())
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	if err := os.MkdirAll(filepath.Join(home, "dev", "projects"), 0o755); err != nil {
 		t.Fatalf("create completion fixture: %v", err)
 	}
