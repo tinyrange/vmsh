@@ -58,6 +58,12 @@ func TestParseSSHExecPayload(t *testing.T) {
 	}
 }
 
+func TestVMSHBuildEmbedsDaemonAndGuestInit(t *testing.T) {
+	if got := vmshBuildTags(); got != "embed_ccvm embed_guestinit" {
+		t.Fatalf("vmsh build tags = %q", got)
+	}
+}
+
 func splitCastLines(text string) []string {
 	var lines []string
 	for _, line := range strings.Split(text, "\n") {

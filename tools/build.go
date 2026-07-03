@@ -260,7 +260,7 @@ func build(p paths) error {
 		return err
 	}
 	if err := step("build vmsh", func() error {
-		return goBuild(p.root, nil, p.vmsh, "./cmd/vmsh")
+		return goBuild(p.root, nil, p.vmsh, "-tags", vmshBuildTags(), "./cmd/vmsh")
 	}); err != nil {
 		return err
 	}
@@ -313,6 +313,10 @@ func guestInitPayloads() []guestInitPayload {
 		}
 	}
 	return payloads
+}
+
+func vmshBuildTags() string {
+	return "embed_ccvm embed_guestinit"
 }
 
 func buildGuestInitPayloads(p paths) ([]string, error) {
