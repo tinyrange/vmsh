@@ -60,8 +60,8 @@ python3 --version
 - `cc`: git submodule containing `ccvm`, VM backends, image import, and the
   lower-level `cc` CLI.
 - `tools/build.go`: local build and run helper for `cc`, `ccvm`, and `vmsh`.
-  It builds guest init payloads, builds `ccvm` from the submodule, builds
-  `vmsh`, signs `ccvm` on macOS, and can launch `vmsh -ccvm build/vmsh/ccvm`.
+  It builds `ccvm` from the submodule as a sidecar artifact, builds `vmsh`,
+  signs `ccvm` on macOS, and can launch the built `vmsh`.
 - `.github/workflows/release.yml`: tag-triggered single-binary releases for
   Linux, Windows, and signed macOS ARM64.
 
