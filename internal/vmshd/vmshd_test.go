@@ -46,6 +46,22 @@ func TestTokenFileIsPrivate(t *testing.T) {
 	}
 }
 
+func TestHostShellCommandPrefersSupportedShellOverEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host shell lookup is Unix-specific")
+	}
+	dir := t.TempDir()
+	zsh := filepath.Join(dir, "zsh")
+	if err := os.WriteFile(zsh, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write zsh fixture: %v", err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("SHELL", "/usr/bin/fish")
+	if got := hostShellCommand(); got != zsh {
+		t.Fatalf("host shell command = %q, want %q", got, zsh)
+	}
+}
+
 func TestAuthenticateRequiresBearerToken(t *testing.T) {
 	srv := NewServer("secret")
 	handler := srv.Authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

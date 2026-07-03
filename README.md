@@ -60,8 +60,8 @@ python3 --version
 - `cc`: git submodule containing `ccvm`, VM backends, image import, and the
   lower-level `cc` CLI.
 - `tools/build.go`: local build and run helper for `cc`, `ccvm`, and `vmsh`.
-  It builds guest init payloads, builds `ccvm` from the submodule, builds
-  `vmsh`, signs `ccvm` on macOS, and can launch `vmsh -ccvm build/vmsh/ccvm`.
+  It builds `ccvm` from the submodule as a sidecar artifact, builds `vmsh`,
+  signs `ccvm` on macOS, and can launch the built `vmsh`.
 - `.github/workflows/release.yml`: tag-triggered single-binary releases for
   Linux, Windows, and signed macOS ARM64.
 
@@ -212,13 +212,11 @@ The workflow builds one standalone `vmsh` binary per target:
 - `windows/amd64`
 - `darwin/arm64`
 
-Release binaries are built with `embed_ccvm` and `embed_guestinit`. That compiles
-the `ccvm` daemon entrypoint into the same Go executable as `vmsh`, embeds the
-static Linux guest init payloads for amd64 and arm64 guests, and embeds the
-native OpenBSD, FreeBSD, and NetBSD guest init payloads for the release target
-architecture. At runtime, `vmsh` re-execs itself with `VMSH_INTERNAL_VMSHD=1`
-when it needs to start the authenticated local daemon, so release assets do not
-need a `ccvm` sidecar or a Go toolchain to build guest init helpers.
+Release binaries always include the vmshd daemon entrypoint in the same Go
+executable as `vmsh`. At runtime, `vmsh` re-execs itself with
+`VMSH_INTERNAL_VMSHD=1` when it needs to start the authenticated local daemon.
+Guest init helpers are built through the cc runtime cache path when a backend
+needs them.
 
 The release workflow also supports manual dry runs from GitHub Actions. Use
 `workflow_dispatch`, provide a version string for artifact names, and leave

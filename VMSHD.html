@@ -335,7 +335,7 @@ func (s *Server) Handler() http.Handler {
   "version": 1,
   "addr": "127.0.0.1:55433",
   "socket": "",
-  "token_path": "/Users/joshua/Library/Caches/vmsh/ccprod/vmshd.token",
+  "token_path": "/Users/joshua/Library/Caches/vmsh/vmshd/vmshd.token",
   "launch_key": "path=...",
   "api_version": "2026-06-25"
 }</code></pre>
@@ -596,7 +596,7 @@ GET /vmsh/status</code></pre>
 
       <h3>Phase 2: Same-Process vmshd Entrypoint</h3>
       <ul>
-        <li>Add <code>VMSH_INTERNAL_VMSHD</code> daemon mode to the release binary.</li>
+        <li>Add <code>VMSH_INTERNAL_VMSHD</code> daemon mode to the vmsh binary.</li>
         <li>Factor ccvm daemon code into a mountable handler/runtime component.</li>
         <li>Start vmshd instead of embedded ccvm from vmsh.</li>
         <li>Keep existing ccvm routes passing through the same listener.</li>
@@ -621,7 +621,7 @@ GET /vmsh/status</code></pre>
 
       <h3>Phase 5: Cleanup and Compatibility Removal</h3>
       <ul>
-        <li>Remove direct embedded ccvm startup from vmsh once vmshd is stable. This is now handled by keeping embedded startup on <code>VMSH_INTERNAL_VMSHD=1</code> and leaving separate ccvm usage behind explicit <code>-ccvm</code>.</li>
+        <li>Use vmshd as the default daemon path and leave separate ccvm usage behind explicit <code>-ccvm</code>.</li>
         <li>Delete compatibility state readers after a reasonable transition window.</li>
         <li>Consolidate daemon lease and shutdown behavior under vmshd.</li>
       </ul>

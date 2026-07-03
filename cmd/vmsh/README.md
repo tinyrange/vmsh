@@ -4,9 +4,8 @@
 
 `vmsh` must be run from an interactive terminal. Interactive sessions use the native `vmsh` line editor, persistent history stored in the `ccvm` cache directory, and autocomplete support for `@` builtins, cached image names, `vmsh` options, command names, and host paths.
 
-Release builds use a `ccprod` cache/daemon identity by default. Development
-builds use `ccdev`, so a checkout build can run alongside an installed release
-without sharing daemon state. Pass `-cache-dir` to use an explicit cache root.
+`vmsh` uses a `vmshd` cache/daemon identity by default. Pass `-cache-dir` to use
+an explicit cache root.
 By default, a `vmsh` frontend owns its daemon session and the session is cleaned
 up when that frontend exits. Start with `-system-session` or run `@detach` to
 keep the session available after the current frontend closes.
@@ -144,8 +143,8 @@ context or a one-shot command.
 
 ## Building
 
-For local development, `tools/build.go run` builds `ccvm` and `vmsh`
-separately and runs `vmsh -ccvm build/vmsh/ccvm`.
+For local development, `tools/build.go run` builds `ccvm` and `vmsh`, then runs
+the built `vmsh` with its built-in vmshd daemon path.
 
 `vmsh` keeps `cc` as a submodule. After cloning, initialize it with:
 
@@ -165,8 +164,8 @@ On Windows, run the same helper with:
 go run .\tools\build.go run
 ```
 
-The runner builds the Linux guest init payloads and `ccvm` inside the `cc`
-submodule, then builds this repository's `vmsh` binary.
+The runner builds `ccvm` inside the `cc` submodule as a sidecar artifact for
+explicit compatibility testing, then builds this repository's `vmsh` binary.
 
 You can also build `vmsh` directly and point it at a `ccvm` binary:
 
