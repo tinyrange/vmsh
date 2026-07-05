@@ -1054,6 +1054,68 @@ func TestVersionBuiltinReportsBuildIdentity(t *testing.T) {
 	}
 }
 
+func TestInstallBuiltinUpdatesStableDaemonCopy(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	src := filepath.Join(t.TempDir(), backend.HostExecutableName("vmsh"))
+	if err := os.WriteFile(src, []byte("vmsh-binary"), 0o755); err != nil {
+		t.Fatalf("write source binary: %v", err)
+	}
+	sh.vmshPath = src
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@install", &stdout, &stderr); err != nil {
+		t.Fatalf("@install: %v", err)
+	}
+	stablePath := filepath.Join(sh.rootCache, "bin", backend.HostExecutableName("vmshd"))
+	data, err := os.ReadFile(stablePath)
+	if err != nil {
+		t.Fatalf("read stable daemon copy: %v", err)
+	}
+	if string(data) != "vmsh-binary" {
+		t.Fatalf("stable daemon copy contents = %q", data)
+	}
+	if !strings.Contains(stdout.String(), "Manual start command:") {
+		t.Fatalf("@install output = %q", stdout.String())
+	}
+}
+
+func TestInstallBuiltinCanInstallSystemdUserUnit(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	src := filepath.Join(t.TempDir(), backend.HostExecutableName("vmsh"))
+	if err := os.WriteFile(src, []byte("vmsh-binary"), 0o755); err != nil {
+		t.Fatalf("write source binary: %v", err)
+	}
+	sh.vmshPath = src
+	sh.hasSystemdUser = func() bool { return true }
+	sh.confirmSystemd = func(io.Writer) (bool, error) { return true, nil }
+	var installedPath, installedCache string
+	sh.installSystemdUser = func(path, cache string) error {
+		installedPath = path
+		installedCache = cache
+		return nil
+	}
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@install", &stdout, &stderr); err != nil {
+		t.Fatalf("@install: %v", err)
+	}
+	wantPath := filepath.Join(sh.rootCache, "bin", backend.HostExecutableName("vmshd"))
+	if installedPath != wantPath || installedCache != sh.rootCache {
+		t.Fatalf("systemd install path/cache = %q %q, want %q %q", installedPath, installedCache, wantPath, sh.rootCache)
+	}
+	if !strings.Contains(stdout.String(), "vmshd.service") {
+		t.Fatalf("@install output = %q", stdout.String())
+	}
+}
+
+func TestVMSHDSystemdUnitUsesStableDaemonAndCache(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("systemd unit paths are POSIX-only")
+	}
+	unit := vmshdSystemdUnit("/tmp/vmsh dir/vmshd", "/tmp/cache dir")
+	if !strings.Contains(unit, `ExecStart="/tmp/vmsh dir/vmshd" -cache-dir "/tmp/cache dir" -state-path "/tmp/cache dir/vmshd.json"`) {
+		t.Fatalf("unit = %q", unit)
+	}
+}
+
 func versionOutputFields(out string) map[string]string {
 	fields := map[string]string{}
 	for _, line := range strings.Split(out, "\n") {
@@ -1181,6 +1243,7 @@ func TestGuestPersistentShellRestartsEndedCachedSession(t *testing.T) {
 	ctx := commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu", Network: true}
 	req := client.RunRequest{Image: "ubuntu", WorkDir: "/host/project", TTY: true}
 	var starts atomic.Int32
+	releases := make(chan chan struct{}, 2)
 	api.runInteractive = func(id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 		starts.Add(1)
 		if onEvent != nil {
@@ -1188,12 +1251,17 @@ func TestGuestPersistentShellRestartsEndedCachedSession(t *testing.T) {
 				return err
 			}
 		}
+		release := make(chan struct{})
+		releases <- release
+		<-release
 		return nil
 	}
 	first, err := sh.guestPersistentShell(ctx, req, nil, nil)
 	if err != nil {
 		t.Fatalf("start first shell: %v", err)
 	}
+	firstRelease := <-releases
+	close(firstRelease)
 	deadline := time.After(2 * time.Second)
 	for !first.ended.Load() {
 		select {
@@ -1210,6 +1278,8 @@ func TestGuestPersistentShellRestartsEndedCachedSession(t *testing.T) {
 	if second == first {
 		t.Fatal("reused ended persistent guest shell")
 	}
+	secondRelease := <-releases
+	close(secondRelease)
 	if got := starts.Load(); got != 2 {
 		t.Fatalf("persistent shell starts = %d, want 2", got)
 	}
@@ -7919,6 +7989,9 @@ func newUnitShell(t *testing.T, api *recordingShellAPI) *shellState {
 		confirmVMRestart: func(string, io.Writer) (bool, error) {
 			return true, nil
 		},
+		confirmSystemd:     func(io.Writer) (bool, error) { return false, nil },
+		hasSystemdUser:     func() bool { return false },
+		installSystemdUser: func(string, string) error { return nil },
 	}
 	sh.completion = newVMSHCompleter(sh)
 	return sh

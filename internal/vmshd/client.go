@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/tinyrange/vmsh/internal/backend"
+	"github.com/tinyrange/vmsh/internal/vmshdprotocol"
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
 )
@@ -128,6 +129,7 @@ func (c *HTTPClient) DialTerminalStream(ctx context.Context, sessionID, attachme
 		cfg.Header = http.Header{}
 	}
 	cfg.Header.Set("Authorization", "Bearer "+c.token)
+	setFrontendProtocolHeaders(cfg.Header)
 	ws, err := websocket.DialConfig(cfg)
 	if err != nil {
 		return nil, err
@@ -210,6 +212,7 @@ func (c *HTTPClient) doJSON(method, path string, reqBody any, respBody any) erro
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
+	setFrontendProtocolHeaders(req.Header)
 	if reqBody != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -229,6 +232,15 @@ func (c *HTTPClient) doJSON(method, path string, reqBody any, respBody any) erro
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(respBody)
+}
+
+func setFrontendProtocolHeaders(header http.Header) {
+	if header == nil {
+		return
+	}
+	header.Set(vmshdprotocol.HeaderProtocol, fmt.Sprintf("%d", vmshdprotocol.Current))
+	header.Set(vmshdprotocol.HeaderMinProtocol, fmt.Sprintf("%d", vmshdprotocol.Minimum))
+	header.Set(vmshdprotocol.HeaderName, "vmsh")
 }
 
 func websocketURL(baseURL, path string) (string, error) {

@@ -5,6 +5,7 @@ import (
 
 	"github.com/tinyrange/vmsh/internal/backend"
 	"github.com/tinyrange/vmsh/internal/vmshd"
+	"github.com/tinyrange/vmsh/internal/vmshdprotocol"
 )
 
 func bundledCCVMAvailable() bool {
@@ -12,7 +13,7 @@ func bundledCCVMAvailable() bool {
 }
 
 func runInternalCCVMFromEnv() bool {
-	if os.Getenv(backend.InternalVMSHDEnv) == "1" {
+	if os.Getenv(backend.InternalVMSHDEnv) == "1" || vmshdprotocol.IsDaemonExecutableName(os.Args[0]) {
 		_ = os.Setenv(backend.InternalCCVMSidecarModeEnv, backend.InternalCCVMSidecarMode)
 		vmshd.Main(os.Args[1:])
 		return true
