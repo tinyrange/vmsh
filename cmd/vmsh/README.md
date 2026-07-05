@@ -99,6 +99,7 @@ These attention words are reserved:
 @detach
 @ps
 @status
+@version
 @start
 @stop [name|vm:name|ssh:name]
 @forward <host-port:guest-port>

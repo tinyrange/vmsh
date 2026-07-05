@@ -81,7 +81,9 @@ jobs:
             done
           done
           cd ..
-          GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -tags "embed_ccvm embed_guestinit" -o "dist/${name}" ./cmd/vmsh
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-X github.com/tinyrange/vmsh/internal/version.Release=${version} -X github.com/tinyrange/vmsh/internal/version.Commit=${GITHUB_SHA} -X github.com/tinyrange/vmsh/internal/version.Dirty=false -X github.com/tinyrange/vmsh/internal/version.BuildDate=${build_date}"
+          GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -tags "embed_ccvm embed_guestinit" -ldflags "$ldflags" -o "dist/${name}" ./cmd/vmsh
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -166,7 +168,9 @@ jobs:
             done
           done
           cd ..
-          GOOS=darwin GOARCH=arm64 go build -trimpath -tags "embed_ccvm embed_guestinit" -o "dist/${name}" ./cmd/vmsh
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-X github.com/tinyrange/vmsh/internal/version.Release=${version} -X github.com/tinyrange/vmsh/internal/version.Commit=${GITHUB_SHA} -X github.com/tinyrange/vmsh/internal/version.Dirty=false -X github.com/tinyrange/vmsh/internal/version.BuildDate=${build_date}"
+          GOOS=darwin GOARCH=arm64 go build -trimpath -tags "embed_ccvm embed_guestinit" -ldflags "$ldflags" -o "dist/${name}" ./cmd/vmsh
 
       - name: Sign macOS binaries
         run: |

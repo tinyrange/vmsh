@@ -31,6 +31,7 @@ import (
 	"github.com/tinyrange/vmsh/internal/backend"
 	"github.com/tinyrange/vmsh/internal/terminal"
 	"github.com/tinyrange/vmsh/internal/termui/editor"
+	"github.com/tinyrange/vmsh/internal/version"
 	"github.com/tinyrange/vmsh/internal/vmshd"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
@@ -352,7 +353,7 @@ func (c *vmshCompleter) completionContext(prefix string) commandContext {
 		if err == nil {
 			ctx = sshCommandContext(ctx, at.Options, host)
 		}
-	case "help", "ps", "jobs", "sessions", "detach", "alias", "exec", "status", "where", "start", "stop", "restart", "forward", "tmux", "agent":
+	case "help", "ps", "jobs", "sessions", "detach", "alias", "exec", "status", "where", "version", "start", "stop", "restart", "forward", "tmux", "agent":
 	default:
 		if sshCtx, ok := c.shellSSHSessionContext(at.Target); ok {
 			ctx = sshCtx
@@ -371,7 +372,7 @@ func (c *vmshCompleter) shellSSHSessionContext(name string) (commandContext, boo
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@agent", "@alias", "@copy", "@detach", "@exec", "@help", "@host", "@jobs", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux"}
+	words := []string{"@agent", "@alias", "@copy", "@detach", "@exec", "@help", "@host", "@jobs", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux", "@version"}
 	if c.shell != nil {
 		for _, name := range c.shell.sshSessionNames() {
 			words = append(words, "@"+name)
@@ -1100,11 +1101,16 @@ func Run(args []string) error {
 	recordPath := fs.String("record", "", "Record terminal output to an asciinema v2 .cast file")
 	recordRawPath := fs.String("record-raw", "", "Record lossless raw terminal input/output events to a JSONL file")
 	systemSession := fs.Bool("system-session", false, "Keep the vmshd session after this frontend exits")
+	showVersion := fs.Bool("version", false, "Print version information and exit")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("usage: vmsh [flags]")
+	}
+	if *showVersion {
+		_, err := fmt.Fprint(os.Stdout, versionText(strings.TrimSpace(*ccvmPath)))
+		return err
 	}
 
 	rootCache, err := resolveShellCacheDir(*cacheDir, defaultDaemonIdentity(), nestedVMSHActive())
@@ -2069,6 +2075,21 @@ func shouldSaveHistory(line string) bool {
 	return trimmed != "" && !strings.HasPrefix(trimmed, "#")
 }
 
+func versionText(ccvmPath string) string {
+	var b strings.Builder
+	b.WriteString(version.Current().String())
+	ccvmPath = strings.TrimSpace(ccvmPath)
+	switch {
+	case ccvmPath != "":
+		fmt.Fprintf(&b, "ccvm external %s\n", ccvmPath)
+	case bundledCCVMAvailable():
+		b.WriteString("ccvm bundled\n")
+	default:
+		b.WriteString("ccvm auto\n")
+	}
+	return b.String()
+}
+
 func (s *shellState) eval(line string, stdout, stderr io.Writer) error {
 	line = strings.TrimSpace(line)
 	if line == "" {
@@ -2729,7 +2750,7 @@ func (s *shellState) preparePipelineStage(base commandContext, index int, segmen
 
 func isControlAtTarget(target string) bool {
 	switch target {
-	case "help", "?", "ps", "jobs", "sessions", "detach", "alias", "status", "where", "start", "stop", "restart", "save", "rmi", "tmux", "forward", "copy", "cp", "agent", "ssh":
+	case "help", "?", "ps", "jobs", "sessions", "detach", "alias", "status", "where", "version", "start", "stop", "restart", "save", "rmi", "tmux", "forward", "copy", "cp", "agent", "ssh":
 		return true
 	default:
 		return false
@@ -3285,6 +3306,12 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("usage: @%s", at.Target)
 		}
 		return s.printStatus(stdout)
+	case "version":
+		if at.Command != "" || len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @version")
+		}
+		_, err := fmt.Fprint(stdout, versionText(s.ccvmPath))
+		return err
 	case "sudo":
 		ctx := s.context.withOptions(at.Options)
 		if at.Command == "" {
@@ -9771,6 +9798,7 @@ func (s *shellState) help(w io.Writer) error {
 @sessions                list vmshd shell sessions and resource counts
 @detach                  keep the current vmshd session after this frontend exits
 @status                  show vmsh and selected VM state
+@version                 show vmsh build metadata
 @start                   start the current VM
 @stop [name|vm:name|ssh:name]  stop an SSH session or VM
 @restart [name|vm:name]  restart a VM after confirmation

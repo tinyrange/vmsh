@@ -1042,6 +1042,36 @@ func TestExitUsageRejectsUnknownArguments(t *testing.T) {
 	}
 }
 
+func TestVersionBuiltinReportsBuildIdentity(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@version", &stdout, &stderr); err != nil {
+		t.Fatalf("@version: %v", err)
+	}
+	fields := versionOutputFields(stdout.String())
+	if fields["version"] == "" || fields["dirty"] == "" || fields["platform"] == "" || fields["go"] == "" || fields["ccvm"] == "" {
+		t.Fatalf("version fields = %#v output:\n%s", fields, stdout.String())
+	}
+}
+
+func versionOutputFields(out string) map[string]string {
+	fields := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+		if len(parts) >= 3 && parts[0] == "vmsh" && parts[1] == "version" {
+			fields["version"] = parts[2]
+			continue
+		}
+		if len(parts) >= 2 {
+			fields[parts[0]] = strings.Join(parts[1:], " ")
+		}
+	}
+	return fields
+}
+
 func hasExitResource(resources []exitResource, kind, name string) bool {
 	for _, resource := range resources {
 		if resource.Kind == kind && resource.Name == name {
@@ -3118,6 +3148,10 @@ func TestCompletionsUseCachedImagesOptionsAndHostMappedPaths(t *testing.T) {
 	if kind != completionAt || replaceLen != len("@sta") || !hasString(candidates, "@status") || !hasString(candidates, "@start") {
 		t.Fatalf("status/start target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
+	candidates, replaceLen, kind = c.Complete([]rune("@ver"), len("@ver"))
+	if kind != completionAt || replaceLen != len("@ver") || !hasString(candidates, "@version") {
+		t.Fatalf("version target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
+	}
 	candidates, _, _ = c.Complete([]rune("@alpine --pr"), len("@alpine --pr"))
 	if hasString(candidates, "--proxy") {
 		t.Fatalf("non-agent option completion included proxy: %q", candidates)
@@ -3940,18 +3974,44 @@ func TestHostCommandInterruptIsNotFatal(t *testing.T) {
 	}
 	t.Cleanup(session.close)
 
+	startedPath := filepath.Join(t.TempDir(), "started")
 	var interrupted atomic.Bool
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- session.run("sleep 30", io.Discard, io.Discard, func() (func(), error) {
+		errCh <- session.run("printf started > "+shellQuote(startedPath)+"; sleep 30", io.Discard, io.Discard, func() (func(), error) {
 			go func() {
-				time.Sleep(100 * time.Millisecond)
+				deadline := time.Now().Add(2 * time.Second)
+				for {
+					if _, err := os.Stat(startedPath); err == nil {
+						break
+					}
+					if time.Now().After(deadline) {
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
 				interrupted.Store(true)
-				_, _ = session.tty.Write([]byte{0x03})
+				go session.close()
 			}()
 			return func() {}, nil
 		})
 	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(startedPath); err == nil {
+			break
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("host command returned before start marker: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("host command did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	select {
 	case err := <-errCh:
