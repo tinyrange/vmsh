@@ -224,6 +224,9 @@ jobs:
     needs: [build-unix-windows, build-macos]
     runs-on: ubuntu-24.04
     steps:
+      - name: Checkout release notes
+        uses: actions/checkout@v6
+
       - name: Download binaries
         uses: actions/download-artifact@v4
         with:
@@ -250,7 +253,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_VERSION }}
-          generate_release_notes: true
+          body_path: RELEASENOTES.md
           files: |
             artifacts/**/vmsh_*
             checksums.txt

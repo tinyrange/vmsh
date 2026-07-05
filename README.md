@@ -73,8 +73,8 @@ Install the latest release to `~/.local/bin`:
 curl -fsSL https://raw.githubusercontent.com/tinyrange/vmsh/main/install.sh | sh
 ```
 
-The installer supports macOS ARM64 and Linux ARM64/AMD64 release binaries. To
-install a specific release or choose another destination:
+The installer supports macOS ARM64, Linux ARM64/AMD64, and Windows ARM64/AMD64
+release binaries. To install a specific release or choose another destination:
 
 ```sh
 VMSH_VERSION=v0.1.0 VMSH_INSTALL_DIR=/usr/local/bin sh install.sh
