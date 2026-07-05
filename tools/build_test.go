@@ -83,6 +83,26 @@ func TestRunArgsPreserveExplicitRecordArgs(t *testing.T) {
 	}
 }
 
+func TestVersionLDFlagsTargetVersionPackage(t *testing.T) {
+	ldflags := vmshVersionLDFlags(".")
+	fields := strings.Fields(ldflags)
+	for _, name := range []string{"Release", "Commit", "Dirty", "BuildDate"} {
+		wantPrefix := "github.com/tinyrange/vmsh/internal/version." + name + "="
+		if !hasFieldWithPrefix(fields, wantPrefix) {
+			t.Fatalf("ldflags missing %s assignment: %q", name, ldflags)
+		}
+	}
+}
+
+func hasFieldWithPrefix(fields []string, prefix string) bool {
+	for _, field := range fields {
+		if strings.HasPrefix(field, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func splitCastLines(text string) []string {
 	var lines []string
 	for _, line := range strings.Split(text, "\n") {

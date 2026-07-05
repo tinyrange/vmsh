@@ -246,7 +246,11 @@ func build(p paths) error {
 		return err
 	}
 	if err := step("build vmsh", func() error {
-		return goBuild(p.root, nil, p.vmsh, "./cmd/vmsh")
+		args := []string{"./cmd/vmsh"}
+		if ldflags := vmshVersionLDFlags(p.root); ldflags != "" {
+			args = append([]string{"-ldflags", ldflags}, args...)
+		}
+		return goBuild(p.root, nil, p.vmsh, args...)
 	}); err != nil {
 		return err
 	}
@@ -295,6 +299,41 @@ func formatDuration(d time.Duration) string {
 func goBuild(workDir string, env []string, output string, args ...string) error {
 	goArgs := append([]string{"build", "-o", output}, args...)
 	return command(workDir, env, "go", goArgs...)
+}
+
+func vmshVersionLDFlags(root string) string {
+	values := map[string]string{
+		"Release":   gitOutput(root, "describe", "--tags", "--dirty", "--always"),
+		"Commit":    gitOutput(root, "rev-parse", "HEAD"),
+		"Dirty":     fmt.Sprintf("%t", gitDirty(root)),
+		"BuildDate": time.Now().UTC().Format(time.RFC3339),
+	}
+	var parts []string
+	for _, key := range []string{"Release", "Commit", "Dirty", "BuildDate"} {
+		value := strings.TrimSpace(values[key])
+		if value == "" {
+			continue
+		}
+		parts = append(parts, "-X", "github.com/tinyrange/vmsh/internal/version."+key+"="+value)
+	}
+	return strings.Join(parts, " ")
+}
+
+func gitOutput(root string, args ...string) string {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func gitDirty(root string) bool {
+	cmd := exec.Command("git", "status", "--porcelain")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	return err == nil && strings.TrimSpace(string(out)) != ""
 }
 
 func command(workDir string, env []string, name string, args ...string) error {

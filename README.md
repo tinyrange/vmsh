@@ -112,6 +112,12 @@ go build -o build/vmsh/vmsh ./cmd/vmsh
 ./build/vmsh/vmsh -ccvm /path/to/ccvm
 ```
 
+Check the local build identity:
+
+```sh
+vmsh --version
+```
+
 Run a non-interactive script:
 
 ```sh
@@ -146,6 +152,7 @@ Common forms:
 @alias expand ll /tmp           # preview the expanded command
 @jobs                           # list background jobs
 @status                         # show selected context and VM status
+@version                        # show vmsh build metadata
 @stop work                      # stop a named VM
 ```
 
