@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -460,7 +461,7 @@ func TestConnectCCVMWithOptionsStartsPrivateDaemonForIncompatibleVMSHD(t *testin
 	if err := WriteDaemonState(statePath, oldState); err != nil {
 		t.Fatalf("write old state: %v", err)
 	}
-	restore := stubStartDaemonProcess(t, `{"addr":"`+newLn.Addr().String()+`","kind":"vmshd","token_path":"`+newTokenPath+`"}`+"\n")
+	restore := stubStartDaemonProcess(t, serverHelloBanner(t, client.ServerHello{Addr: newLn.Addr().String(), Kind: "vmshd", TokenPath: newTokenPath}))
 	defer restore()
 
 	var incompatible DaemonState
@@ -568,7 +569,7 @@ func TestConnectCCVMWithOptionsStartsPrivateDaemonForUnauthenticatedVMSHDState(t
 		if err := os.WriteFile(newTokenPath, []byte(newToken+"\n"), 0o600); err != nil {
 			return nil, err
 		}
-		banner := `{"addr":"` + newLn.Addr().String() + `","kind":"vmshd","token_path":"` + newTokenPath + `"}` + "\n"
+		banner := serverHelloBanner(t, client.ServerHello{Addr: newLn.Addr().String(), Kind: "vmshd", TokenPath: newTokenPath})
 		return &startedDaemonProcess{
 			stdout: io.NopCloser(strings.NewReader(banner)),
 			stop:   func() {},
@@ -737,6 +738,15 @@ func stubStartDaemonProcess(t *testing.T, banner string) func() {
 	return func() {
 		startDaemonProcess = old
 	}
+}
+
+func serverHelloBanner(t *testing.T, hello client.ServerHello) string {
+	t.Helper()
+	data, err := json.Marshal(hello)
+	if err != nil {
+		t.Fatalf("marshal server hello: %v", err)
+	}
+	return string(data) + "\n"
 }
 
 func requireBearer(token string, next http.HandlerFunc) http.HandlerFunc {

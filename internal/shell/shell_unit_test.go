@@ -1107,6 +1107,9 @@ func TestInstallBuiltinCanInstallSystemdUserUnit(t *testing.T) {
 }
 
 func TestVMSHDSystemdUnitUsesStableDaemonAndCache(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("systemd unit paths are POSIX-only")
+	}
 	unit := vmshdSystemdUnit("/tmp/vmsh dir/vmshd", "/tmp/cache dir")
 	if !strings.Contains(unit, `ExecStart="/tmp/vmsh dir/vmshd" -cache-dir "/tmp/cache dir" -state-path "/tmp/cache dir/vmshd.json"`) {
 		t.Fatalf("unit = %q", unit)
