@@ -1243,6 +1243,7 @@ func TestGuestPersistentShellRestartsEndedCachedSession(t *testing.T) {
 	ctx := commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu", Network: true}
 	req := client.RunRequest{Image: "ubuntu", WorkDir: "/host/project", TTY: true}
 	var starts atomic.Int32
+	releases := make(chan chan struct{}, 2)
 	api.runInteractive = func(id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 		starts.Add(1)
 		if onEvent != nil {
@@ -1250,12 +1251,17 @@ func TestGuestPersistentShellRestartsEndedCachedSession(t *testing.T) {
 				return err
 			}
 		}
+		release := make(chan struct{})
+		releases <- release
+		<-release
 		return nil
 	}
 	first, err := sh.guestPersistentShell(ctx, req, nil, nil)
 	if err != nil {
 		t.Fatalf("start first shell: %v", err)
 	}
+	firstRelease := <-releases
+	close(firstRelease)
 	deadline := time.After(2 * time.Second)
 	for !first.ended.Load() {
 		select {
@@ -1272,6 +1278,8 @@ func TestGuestPersistentShellRestartsEndedCachedSession(t *testing.T) {
 	if second == first {
 		t.Fatal("reused ended persistent guest shell")
 	}
+	secondRelease := <-releases
+	close(secondRelease)
 	if got := starts.Load(); got != 2 {
 		t.Fatalf("persistent shell starts = %d, want 2", got)
 	}
