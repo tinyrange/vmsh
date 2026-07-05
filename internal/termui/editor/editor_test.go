@@ -184,9 +184,9 @@ func TestCompletionMenuRendersFuzzyPickerAndAcceptsSelection(t *testing.T) {
 	}
 }
 
-func TestCompletionMenuLinesStayWithinTerminalWidth(t *testing.T) {
+func TestCompletionMenuUsesInlineLayoutOnWideTerminal(t *testing.T) {
 	e := New(Options{Reader: eofReader{}, Writer: io.Discard})
-	st := &lineState{prompt: "> ", width: 80, height: 12}
+	st := &lineState{prompt: "> ", width: 140, height: 12}
 	menu := completionMenu{active: true, selected: 0}
 	for _, item := range []string{
 		"411toppm", "DeRez", "MagickWand-config", "aa",
@@ -204,6 +204,44 @@ func TestCompletionMenuLinesStayWithinTerminalWidth(t *testing.T) {
 	}
 	if w := visibleWidth(suffix); w > st.width-1 {
 		t.Fatalf("line width = %d > %d: %q", w, st.width-1, suffix)
+	}
+}
+
+func TestCompletionMenuUsesVerticalLayoutOnNarrowTerminal(t *testing.T) {
+	e := New(Options{Reader: eofReader{}, Writer: io.Discard})
+	st := &lineState{prompt: "> ", width: 64, height: 12}
+	menu := completionMenu{
+		active:   true,
+		selected: 2,
+		items: []string{
+			"411toppm", "DeRez", "MagickWand-config", "aa",
+			"aarch64-elf-gcc-15.2.0", "aarch64-elf-lto-dump",
+		},
+	}
+	menu.filtered = append([]string(nil), menu.items...)
+
+	suffix := e.completionMenuSuffix(&menu, st)
+	overlay, inline := splitOverlay(suffix)
+	if inline != "" {
+		t.Fatalf("inline suffix = %q, want vertical overlay", inline)
+	}
+	if len(overlay) < 2 {
+		t.Fatalf("overlay lines = %d, want completion menu lines", len(overlay))
+	}
+	if visibleWidth(overlay[0]) > st.width {
+		t.Fatalf("header width = %d > %d: %q", visibleWidth(overlay[0]), st.width, overlay[0])
+	}
+	var selected bool
+	for _, line := range overlay[1:] {
+		if visibleWidth(line) > st.width {
+			t.Fatalf("item width = %d > %d: %q", visibleWidth(line), st.width, line)
+		}
+		if strings.HasPrefix(line, "\x1b[7m>") {
+			selected = true
+		}
+	}
+	if !selected {
+		t.Fatalf("overlay = %#v, want selected item marker", overlay)
 	}
 }
 

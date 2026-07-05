@@ -987,9 +987,15 @@ func (c *vmshCompleter) guestHostCompletionDir(dirPart string) (string, bool) {
 }
 
 func shellEscapeCompletion(value string) string {
-	value = strings.ReplaceAll(value, `\`, `\\`)
-	value = strings.ReplaceAll(value, " ", `\ `)
-	return value
+	var b strings.Builder
+	for _, r := range value {
+		switch r {
+		case '\\', ' ', '\t', '\n', '"', '\'', '`', '$', '&', ';', '(', ')', '<', '>', '|', '*', '?', '[', ']', '{', '}', '!':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 func stringCompletions(items []string) [][]rune {

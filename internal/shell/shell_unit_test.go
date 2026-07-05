@@ -3158,6 +3158,22 @@ func TestPathCompletionAfterTrailingSlashAppendsChild(t *testing.T) {
 	}
 }
 
+func TestPathCompletionEscapesShellMetacharacters(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	name := "archive sample (v1).7z"
+	if err := os.WriteFile(filepath.Join(sh.hostCWD, name), []byte("archive"), 0o644); err != nil {
+		t.Fatalf("create completion fixture: %v", err)
+	}
+
+	c := newVMSHCompleter(sh)
+	line := []rune("7z x archive")
+	candidates, replaceLen, kind := c.Complete(line, len(line))
+	want := `archive\ sample\ \(v1\).7z`
+	if kind != completionPath || replaceLen != len("archive") || !reflect.DeepEqual(candidates, []string{want}) {
+		t.Fatalf("path completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
+	}
+}
+
 func TestTildePathCompletionPreservesTypedBase(t *testing.T) {
 	sh := newUnitShell(t, newRecordingShellAPI())
 	home := t.TempDir()

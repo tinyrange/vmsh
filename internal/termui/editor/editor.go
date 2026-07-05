@@ -80,6 +80,15 @@ type completionMenu struct {
 	selected   int
 }
 
+type completionLayout int
+
+const (
+	completionLayoutInline completionLayout = iota
+	completionLayoutVertical
+)
+
+const minInlineCompletionWidth = 100
+
 func New(opts Options) *Editor {
 	if opts.In == nil {
 		opts.In = os.Stdin
@@ -721,6 +730,9 @@ func (e *Editor) completionMenuSuffix(menu *completionMenu, st *lineState) strin
 	if len(menu.filtered) == 0 {
 		return fmt.Sprintf("  [complete %q: no matches]", query)
 	}
+	if e.completionLayout(menu, st) == completionLayoutVertical {
+		return e.verticalCompletionMenuSuffix(menu, st)
+	}
 	limit := 5
 	if len(menu.filtered) < limit {
 		limit = len(menu.filtered)
@@ -753,6 +765,54 @@ func (e *Editor) completionMenuSuffix(menu *completionMenu, st *lineState) strin
 		b.WriteString(" ...")
 	}
 	b.WriteByte(']')
+	return b.String()
+}
+
+func (e *Editor) completionLayout(menu *completionMenu, st *lineState) completionLayout {
+	width := st.width
+	if width <= 0 {
+		width = 80
+	}
+	if width < minInlineCompletionWidth {
+		return completionLayoutVertical
+	}
+	return completionLayoutInline
+}
+
+func (e *Editor) verticalCompletionMenuSuffix(menu *completionMenu, st *lineState) string {
+	limit := e.completionRows(menu, st)
+	if limit < 1 {
+		limit = 1
+	}
+	start := completionWindowStart(menu.selected, limit, len(menu.filtered))
+	end := start + limit
+	width := st.width
+	if width <= 0 {
+		width = 80
+	}
+	itemWidth := width - 4
+	if itemWidth < 3 {
+		itemWidth = 3
+	}
+	query := string(menu.query)
+	var b strings.Builder
+	header := fmt.Sprintf("[complete %q %d/%d]", query, len(menu.filtered), len(menu.items))
+	b.WriteByte('\n')
+	b.WriteString(truncateCells(header, width))
+	for idx := start; idx < end; idx++ {
+		b.WriteByte('\n')
+		if idx == menu.selected {
+			b.WriteString("\x1b[7m>")
+			b.WriteString(truncateCells(menu.filtered[idx], itemWidth-1))
+			b.WriteString("\x1b[0m")
+			continue
+		}
+		b.WriteByte(' ')
+		b.WriteString(truncateCells(menu.filtered[idx], itemWidth-1))
+	}
+	if end < len(menu.filtered) {
+		b.WriteString("\n ...")
+	}
 	return b.String()
 }
 
