@@ -152,6 +152,7 @@ Common forms:
 @alias expand ll /tmp           # preview the expanded command
 @jobs                           # list background jobs
 @status                         # show selected context and VM status
+@install                        # install/update the user-wide vmshd daemon copy
 @version                        # show vmsh build metadata
 @stop work                      # stop a named VM
 ```

@@ -1,11 +1,13 @@
 package backend
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tinyrange/vmsh/internal/vmshdprotocol"
 	"j5.nz/cc/client"
 )
 
@@ -63,6 +66,10 @@ type CCVMLaunch struct {
 }
 
 func ResolveCCVMPath(path string, bundledAvailable bool) (CCVMLaunch, error) {
+	return ResolveCCVMPathForCache(path, bundledAvailable, "")
+}
+
+func ResolveCCVMPathForCache(path string, bundledAvailable bool, cacheDir string) (CCVMLaunch, error) {
 	if path != "" {
 		return CCVMLaunch{Path: path}, nil
 	}
@@ -71,6 +78,9 @@ func ResolveCCVMPath(path string, bundledAvailable bool) (CCVMLaunch, error) {
 		return CCVMLaunch{}, err
 	}
 	if bundledAvailable {
+		if stablePath, err := EnsureStableVMSHDCopy(exePath, cacheDir); err == nil {
+			return CCVMLaunch{Path: stablePath}, nil
+		}
 		return CCVMLaunch{Path: exePath, Env: []string{InternalVMSHDEnv + "=1"}}, nil
 	}
 	for _, candidate := range CCVMPathCandidates(exePath) {
@@ -82,6 +92,88 @@ func ResolveCCVMPath(path string, bundledAvailable bool) (CCVMLaunch, error) {
 		return CCVMLaunch{Path: found}, nil
 	}
 	return CCVMLaunch{}, fmt.Errorf("ccvm binary not found next to %s, bundled in vmsh, or on PATH; pass -ccvm", exePath)
+}
+
+func EnsureStableVMSHDCopy(exePath, cacheDir string) (string, error) {
+	exePath = strings.TrimSpace(exePath)
+	if exePath == "" {
+		return "", fmt.Errorf("executable path is required")
+	}
+	if strings.TrimSpace(cacheDir) == "" {
+		cacheDir = filepath.Dir(exePath)
+	}
+	stablePath := filepath.Join(cacheDir, "bin", HostExecutableName("vmshd"))
+	if sameFileContents(exePath, stablePath) {
+		return stablePath, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(stablePath), 0o700); err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(stablePath), ".vmshd-*")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	src, err := os.Open(exePath)
+	if err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if _, err := io.Copy(tmp, src); err != nil {
+		_ = src.Close()
+		_ = tmp.Close()
+		return "", err
+	}
+	if err := src.Close(); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	if err := replaceFile(tmpPath, stablePath); err != nil {
+		return "", err
+	}
+	cleanup = false
+	return stablePath, nil
+}
+
+func replaceFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	_ = os.Remove(dst)
+	return os.Rename(src, dst)
+}
+
+func sameFileContents(a, b string) bool {
+	aInfo, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	bInfo, err := os.Stat(b)
+	if err != nil || aInfo.Size() != bInfo.Size() {
+		return false
+	}
+	aData, err := os.ReadFile(a)
+	if err != nil {
+		return false
+	}
+	bData, err := os.ReadFile(b)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(aData, bData)
 }
 
 func CCVMPathCandidates(exePath string) []string {
@@ -110,8 +202,9 @@ func CompanionExecutablePath(exePath, suffix string) string {
 }
 
 type ConnectOptions struct {
-	OnReuse func(DaemonState)
-	OnStart func(DaemonState)
+	OnReuse        func(DaemonState)
+	OnStart        func(DaemonState)
+	OnIncompatible func(DaemonState, error)
 }
 
 func ConnectCCVM(launch CCVMLaunch, cacheDir, statePath string) (*client.Client, error) {
@@ -120,22 +213,57 @@ func ConnectCCVM(launch CCVMLaunch, cacheDir, statePath string) (*client.Client,
 
 func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts ConnectOptions) (*client.Client, error) {
 	launchKey := DaemonLaunchKey(launch)
+	var preservedState *DaemonState
+	var incompatibility error
 	if state, err := ReadDaemonState(statePath); err == nil {
+		preserveVMSHDState := func(reason error) {
+			if strings.TrimSpace(state.Kind) != "vmshd" || strings.TrimSpace(state.TokenPath) == "" || preservedState != nil {
+				return
+			}
+			preserved := state
+			preservedState = &preserved
+			incompatibility = firstNonNil(reason, fmt.Errorf("existing vmshd daemon is not compatible with this frontend"))
+			if opts.OnIncompatible != nil {
+				opts.OnIncompatible(state, incompatibility)
+			}
+		}
 		api := NewClient(state.Addr)
 		if err := ApplyDaemonStateAuth(api, state); err != nil {
-			_ = os.Remove(statePath)
-		} else if state.LaunchKey == launchKey && api.HealthCheck() == nil && apiCompatible(api, state) {
-			if opts.OnReuse != nil {
-				opts.OnReuse(state)
+			preserveVMSHDState(err)
+			if preservedState == nil {
+				_ = os.Remove(statePath)
 			}
-			return api, nil
+		} else if err := api.HealthCheck(); err != nil {
+			preserveVMSHDState(err)
+			if preservedState == nil {
+				_ = os.Remove(statePath)
+			}
+		} else {
+			reusable, compatibilityErr := daemonReusable(api, state, launchKey)
+			if reusable {
+				if opts.OnReuse != nil {
+					opts.OnReuse(state)
+				}
+				return api, nil
+			}
+			preserveVMSHDState(compatibilityErr)
+			if preservedState == nil {
+				_ = os.Remove(statePath)
+			}
 		}
-		_ = os.Remove(statePath)
 	}
 
-	started, err := startDaemonProcess(launch, cacheDir)
+	startCacheDir := cacheDir
+	if preservedState != nil {
+		var err error
+		startCacheDir, err = privateDaemonCacheDir(cacheDir)
+		if err != nil {
+			return nil, err
+		}
+	}
+	started, err := startDaemonProcess(launch, startCacheDir)
 	if err != nil {
-		return nil, fmt.Errorf("start ccvm daemon %s with cache %s: %w", CCVMLaunchName(launch), cacheDir, err)
+		return nil, fmt.Errorf("start ccvm daemon %s with cache %s: %w", CCVMLaunchName(launch), startCacheDir, err)
 	}
 
 	var hello client.ServerHello
@@ -148,23 +276,32 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		return nil, err
 	}
 	state := normalizeDaemonState(DaemonState{Addr: hello.Addr, Kind: hello.Kind, TokenPath: hello.TokenPath, LaunchKey: launchKey})
-	if err := WriteDaemonState(statePath, state); err != nil {
-		started.stop()
-		return nil, fmt.Errorf("write daemon state %s for %s: %w", statePath, hello.Addr, err)
+	writeState := preservedState == nil
+	if writeState {
+		if err := WriteDaemonState(statePath, state); err != nil {
+			started.stop()
+			return nil, fmt.Errorf("write daemon state %s for %s: %w", statePath, hello.Addr, err)
+		}
 	}
 	api := NewClient(hello.Addr)
 	if err := ApplyDaemonStateAuth(api, state); err != nil {
-		_ = os.Remove(statePath)
+		if writeState {
+			_ = os.Remove(statePath)
+		}
 		started.stop()
 		return nil, fmt.Errorf("read daemon auth token: %w", err)
 	}
 	if err := api.HealthCheck(); err != nil {
-		_ = os.Remove(statePath)
+		if writeState {
+			_ = os.Remove(statePath)
+		}
 		started.stop()
 		return nil, fmt.Errorf("ccvm daemon started at %s but health check failed: %w", hello.Addr, err)
 	}
 	if strings.TrimSpace(state.Kind) == "vmshd" && !apiCompatible(api, state) {
-		_ = os.Remove(statePath)
+		if writeState {
+			_ = os.Remove(statePath)
+		}
 		started.stop()
 		return nil, fmt.Errorf("vmshd daemon started at %s but required routes are unavailable", hello.Addr)
 	}
@@ -172,6 +309,23 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		opts.OnStart(state)
 	}
 	return api, nil
+}
+
+func privateDaemonCacheDir(cacheDir string) (string, error) {
+	parent := filepath.Join(cacheDir, "private")
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return "", err
+	}
+	dir, err := os.MkdirTemp(parent, "vmshd-")
+	if err != nil {
+		return "", err
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return "", err
+		}
+	}
+	return dir, nil
 }
 
 type startedDaemonProcess struct {
@@ -227,6 +381,82 @@ func apiCompatible(api *client.Client, state DaemonState) bool {
 	return true
 }
 
+func daemonReusable(api *client.Client, state DaemonState, launchKey string) (bool, error) {
+	if strings.TrimSpace(state.Kind) != "vmshd" && state.LaunchKey != launchKey {
+		return false, fmt.Errorf("daemon launch identity changed")
+	}
+	if !apiCompatible(api, state) {
+		return false, fmt.Errorf("daemon required routes are unavailable")
+	}
+	if strings.TrimSpace(state.Kind) != "vmshd" {
+		return true, nil
+	}
+	if err := vmshdProtocolCompatible(state); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func vmshdProtocolCompatible(state DaemonState) error {
+	req, err := http.NewRequest(http.MethodGet, "http://"+state.Addr+"/vmsh/protocol", nil)
+	if err != nil {
+		return err
+	}
+	q := req.URL.Query()
+	q.Set("frontend_protocol", strconv.Itoa(vmshdprotocol.Current))
+	q.Set("frontend_min_protocol", strconv.Itoa(vmshdprotocol.Minimum))
+	q.Set("frontend_name", "vmsh")
+	req.URL.RawQuery = q.Encode()
+	if strings.TrimSpace(state.TokenPath) != "" {
+		token, err := ReadDaemonToken(state.TokenPath)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("vmshd protocol discovery route is unavailable")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("vmshd protocol discovery returned status %d", resp.StatusCode)
+	}
+	var info vmshdprotocol.Info
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return err
+	}
+	if strings.TrimSpace(info.Kind) != "vmshd" {
+		return fmt.Errorf("vmshd protocol discovery returned kind %q", info.Kind)
+	}
+	if strings.TrimSpace(info.Protocol.Name) != vmshdprotocol.Name {
+		return fmt.Errorf("vmshd protocol discovery returned protocol %q", info.Protocol.Name)
+	}
+	if info.Protocol.Current < vmshdprotocol.Minimum {
+		return fmt.Errorf("vmshd protocol is older than this frontend supports")
+	}
+	if info.Protocol.Minimum > vmshdprotocol.Current {
+		return fmt.Errorf("vmshd protocol is newer than this frontend supports")
+	}
+	if !info.Compatibility.Compatible {
+		return fmt.Errorf("vmshd protocol is incompatible: %s", strings.TrimSpace(info.Compatibility.Reason))
+	}
+	return nil
+}
+
+func firstNonNil(values ...error) error {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
 func CCVMLaunchName(launch CCVMLaunch) string {
 	if len(launch.Args) == 0 {
 		return launch.Path
@@ -262,13 +492,40 @@ func ValidateServerHello(hello client.ServerHello, cacheDir string) error {
 	if strings.TrimSpace(hello.Kind) == "vmshd" && strings.TrimSpace(hello.TokenPath) == "" {
 		return fmt.Errorf("vmshd daemon sent a startup banner without a token path")
 	}
+	if strings.TrimSpace(hello.Kind) == "vmshd" && !isLoopbackAddr(hello.Addr) {
+		return fmt.Errorf("vmshd daemon sent a non-loopback address: %s", hello.Addr)
+	}
 	return nil
 }
 
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return false
+	}
+	host = strings.Trim(strings.ToLower(host), "[]")
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func NewClient(addr string) *client.Client {
-	return client.NewClient("http://"+addr, func() (net.Conn, error) {
+	api := client.NewClient("http://"+addr, func() (net.Conn, error) {
 		return net.Dial("tcp", addr)
 	})
+	SetFrontendProtocolHeaders(api)
+	return api
+}
+
+func SetFrontendProtocolHeaders(api interface{ SetHeader(string, string) }) {
+	if api == nil {
+		return
+	}
+	api.SetHeader(vmshdprotocol.HeaderProtocol, strconv.Itoa(vmshdprotocol.Current))
+	api.SetHeader(vmshdprotocol.HeaderMinProtocol, strconv.Itoa(vmshdprotocol.Minimum))
+	api.SetHeader(vmshdprotocol.HeaderName, "vmsh")
 }
 
 func ApplyDaemonStateAuth(api *client.Client, state DaemonState) error {

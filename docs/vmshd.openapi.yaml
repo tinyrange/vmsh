@@ -1,0 +1,1197 @@
+openapi: 3.1.0
+info:
+  title: vmshd frontend protocol
+  version: 0.1.0
+  summary: Local HTTP and WebSocket protocol used by vmsh frontends.
+  description: |
+    This document specifies the vmshd frontend protocol. The daemon is a
+    per-user local service reached through a loopback HTTP listener and protected
+    by a bearer token stored in the private daemon state directory.
+
+    The HTTP API is intentionally local-only. It is not a public network API and
+    it assumes the caller already has access to the user's private daemon state
+    file and token.
+
+    Compatibility rules:
+
+    - A frontend MUST perform protocol discovery before making any mutating
+      request to an existing vmshd.
+    - Compatible frontends SHOULD send `X-VMSH-Frontend-Protocol`,
+      `X-VMSH-Frontend-Min-Protocol`, and `X-VMSH-Frontend-Name` on every daemon
+      request. Mutating requests without those headers are treated as legacy
+      protocol 1 requests.
+    - If the daemon protocol is outside the frontend's supported range, the
+      frontend MUST NOT mutate, stop, restart, upgrade, or replace that daemon.
+    - An incompatible frontend MAY start its own private daemon instance, but it
+      MUST show an obvious warning that the existing daemon was not compatible
+      and that the new daemon is separate.
+    - A compatible frontend MUST ignore unknown object properties and unknown
+      enum values it does not need for the requested operation.
+    - Within a protocol major version, additive response fields and additive
+      enum values are backward-compatible changes. Removing fields, changing
+      field types, changing ID semantics, or changing mutating endpoint behavior
+      requires a new incompatible protocol range.
+    - Stable long-lived shells are expected. Daemons launched from an embedded
+      frontend binary SHOULD use an executable-name switch so an installed
+      stable daemon copy can behave as vmshd, while ordinary vmsh invocations
+      behave as the frontend.
+
+    The `GET /vmsh/protocol` endpoint is the compatibility gate for daemon
+    reuse. Endpoints marked `current` describe the daemon surface implemented
+    today.
+
+    Security rules:
+
+    - vmshd MUST listen on a loopback address unless a future transport replaces
+      TCP loopback with an equal or stronger local-only mechanism.
+    - vmshd MUST require the bearer token from the private daemon token file for
+      every HTTP and WebSocket request, including backend runtime routes.
+servers:
+  - url: http://127.0.0.1:{port}
+    description: Loopback daemon listener from the private daemon state file.
+    variables:
+      port:
+        default: "0"
+        description: Ephemeral TCP port selected by vmshd.
+security:
+  - bearerToken: []
+tags:
+  - name: Compatibility
+    description: Protocol discovery and frontend/daemon compatibility.
+  - name: Status
+    description: Daemon health and aggregate state.
+  - name: Frontends
+    description: Frontend lifecycle records.
+  - name: Sessions
+    description: Shell session lifecycle and metadata.
+  - name: Attachments
+    description: Interactive frontend attachments.
+  - name: Streams
+    description: Terminal WebSocket stream.
+  - name: Jobs
+    description: Daemon-owned background jobs.
+  - name: Events
+    description: NDJSON event stream.
+paths:
+  /vmsh/protocol:
+    get:
+      tags: [Compatibility]
+      summary: Discover daemon protocol and runtime compatibility.
+      description: |
+        A frontend calls this before reusing an existing vmshd. If the response
+        says the daemon is incompatible, or if the daemon
+        protocol range falls outside the frontend's supported range, the
+        frontend must not send mutating requests to that daemon.
+
+        Old daemons may not implement this route. A frontend that requires this
+        route must treat a 404 or connection to a route-incomplete vmshd as
+        incompatible and may start a private daemon with an obvious warning.
+      x-vmsh-status: current
+      parameters:
+        - $ref: "#/components/parameters/FrontendProtocol"
+        - $ref: "#/components/parameters/FrontendMinProtocol"
+        - $ref: "#/components/parameters/FrontendVersion"
+        - $ref: "#/components/parameters/FrontendName"
+      responses:
+        "200":
+          description: Protocol and compatibility metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProtocolInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /vmsh/status:
+    get:
+      tags: [Status]
+      summary: Return daemon health and aggregate resource state.
+      x-vmsh-status: current
+      responses:
+        "200":
+          description: Daemon status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Status"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /vmsh/frontends:
+    get:
+      tags: [Frontends]
+      summary: List known frontends.
+      x-vmsh-status: current
+      responses:
+        "200":
+          description: Frontend records.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/FrontendSummary"
+    post:
+      tags: [Frontends]
+      summary: Register a frontend instance.
+      description: |
+        Creates a frontend record. Sessions can be scoped to this frontend so
+        they are cleaned up when the frontend closes.
+      x-vmsh-status: current
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterFrontendRequest"
+      responses:
+        "200":
+          description: Registered frontend.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FrontendSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /vmsh/frontends/{frontend_id}:
+    delete:
+      tags: [Frontends]
+      summary: Close a frontend and clean up its scoped sessions.
+      x-vmsh-status: current
+      parameters:
+        - $ref: "#/components/parameters/FrontendID"
+      responses:
+        "200":
+          description: Closed frontend.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FrontendSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /vmsh/sessions:
+    get:
+      tags: [Sessions]
+      summary: List sessions.
+      x-vmsh-status: current
+      responses:
+        "200":
+          description: Session summaries.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SessionSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Sessions]
+      summary: Create a session.
+      x-vmsh-status: current
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSessionRequest"
+      responses:
+        "200":
+          description: Created session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /vmsh/sessions/{session_id}:
+    get:
+      tags: [Sessions]
+      summary: Get a session.
+      x-vmsh-status: current
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      responses:
+        "200":
+          description: Session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Sessions]
+      summary: Replace frontend-published session metadata.
+      description: |
+        Updates mutable metadata reported by a frontend. The daemon treats
+        omitted arrays as empty for the published metadata set.
+      x-vmsh-status: current
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateSessionRequest"
+      responses:
+        "200":
+          description: Updated session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Sessions]
+      summary: Delete a session.
+      description: |
+        Deletes the session and cancels daemon-owned jobs associated with it.
+      x-vmsh-status: current
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      responses:
+        "200":
+          description: Deleted session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /vmsh/sessions/{session_id}/attach:
+    post:
+      tags: [Attachments]
+      summary: Attach a frontend to a session.
+      description: |
+        `interactive` attachments are exclusive for a session. Other modes are
+        reserved for future use and may be rejected by current daemons.
+      x-vmsh-status: current
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AttachSessionRequest"
+      responses:
+        "200":
+          description: Session and attachment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AttachSessionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /vmsh/sessions/{session_id}/detach:
+    post:
+      tags: [Attachments]
+      summary: Detach a frontend attachment from a session.
+      x-vmsh-status: current
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DetachSessionRequest"
+      responses:
+        "200":
+          description: Updated session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /vmsh/sessions/{session_id}/persist:
+    post:
+      tags: [Sessions]
+      summary: Persist a session beyond the frontend lifetime.
+      description: |
+        Current daemons accept `system` to make the session survive frontend
+        close. Other scopes may be rejected.
+      x-vmsh-status: current
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PersistSessionRequest"
+      responses:
+        "200":
+          description: Updated session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /vmsh/sessions/{session_id}/attachments/{attachment_id}/terminal:
+    post:
+      tags: [Attachments]
+      summary: Update terminal size for an attachment.
+      x-vmsh-status: current
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+        - $ref: "#/components/parameters/AttachmentID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Terminal"
+      responses:
+        "200":
+          description: Session and updated attachment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AttachSessionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /vmsh/sessions/{session_id}/attachments/{attachment_id}/stream:
+    get:
+      tags: [Streams]
+      summary: Open an interactive terminal WebSocket stream.
+      description: |
+        Upgrades to a WebSocket. Messages are JSON objects matching
+        `TerminalStreamMessage`. The `data` field is a base64-encoded byte
+        string because Go JSON encodes byte slices as base64.
+
+        Server-to-client messages:
+
+        - `attached`: stream metadata is available in `stream`.
+        - `data`: terminal output bytes are available in `data`.
+        - `error`: the daemon rejected a stream operation.
+
+        Client-to-server messages:
+
+        - `stdin` or `data`: write bytes from `data` to the terminal.
+        - `resize`: apply `terminal` dimensions.
+        - `close`: close the stream.
+      x-vmsh-status: current
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+        - $ref: "#/components/parameters/AttachmentID"
+      responses:
+        "101":
+          description: WebSocket upgrade accepted.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /vmsh/jobs:
+    get:
+      tags: [Jobs]
+      summary: List daemon-owned jobs.
+      x-vmsh-status: current
+      responses:
+        "200":
+          description: Daemon-owned jobs.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/JobSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /vmsh/sessions/{session_id}/jobs:
+    post:
+      tags: [Jobs]
+      summary: Start a daemon-owned host job for a session.
+      description: |
+        Starts a command controlled by vmshd. Current implementations support
+        host-origin work and selected VM/SSH contexts.
+      x-vmsh-status: current
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartHostJobRequest"
+      responses:
+        "200":
+          description: Started job.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /vmsh/sessions/{session_id}/jobs/{job_id}:
+    delete:
+      tags: [Jobs]
+      summary: Cancel a daemon-owned job.
+      x-vmsh-status: current
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+        - $ref: "#/components/parameters/JobID"
+      responses:
+        "200":
+          description: Canceling or canceled job.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /vmsh/events:
+    get:
+      tags: [Events]
+      summary: Stream daemon events as newline-delimited JSON.
+      description: |
+        Response content type is `application/x-ndjson`. The first event is
+        always a synthetic `connected` event, followed by state-change events.
+        Clients should treat unknown event kinds as notifications and refresh
+        the resource they care about if necessary.
+      x-vmsh-status: current
+      responses:
+        "200":
+          description: Stream of Event objects, one JSON object per line.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+                description: Newline-delimited Event JSON objects.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+components:
+  securitySchemes:
+    bearerToken:
+      type: http
+      scheme: bearer
+      bearerFormat: vmshd-token
+      description: Token read from the private daemon token path.
+  parameters:
+    FrontendProtocol:
+      name: frontend_protocol
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+      description: Highest protocol major version supported by the frontend.
+    FrontendMinProtocol:
+      name: frontend_min_protocol
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+      description: Lowest protocol major version supported by the frontend.
+    FrontendVersion:
+      name: frontend_version
+      in: query
+      required: false
+      schema:
+        type: string
+      description: Human-readable frontend version.
+    FrontendName:
+      name: frontend_name
+      in: query
+      required: false
+      schema:
+        type: string
+      description: Human-readable frontend name.
+    FrontendID:
+      name: frontend_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Frontend identifier assigned by vmshd.
+    SessionID:
+      name: session_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Session identifier assigned by vmshd.
+    AttachmentID:
+      name: attachment_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Attachment identifier assigned by vmshd.
+    JobID:
+      name: job_id
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+      description: Daemon-owned job identifier.
+  responses:
+    BadRequest:
+      description: The request was malformed or unsupported.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: The requested resource does not exist.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Conflict:
+      description: The request conflicts with current daemon state.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    ProtocolInfo:
+      type: object
+      additionalProperties: true
+      required: [kind, protocol, daemon, compatibility]
+      properties:
+        kind:
+          type: string
+          const: vmshd
+        protocol:
+          $ref: "#/components/schemas/ProtocolRange"
+        daemon:
+          $ref: "#/components/schemas/DaemonRuntime"
+        compatibility:
+          $ref: "#/components/schemas/Compatibility"
+        routes:
+          type: array
+          description: Route capabilities supported by this daemon.
+          items:
+            $ref: "#/components/schemas/RouteCapability"
+    ProtocolRange:
+      type: object
+      additionalProperties: true
+      required: [name, current, minimum]
+      properties:
+        name:
+          type: string
+          const: vmshd.frontend
+        current:
+          type: integer
+          minimum: 1
+          description: Highest protocol major version implemented by vmshd.
+        minimum:
+          type: integer
+          minimum: 1
+          description: Lowest protocol major version accepted by vmshd.
+        schema_version:
+          type: string
+          description: Human-readable version of this OpenAPI document.
+    Compatibility:
+      type: object
+      additionalProperties: true
+      required: [compatible, action]
+      properties:
+        compatible:
+          type: boolean
+          description: Whether the daemon can be reused by the requesting frontend.
+        action:
+          type: string
+          enum: [reuse, refuse, start-private-daemon]
+          description: Recommended frontend action.
+        warning:
+          type: string
+          description: Warning text suitable for prominent CLI display.
+        reason:
+          type: string
+          enum:
+            - compatible
+            - frontend-too-old
+            - frontend-too-new
+            - daemon-too-old
+            - daemon-too-new
+            - route-missing
+            - auth-required
+            - unknown
+          description: Machine-readable compatibility reason.
+    DaemonRuntime:
+      type: object
+      additionalProperties: true
+      required: [version, platform, executable]
+      properties:
+        version:
+          type: string
+          description: vmshd build version.
+        commit:
+          type: string
+          description: Source commit used to build the daemon.
+        dirty:
+          type: boolean
+          description: Whether the daemon was built from a dirty tree.
+        started_at:
+          type: string
+          format: date-time
+        platform:
+          type: string
+          description: GOOS/GOARCH pair such as linux/amd64.
+        executable:
+          $ref: "#/components/schemas/DaemonExecutable"
+    DaemonExecutable:
+      type: object
+      additionalProperties: true
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [embedded-frontend, stable-daemon-copy, explicit-daemon, unknown]
+          description: |
+            How the running process selected daemon behavior. A stable daemon
+            copy should report `stable-daemon-copy`; an embedded frontend
+            re-exec should report `embedded-frontend`.
+        path:
+          type: string
+          description: Absolute executable path when available.
+        argv0:
+          type: string
+          description: Process argv[0] when available.
+        name:
+          type: string
+          description: Executable basename used for behavior switching.
+    RouteCapability:
+      type: object
+      additionalProperties: true
+      required: [method, path]
+      properties:
+        method:
+          type: string
+          examples: [GET, POST, PATCH, DELETE]
+        path:
+          type: string
+          examples: [/vmsh/status, /vmsh/sessions]
+        status:
+          type: string
+          enum: [current, proposed, deprecated]
+    Status:
+      type: object
+      additionalProperties: true
+      required: [kind, status, sessions, active_streams, vms, started_at]
+      properties:
+        kind:
+          type: string
+          const: vmshd
+        status:
+          type: string
+          enum: [running]
+        frontends:
+          type: array
+          items:
+            $ref: "#/components/schemas/FrontendSummary"
+        sessions:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionSummary"
+        active_streams:
+          type: array
+          items:
+            $ref: "#/components/schemas/StreamSummary"
+        vms:
+          type: array
+          description: Backend VM instance states. Clients should treat fields as backend-specific.
+          items:
+            type: object
+            additionalProperties: true
+        started_at:
+          type: string
+          format: date-time
+    Event:
+      type: object
+      additionalProperties: true
+      required: [id, kind, at]
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          enum:
+            - connected
+            - frontend_registered
+            - frontend_closed
+            - session_created
+            - session_updated
+            - session_deleted
+            - session_attached
+            - session_detached
+            - session_persisted
+            - terminal_updated
+            - terminal_stream_opened
+            - terminal_stream_closed
+            - job_started
+            - job_finished
+            - job_canceled
+        frontend:
+          $ref: "#/components/schemas/FrontendSummary"
+        session:
+          $ref: "#/components/schemas/Session"
+        attachment:
+          $ref: "#/components/schemas/ClientAttachment"
+        job:
+          $ref: "#/components/schemas/JobSummary"
+        at:
+          type: string
+          format: date-time
+    FrontendSummary:
+      type: object
+      additionalProperties: true
+      required: [id, state, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        state:
+          type: string
+          enum: [open, closed]
+        sessions:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        closed_at:
+          type: string
+          format: date-time
+    RegisterFrontendRequest:
+      type: object
+      additionalProperties: true
+      properties:
+        name:
+          type: string
+    CreateSessionRequest:
+      type: object
+      additionalProperties: true
+      properties:
+        name:
+          type: string
+        frontend_id:
+          type: string
+        scope:
+          $ref: "#/components/schemas/SessionScope"
+        detach_on_close:
+          type: boolean
+    UpdateSessionRequest:
+      type: object
+      additionalProperties: true
+      properties:
+        host_cwd:
+          type: string
+        selected_context:
+          $ref: "#/components/schemas/SessionContext"
+        vm_refs:
+          type: array
+          items:
+            $ref: "#/components/schemas/VMRef"
+        host_shells:
+          type: array
+          items:
+            $ref: "#/components/schemas/ShellHandle"
+        guest_shells:
+          type: array
+          items:
+            $ref: "#/components/schemas/ShellHandle"
+        ssh_shells:
+          type: array
+          items:
+            $ref: "#/components/schemas/ShellHandle"
+        jobs:
+          type: array
+          items:
+            $ref: "#/components/schemas/JobSummary"
+        copies:
+          type: array
+          items:
+            $ref: "#/components/schemas/CopySummary"
+    PersistSessionRequest:
+      type: object
+      additionalProperties: true
+      properties:
+        scope:
+          $ref: "#/components/schemas/SessionScope"
+    Session:
+      allOf:
+        - $ref: "#/components/schemas/SessionSummary"
+    SessionSummary:
+      type: object
+      additionalProperties: true
+      required: [id, name, state, attached_clients, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        state:
+          type: string
+          enum: [attached, detached]
+        scope:
+          $ref: "#/components/schemas/SessionScope"
+        frontend_id:
+          type: string
+        detach_on_close:
+          type: boolean
+        host_cwd:
+          type: string
+        selected_context:
+          $ref: "#/components/schemas/SessionContext"
+        vm_refs:
+          type: array
+          items:
+            $ref: "#/components/schemas/VMRef"
+        host_shells:
+          type: array
+          items:
+            $ref: "#/components/schemas/ShellHandle"
+        guest_shells:
+          type: array
+          items:
+            $ref: "#/components/schemas/ShellHandle"
+        ssh_shells:
+          type: array
+          items:
+            $ref: "#/components/schemas/ShellHandle"
+        jobs:
+          type: array
+          items:
+            $ref: "#/components/schemas/JobSummary"
+        copies:
+          type: array
+          items:
+            $ref: "#/components/schemas/CopySummary"
+        attached_clients:
+          type: array
+          items:
+            $ref: "#/components/schemas/ClientAttachment"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    SessionScope:
+      type: string
+      enum: [frontend, system]
+      description: |
+        `frontend` sessions are cleaned up when their owning frontend closes.
+        `system` sessions survive frontend close.
+    SessionContext:
+      type: object
+      additionalProperties: true
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [host, vm, ssh]
+        name:
+          type: string
+        short:
+          type: string
+        source:
+          type: string
+        vm:
+          type: string
+        image:
+          type: string
+        ssh_host:
+          type: string
+        cwd:
+          type: string
+        user:
+          type: string
+        isolated:
+          type: boolean
+    VMRef:
+      type: object
+      additionalProperties: true
+      required: [id]
+      properties:
+        id:
+          type: string
+        backend_id:
+          type: string
+        context:
+          type: string
+        image:
+          type: string
+        isolated:
+          type: boolean
+    ShellHandle:
+      type: object
+      additionalProperties: true
+      required: [id, kind, state]
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          enum: [host, guest, ssh]
+        name:
+          type: string
+        context:
+          type: string
+        cwd:
+          type: string
+        vm:
+          type: string
+        ssh_host:
+          type: string
+        user:
+          type: string
+        state:
+          type: string
+          enum: [open, closed]
+    ClientAttachment:
+      type: object
+      additionalProperties: true
+      required: [id, mode, attached_at, updated_at]
+      properties:
+        id:
+          type: string
+        frontend_id:
+          type: string
+        mode:
+          type: string
+          enum: [interactive]
+        terminal:
+          $ref: "#/components/schemas/Terminal"
+        attached_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    AttachSessionRequest:
+      type: object
+      additionalProperties: true
+      properties:
+        frontend_id:
+          type: string
+        mode:
+          type: string
+          enum: [interactive]
+        terminal:
+          $ref: "#/components/schemas/Terminal"
+    AttachSessionResponse:
+      type: object
+      additionalProperties: true
+      required: [session, attachment]
+      properties:
+        session:
+          $ref: "#/components/schemas/Session"
+        attachment:
+          $ref: "#/components/schemas/ClientAttachment"
+    DetachSessionRequest:
+      type: object
+      additionalProperties: true
+      required: [attachment_id]
+      properties:
+        attachment_id:
+          type: string
+    Terminal:
+      type: object
+      additionalProperties: true
+      properties:
+        cols:
+          type: integer
+          minimum: 0
+        rows:
+          type: integer
+          minimum: 0
+    TerminalStreamMessage:
+      type: object
+      additionalProperties: true
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [attached, data, error, stdin, resize, close]
+        data:
+          type: string
+          format: byte
+          description: Base64-encoded terminal bytes.
+        terminal:
+          $ref: "#/components/schemas/Terminal"
+        stream:
+          $ref: "#/components/schemas/StreamSummary"
+    StreamSummary:
+      type: object
+      additionalProperties: true
+      required: [id, kind, state, connected_at]
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          enum: [terminal, events]
+        state:
+          type: string
+          enum: [open, closed]
+        session_id:
+          type: string
+        attachment_id:
+          type: string
+        connected_at:
+          type: string
+          format: date-time
+        last_event_id:
+          type: string
+    StartHostJobRequest:
+      type: object
+      additionalProperties: true
+      required: [command]
+      properties:
+        command:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        workdir:
+          type: string
+        env:
+          type: array
+          items:
+            type: string
+          description: Environment assignments in KEY=value form.
+        context:
+          type: string
+        kind:
+          type: string
+        vm:
+          type: string
+        run:
+          type: object
+          additionalProperties: true
+          description: Backend run request for VM execution.
+    JobSummary:
+      type: object
+      additionalProperties: true
+      required: [id, command, status, started_at]
+      properties:
+        id:
+          type: integer
+          minimum: 1
+        session_id:
+          type: string
+        context:
+          type: string
+        command:
+          type: string
+        status:
+          type: string
+          enum: [running, canceling, canceled, exited, failed]
+        exit_code:
+          type: integer
+        error:
+          type: string
+        control:
+          type: string
+          enum: [frontend, vmshd]
+        logs:
+          type: string
+        log_dropped:
+          type: boolean
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+    CopySummary:
+      type: object
+      additionalProperties: true
+      required: [id, source, dest, status, started_at]
+      properties:
+        id:
+          type: integer
+          minimum: 1
+        source:
+          type: string
+        dest:
+          type: string
+        status:
+          type: string
+        bytes:
+          type: integer
+          format: int64
+        error:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+    ErrorResponse:
+      type: object
+      additionalProperties: true
+      required: [error]
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+          description: Optional future machine-readable error code.
+        details:
+          type: object
+          additionalProperties: true
+          description: Optional future structured error details.
