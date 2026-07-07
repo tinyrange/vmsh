@@ -13,8 +13,8 @@ import (
 func TestDefaultCommandIsInteractive(t *testing.T) {
 	command := defaultCommand(nil)
 	if runtime.GOOS == "windows" {
-		if len(command) == 0 {
-			t.Fatalf("default command is empty")
+		if len(command) != 1 || !strings.HasSuffix(strings.ToLower(command[0]), "cmd.exe") {
+			t.Fatalf("default command = %#v, want cmd.exe", command)
 		}
 		return
 	}
@@ -27,9 +27,6 @@ func TestDefaultCommandIsInteractive(t *testing.T) {
 }
 
 func TestDefaultFrontendStartsVisibleShell(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("PTY ownership is unsupported on Windows")
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	frontend, err := New(ctx, Options{Size: ptyterm.Size{Cols: 80, Rows: 8}})

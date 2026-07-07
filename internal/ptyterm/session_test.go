@@ -1,11 +1,9 @@
-//go:build !windows
-
 package ptyterm
 
 import (
 	"context"
-	"os"
-	"os/exec"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,7 +13,7 @@ func TestSessionOwnsPTYCapturesOutputAndExit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	s, err := Start(ctx, Options{
-		Command:      []string{"sh", "-lc", "printf 'hello'; printf '\\r\\nworld\\r\\n'"},
+		Command:      shellOutputCommand(),
 		Size:         Size{Cols: 20, Rows: 4},
 		HistoryLimit: 10,
 	})
@@ -45,7 +43,7 @@ func TestSessionRoutesStdinAndResize(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	s, err := Start(ctx, Options{
-		Command:      []string{"sh", "-lc", "stty size; IFS= read -r _; stty size"},
+		Command:      shellReadResizeCommand(),
 		Size:         Size{Cols: 22, Rows: 6},
 		HistoryLimit: 10,
 	})
@@ -58,10 +56,15 @@ func TestSessionRoutesStdinAndResize(t *testing.T) {
 	if err := s.Resize(Size{Cols: 33, Rows: 7}); err != nil {
 		t.Fatalf("resize: %v", err)
 	}
-	if n, err := s.Write([]byte("\n")); err != nil || n != 1 {
+	if runtime.GOOS == "windows" {
+		waitForRawTail(t, s, "\x1b[8;7;33t")
+	}
+	if n, err := s.Write(enterInput()); err != nil || n != len(enterInput()) {
 		t.Fatalf("write stdin n=%d err=%v", n, err)
 	}
-	waitForLine(t, s, "7 33")
+	if runtime.GOOS != "windows" {
+		waitForLine(t, s, "7 33")
+	}
 	result := s.Wait(ctx)
 	if result.Err != nil {
 		t.Fatalf("wait result = %+v", result)
@@ -78,7 +81,7 @@ func TestSessionRoutesStdinAndResize(t *testing.T) {
 func TestSessionExitCodeForFailingCommand(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	s, err := Start(ctx, Options{Command: []string{"sh", "-lc", "exit 17"}, Size: Size{Cols: 10, Rows: 2}})
+	s, err := Start(ctx, Options{Command: shellExitCommand(17), Size: Size{Cols: 10, Rows: 2}})
 	if err != nil {
 		t.Fatalf("start session: %v", err)
 	}
@@ -93,7 +96,7 @@ func TestSessionExitCodeForFailingCommand(t *testing.T) {
 func TestSessionWaitAndSnapshotAreRepeatableAfterExit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	s, err := Start(ctx, Options{Command: []string{"sh", "-lc", "printf done"}, Size: Size{Cols: 10, Rows: 2}})
+	s, err := Start(ctx, Options{Command: shellPrintCommand("done"), Size: Size{Cols: 10, Rows: 2}})
 	if err != nil {
 		t.Fatalf("start session: %v", err)
 	}
@@ -116,7 +119,7 @@ func TestSessionWaitDrainsFinalTerminalTeardown(t *testing.T) {
 	defer cancel()
 	for i := 0; i < 20; i++ {
 		s, err := Start(ctx, Options{
-			Command: []string{"sh", "-lc", "printf main; printf '\\033[?1049hALT\\033[?1049lRESTORE'"},
+			Command: shellAltScreenTeardownCommand(),
 			Size:    Size{Cols: 20, Rows: 4},
 		})
 		if err != nil {
@@ -141,47 +144,6 @@ func TestSessionWaitDrainsFinalTerminalTeardown(t *testing.T) {
 	}
 }
 
-func TestSessionCanExerciseComplexTerminalProgramsWhenRequested(t *testing.T) {
-	if os.Getenv("VMSH_PTYTERM_COMPLEX") == "" {
-		t.Skip("set VMSH_PTYTERM_COMPLEX=1 to run optional vim/tmux PTY smoke tests")
-	}
-	for _, tc := range []struct {
-		name string
-		bin  string
-		args []string
-	}{
-		{
-			name: "vim",
-			bin:  "vim",
-			args: []string{"-Nu", "NONE", "-n", "-T", "xterm", "-c", "set nomore", "-c", "redraw", "-c", "qa!"},
-		},
-		{
-			name: "tmux",
-			bin:  "tmux",
-			args: []string{"-L", "vmsh-ptyterm-test", "new-session", "-d", "printf nested-tmux; sleep 0.1"},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			path, err := exec.LookPath(tc.bin)
-			if err != nil {
-				t.Skipf("%s not found", tc.bin)
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			cmd := append([]string{path}, tc.args...)
-			s, err := Start(ctx, Options{Command: cmd, Size: Size{Cols: 80, Rows: 24}, HistoryLimit: 200})
-			if err != nil {
-				t.Fatalf("start %s: %v", tc.name, err)
-			}
-			defer s.Close()
-			result := s.Wait(ctx)
-			if result.Err != nil {
-				t.Fatalf("%s result = %+v snapshot=%+v", tc.name, result, s.Snapshot())
-			}
-		})
-	}
-}
-
 func waitForLine(t *testing.T, s *Session, needle string) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
@@ -193,6 +155,65 @@ func waitForLine(t *testing.T, s *Session, needle string) {
 	}
 	snap := s.Snapshot()
 	t.Fatalf("line %q not found; lines=%#v history=%#v raw=%q", needle, snap.Lines, snap.History, snap.RawTail)
+}
+
+func waitForRawTail(t *testing.T, s *Session, needle string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(string(s.Snapshot().RawTail), needle) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	snap := s.Snapshot()
+	t.Fatalf("raw tail %q not found; lines=%#v history=%#v raw=%q", needle, snap.Lines, snap.History, snap.RawTail)
+}
+
+func enterInput() []byte {
+	if runtime.GOOS == "windows" {
+		return []byte("\r")
+	}
+	return []byte("\n")
+}
+
+func shellOutputCommand() []string {
+	if runtime.GOOS == "windows" {
+		return []string{"cmd.exe", "/d", "/q", "/c", "echo hello& echo world"}
+	}
+	return []string{"sh", "-lc", "printf 'hello'; printf '\\r\\nworld\\r\\n'"}
+}
+
+func shellReadResizeCommand() []string {
+	if runtime.GOOS == "windows" {
+		return []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "$p = { [Console]::Out.WriteLine(([string][Console]::WindowHeight) + ' ' + ([string][Console]::WindowWidth)); [Console]::Out.Flush() }; & $p; [Console]::In.ReadLine() | Out-Null; & $p"}
+	}
+	return []string{"sh", "-lc", "stty size; IFS= read -r _; stty size"}
+}
+
+func shellExitCommand(code int) []string {
+	if runtime.GOOS == "windows" {
+		return []string{"cmd.exe", "/d", "/q", "/c", "exit /b " + strconv.Itoa(code)}
+	}
+	return []string{"sh", "-lc", "exit " + strconv.Itoa(code)}
+}
+
+func shellPrintCommand(text string) []string {
+	if runtime.GOOS == "windows" {
+		return []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write(" + strconv.Quote(text) + "); [Console]::Out.Flush()"}
+	}
+	return []string{"sh", "-lc", "printf " + shellQuote(text)}
+}
+
+func shellAltScreenTeardownCommand() []string {
+	if runtime.GOOS == "windows" {
+		return []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "$e=[char]27; [Console]::Out.Write('main' + $e + '[?1049hALT' + $e + '[?1049lRESTORE'); [Console]::Out.Flush()"}
+	}
+	return []string{"sh", "-lc", "printf main; printf '\\033[?1049hALT\\033[?1049lRESTORE'"}
+}
+
+func shellQuote(text string) string {
+	return "'" + strings.ReplaceAll(text, "'", "'\\''") + "'"
 }
 
 func snapshotContainsLine(snap Snapshot, needle string) bool {

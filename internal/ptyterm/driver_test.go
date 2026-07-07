@@ -1,5 +1,3 @@
-//go:build !windows
-
 package ptyterm
 
 import (
@@ -7,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -45,7 +44,7 @@ func TestDriverSendsTextKeysAndRecordsAsciicast(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	s, err := Start(ctx, Options{
-		Command:      []string{"sh", "-lc", "printf ready; IFS= read -r line; printf '\\r\\ngot:%s\\r\\n' \"$line\""},
+		Command:      driverEchoCommand(),
 		Size:         Size{Cols: 24, Rows: 4},
 		HistoryLimit: 10,
 		Recorder:     rec,
@@ -106,4 +105,11 @@ func assertAsciicastHasOutput(t *testing.T, path string) {
 		}
 	}
 	t.Fatalf("asciicast had no output events")
+}
+
+func driverEchoCommand() []string {
+	if runtime.GOOS == "windows" {
+		return []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write('ready'); [Console]::Out.Flush(); $line = [Console]::In.ReadLine(); [Console]::Out.Write(\"`r`ngot:$line`r`n\"); [Console]::Out.Flush()"}
+	}
+	return []string{"sh", "-lc", "printf ready; IFS= read -r line; printf '\\r\\ngot:%s\\r\\n' \"$line\""}
 }
