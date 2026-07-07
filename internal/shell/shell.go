@@ -29,6 +29,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/tinyrange/vmsh/internal/backend"
+	"github.com/tinyrange/vmsh/internal/ptymux"
 	"github.com/tinyrange/vmsh/internal/terminal"
 	"github.com/tinyrange/vmsh/internal/termui/editor"
 	"github.com/tinyrange/vmsh/internal/version"
@@ -356,7 +357,7 @@ func (c *vmshCompleter) completionContext(prefix string) commandContext {
 		if err == nil {
 			ctx = sshCommandContext(ctx, at.Options, host)
 		}
-	case "help", "ps", "jobs", "sessions", "detach", "install", "alias", "exec", "status", "where", "version", "start", "stop", "restart", "forward", "tmux", "agent":
+	case "help", "ps", "jobs", "sessions", "detach", "install", "alias", "exec", "status", "where", "version", "start", "stop", "restart", "forward", "tmux", "mux", "agent":
 	default:
 		if sshCtx, ok := c.shellSSHSessionContext(at.Target); ok {
 			ctx = sshCtx
@@ -375,7 +376,7 @@ func (c *vmshCompleter) shellSSHSessionContext(name string) (commandContext, boo
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@agent", "@alias", "@copy", "@detach", "@exec", "@help", "@host", "@install", "@jobs", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux", "@version"}
+	words := []string{"@agent", "@alias", "@copy", "@detach", "@exec", "@help", "@host", "@install", "@jobs", "@mux", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux", "@version"}
 	if c.shell != nil {
 		for _, name := range c.shell.sshSessionNames() {
 			words = append(words, "@"+name)
@@ -3357,6 +3358,8 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		return s.removeImage(at, stdout)
 	case "tmux":
 		return s.startTmux(at)
+	case "mux":
+		return s.startNativeMux(at)
 	case "forward":
 		if at.Command == "" {
 			return fmt.Errorf("usage: @forward <host-port:guest-port>")
@@ -8513,6 +8516,27 @@ func (s *shellState) startTmux(at atLine) error {
 	return cmd.Run()
 }
 
+func (s *shellState) startNativeMux(at atLine) error {
+	fields, err := splitShellFields(at.Command)
+	if err != nil {
+		return err
+	}
+	if len(at.Options.OptionFields) != 0 {
+		return fmt.Errorf("usage: @mux [cmd]")
+	}
+	dir := strings.TrimSpace(s.hostCWD)
+	if dir == "" {
+		dir, _ = os.Getwd()
+	}
+	return ptymux.Run(context.Background(), ptymux.Options{
+		Command: fields,
+		Dir:     dir,
+		Env:     terminalEnv(0, 0),
+		Stdin:   os.Stdin,
+		Stdout:  os.Stdout,
+	})
+}
+
 func (s *shellState) tmuxDefaultCommand() (string, error) {
 	vmshPath := strings.TrimSpace(s.vmshPath)
 	if vmshPath == "" {
@@ -9979,6 +10003,7 @@ func (s *shellState) help(w io.Writer) error {
 @agent codex [args]      run Codex inside the current VM with host ~/.codex mounted
 @agent --proxy codex     run Codex through a host auth proxy without mounting ~/.codex
 @tmux [session]          open tmux with vmsh as the default pane command
+@mux [cmd]               open native vmsh pane frontend; Ctrl+G q exits, Ctrl+G c creates panes
 @forward H:G             forward host port H to guest port G
 opts: --from source --cwd path --user user --sudo --init --no-init --kernel default|ubuntu --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
 keys: Ctrl+R reverse history search; Esc/Ctrl+G cancel search

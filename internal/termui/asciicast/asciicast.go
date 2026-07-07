@@ -54,6 +54,13 @@ func (r *Recorder) Writer(dst io.Writer) io.Writer {
 	return writer{rec: r, dst: dst}
 }
 
+func (r *Recorder) Output(data []byte) {
+	if r == nil || len(data) == 0 {
+		return
+	}
+	r.event("o", string(data))
+}
+
 func (r *Recorder) Metadata(name string, fields map[string]any) {
 	if r == nil {
 		return
