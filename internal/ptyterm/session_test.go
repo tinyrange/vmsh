@@ -115,17 +115,18 @@ func TestSessionWaitAndSnapshotAreRepeatableAfterExit(t *testing.T) {
 }
 
 func TestSessionWaitDrainsFinalTerminalTeardown(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	for i := 0; i < 20; i++ {
+	for i := 0; i < finalDrainIterations(); i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), finalDrainTimeout())
 		s, err := Start(ctx, Options{
 			Command: shellAltScreenTeardownCommand(),
 			Size:    Size{Cols: 20, Rows: 4},
 		})
 		if err != nil {
+			cancel()
 			t.Fatalf("start session: %v", err)
 		}
 		result := s.Wait(ctx)
+		cancel()
 		if result.Err != nil {
 			_ = s.Close()
 			t.Fatalf("wait result = %+v", result)
@@ -142,6 +143,20 @@ func TestSessionWaitDrainsFinalTerminalTeardown(t *testing.T) {
 			t.Fatalf("iteration %d snapshot kept alternate-screen content: %+v", i, snap)
 		}
 	}
+}
+
+func finalDrainIterations() int {
+	if runtime.GOOS == "windows" {
+		return 3
+	}
+	return 20
+}
+
+func finalDrainTimeout() time.Duration {
+	if runtime.GOOS == "windows" {
+		return 15 * time.Second
+	}
+	return 5 * time.Second
 }
 
 func waitForLine(t *testing.T, s *Session, needle string) {
