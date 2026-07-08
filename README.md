@@ -1,16 +1,25 @@
 # vmsh
 
-`vmsh` is an interactive shell for running host commands and VM-backed Linux
-commands from one prompt. It is a product shell around the `ccvm` daemon: OCI
-images become selectable command contexts, and `cc` remains the underlying VM
-runtime, image importer, and debug command repository.
+`vmsh` is an interactive shell for running commands across host, VM, and SSH
+systems from one prompt. A normal shell keeps context as "the current working
+directory." `vmsh` extends that idea: the current context is both the selected
+system and that system's working directory. Ordinary command lines run in that
+context, and `@` control lines change the selected system or ask `vmsh` to do
+something directly.
+
+`vmsh` is a product shell around the `ccvm` daemon: OCI images become selectable
+VM systems, and `cc` remains the underlying VM runtime, image importer, and
+debug command repository.
 
 The repository is intended to be published as `github.com/tinyrange/vmsh`.
 
 ## What It Does
 
 - Runs ordinary shell commands on the host by default.
-- Switches to VM-backed command execution with `@<image>`.
+- Tracks the selected system as part of shell context, alongside the working
+  directory.
+- Switches to VM-backed systems with `@<image>` and back to the host with
+  `@host`.
 - Keeps host and guest shell state warm when possible, so `cd`, aliases,
   functions, and exported variables survive across commands.
 - Mounts the host root into guests at `/host` and mirrors the current host
@@ -29,17 +38,20 @@ SSH server:
 ./tools/build.go demo
 ```
 
-Example session:
+Example interactive session:
 
 ```sh
 @alpine
 cat /etc/alpine-release
+cd /tmp
+printf 'hello\n' > note.txt
 
 @work --from ubuntu:24.04 --memory 2g --cpus 4
 python3 --version
 
 @host git status
-@alpine --no-network sh -lc 'uname -m && whoami'
+@alpine --no-network
+sh -lc 'uname -m && whoami'
 @ --sudo apk add curl
 ```
 
@@ -99,6 +111,15 @@ Run the shell locally:
 ./tools/build.go run
 ```
 
+`vmsh` expects an interactive terminal for normal use. Interactive sessions use
+the native `vmsh` line editor, persistent history stored in the `ccvm` cache
+directory, and autocomplete for `@` builtins, cached image names, options,
+command names, and host paths.
+
+By default, a `vmsh` frontend owns its daemon session and cleans it up when the
+frontend exits. Start with `-system-session` or run `@detach` to keep the
+session available after the current frontend closes.
+
 On Windows, the same helper can be run with:
 
 ```powershell
@@ -133,19 +154,43 @@ EOF
 
 ## Command Syntax
 
-`vmsh` treats ordinary lines as commands in the current context. Lines beginning
-with `@` are `vmsh` control lines:
+`vmsh` is a session shell. It treats ordinary lines as commands in the current
+context: selected system plus working directory. Lines beginning with `@` are
+`vmsh` control lines that switch system context, create named VM systems, run
+builtins, or apply one-shot options:
 
 ```sh
 @<oci-image> [vmsh-options] [--] [command...]
 ```
 
+The primary workflow is selecting a system, then running ordinary commands in
+that system:
+
+```sh
+@alpine
+uname -a
+cat /etc/alpine-release
+cd /tmp
+pwd
+@host
+git status
+```
+
+Appending a command to a context line is supported for one-shot use, but it is
+not the main execution model:
+
+```sh
+@alpine uname -a
+```
+
 Common forms:
 
 ```sh
-@alpine                         # select an image; VM starts lazily
-@alpine uname -a                # run one command in alpine
-@host pwd                       # run one command on the host
+@alpine                         # select an image context; VM starts lazily
+uname -a                        # run in the selected context
+@alpine uname -a                # one-shot command in alpine
+@host                           # switch back to the host context
+@host pwd                       # one-shot host command
 @work --from alpine --memory 4g # create or switch to a named VM system
 @ --sudo whoami                 # run as root in the current VM
 @alias ll=@host ls -la          # create an alias
@@ -157,11 +202,40 @@ Common forms:
 @stop work                      # stop a named VM
 ```
 
+Builtins:
+
+```sh
+@help
+@host [command...]
+@jobs
+@sessions
+@detach
+@ps
+@status
+@version
+@start
+@stop [name|vm:name|ssh:name]
+@forward <host-port:guest-port>
+@copy SRC DST
+@alias [name=value]
+@alias expand line
+```
+
+`@host` with no command switches the current system to the host. `@host
+<command>` runs a one-shot host command.
+
 Pipelines can mix host, VM, and SSH stages. `vmsh` follows normal POSIX shell
 status semantics: the pipeline status is the final command's status. When an
 earlier mixed-context stage exits non-zero, `vmsh` also prints a diagnostic that
 names the stage number, context, exit status, and command so the final stage does
 not hide the failure.
+
+Guest commands receive a TTY, terminal dimensions, and terminal color
+environment. `vmsh` keeps command execution non-interactive and adds a small
+color prelude for common commands such as `ls`. Interactive host and guest
+commands run through persistent shell sessions when possible, so shell state can
+survive across commands. Commands that need full foreground terminal control
+fall back to a one-shot shell path.
 
 Copy endpoints use explicit context prefixes so accidental names fail early:
 
@@ -203,6 +277,18 @@ Use `--` when the guest command itself begins with an option:
 ```sh
 @alpine -- --help
 ```
+
+Guest commands run as UID `1000` by default. Use `@ --sudo <cmd>` or
+`@sudo <cmd>` to run a command as root in the current VM.
+
+If the daemon reports nested virtualization support, `vmsh` enables it by
+default for VM contexts. Use `@ --no-nested` to disable it for the current
+context or a one-shot command.
+
+Use `-record session.cast` to write asciinema v2 output. Use
+`-record-raw session.raw.jsonl` to write a lossless JSONL event stream with
+base64 terminal input/output bytes and resize events for rendering and
+debugging investigations.
 
 ## Releases
 
