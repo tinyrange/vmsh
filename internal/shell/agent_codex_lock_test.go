@@ -3,6 +3,7 @@ package shell
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,7 +17,7 @@ func TestCodexInstallLockCannotBeStolen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	owner := readCodexLockOwner(t, path)
+	owner := readCodexLockOwner(t, first)
 	if owner.PID != os.Getpid() || owner.Generation == "" {
 		t.Fatalf("lock owner = %+v", owner)
 	}
@@ -36,7 +37,7 @@ func TestCodexInstallLockCannotBeStolen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.Release()
-	if next := readCodexLockOwner(t, path); next.Generation == owner.Generation {
+	if next := readCodexLockOwner(t, second); next.Generation == owner.Generation {
 		t.Fatalf("new owner reused generation %q", next.Generation)
 	}
 }
@@ -75,9 +76,12 @@ func TestCodexInstallLockHelper(t *testing.T) {
 	os.Exit(0)
 }
 
-func readCodexLockOwner(t *testing.T, path string) codexLockOwner {
+func readCodexLockOwner(t *testing.T, lock *codexFileLock) codexLockOwner {
 	t.Helper()
-	data, err := os.ReadFile(path)
+	if _, err := lock.file.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(lock.file)
 	if err != nil {
 		t.Fatal(err)
 	}
