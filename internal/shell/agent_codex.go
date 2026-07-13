@@ -30,6 +30,16 @@ const (
 	codexGuestStandaloneMount = "/vmsh/codex-standalone"
 	codexGuestCertMount       = "/vmsh/host-certs"
 	codexStandaloneDir        = "packages/standalone"
+
+	// Current Codex packages are about 140 MiB compressed, contain 11 entries,
+	// and expand to about 310 MiB with a largest file around 260 MiB. These
+	// budgets leave substantial release-growth headroom while bounding disk,
+	// inode, and decompression work before publication.
+	codexPackageMaxArchiveBytes  int64 = 256 << 20
+	codexPackageMaxExpandedBytes int64 = 1 << 30
+	codexPackageMaxFileBytes     int64 = 512 << 20
+	codexPackageMaxEntries             = 1024
+	codexChecksumMaxBytes        int64 = 1 << 20
 )
 
 var (
@@ -71,6 +81,13 @@ type codexGitHubAsset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 	Digest             string `json:"digest"`
+	Size               int64  `json:"size"`
+}
+
+type tarExtractionLimits struct {
+	MaxEntries       int
+	MaxFileBytes     int64
+	MaxExpandedBytes int64
 }
 
 func (s *shellState) runAgent(at atLine, stdout, stderr io.Writer) error {
@@ -1070,6 +1087,13 @@ func downloadCodexAsset(asset codexGitHubAsset, dst string) error {
 	if asset.BrowserDownloadURL == "" {
 		return fmt.Errorf("release asset %s is missing a download URL", asset.Name)
 	}
+	maxBytes := codexPackageMaxArchiveBytes
+	if asset.Name == "codex-package_SHA256SUMS" {
+		maxBytes = codexChecksumMaxBytes
+	}
+	if asset.Size < 0 || asset.Size > maxBytes {
+		return fmt.Errorf("release asset %s size %d exceeds limit %d", asset.Name, asset.Size, maxBytes)
+	}
 	req, err := http.NewRequest(http.MethodGet, asset.BrowserDownloadURL, nil)
 	if err != nil {
 		return err
@@ -1083,14 +1107,25 @@ func downloadCodexAsset(asset codexGitHubAsset, dst string) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("download %s: %s", asset.Name, resp.Status)
 	}
+	if resp.ContentLength > maxBytes {
+		return fmt.Errorf("download %s content length %d exceeds limit %d", asset.Name, resp.ContentLength, maxBytes)
+	}
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(out, resp.Body)
+	written, copyErr := io.Copy(out, io.LimitReader(resp.Body, maxBytes+1))
 	closeErr := out.Close()
 	if copyErr != nil {
 		return copyErr
+	}
+	if written > maxBytes {
+		_ = os.Remove(dst)
+		return fmt.Errorf("download %s exceeds limit %d", asset.Name, maxBytes)
+	}
+	if asset.Size > 0 && written != asset.Size {
+		_ = os.Remove(dst)
+		return fmt.Errorf("download %s size %d does not match release metadata %d", asset.Name, written, asset.Size)
 	}
 	return closeErr
 }
@@ -1192,7 +1227,17 @@ func extractCodexPackageArchive(releaseDir, archivePath string) error {
 }
 
 func extractTarSafe(r io.Reader, dst string) error {
+	return extractTarSafeWithLimits(r, dst, tarExtractionLimits{
+		MaxEntries:       codexPackageMaxEntries,
+		MaxFileBytes:     codexPackageMaxFileBytes,
+		MaxExpandedBytes: codexPackageMaxExpandedBytes,
+	})
+}
+
+func extractTarSafeWithLimits(r io.Reader, dst string, limits tarExtractionLimits) error {
 	tr := tar.NewReader(r)
+	entries := 0
+	var expanded int64
 	for {
 		header, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -1200,6 +1245,19 @@ func extractTarSafe(r io.Reader, dst string) error {
 		}
 		if err != nil {
 			return err
+		}
+		entries++
+		if limits.MaxEntries > 0 && entries > limits.MaxEntries {
+			return fmt.Errorf("archive contains more than %d entries", limits.MaxEntries)
+		}
+		if header.Size < 0 || limits.MaxFileBytes > 0 && header.Size > limits.MaxFileBytes {
+			return fmt.Errorf("archive entry %q size %d exceeds limit %d", header.Name, header.Size, limits.MaxFileBytes)
+		}
+		if header.Size > 0 && limits.MaxExpandedBytes > 0 {
+			if expanded > limits.MaxExpandedBytes-header.Size {
+				return fmt.Errorf("archive expanded size exceeds limit %d", limits.MaxExpandedBytes)
+			}
+			expanded += header.Size
 		}
 		name := path.Clean(strings.TrimPrefix(header.Name, "/"))
 		if name == "." || name == ".." || strings.HasPrefix(name, "../") {

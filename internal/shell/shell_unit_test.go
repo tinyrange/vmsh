@@ -2834,6 +2834,45 @@ func TestCodexAgentProxyServeHTTPStreamsResponsesWithoutContentLength(t *testing
 	}
 }
 
+func TestCodexAgentProxyRejectsOversizedGuestRequest(t *testing.T) {
+	proxy := &codexAgentProxy{
+		token:           "guest-token",
+		maxRequestBytes: 8,
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://guest/v1/responses", strings.NewReader("123456789"))
+	req.Header.Set(codexAgentProxyTokenHeader, "guest-token")
+	rec := httptest.NewRecorder()
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
+func TestCodexAgentProxyStopsWaitingForUpstreamHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+
+	client := &http.Client{Transport: codexAgentProxyRoundTripperWithResponseHeaderTimeout(25 * time.Millisecond)}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstream.URL, nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	_, err = client.Do(req)
+	if err == nil {
+		t.Fatal("request succeeded without upstream response headers")
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("request error = %v, want transport timeout", err)
+	}
+}
+
 func TestCodexAgentProxyPrefersChatGPTTokensWhenAuthModeIsChatGPT(t *testing.T) {
 	idToken := testCodexJWT(t, map[string]any{
 		"https://api.openai.com/auth": map[string]any{
@@ -3136,6 +3175,59 @@ func TestEnsureHostCodexReleaseDownloadsLatestForMissingGuestTarget(t *testing.T
 	if release.CodexGuestBin != path.Join(codexGuestStandaloneMount, "releases", "1.2.3-"+target, "bin/codex") {
 		t.Fatalf("guest binary = %q", release.CodexGuestBin)
 	}
+}
+
+func TestExtractTarSafeEnforcesResourceBudgets(t *testing.T) {
+	archive := func(t *testing.T, files ...string) []byte {
+		t.Helper()
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		for index, contents := range files {
+			if err := tw.WriteHeader(&tar.Header{Name: fmt.Sprintf("file-%d", index), Mode: 0o600, Size: int64(len(contents))}); err != nil {
+				t.Fatalf("write tar header: %v", err)
+			}
+			if _, err := io.WriteString(tw, contents); err != nil {
+				t.Fatalf("write tar contents: %v", err)
+			}
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatalf("close tar: %v", err)
+		}
+		return buf.Bytes()
+	}
+
+	t.Run("entry count", func(t *testing.T) {
+		dst := t.TempDir()
+		err := extractTarSafeWithLimits(bytes.NewReader(archive(t, "a", "b")), dst, tarExtractionLimits{MaxEntries: 1, MaxFileBytes: 8, MaxExpandedBytes: 8})
+		if err == nil {
+			t.Fatal("extract succeeded past entry budget")
+		}
+		if _, statErr := os.Stat(filepath.Join(dst, "file-1")); !os.IsNotExist(statErr) {
+			t.Fatalf("over-budget entry was created: %v", statErr)
+		}
+	})
+
+	t.Run("individual file", func(t *testing.T) {
+		dst := t.TempDir()
+		err := extractTarSafeWithLimits(bytes.NewReader(archive(t, "12345")), dst, tarExtractionLimits{MaxEntries: 2, MaxFileBytes: 4, MaxExpandedBytes: 8})
+		if err == nil {
+			t.Fatal("extract succeeded past file budget")
+		}
+		if _, statErr := os.Stat(filepath.Join(dst, "file-0")); !os.IsNotExist(statErr) {
+			t.Fatalf("over-budget file was created: %v", statErr)
+		}
+	})
+
+	t.Run("expanded bytes", func(t *testing.T) {
+		dst := t.TempDir()
+		err := extractTarSafeWithLimits(bytes.NewReader(archive(t, "123", "456")), dst, tarExtractionLimits{MaxEntries: 2, MaxFileBytes: 4, MaxExpandedBytes: 5})
+		if err == nil {
+			t.Fatal("extract succeeded past expanded-byte budget")
+		}
+		if _, statErr := os.Stat(filepath.Join(dst, "file-1")); !os.IsNotExist(statErr) {
+			t.Fatalf("entry exceeding expanded-byte budget was created: %v", statErr)
+		}
+	})
 }
 
 func TestCodexGuestTargetMapsLinuxArchitectures(t *testing.T) {
