@@ -15,7 +15,11 @@ import (
 
 func TestTrustedManagerBindsGatewayAdmissionToRunningVMGeneration(t *testing.T) {
 	root := t.TempDir()
-	executable, err := os.ReadFile("/bin/echo")
+	executablePath, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.ReadFile(executablePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +37,7 @@ func TestTrustedManagerBindsGatewayAdmissionToRunningVMGeneration(t *testing.T) 
 		DefaultRootID:    "workspace",
 		Roots:            map[string]trusted.Root{"workspace": {Path: root}},
 		Actions: map[string]trusted.Action{"echo": {
-			Executable:       "/bin/echo",
+			Executable:       executablePath,
 			ExecutableDigest: hex.EncodeToString(executableDigest[:]),
 			RootIDs:          []string{"workspace"},
 			ArgumentRules:    []trusted.ArgumentRule{{Position: 0, Pattern: "hello"}},

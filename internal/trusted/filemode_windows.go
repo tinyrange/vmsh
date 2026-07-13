@@ -2,6 +2,15 @@
 
 package trusted
 
-import "os"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+)
 
 func fileAccessibleByOthers(info os.FileInfo) bool { return false }
+
+func fileIsExecutable(path string, _ os.FileInfo) bool {
+	extension := strings.ToLower(filepath.Ext(path))
+	return extension == ".exe" || extension == ".com"
+}

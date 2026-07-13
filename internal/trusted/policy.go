@@ -355,7 +355,7 @@ func resolveExecutable(action Action) (string, error) {
 		return "", policyError(DeniedExecutable, err.Error())
 	}
 	info, err := os.Stat(resolved)
-	if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+	if err != nil || info.IsDir() || !fileIsExecutable(resolved, info) {
 		return "", policyError(DeniedExecutable, "executable is not a runnable regular file")
 	}
 	if action.ExecutableDigest != "" {

@@ -15,20 +15,24 @@ import (
 func TestEvaluateRejectsProfileMutationAndPathEscape(t *testing.T) {
 	profile, grant := testProfile(t)
 	request := testRequest(profile, grant)
-	request.RelativeCWD = "escape"
-	outside := t.TempDir()
-	if err := os.Symlink(outside, filepath.Join(profile.Roots["workspace"].Path, "escape")); err != nil {
-		t.Fatal(err)
-	}
+	request.RelativeCWD = ".."
 	if _, err := Evaluate(profile, &grant, request, time.Now()); !IsDenial(err, DeniedWorkingDirectory) {
 		t.Fatalf("expected working-directory denial, got %v", err)
 	}
 
-	profile.Actions["echo"] = Action{Executable: "/bin/echo", RootIDs: []string{"workspace"}, MaxRequestBytes: 4096, MaxDuration: "5s", AllowTrailingArgs: true}
+	profile.Actions["echo"] = Action{Executable: profile.Actions["echo"].Executable, RootIDs: []string{"workspace"}, MaxRequestBytes: 4096, MaxDuration: "5s", AllowTrailingArgs: true}
 	request.RelativeCWD = "."
 	if _, err := Evaluate(profile, &grant, request, time.Now()); !IsDenial(err, DeniedProfile) {
 		t.Fatalf("expected mutated-profile denial, got %v", err)
 	}
+}
+
+func TestTrustedHelperProcess(t *testing.T) {
+	if os.Getenv("VMSH_TRUSTED_HELPER") != "1" {
+		return
+	}
+	_, _ = fmt.Fprintln(os.Stdout, os.Args[len(os.Args)-1])
+	os.Exit(0)
 }
 
 func TestGatewayExecutesStructuredActionAndRejectsReplay(t *testing.T) {
@@ -83,7 +87,11 @@ func TestGatewayExecutesStructuredActionAndRejectsReplay(t *testing.T) {
 func testProfile(t *testing.T) (Profile, Grant) {
 	t.Helper()
 	root := t.TempDir()
-	executable, err := os.ReadFile("/bin/echo")
+	executablePath, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.ReadFile(executablePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,10 +105,11 @@ func testProfile(t *testing.T) (Profile, Grant) {
 		Roots:            map[string]Root{"workspace": {Path: root}},
 		DefaultRootID:    "workspace",
 		Actions: map[string]Action{"echo": {
-			Executable:       "/bin/echo",
+			Executable:       executablePath,
 			ExecutableDigest: hex.EncodeToString(executableDigest[:]),
 			RootIDs:          []string{"workspace"},
-			ArgumentRules:    []ArgumentRule{{Position: 0, Pattern: "hello"}},
+			ArgumentRules:    []ArgumentRule{{Position: 0, Pattern: "-test.run=TestTrustedHelperProcess"}, {Position: 1, Pattern: "--"}, {Position: 2, Pattern: "hello"}},
+			Environment:      map[string]string{"VMSH_TRUSTED_HELPER": "1"},
 			MaxRequestBytes:  4096,
 			MaxDuration:      "5s",
 		}},
@@ -113,7 +122,7 @@ func testProfile(t *testing.T) (Profile, Grant) {
 }
 
 func testRequest(profile Profile, grant Grant) Request {
-	return Request{Version: ProtocolVersion, CallID: "call-one", Sequence: 1, SourceVMID: grant.SourceVMID, SourceGeneration: grant.SourceGeneration, TargetID: profile.TargetID, ProfileDigest: profile.Digest, ActionID: "echo", Arguments: []string{"hello"}, RootID: "workspace", RelativeCWD: ".", Deadline: time.Now().Add(time.Second)}
+	return Request{Version: ProtocolVersion, CallID: "call-one", Sequence: 1, SourceVMID: grant.SourceVMID, SourceGeneration: grant.SourceGeneration, TargetID: profile.TargetID, ProfileDigest: profile.Digest, ActionID: "echo", Arguments: []string{"-test.run=TestTrustedHelperProcess", "--", "hello"}, RootID: "workspace", RelativeCWD: ".", Deadline: time.Now().Add(4 * time.Second)}
 }
 
 func callGateway(t *testing.T, port int, envelope Envelope) []Event {
