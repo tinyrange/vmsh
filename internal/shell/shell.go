@@ -171,12 +171,11 @@ type shellCopy struct {
 }
 
 type vmshdSessionReporter struct {
+	publishMu    sync.Mutex
 	client       *vmshd.HTTPClient
 	frontendID   string
 	sessionID    string
 	attachmentID string
-	hostCWD      string
-	context      commandContext
 	detached     bool
 	startedAt    time.Time
 	startedKnown bool
@@ -1251,7 +1250,7 @@ func Run(args []string) error {
 		return err
 	}
 	if haveDaemonState {
-		reporter, stopVMSHDSession, err := startVMSHDSession(daemonState, os.Stdout, vmshdSessionMetadata(sh.hostCWD, sh.context), sh.context, *systemSession)
+		reporter, stopVMSHDSession, err := startVMSHDSession(daemonState, os.Stdout, vmshdSessionMetadata(sh.hostCWD, sh.context), *systemSession)
 		if err != nil {
 			return err
 		}
@@ -1313,7 +1312,7 @@ func daemonDisplayName(state backend.DaemonState, launch backend.CCVMLaunch) str
 	return "ccvm"
 }
 
-func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmshd.UpdateSessionRequest, ctx commandContext, systemSession bool) (*vmshdSessionReporter, func(), error) {
+func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmshd.UpdateSessionRequest, systemSession bool) (*vmshdSessionReporter, func(), error) {
 	if state.Kind != vmshd.Kind {
 		return nil, func() {}, nil
 	}
@@ -1358,8 +1357,6 @@ func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmsh
 		frontendID:   frontend.ID,
 		sessionID:    session.ID,
 		attachmentID: attached.Attachment.ID,
-		hostCWD:      metadata.HostCWD,
-		context:      ctx,
 		detached:     systemSession,
 	}
 	if status, err := client.Status(); err == nil && !status.StartedAt.IsZero() {
@@ -1394,12 +1391,13 @@ func (s *shellState) publishVMSHDSessionState() {
 	if s.vmshd == nil {
 		return
 	}
-	s.vmshd.hostCWD = s.hostCWD
-	s.vmshd.context = s.context
-	jobs := s.vmshdJobSummaries()
-	copies := s.vmshdCopySummaries()
-	hostShells, guestShells, sshShells := s.vmshdShellHandles()
-	s.vmshd.publish(jobs, copies, hostShells, guestShells, sshShells)
+	s.vmshd.publish(func() vmshd.UpdateSessionRequest {
+		req := vmshdSessionMetadata(s.hostCWD, s.context)
+		req.Jobs = s.vmshdJobSummaries()
+		req.Copies = s.vmshdCopySummaries()
+		req.HostShells, req.GuestShells, req.SSHShells = s.vmshdShellHandles()
+		return req
+	})
 }
 
 func vmshdVMRefs(ctx commandContext) []vmshd.VMRef {
@@ -1554,16 +1552,13 @@ func jobStatus(job shellJob) string {
 	return "done"
 }
 
-func (r *vmshdSessionReporter) publish(jobs []vmshd.JobSummary, copies []vmshd.CopySummary, hostShells, guestShells, sshShells []vmshd.ShellHandle) {
+func (r *vmshdSessionReporter) publish(snapshot func() vmshd.UpdateSessionRequest) {
 	if r == nil || r.client == nil || strings.TrimSpace(r.sessionID) == "" {
 		return
 	}
-	req := vmshdSessionMetadata(r.hostCWD, r.context)
-	req.HostShells = hostShells
-	req.GuestShells = guestShells
-	req.SSHShells = sshShells
-	req.Jobs = jobs
-	req.Copies = copies
+	r.publishMu.Lock()
+	defer r.publishMu.Unlock()
+	req := snapshot()
 	_, _ = r.client.UpdateSession(r.sessionID, req)
 }
 
