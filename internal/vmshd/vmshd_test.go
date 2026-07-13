@@ -970,6 +970,91 @@ func TestTerminalAttachmentStreamTracksActiveStreamAndResize(t *testing.T) {
 	})
 }
 
+func TestObserverTerminalStreamIsReadOnlyAndReceivesOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host PTY shell test requires a Unix shell")
+	}
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, nil)
+	session := mustCreateRegistrySession(t, srv.registry, "main")
+	_, observer, err := srv.registry.Attach(session.ID, AttachSessionRequest{Mode: "observer", Terminal: &Terminal{Cols: 80, Rows: 24}})
+	if err != nil {
+		t.Fatalf("attach observer: %v", err)
+	}
+	httpSrv := httptest.NewServer(srv.Authenticate(mux))
+	defer httpSrv.Close()
+
+	dial := func(attachmentID string) *websocket.Conn {
+		t.Helper()
+		target := strings.Replace(httpSrv.URL, "http://", "ws://", 1) + "/vmsh/sessions/" + session.ID + "/attachments/" + attachmentID + "/stream"
+		cfg, err := websocket.NewConfig(target, httpSrv.URL)
+		if err != nil {
+			t.Fatalf("websocket config: %v", err)
+		}
+		cfg.Header.Set("Authorization", "Bearer secret")
+		ws, err := websocket.DialConfig(cfg)
+		if err != nil {
+			t.Fatalf("dial stream: %v", err)
+		}
+		var attached TerminalStreamMessage
+		if err := websocket.JSON.Receive(ws, &attached); err != nil {
+			t.Fatalf("receive attached message: %v", err)
+		}
+		if attached.Kind != "attached" || attached.Stream == nil || attached.Stream.AttachmentID != attachmentID {
+			t.Fatalf("attached message = %+v", attached)
+		}
+		return ws
+	}
+	observerWS := dial(observer.ID)
+	defer observerWS.Close()
+
+	if err := websocket.JSON.Send(observerWS, TerminalStreamMessage{Kind: "resize", Terminal: &Terminal{Cols: 1, Rows: 1}}); err != nil {
+		t.Fatalf("send observer resize: %v", err)
+	}
+	receiveTerminalMessageKind(t, observerWS, "error")
+	if err := websocket.JSON.Send(observerWS, TerminalStreamMessage{Kind: "stdin", Data: []byte("printf '__observer_injected__\\n'\n")}); err != nil {
+		t.Fatalf("send observer stdin: %v", err)
+	}
+	receiveTerminalMessageKind(t, observerWS, "error")
+
+	_, storedObserver, ok := srv.registry.GetAttachment(session.ID, observer.ID)
+	if !ok || storedObserver.Terminal == nil || storedObserver.Terminal.Cols != 80 || storedObserver.Terminal.Rows != 24 {
+		t.Fatalf("observer terminal changed = %+v", storedObserver.Terminal)
+	}
+	var shell *hostShell
+	requireEventually(t, func() bool {
+		srv.shells.mu.Lock()
+		shell = srv.shells.shells[session.ID]
+		srv.shells.mu.Unlock()
+		if shell == nil {
+			return false
+		}
+		shell.mu.Lock()
+		defer shell.mu.Unlock()
+		return len(shell.subscribers) > 0
+	})
+	shell.publish([]byte("__observer_can_read__\n"))
+	receiveTerminalDataUntil(t, observerWS, "__observer_can_read__")
+}
+
+func receiveTerminalMessageKind(t *testing.T, ws *websocket.Conn, want string) TerminalStreamMessage {
+	t.Helper()
+	if err := ws.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set terminal read deadline: %v", err)
+	}
+	defer ws.SetReadDeadline(time.Time{})
+	for {
+		var msg TerminalStreamMessage
+		if err := websocket.JSON.Receive(ws, &msg); err != nil {
+			t.Fatalf("receive terminal message: %v", err)
+		}
+		if msg.Kind == want {
+			return msg
+		}
+	}
+}
+
 func receiveTerminalDataUntil(t *testing.T, ws *websocket.Conn, marker string) string {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
