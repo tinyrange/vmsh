@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -25,6 +26,14 @@ const InternalCCVMSidecarModeEnv = "CCX3_CCVM_SIDECAR_MODE"
 const InternalCCVMSidecarMode = "vmsh-internal"
 const DaemonStateVersion = 1
 const DaemonAPIVersion = "2026-06-25"
+
+// The daemon emits its banner immediately after local cache initialization and
+// listener creation, before kernel, image, or VM work. Thirty seconds leaves
+// substantial room for slow local filesystems without permitting a broken
+// child to hang shell startup indefinitely.
+const daemonStartupHandshakeTimeout = 30 * time.Second
+
+var ErrDaemonStartupTimeout = errors.New("daemon startup banner timed out")
 
 type API interface {
 	HealthCheck() error
@@ -266,10 +275,9 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		return nil, fmt.Errorf("start ccvm daemon %s with cache %s: %w", CCVMLaunchName(launch), startCacheDir, err)
 	}
 
-	var hello client.ServerHello
-	if err := json.NewDecoder(started.stdout).Decode(&hello); err != nil {
-		started.stop()
-		return nil, fmt.Errorf("ccvm daemon did not send a startup banner from %s: %w", CCVMLaunchName(launch), err)
+	hello, err := readDaemonStartupBanner(started, launch, daemonStartupHandshakeTimeout)
+	if err != nil {
+		return nil, err
 	}
 	if err := ValidateServerHello(hello, cacheDir); err != nil {
 		started.stop()
@@ -309,6 +317,34 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		opts.OnStart(state)
 	}
 	return api, nil
+}
+
+type daemonStartupResult struct {
+	hello client.ServerHello
+	err   error
+}
+
+func readDaemonStartupBanner(started *startedDaemonProcess, launch CCVMLaunch, timeout time.Duration) (client.ServerHello, error) {
+	result := make(chan daemonStartupResult, 1)
+	go func() {
+		var hello client.ServerHello
+		err := json.NewDecoder(started.stdout).Decode(&hello)
+		result <- daemonStartupResult{hello: hello, err: err}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case decoded := <-result:
+		if decoded.err != nil {
+			started.stop()
+			return client.ServerHello{}, fmt.Errorf("ccvm daemon did not send a startup banner from %s: %w", CCVMLaunchName(launch), decoded.err)
+		}
+		return decoded.hello, nil
+	case <-timer.C:
+		started.stop()
+		_ = started.stdout.Close()
+		return client.ServerHello{}, fmt.Errorf("ccvm daemon did not send a startup banner from %s within %s: %w", CCVMLaunchName(launch), timeout, ErrDaemonStartupTimeout)
+	}
 }
 
 func privateDaemonCacheDir(cacheDir string) (string, error) {
