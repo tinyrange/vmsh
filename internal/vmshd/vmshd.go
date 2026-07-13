@@ -947,7 +947,13 @@ func (m *hostShellManager) Start(sessionID string, term *Terminal) (*hostShell, 
 	delete(m.shells, sessionID)
 	m.mu.Unlock()
 
-	cmd := exec.Command(hostShellCommand())
+	shellPath := hostShellCommand()
+	cmd := exec.Command(shellPath)
+	if runtime.GOOS != "windows" {
+		// A leading dash in argv[0] is the portable login-shell convention. A
+		// PTY makes the configured shell interactive without shell-specific flags.
+		cmd.Args[0] = "-" + filepath.Base(shellPath)
+	}
 	cmd.Env = append(os.Environ(), "VMSH_ACTIVE=1")
 	tty, err := pty.StartWithSize(cmd, terminalWinsize(term))
 	if err != nil {
@@ -1099,6 +1105,11 @@ func terminalWinsize(term *Terminal) *pty.Winsize {
 func hostShellCommand() string {
 	if runtime.GOOS == "windows" {
 		return firstNonEmpty(os.Getenv("COMSPEC"), "cmd.exe")
+	}
+	if shell := strings.TrimSpace(os.Getenv("SHELL")); filepath.IsAbs(shell) {
+		if info, err := os.Stat(shell); err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+			return shell
+		}
 	}
 	for _, name := range []string{"zsh", "bash", "sh"} {
 		if path, err := exec.LookPath(name); err == nil {

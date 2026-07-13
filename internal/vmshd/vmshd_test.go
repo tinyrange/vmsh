@@ -46,19 +46,38 @@ func TestTokenFileIsPrivate(t *testing.T) {
 	}
 }
 
-func TestHostShellCommandPrefersSupportedShellOverEnv(t *testing.T) {
+func TestHostShellCommandUsesConfiguredExecutable(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("host shell lookup is Unix-specific")
 	}
 	dir := t.TempDir()
-	zsh := filepath.Join(dir, "zsh")
-	if err := os.WriteFile(zsh, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatalf("write zsh fixture: %v", err)
+	configured := filepath.Join(dir, "fish")
+	if err := os.WriteFile(configured, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write configured shell fixture: %v", err)
 	}
+	t.Setenv("SHELL", configured)
+	if got := hostShellCommand(); got != configured {
+		t.Fatalf("host shell command = %q, want %q", got, configured)
+	}
+}
+
+func TestHostShellCommandRejectsNonExecutableConfiguration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host shell lookup is Unix-specific")
+	}
+	dir := t.TempDir()
+	configured := filepath.Join(dir, "configured")
+	fallback := filepath.Join(dir, "sh")
+	if err := os.WriteFile(configured, []byte("not executable\n"), 0o600); err != nil {
+		t.Fatalf("write configured shell fixture: %v", err)
+	}
+	if err := os.WriteFile(fallback, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write fallback shell fixture: %v", err)
+	}
+	t.Setenv("SHELL", configured)
 	t.Setenv("PATH", dir)
-	t.Setenv("SHELL", "/usr/bin/fish")
-	if got := hostShellCommand(); got != zsh {
-		t.Fatalf("host shell command = %q, want %q", got, zsh)
+	if got := hostShellCommand(); got != fallback {
+		t.Fatalf("host shell command = %q, want fallback %q", got, fallback)
 	}
 }
 
