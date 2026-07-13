@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tinyrange/vmsh/internal/vmshdprotocol"
@@ -25,6 +26,8 @@ const InternalCCVMSidecarModeEnv = "CCX3_CCVM_SIDECAR_MODE"
 const InternalCCVMSidecarMode = "vmsh-internal"
 const DaemonStateVersion = 1
 const DaemonAPIVersion = "2026-06-25"
+
+var daemonStateFileMu sync.RWMutex
 
 type API interface {
 	HealthCheck() error
@@ -619,6 +622,12 @@ func daemonWatchdogTimeout() time.Duration {
 }
 
 func ReadDaemonState(path string) (DaemonState, error) {
+	daemonStateFileMu.RLock()
+	defer daemonStateFileMu.RUnlock()
+	return readDaemonState(path)
+}
+
+func readDaemonState(path string) (DaemonState, error) {
 	var state DaemonState
 	if info, err := os.Stat(path); err != nil {
 		return state, err
@@ -683,9 +692,11 @@ func writeDaemonStateAtomically(path string, data []byte, replace func(string, s
 		return err
 	}
 	closed = true
-	if _, err := ReadDaemonState(tmpPath); err != nil {
+	if _, err := readDaemonState(tmpPath); err != nil {
 		return err
 	}
+	daemonStateFileMu.Lock()
+	defer daemonStateFileMu.Unlock()
 	if err := replace(tmpPath, path); err != nil {
 		return err
 	}
