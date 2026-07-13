@@ -249,13 +249,13 @@ func codexAgentProxyUpstreamURL(base, guestPath, rawQuery string) string {
 func (s *codexAgentProxyAuthStore) auth(ctx context.Context, refreshIfNeeded bool) (codexAgentProxyAuth, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	authFile, err := s.load()
+	authFile, err := s.loadLocked()
 	if err != nil {
 		return codexAgentProxyAuth{}, err
 	}
 	if refreshIfNeeded && authFile.shouldRefresh(s.now()) {
 		if err := s.refreshLocked(ctx, &authFile); err == nil {
-			authFile, err = s.load()
+			authFile, err = s.loadLocked()
 			if err != nil {
 				return codexAgentProxyAuth{}, err
 			}
@@ -267,7 +267,7 @@ func (s *codexAgentProxyAuthStore) auth(ctx context.Context, refreshIfNeeded boo
 func (s *codexAgentProxyAuthStore) refresh(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	authFile, err := s.load()
+	authFile, err := s.loadLocked()
 	if err != nil {
 		return err
 	}
@@ -275,6 +275,12 @@ func (s *codexAgentProxyAuthStore) refresh(ctx context.Context) error {
 }
 
 func (s *codexAgentProxyAuthStore) load() (codexAgentProxyAuthFile, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loadLocked()
+}
+
+func (s *codexAgentProxyAuthStore) loadLocked() (codexAgentProxyAuthFile, error) {
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -290,12 +296,79 @@ func (s *codexAgentProxyAuthStore) load() (codexAgentProxyAuthFile, error) {
 }
 
 func (s *codexAgentProxyAuthStore) save(authFile codexAgentProxyAuthFile) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveLocked(authFile)
+}
+
+func (s *codexAgentProxyAuthStore) saveLocked(authFile codexAgentProxyAuthFile) error {
 	data, err := json.MarshalIndent(authFile, "", "  ")
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
-	return os.WriteFile(s.path, data, 0o600)
+	return writeCodexAuthFile(s.path, data, os.Rename)
+}
+
+func writeCodexAuthFile(path string, data []byte, rename func(string, string) error) error {
+	dir := filepath.Dir(path)
+	mode := os.FileMode(0o600)
+	var previous os.FileInfo
+	if info, err := os.Stat(path); err == nil {
+		previous = info
+		mode = info.Mode().Perm()
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = tmp.Close()
+		}
+		_ = os.Remove(tmpPath)
+	}()
+	if err := tmp.Chmod(mode); err != nil {
+		return err
+	}
+	if previous != nil {
+		if err := preserveCodexAuthOwnership(tmpPath, previous); err != nil {
+			return err
+		}
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	var validated json.RawMessage
+	if err := json.Unmarshal(data, &validated); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	closed = true
+	if err := rename(tmpPath, path); err != nil {
+		return err
+	}
+	_ = syncCodexAuthDirectory(dir)
+	return nil
+}
+
+func syncCodexAuthDirectory(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 func (s *codexAgentProxyAuthStore) refreshLocked(ctx context.Context, authFile *codexAgentProxyAuthFile) error {
@@ -348,7 +421,7 @@ func (s *codexAgentProxyAuthStore) refreshLocked(ctx context.Context, authFile *
 		authFile.Tokens.RefreshToken = *refresh.RefreshToken
 	}
 	authFile.LastRefresh = s.now().UTC().Format(time.RFC3339Nano)
-	return s.save(*authFile)
+	return s.saveLocked(*authFile)
 }
 
 func (a codexAgentProxyAuthFile) proxyAuth() (codexAgentProxyAuth, error) {
