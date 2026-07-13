@@ -38,6 +38,7 @@ import (
 	"github.com/tinyrange/vmsh/internal/backend"
 	"github.com/tinyrange/vmsh/internal/vmshd"
 	cryptossh "golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
 )
@@ -3917,7 +3918,7 @@ func TestSSHRouteTextRedactsProxyCommand(t *testing.T) {
 
 func TestSSHClientConfigPrefersOpenSSHHostKeyOrder(t *testing.T) {
 	sh := newUnitShell(t, newRecordingShellAPI())
-	config, closers, err := sh.sshClientConfig(resolvedSSHConfig{
+	config, closers, err := sh.sshClientConfig(context.Background(), resolvedSSHConfig{
 		User:                  "deploy",
 		HostName:              "example.internal",
 		Port:                  "22",
@@ -3947,6 +3948,87 @@ func TestSSHClientConfigPrefersOpenSSHHostKeyOrder(t *testing.T) {
 	}
 	if slices.Contains(algorithms, cryptossh.KeyAlgoRSA) {
 		t.Fatalf("HostKeyAlgorithms = %v, should not enable legacy ssh-rsa by default", algorithms)
+	}
+}
+
+func TestSSHAgentDialHonorsCancellationAndConnectionBudget(t *testing.T) {
+	originalDial := sshAgentDialContext
+	sshAgentDialContext = func(ctx context.Context, _ string, _ time.Duration) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	t.Cleanup(func() { sshAgentDialContext = originalDial })
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	base := resolvedSSHConfig{
+		HostName:              "127.0.0.1",
+		Port:                  "1",
+		User:                  "test",
+		IdentityAgent:         "/non-responsive-agent",
+		StrictHostKeyChecking: "no",
+	}
+
+	t.Run("caller cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		cfg := base
+		cfg.ConnectTimeout = 5 * time.Second
+		started := time.Now()
+		if _, err := sh.dialSSHConfigContext(ctx, cfg); err == nil {
+			t.Fatal("canceled SSH dial returned no error")
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("canceled SSH agent dial took %s", elapsed)
+		}
+	})
+
+	t.Run("connection budget", func(t *testing.T) {
+		cfg := base
+		cfg.ConnectTimeout = 25 * time.Millisecond
+		started := time.Now()
+		if _, err := sh.dialSSHConfigContext(context.Background(), cfg); err == nil {
+			t.Fatal("timed out SSH dial returned no error")
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("SSH agent dial exceeded connection budget: %s", elapsed)
+		}
+	})
+}
+
+func TestSSHAgentConnectionStaysOpenUntilAuthSetupCompletes(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatalf("generate agent key: %v", err)
+	}
+	keyring := agent.NewKeyring()
+	if err := keyring.Add(agent.AddedKey{PrivateKey: key}); err != nil {
+		t.Fatalf("add agent key: %v", err)
+	}
+	clientConn, serverConn := net.Pipe()
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- agent.ServeAgent(keyring, serverConn)
+	}()
+
+	originalDial := sshAgentDialContext
+	sshAgentDialContext = func(context.Context, string, time.Duration) (net.Conn, error) {
+		return clientConn, nil
+	}
+	t.Cleanup(func() {
+		sshAgentDialContext = originalDial
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	})
+
+	methods, closers := sshAuthMethods(context.Background(), resolvedSSHConfig{IdentityAgent: "/agent"}, nil, nil)
+	if len(methods) != 1 || len(closers) != 1 {
+		t.Fatalf("agent auth methods=%d closers=%d, want one of each", len(methods), len(closers))
+	}
+	closeAll(closers)
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("SSH agent connection remained open after auth cleanup")
 	}
 }
 

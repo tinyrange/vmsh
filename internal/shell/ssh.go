@@ -29,8 +29,11 @@ import (
 )
 
 var (
-	sshConfigPaths = []string{"~/.ssh/config"}
-	sshKnownHosts  = []string{"~/.ssh/known_hosts", "~/.ssh/known_hosts2", "/etc/ssh/ssh_known_hosts"}
+	sshConfigPaths      = []string{"~/.ssh/config"}
+	sshKnownHosts       = []string{"~/.ssh/known_hosts", "~/.ssh/known_hosts2", "/etc/ssh/ssh_known_hosts"}
+	sshAgentDialContext = func(ctx context.Context, path string, timeout time.Duration) (net.Conn, error) {
+		return (&net.Dialer{Timeout: timeout}).DialContext(ctx, "unix", path)
+	}
 )
 
 type persistentSSHClient struct {
@@ -1190,7 +1193,12 @@ func (s *shellState) dialSSHConfig(cfg resolvedSSHConfig) (*ssh.Client, error) {
 }
 
 func (s *shellState) dialSSHConfigContext(ctx context.Context, cfg resolvedSSHConfig) (*ssh.Client, error) {
-	clientConfig, closers, err := s.sshClientConfig(cfg)
+	if cfg.ConnectTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cfg.ConnectTimeout)
+		defer cancel()
+	}
+	clientConfig, closers, err := s.sshClientConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -1409,12 +1417,12 @@ func sshSessionDisplayName(ctx commandContext, cfg resolvedSSHConfig) string {
 	return cfg.HostName
 }
 
-func (s *shellState) sshClientConfig(cfg resolvedSSHConfig) (*ssh.ClientConfig, []io.Closer, error) {
+func (s *shellState) sshClientConfig(ctx context.Context, cfg resolvedSSHConfig) (*ssh.ClientConfig, []io.Closer, error) {
 	callback, err := s.sshHostKeyCallback(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
-	auth, closers := sshAuthMethods(cfg, s.sshPassword, s.sshKeyboardAuth)
+	auth, closers := sshAuthMethods(ctx, cfg, s.sshPassword, s.sshKeyboardAuth)
 	config := &ssh.ClientConfig{
 		User:              cfg.User,
 		Auth:              auth,
@@ -1525,13 +1533,13 @@ func sshUserKnownHostsPath() string {
 	return ""
 }
 
-func sshAuthMethods(cfg resolvedSSHConfig, password func(resolvedSSHConfig) (string, error), keyboard func(resolvedSSHConfig, string, string, []string, []bool) ([]string, error)) ([]ssh.AuthMethod, []io.Closer) {
+func sshAuthMethods(ctx context.Context, cfg resolvedSSHConfig, password func(resolvedSSHConfig) (string, error), keyboard func(resolvedSSHConfig, string, string, []string, []bool) ([]string, error)) ([]ssh.AuthMethod, []io.Closer) {
 	var methods []ssh.AuthMethod
 	var closers []io.Closer
 	agentPath := firstNonEmpty(cfg.IdentityAgent, os.Getenv("SSH_AUTH_SOCK"))
 	if agentPath != "" && strings.ToLower(agentPath) != "none" {
 		agentPath = expandSSHConfigValue(agentPath, cfg)
-		if conn, err := net.Dial("unix", agentPath); err == nil {
+		if conn, err := sshAgentDialContext(ctx, agentPath, cfg.ConnectTimeout); err == nil {
 			client := agent.NewClient(conn)
 			if signers, err := client.Signers(); err == nil && len(signers) > 0 {
 				closers = append(closers, conn)
