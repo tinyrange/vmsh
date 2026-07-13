@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -40,7 +41,7 @@ func TestCodexAuthSaveFailurePreservesPreviousFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat preserved auth: %v", err)
 	}
-	if gotMode := info.Mode().Perm(); gotMode != 0o640 {
+	if gotMode := info.Mode().Perm(); runtime.GOOS != "windows" && gotMode != 0o640 {
 		t.Fatalf("preserved auth mode = %o, want 640", gotMode)
 	}
 	assertOnlyCodexAuthFile(t, dir)
