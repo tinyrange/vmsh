@@ -646,6 +646,8 @@ func TestSessionAttachRejectsBadRequests(t *testing.T) {
 		{name: "missing session", target: "/vmsh/sessions/sess_missing/attach", body: `{}`, status: http.StatusNotFound},
 		{name: "bad mode", target: "/vmsh/sessions/" + session.ID + "/attach", body: `{"mode":"writer"}`, status: http.StatusBadRequest},
 		{name: "bad attach json", target: "/vmsh/sessions/" + session.ID + "/attach", body: `{`, status: http.StatusBadRequest},
+		{name: "trailing attach json", target: "/vmsh/sessions/" + session.ID + "/attach", body: `{"mode":"interactive"}{}`, status: http.StatusBadRequest},
+		{name: "unknown attach field", target: "/vmsh/sessions/" + session.ID + "/attach", body: `{"mode":"interactive","unexpected":true}`, status: http.StatusBadRequest},
 		{name: "missing attachment id", target: "/vmsh/sessions/" + session.ID + "/detach", body: `{}`, status: http.StatusBadRequest},
 		{name: "missing attachment", target: "/vmsh/sessions/" + session.ID + "/detach", body: `{"attachment_id":"attach_missing"}`, status: http.StatusNotFound},
 	} {

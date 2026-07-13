@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -30,7 +31,10 @@ import (
 
 const Kind = "vmshd"
 
-const maxJobLogBytes = 64 * 1024
+const (
+	maxJobLogBytes                   = 64 * 1024
+	maxTerminalWebSocketMessageBytes = 8 << 20
+)
 
 type Status struct {
 	Kind      string                 `json:"kind"`
@@ -644,6 +648,8 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 	mux.Handle("GET /vmsh/sessions/{id}/attachments/{attachment}/stream", websocket.Server{
 		Handshake: func(*websocket.Config, *http.Request) error { return nil },
 		Handler: func(ws *websocket.Conn) {
+			ws.MaxPayloadBytes = maxTerminalWebSocketMessageBytes
+			_ = ws.SetDeadline(time.Time{})
 			s.serveTerminalStream(ws)
 		},
 	})
@@ -2316,21 +2322,34 @@ func normalizeTerminal(term *Terminal) *Terminal {
 }
 
 func decodeOptionalJSON(r *http.Request, dst any) error {
-	if r.Body == nil || r.ContentLength == 0 {
-		return nil
-	}
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
-		return fmt.Errorf("decode request body: %w", err)
-	}
-	return nil
+	return decodeJSON(r, dst, false)
 }
 
 func decodeRequiredJSON(r *http.Request, dst any) error {
-	if r.Body == nil {
-		return fmt.Errorf("request body is required")
+	return decodeJSON(r, dst, true)
+}
+
+func decodeJSON(r *http.Request, dst any, required bool) error {
+	if r.Body == nil || r.ContentLength == 0 {
+		if required {
+			return fmt.Errorf("request body is required")
+		}
+		return nil
 	}
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		if !required && errors.Is(err, io.EOF) {
+			return nil
+		}
 		return fmt.Errorf("decode request body: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("decode request body: multiple JSON values")
+		}
+		return fmt.Errorf("decode request body: trailing data: %w", err)
 	}
 	return nil
 }
