@@ -6905,13 +6905,18 @@ func (s *shellState) startInterruptWatcher(onInterrupt func()) (func(), *atomic.
 		return func() {}, interrupted
 	}
 	done := make(chan struct{})
+	stopped := make(chan struct{})
 	var once sync.Once
 	go func() {
+		defer close(stopped)
 		for {
 			select {
 			case <-done:
 				return
-			case sig := <-signals:
+			case sig, ok := <-signals:
+				if !ok {
+					return
+				}
 				if !isInterruptSignal(sig) {
 					continue
 				}
@@ -6926,13 +6931,17 @@ func (s *shellState) startInterruptWatcher(onInterrupt func()) (func(), *atomic.
 		once.Do(func() {
 			close(done)
 		})
+		<-stopped
 	}, interrupted
 }
 
 func drainInterruptSignals(signals <-chan os.Signal) {
 	for {
 		select {
-		case <-signals:
+		case _, ok := <-signals:
+			if !ok {
+				return
+			}
 		default:
 			return
 		}
