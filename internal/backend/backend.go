@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tinyrange/vmsh/internal/vmshdprotocol"
@@ -271,6 +272,9 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		started.stop()
 		return nil, fmt.Errorf("ccvm daemon did not send a startup banner from %s: %w", CCVMLaunchName(launch), err)
 	}
+	if started.release != nil {
+		started.release()
+	}
 	if err := ValidateServerHello(hello, cacheDir); err != nil {
 		started.stop()
 		return nil, err
@@ -329,8 +333,10 @@ func privateDaemonCacheDir(cacheDir string) (string, error) {
 }
 
 type startedDaemonProcess struct {
-	stdout io.ReadCloser
-	stop   func()
+	stdout  io.ReadCloser
+	release func()
+	stop    func()
+	done    <-chan struct{}
 }
 
 var startDaemonProcess = startDaemonCommand
@@ -351,14 +357,32 @@ func startDaemonCommand(launch CCVMLaunch, cacheDir string) (*startedDaemonProce
 	if err := proc.Start(); err != nil {
 		return nil, err
 	}
+	done := make(chan struct{})
+	go func() {
+		_ = proc.Wait()
+		close(done)
+	}()
+	var releaseOnce sync.Once
+	var stopOnce sync.Once
 	return &startedDaemonProcess{
 		stdout: stdout,
-		stop: func() {
-			if proc.Process != nil {
-				_ = proc.Process.Kill()
-			}
-			_ = proc.Wait()
+		release: func() {
+			releaseOnce.Do(func() {
+				go func() {
+					_, _ = io.Copy(io.Discard, stdout)
+					_ = stdout.Close()
+				}()
+			})
 		},
+		stop: func() {
+			stopOnce.Do(func() {
+				if proc.Process != nil {
+					_ = proc.Process.Kill()
+				}
+			})
+			<-done
+		},
+		done: done,
 	}, nil
 }
 

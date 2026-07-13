@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"j5.nz/cc/client"
 )
@@ -140,6 +141,89 @@ func TestEnsureStableVMSHDCopyCreatesExecutableCopy(t *testing.T) {
 			t.Fatalf("stable copy mode = %o, want executable", info.Mode().Perm())
 		}
 	}
+}
+
+func TestDaemonChildReapHelper(t *testing.T) {
+	mode := os.Getenv("VMSH_TEST_DAEMON_REAP_HELPER")
+	if mode == "" {
+		t.Skip("subprocess helper")
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(client.ServerHello{Addr: "127.0.0.1:1"}); err != nil {
+		t.Fatalf("write startup banner: %v", err)
+	}
+	switch mode {
+	case "drain":
+		if _, err := io.CopyN(os.Stdout, zeroReader{}, 2*1024*1024); err != nil {
+			t.Fatalf("write daemon output: %v", err)
+		}
+	case "stop":
+		time.Sleep(30 * time.Second)
+	}
+}
+
+func TestStartDaemonCommandDrainsAndReapsSuccessfulChild(t *testing.T) {
+	started, err := startDaemonCommand(CCVMLaunch{
+		Path: os.Args[0],
+		Args: []string{"-test.run=^TestDaemonChildReapHelper$", "--"},
+		Env:  []string{"VMSH_TEST_DAEMON_REAP_HELPER=drain"},
+	}, t.TempDir())
+	if err != nil {
+		t.Fatalf("start daemon helper: %v", err)
+	}
+	var hello client.ServerHello
+	if err := json.NewDecoder(started.stdout).Decode(&hello); err != nil {
+		started.stop()
+		t.Fatalf("decode startup banner: %v", err)
+	}
+	started.release()
+	select {
+	case <-started.done:
+	case <-time.After(5 * time.Second):
+		started.stop()
+		t.Fatal("successful daemon child was not drained and reaped")
+	}
+	started.stop()
+	started.stop()
+}
+
+func TestStartDaemonCommandStopReapsChildIdempotently(t *testing.T) {
+	started, err := startDaemonCommand(CCVMLaunch{
+		Path: os.Args[0],
+		Args: []string{"-test.run=^TestDaemonChildReapHelper$", "--"},
+		Env:  []string{"VMSH_TEST_DAEMON_REAP_HELPER=stop"},
+	}, t.TempDir())
+	if err != nil {
+		t.Fatalf("start daemon helper: %v", err)
+	}
+	var hello client.ServerHello
+	if err := json.NewDecoder(started.stdout).Decode(&hello); err != nil {
+		started.stop()
+		t.Fatalf("decode startup banner: %v", err)
+	}
+	started.release()
+	done := make(chan struct{})
+	go func() {
+		started.stop()
+		started.stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stopped daemon child was not reaped")
+	}
+	select {
+	case <-started.done:
+	default:
+		t.Fatal("Wait completion was not recorded")
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
 }
 
 func TestConnectCCVMWithOptionsReportsDaemonReuse(t *testing.T) {
@@ -731,8 +815,9 @@ func stubStartDaemonProcess(t *testing.T, banner string) func() {
 	old := startDaemonProcess
 	startDaemonProcess = func(CCVMLaunch, string) (*startedDaemonProcess, error) {
 		return &startedDaemonProcess{
-			stdout: io.NopCloser(strings.NewReader(banner)),
-			stop:   func() {},
+			stdout:  io.NopCloser(strings.NewReader(banner)),
+			release: func() {},
+			stop:    func() {},
 		}, nil
 	}
 	return func() {
