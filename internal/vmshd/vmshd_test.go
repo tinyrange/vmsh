@@ -46,6 +46,41 @@ func TestTokenFileIsPrivate(t *testing.T) {
 	}
 }
 
+func TestWriteSessionErrorPreservesWrappedDomainStatus(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writeSessionError(recorder, fmt.Errorf("update session: %w", sessionError{
+		status: http.StatusConflict,
+		err:    "session state conflict",
+	}))
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusConflict)
+	}
+	var response client.ErrorResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if response.Error != "session state conflict" {
+		t.Fatalf("error field = %q, want domain error", response.Error)
+	}
+}
+
+func TestWriteSessionErrorKeepsUnknownErrorsInternal(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writeSessionError(recorder, fmt.Errorf("database unavailable"))
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusInternalServerError)
+	}
+	var response client.ErrorResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if response.Error != "database unavailable" {
+		t.Fatalf("error field = %q, want internal error", response.Error)
+	}
+}
+
 func TestHostShellCommandPrefersSupportedShellOverEnv(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("host shell lookup is Unix-specific")
