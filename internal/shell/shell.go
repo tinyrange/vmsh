@@ -4651,111 +4651,7 @@ func writePathTar(w io.Writer, src, rootName string) error {
 }
 
 func extractTarToHost(r io.Reader, dst copyTargetPath) error {
-	mode := hostCopyDestMode(dst.path, dst.directory)
-	tr := tar.NewReader(r)
-	var dirs []tarDirMtime
-	for {
-		header, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			return restoreTarDirMtimes(dirs)
-		}
-		if err != nil {
-			return err
-		}
-		target, err := hostTarTarget(dst.path, mode, header.Name)
-		if err != nil {
-			return err
-		}
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := ensureHostTarTargetCompatible(target, true); err != nil {
-				return err
-			}
-			if err := os.MkdirAll(target, os.FileMode(header.Mode).Perm()); err != nil {
-				return err
-			}
-			_ = os.Chmod(target, os.FileMode(header.Mode).Perm())
-			dirs = append(dirs, tarDirMtime{path: target, mtime: header.ModTime})
-		case tar.TypeSymlink:
-			if err := ensureHostTarTargetCompatible(target, false); err != nil {
-				return err
-			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
-			}
-			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-			if err := os.Symlink(header.Linkname, target); err != nil {
-				return err
-			}
-		case tar.TypeReg, tar.TypeRegA:
-			if err := ensureHostTarTargetCompatible(target, false); err != nil {
-				return err
-			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
-			}
-			file, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(header.Mode).Perm())
-			if err != nil {
-				return err
-			}
-			_, copyErr := io.Copy(file, tr)
-			closeErr := file.Close()
-			if copyErr != nil {
-				return copyErr
-			}
-			if closeErr != nil {
-				return closeErr
-			}
-			perm := os.FileMode(header.Mode).Perm()
-			if err := os.Chmod(target, perm); err != nil {
-				return err
-			}
-			if err := os.Chtimes(target, header.ModTime, header.ModTime); err != nil {
-				return err
-			}
-		default:
-			continue
-		}
-	}
-}
-
-func ensureHostTarTargetCompatible(target string, incomingDir bool) error {
-	info, err := os.Lstat(target)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	existingDir := info.IsDir()
-	switch {
-	case incomingDir && !existingDir:
-		return fmt.Errorf("copy conflict at %s: cannot overwrite non-directory with directory", target)
-	case !incomingDir && existingDir:
-		return fmt.Errorf("copy conflict at %s: cannot overwrite directory with non-directory", target)
-	default:
-		return nil
-	}
-}
-
-type tarDirMtime struct {
-	path  string
-	mtime time.Time
-}
-
-func restoreTarDirMtimes(dirs []tarDirMtime) error {
-	for i := len(dirs) - 1; i >= 0; i-- {
-		dir := dirs[i]
-		if dir.mtime.IsZero() {
-			continue
-		}
-		if err := os.Chtimes(dir.path, dir.mtime, dir.mtime); err != nil {
-			return err
-		}
-	}
-	return nil
+	return extractTarToHostRooted(r, dst)
 }
 
 type copyDestMode int
@@ -4773,21 +4669,6 @@ func hostCopyDestMode(dst string, directoryHint bool) copyDestMode {
 		return copyDestIntoDir
 	}
 	return copyDestExact
-}
-
-func hostTarTarget(dst string, mode copyDestMode, name string) (string, error) {
-	cleanName := path.Clean(strings.TrimPrefix(filepath.ToSlash(name), "/"))
-	if cleanName == "." || strings.HasPrefix(cleanName, "../") || cleanName == ".." {
-		return "", fmt.Errorf("unsafe tar path %q", name)
-	}
-	if mode == copyDestIntoDir {
-		return filepath.Join(dst, filepath.FromSlash(cleanName)), nil
-	}
-	parts := strings.SplitN(cleanName, "/", 2)
-	if len(parts) == 1 {
-		return dst, nil
-	}
-	return filepath.Join(dst, filepath.FromSlash(parts[1])), nil
 }
 
 func copyHostDir(src, dst string, mode os.FileMode) error {

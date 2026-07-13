@@ -7454,6 +7454,184 @@ func TestExtractTarToHostRejectsTraversal(t *testing.T) {
 	}
 }
 
+func TestExtractTarToHostRejectsSymlinkEscapes(t *testing.T) {
+	testCases := []struct {
+		name               string
+		destinationMissing bool
+		prepare            func(t *testing.T, dst, outside string)
+		entries            []tar.Header
+		body               string
+	}{
+		{
+			name: "archive-created parent symlink",
+			entries: []tar.Header{
+				{Name: "link", Typeflag: tar.TypeSymlink, Linkname: "../outside", Mode: 0o777},
+				{Name: "link/escaped.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len("escaped"))},
+			},
+			body: "escaped",
+		},
+		{
+			name:               "archive-created parent symlink in renamed directory",
+			destinationMissing: true,
+			entries: []tar.Header{
+				{Name: "tree", Typeflag: tar.TypeDir, Mode: 0o755},
+				{Name: "tree/link", Typeflag: tar.TypeSymlink, Linkname: "../outside", Mode: 0o777},
+				{Name: "tree/link/escaped.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len("escaped"))},
+			},
+			body: "escaped",
+		},
+		{
+			name: "pre-existing parent symlink",
+			prepare: func(t *testing.T, dst, outside string) {
+				t.Helper()
+				if err := os.Symlink(outside, filepath.Join(dst, "link")); err != nil {
+					t.Skipf("create symlink: %v", err)
+				}
+			},
+			entries: []tar.Header{
+				{Name: "link/escaped.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len("escaped"))},
+			},
+			body: "escaped",
+		},
+		{
+			name: "pre-existing internal parent symlink",
+			prepare: func(t *testing.T, dst, _ string) {
+				t.Helper()
+				if err := os.Mkdir(filepath.Join(dst, "real"), 0o755); err != nil {
+					t.Fatalf("create internal directory: %v", err)
+				}
+				if err := os.Symlink("real", filepath.Join(dst, "link")); err != nil {
+					t.Skipf("create symlink: %v", err)
+				}
+			},
+			entries: []tar.Header{
+				{Name: "link/escaped.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len("escaped"))},
+			},
+			body: "escaped",
+		},
+		{
+			name: "pre-existing target symlink",
+			prepare: func(t *testing.T, dst, outside string) {
+				t.Helper()
+				outsideFile := filepath.Join(outside, "escaped.txt")
+				if err := os.WriteFile(outsideFile, []byte("keep"), 0o644); err != nil {
+					t.Fatalf("write outside file: %v", err)
+				}
+				if err := os.Symlink(outsideFile, filepath.Join(dst, "escaped.txt")); err != nil {
+					t.Skipf("create symlink: %v", err)
+				}
+			},
+			entries: []tar.Header{
+				{Name: "escaped.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len("escaped"))},
+			},
+			body: "escaped",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := t.TempDir()
+			dst := filepath.Join(parent, "dst")
+			outside := filepath.Join(parent, "outside")
+			if !tc.destinationMissing {
+				if err := os.MkdirAll(dst, 0o755); err != nil {
+					t.Fatalf("create destination: %v", err)
+				}
+			}
+			if err := os.MkdirAll(outside, 0o755); err != nil {
+				t.Fatalf("create outside directory: %v", err)
+			}
+			probe := filepath.Join(parent, "symlink-probe")
+			if err := os.Symlink(outside, probe); err != nil {
+				t.Skipf("symlinks are unavailable: %v", err)
+			}
+			if err := os.Remove(probe); err != nil {
+				t.Fatalf("remove symlink probe: %v", err)
+			}
+			if tc.prepare != nil {
+				tc.prepare(t, dst, outside)
+			}
+
+			var archive bytes.Buffer
+			tw := tar.NewWriter(&archive)
+			for _, entry := range tc.entries {
+				entry := entry
+				if err := tw.WriteHeader(&entry); err != nil {
+					t.Fatalf("write tar header: %v", err)
+				}
+				if entry.Typeflag == tar.TypeReg || entry.Typeflag == 0 {
+					if _, err := tw.Write([]byte(tc.body)); err != nil {
+						t.Fatalf("write tar body: %v", err)
+					}
+				}
+			}
+			if err := tw.Close(); err != nil {
+				t.Fatalf("close tar: %v", err)
+			}
+
+			if err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: dst}); err == nil {
+				t.Fatal("extract symlink escape succeeded")
+			}
+			outsideFile := filepath.Join(outside, "escaped.txt")
+			contents, err := os.ReadFile(outsideFile)
+			switch tc.name {
+			case "pre-existing target symlink":
+				if err != nil {
+					t.Fatalf("read protected outside file: %v", err)
+				}
+				if string(contents) != "keep" {
+					t.Fatalf("outside file contents = %q, want keep", contents)
+				}
+			default:
+				if !os.IsNotExist(err) {
+					t.Fatalf("outside file exists or read failed unexpectedly: %v", err)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(dst, "real", "escaped.txt")); !os.IsNotExist(err) {
+				t.Fatalf("file was written through an internal symlink or stat failed unexpectedly: %v", err)
+			}
+		})
+	}
+}
+
+func TestExtractTarToHostRejectsHardlinks(t *testing.T) {
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	if err := tw.WriteHeader(&tar.Header{Name: "alias", Typeflag: tar.TypeLink, Linkname: "../outside", Mode: 0o644}); err != nil {
+		t.Fatalf("write tar header: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar: %v", err)
+	}
+
+	if err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: t.TempDir()}); err == nil {
+		t.Fatal("extract hardlink succeeded")
+	}
+}
+
+func TestExtractTarToHostRejectsSymlinkDestination(t *testing.T) {
+	parent := t.TempDir()
+	dst := filepath.Join(parent, "dst")
+	outside := filepath.Join(parent, "outside")
+	if err := os.Mkdir(outside, 0o755); err != nil {
+		t.Fatalf("create outside directory: %v", err)
+	}
+	if err := os.Symlink(outside, dst); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+
+	var archive bytes.Buffer
+	if err := writeSingleFileTar(&archive, "src.txt", "escaped"); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+	if err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: dst}); err == nil {
+		t.Fatal("extract through symlink destination succeeded")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "src.txt")); !os.IsNotExist(err) {
+		t.Fatalf("file was written through the destination symlink or stat failed unexpectedly: %v", err)
+	}
+}
+
 func TestExtractTarToHostDirectoryDestinationSemantics(t *testing.T) {
 	var archive bytes.Buffer
 	if err := writePathTar(&archive, makeTestCopyTree(t), "tree"); err != nil {
@@ -7558,45 +7736,6 @@ func TestExtractTarToHostConflictSemantics(t *testing.T) {
 		}
 	})
 
-	t.Run("non-directory over directory fails when forced exact", func(t *testing.T) {
-		var archive bytes.Buffer
-		if err := writeSingleFileTar(&archive, "src.txt", "payload"); err != nil {
-			t.Fatalf("write archive: %v", err)
-		}
-		dst := filepath.Join(t.TempDir(), "dst")
-		if err := os.Mkdir(dst, 0o755); err != nil {
-			t.Fatalf("make dst dir: %v", err)
-		}
-
-		err := extractTarToHostExact(bytes.NewReader(archive.Bytes()), dst)
-		if err == nil {
-			t.Fatalf("extract file over directory error = %v", err)
-		}
-		if info, err := os.Stat(dst); err != nil || !info.IsDir() {
-			t.Fatalf("dst dir stat = %v info=%v", err, info)
-		}
-	})
-}
-
-func extractTarToHostExact(r io.Reader, dst string) error {
-	tr := tar.NewReader(r)
-	for {
-		header, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		target, err := hostTarTarget(dst, copyDestExact, header.Name)
-		if err != nil {
-			return err
-		}
-		incomingDir := header.Typeflag == tar.TypeDir
-		if err := ensureHostTarTargetCompatible(target, incomingDir); err != nil {
-			return err
-		}
-	}
 }
 
 func makeTestCopyTree(t *testing.T) string {
