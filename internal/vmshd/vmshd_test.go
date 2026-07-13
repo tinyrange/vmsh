@@ -532,6 +532,71 @@ func TestFrontendCloseCleansEphemeralSessionsAndKeepsPersistedSessions(t *testin
 	}
 }
 
+func TestFrontendScopedSessionsRequireLiveOwner(t *testing.T) {
+	registry := newSessionRegistry()
+	_, err := registry.Create(CreateSessionRequest{Name: "ownerless", Scope: "frontend"})
+	createErr, ok := err.(sessionError)
+	if !ok || createErr.status != http.StatusBadRequest {
+		t.Fatalf("ownerless create error = %#v, want bad request", err)
+	}
+
+	session, err := registry.Create(CreateSessionRequest{Name: "system", Scope: "system"})
+	if err != nil {
+		t.Fatalf("create system session: %v", err)
+	}
+	_, err = registry.Persist(session.ID, PersistSessionRequest{Scope: "frontend"})
+	persistErr, ok := err.(sessionError)
+	if !ok || persistErr.status != http.StatusBadRequest {
+		t.Fatalf("ownerless persist error = %#v, want bad request", err)
+	}
+	unchanged, ok := registry.Get(session.ID)
+	if !ok || unchanged.Scope != "system" || unchanged.FrontendID != "" {
+		t.Fatalf("session changed after rejected conversion = %+v", unchanged)
+	}
+
+	frontend := registry.RegisterFrontend(RegisterFrontendRequest{Name: "vmsh"})
+	owned, err := registry.Create(CreateSessionRequest{Name: "owned", FrontendID: frontend.ID, Scope: "system"})
+	if err != nil {
+		t.Fatalf("create owned system session: %v", err)
+	}
+	owned, err = registry.Persist(owned.ID, PersistSessionRequest{Scope: "frontend"})
+	if err != nil {
+		t.Fatalf("convert session with live owner: %v", err)
+	}
+	if owned.Scope != "frontend" || owned.FrontendID != frontend.ID || owned.DetachOnClose {
+		t.Fatalf("converted session ownership = %+v", owned)
+	}
+}
+
+func TestFrontendDetachOnCloseSurvivorBecomesSystemOwned(t *testing.T) {
+	registry := newSessionRegistry()
+	frontend := registry.RegisterFrontend(RegisterFrontendRequest{Name: "vmsh"})
+	detach := true
+	session, err := registry.Create(CreateSessionRequest{
+		Name:          "survivor",
+		FrontendID:    frontend.ID,
+		Scope:         "frontend",
+		DetachOnClose: &detach,
+	})
+	if err != nil {
+		t.Fatalf("create frontend session: %v", err)
+	}
+	_, cleanups, err := registry.CloseFrontend(frontend.ID)
+	if err != nil {
+		t.Fatalf("close frontend: %v", err)
+	}
+	if len(cleanups) != 0 {
+		t.Fatalf("detach-on-close session scheduled for cleanup: %+v", cleanups)
+	}
+	kept, ok := registry.Get(session.ID)
+	if !ok {
+		t.Fatal("detach-on-close session was removed")
+	}
+	if kept.Scope != "system" || kept.FrontendID != "" || !kept.DetachOnClose {
+		t.Fatalf("surviving session ownership = %+v", kept)
+	}
+}
+
 func TestSessionAttachDetachRoutes(t *testing.T) {
 	srv := NewServer("secret")
 	mux := http.NewServeMux()
