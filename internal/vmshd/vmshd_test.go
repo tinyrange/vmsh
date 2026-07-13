@@ -1219,6 +1219,7 @@ type fakeRuntimeView struct {
 	statuses  []client.InstanceState
 	runStream func(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	shutdown  func(context.Context, string) error
+	allowPort func(context.Context, string, int) error
 }
 
 func (f fakeRuntimeView) InstanceStatuses() []client.InstanceState {
@@ -1235,6 +1236,13 @@ func (f fakeRuntimeView) RunStreamIn(ctx context.Context, id string, req client.
 func (f fakeRuntimeView) ShutdownInstance(ctx context.Context, id string) error {
 	if f.shutdown != nil {
 		return f.shutdown(ctx, id)
+	}
+	return nil
+}
+
+func (f fakeRuntimeView) AllowServiceProxyPort(ctx context.Context, id string, port int) error {
+	if f.allowPort != nil {
+		return f.allowPort(ctx, id, port)
 	}
 	return nil
 }

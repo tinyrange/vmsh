@@ -376,7 +376,7 @@ func (c *vmshCompleter) shellSSHSessionContext(name string) (commandContext, boo
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@agent", "@alias", "@copy", "@detach", "@exec", "@help", "@host", "@install", "@jobs", "@mux", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux", "@version"}
+	words := []string{"@agent", "@alias", "@copy", "@detach", "@exec", "@help", "@host", "@install", "@jobs", "@mux", "@permissions", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux", "@trust", "@version"}
 	if c.shell != nil {
 		for _, name := range c.shell.sshSessionNames() {
 			words = append(words, "@"+name)
@@ -3254,6 +3254,16 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return nil
 		}
 		return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
+	case "trust":
+		if len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @trust VM --grant PROFILE | @trust VM --revoke PROFILE")
+		}
+		return s.changeTrust(at.Command, stdout)
+	case "permissions":
+		if len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @permissions [VM]")
+		}
+		return s.printPermissions(strings.TrimSpace(at.Command), stdout)
 	case "exec":
 		if len(at.Options.OptionFields) != 0 {
 			return fmt.Errorf("usage: @exec [cmd]")
@@ -9304,6 +9314,78 @@ func (s *shellState) printVMs(w io.Writer) error {
 	return s.printSessionTree(w, states, s.sshSessionStates(), s.sshConnectionStates())
 }
 
+func (s *shellState) changeTrust(command string, w io.Writer) error {
+	tokens, err := lexShellTokens(strings.TrimSpace(command))
+	if err != nil {
+		return err
+	}
+	if len(tokens) != 3 || (tokens[1].Value != "--grant" && tokens[1].Value != "--revoke") || strings.TrimSpace(tokens[0].Value) == "" || strings.TrimSpace(tokens[2].Value) == "" {
+		return fmt.Errorf("usage: @trust VM --grant PROFILE | @trust VM --revoke PROFILE")
+	}
+	if s.vmshd == nil || s.vmshd.client == nil {
+		return fmt.Errorf("trusted context calls require a vmshd session")
+	}
+	vmID := normalizedVMID(tokens[0].Value)
+	profile := tokens[2].Value
+	if tokens[1].Value == "--revoke" {
+		info, err := s.vmshd.client.RevokeTrust(vmID)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(w, "revoked %s from %s (generation %d)\n", info.Profile, info.VMID, info.SourceGeneration)
+		return err
+	}
+	info, err := s.vmshd.client.GrantTrust(vmshd.TrustGrantRequest{VMID: vmID, Profile: profile})
+	if err != nil {
+		return err
+	}
+	guestConfig, err := json.Marshal(struct {
+		Version          int               `json:"version"`
+		Address          string            `json:"address"`
+		Port             int               `json:"port"`
+		Token            string            `json:"token"`
+		SourceGeneration uint64            `json:"source_generation"`
+		TargetID         string            `json:"target_id"`
+		ProfileDigest    string            `json:"profile_digest"`
+		DefaultRootID    string            `json:"default_root_id"`
+		GuestRoot        string            `json:"guest_root"`
+		ActionDeadlines  map[string]string `json:"action_deadlines"`
+	}{Version: 1, Address: info.ServiceAddress, Port: info.ServicePort, Token: info.Token, SourceGeneration: info.SourceGeneration, TargetID: info.TargetID, ProfileDigest: info.ProfileDigest, DefaultRootID: info.DefaultRootID, GuestRoot: guestHostMount, ActionDeadlines: info.ActionDeadlines})
+	if err != nil {
+		return err
+	}
+	install := client.RunRequest{Command: []string{"/bin/sh", "-c", "umask 077; mkdir -p /run/vmsh && cat > /run/vmsh/context.json && chown 1000:1000 /run/vmsh/context.json && chmod 600 /run/vmsh/context.json"}, User: "root", Stdin: guestConfig}
+	if err := s.api.RunStreamInContext(context.Background(), vmID, install, func(event client.ExecEvent) error { return nil }); err != nil {
+		_, _ = s.vmshd.client.RevokeTrust(vmID)
+		return fmt.Errorf("install guest gateway configuration: %w", err)
+	}
+	_, err = fmt.Fprintf(w, "granted %s to %s (generation %d)\n", info.Profile, info.VMID, info.SourceGeneration)
+	return err
+}
+
+func (s *shellState) printPermissions(vmID string, w io.Writer) error {
+	if s.vmshd == nil || s.vmshd.client == nil {
+		return fmt.Errorf("trusted context calls require a vmshd session")
+	}
+	grants, err := s.vmshd.client.TrustGrants()
+	if err != nil {
+		return err
+	}
+	for _, grant := range grants {
+		if vmID != "" && grant.VMID != normalizedVMID(vmID) {
+			continue
+		}
+		state := "active"
+		if grant.Revoked {
+			state = "revoked"
+		}
+		if _, err := fmt.Fprintf(w, "%s %s profile=%s target=%s generation=%d\n", grant.VMID, state, grant.Profile, grant.TargetID, grant.SourceGeneration); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *shellState) liveVMSystemNames() []string {
 	if s == nil || s.api == nil {
 		return nil
@@ -9979,7 +10061,10 @@ func (s *shellState) help(w io.Writer) error {
 @<image> [opts] [cmd]    select/create the default system for an image, or run cmd in it
 @<name> --from SOURCE    create/select a named system from image, library/image, or ssh:host
 @host [cmd]              run cmd on the host, or make host current if cmd is omitted
-	@ssh [--from origin] HOST [cmd]  connect from host by default; origin may be @host, current, a VM, or an SSH session
+@ssh [--from origin] HOST [cmd]  connect from host by default; origin may be @host, current, a VM, or an SSH session
+@trust VM --grant PROFILE  attach a profile-bound host-call gateway to a stable VM
+@trust VM --revoke PROFILE revoke the VM grant immediately
+@permissions [VM]       show trusted-context grants
 @ [opts] [cmd]           update or use the current context
 @sudo [cmd]              open a root VM subshell, or run cmd as root in the current VM
 @exec [cmd]              replace vmsh with your normal shell, or exec cmd on the host

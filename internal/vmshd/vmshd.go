@@ -297,6 +297,7 @@ type Server struct {
 	jobs     *hostJobRunner
 	shells   *hostShellManager
 	balloon  *balloonController
+	trusted  *trustedManager
 
 	startedAt time.Time
 }
@@ -351,6 +352,11 @@ func Run(args []string) (bool, error) {
 	}
 
 	srv := NewServer(token)
+	defer func() {
+		if srv.trusted != nil {
+			srv.trusted.close()
+		}
+	}()
 	args, err = ensureLoopbackAddrArg(args)
 	if err != nil {
 		return false, err
@@ -442,6 +448,7 @@ func isLoopbackListenAddr(addr string) bool {
 }
 
 func NewServer(token string) *Server {
+	trustedManager, _ := newTrustedManager()
 	return &Server{
 		token:     token,
 		registry:  newSessionRegistry(),
@@ -450,11 +457,15 @@ func NewServer(token string) *Server {
 		jobs:      newHostJobRunner(),
 		shells:    newHostShellManager(),
 		balloon:   newBalloonController(systemMemoryObserver{}),
+		trusted:   trustedManager,
 		startedAt: time.Now(),
 	}
 }
 
 func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView) {
+	if s.trusted != nil {
+		s.trusted.register(mux, runtime)
+	}
 	mux.HandleFunc("GET /vmsh/protocol", func(w http.ResponseWriter, r *http.Request) {
 		exePath, _ := os.Executable()
 		writeJSON(w, http.StatusOK, vmshdprotocol.NewInfo(

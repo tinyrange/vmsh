@@ -65,6 +65,24 @@ func (c *HTTPClient) Status() (Status, error) {
 	return status, err
 }
 
+func (c *HTTPClient) GrantTrust(req TrustGrantRequest) (TrustGrantInfo, error) {
+	var info TrustGrantInfo
+	err := c.doJSON(http.MethodPost, "/vmsh/trust", req, &info)
+	return info, err
+}
+
+func (c *HTTPClient) RevokeTrust(vmID string) (TrustGrantInfo, error) {
+	var info TrustGrantInfo
+	err := c.doJSON(http.MethodDelete, "/vmsh/trust/"+url.PathEscape(vmID), nil, &info)
+	return info, err
+}
+
+func (c *HTTPClient) TrustGrants() ([]TrustGrantInfo, error) {
+	var grants []TrustGrantInfo
+	err := c.doJSON(http.MethodGet, "/vmsh/trust", nil, &grants)
+	return grants, err
+}
+
 func (c *HTTPClient) Sessions() ([]SessionSummary, error) {
 	var sessions []SessionSummary
 	err := c.doJSON(http.MethodGet, "/vmsh/sessions", nil, &sessions)
