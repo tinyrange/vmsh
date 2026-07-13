@@ -653,7 +653,44 @@ func WriteDaemonState(path string, state DaemonState) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0o600)
+	return writeDaemonStateAtomically(path, append(data, '\n'), replaceDaemonStateFile)
+}
+
+func writeDaemonStateAtomically(path string, data []byte, replace func(string, string) error) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = tmp.Close()
+		}
+		_ = os.Remove(tmpPath)
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	closed = true
+	if _, err := ReadDaemonState(tmpPath); err != nil {
+		return err
+	}
+	if err := replace(tmpPath, path); err != nil {
+		return err
+	}
+	_ = syncDaemonStateDir(dir)
+	return nil
 }
 
 func normalizeDaemonState(state DaemonState) DaemonState {

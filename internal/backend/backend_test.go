@@ -2,6 +2,8 @@ package backend
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -9,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"j5.nz/cc/client"
@@ -107,6 +110,94 @@ func TestDaemonStateRoundTripAndValidation(t *testing.T) {
 	}
 	if _, err := ReadDaemonState(badAPIPath); err == nil {
 		t.Fatal("unsupported daemon API version was accepted")
+	}
+}
+
+func TestDaemonStateFailedPublicationPreservesPreviousState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vmshd.json")
+	if err := WriteDaemonState(path, DaemonState{Addr: "localhost:1001"}); err != nil {
+		t.Fatalf("write previous daemon state: %v", err)
+	}
+	state := normalizeDaemonState(DaemonState{Addr: "localhost:1002"})
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal replacement state: %v", err)
+	}
+	replaceErr := errors.New("injected state publication failure")
+	err = writeDaemonStateAtomically(path, append(data, '\n'), func(string, string) error {
+		return replaceErr
+	})
+	if !errors.Is(err, replaceErr) {
+		t.Fatalf("publication error = %v, want injected failure", err)
+	}
+	preserved, err := ReadDaemonState(path)
+	if err != nil {
+		t.Fatalf("read preserved daemon state: %v", err)
+	}
+	if preserved.Addr != "localhost:1001" {
+		t.Fatalf("preserved daemon addr = %q, want previous state", preserved.Addr)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read daemon state directory: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "vmshd.json" {
+		t.Fatalf("daemon state directory entries = %v", entries)
+	}
+}
+
+func TestDaemonStateConcurrentPublicationNeverExposesPartialJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vmshd.json")
+	if err := WriteDaemonState(path, DaemonState{Addr: "localhost:1000"}); err != nil {
+		t.Fatalf("write initial daemon state: %v", err)
+	}
+
+	stop := make(chan struct{})
+	readErr := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				readErr <- nil
+				return
+			default:
+			}
+			state, err := ReadDaemonState(path)
+			if err != nil {
+				readErr <- err
+				return
+			}
+			if state.Addr == "" || state.Version != DaemonStateVersion || state.APIVersion != DaemonAPIVersion {
+				readErr <- fmt.Errorf("invalid observed daemon state: %+v", state)
+				return
+			}
+		}
+	}()
+
+	const writers = 24
+	var wg sync.WaitGroup
+	errCh := make(chan error, writers)
+	for i := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errCh <- WriteDaemonState(path, DaemonState{Addr: fmt.Sprintf("localhost:%d", 2000+i)})
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Errorf("concurrent state publication: %v", err)
+		}
+	}
+	close(stop)
+	if err := <-readErr; err != nil {
+		t.Fatalf("concurrent state read: %v", err)
+	}
+	if _, err := ReadDaemonState(path); err != nil {
+		t.Fatalf("read final daemon state: %v", err)
 	}
 }
 
