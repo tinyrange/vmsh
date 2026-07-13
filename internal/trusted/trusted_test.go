@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -43,6 +44,12 @@ func TestGatewayExecutesStructuredActionAndRejectsReplay(t *testing.T) {
 	}
 	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
 	gateway, err := ListenGateway(GatewayConfig{Profile: profile, Grant: grant, Token: token, HandshakeTimeout: time.Second, AuditPath: auditPath})
+	if runtime.GOOS == "windows" {
+		if !IsDenial(err, DeniedPrivilege) {
+			t.Fatalf("Windows gateway did not fail closed without ACL enforcement: %v", err)
+		}
+		return
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

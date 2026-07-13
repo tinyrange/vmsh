@@ -55,6 +55,9 @@ type Gateway struct {
 }
 
 func ListenGateway(config GatewayConfig) (*Gateway, error) {
+	if !ownerOnlyFilesSupported() {
+		return nil, policyError(DeniedPrivilege, "trusted calls require owner-only file enforcement on this platform")
+	}
 	if err := VerifyProfile(config.Profile); err != nil {
 		return nil, err
 	}

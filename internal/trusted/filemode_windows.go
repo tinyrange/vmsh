@@ -8,7 +8,9 @@ import (
 	"strings"
 )
 
-func fileAccessibleByOthers(info os.FileInfo) bool { return false }
+func fileAccessibleByOthers(info os.FileInfo) bool { return true }
+
+func ownerOnlyFilesSupported() bool { return false }
 
 func fileIsExecutable(path string, _ os.FileInfo) bool {
 	extension := strings.ToLower(filepath.Ext(path))

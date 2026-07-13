@@ -4,6 +4,10 @@ The initial implementation exposes narrow, structured VM-to-host actions. It
 does not enable a host shell, guest-selected executable, network or credential
 access, a terminal, stdin, or detached jobs. A gateway is created only after an
 explicit grant and its host port is admitted only to that exact running VM.
+This first execution slice is enabled on Darwin and Linux. Windows builds the
+policy and protocol but rejects grants until owner-only ACL validation is
+implemented; it does not silently treat Unix mode bits as a Windows security
+boundary.
 
 Profiles are owner-only JSON files under:
 

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/tinyrange/vmsh/internal/trusted"
@@ -65,14 +66,20 @@ func TestTrustedManagerBindsGatewayAdmissionToRunningVMGeneration(t *testing.T) 
 	t.Cleanup(manager.close)
 	var admittedVM string
 	var admittedPort int
-	runtime := fakeRuntimeView{
+	runtimeView := fakeRuntimeView{
 		statuses: []client.InstanceState{{ID: "work", Status: "running", StartedAt: "2026-07-14T00:00:00Z"}},
 		allowPort: func(_ context.Context, vmID string, port int) error {
 			admittedVM, admittedPort = vmID, port
 			return nil
 		},
 	}
-	info, err := manager.grant(context.Background(), runtime, TrustGrantRequest{VMID: "work", Profile: "development"})
+	info, err := manager.grant(context.Background(), runtimeView, TrustGrantRequest{VMID: "work", Profile: "development"})
+	if runtime.GOOS == "windows" {
+		if err == nil || admittedPort != 0 {
+			t.Fatalf("Windows grant did not fail closed without ACL enforcement: info=%#v port=%d err=%v", info, admittedPort, err)
+		}
+		return
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

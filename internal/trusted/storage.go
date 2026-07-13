@@ -92,6 +92,9 @@ func writeOwnerJSON(path string, value any) error {
 }
 
 func readOwnerFile(path string) ([]byte, error) {
+	if !ownerOnlyFilesSupported() {
+		return nil, policyError(DeniedPrivilege, "owner-only security files are not enforced on this platform")
+	}
 	if !filepath.IsAbs(path) {
 		return nil, policyError(DeniedProfile, "security file path must be absolute")
 	}
