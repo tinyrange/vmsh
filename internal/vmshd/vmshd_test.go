@@ -604,6 +604,16 @@ func TestSessionAttachDetachRoutes(t *testing.T) {
 	}
 
 	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, resizeTarget, bytes.NewBufferString(`{"cols":65537,"rows":32}`)))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("oversized resize status = %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+	_, unchanged, ok := srv.registry.GetAttachment(session.ID, attached.Attachment.ID)
+	if !ok || unchanged.Terminal == nil || *unchanged.Terminal != (Terminal{Cols: 100, Rows: 32}) {
+		t.Fatalf("attachment changed after oversized resize: %+v", unchanged)
+	}
+
+	rr = httptest.NewRecorder()
 	body := `{"attachment_id":"` + attached.Attachment.ID + `"}`
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/vmsh/sessions/"+session.ID+"/detach", bytes.NewBufferString(body)))
 	if rr.Code != http.StatusOK {
@@ -628,6 +638,35 @@ func TestSessionAttachDetachRoutes(t *testing.T) {
 	}
 	if detached.State != "detached" || len(detached.Attachments) != 0 {
 		t.Fatalf("fully detached session = %+v", detached)
+	}
+}
+
+func TestTerminalWinsizeValidatesBeforeConversion(t *testing.T) {
+	winsize, err := terminalWinsize(&Terminal{})
+	if err != nil {
+		t.Fatalf("default winsize: %v", err)
+	}
+	if winsize.Cols != 80 || winsize.Rows != 24 {
+		t.Fatalf("default winsize = %+v", winsize)
+	}
+
+	winsize, err = terminalWinsize(&Terminal{Cols: maxTerminalDimension, Rows: maxTerminalDimension})
+	if err != nil {
+		t.Fatalf("maximum winsize: %v", err)
+	}
+	if int(winsize.Cols) != maxTerminalDimension || int(winsize.Rows) != maxTerminalDimension {
+		t.Fatalf("maximum winsize wrapped: %+v", winsize)
+	}
+
+	for _, term := range []Terminal{
+		{Cols: -1, Rows: 24},
+		{Cols: 80, Rows: -1},
+		{Cols: maxTerminalDimension + 1, Rows: 24},
+		{Cols: 80, Rows: maxTerminalDimension + 1},
+	} {
+		if _, err := terminalWinsize(&term); err == nil {
+			t.Fatalf("terminalWinsize(%+v) returned no error", term)
+		}
 	}
 }
 

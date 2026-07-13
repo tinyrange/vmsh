@@ -36,6 +36,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/tinyrange/vmsh/internal/backend"
+	"github.com/tinyrange/vmsh/internal/terminal"
 	"github.com/tinyrange/vmsh/internal/vmshd"
 	cryptossh "golang.org/x/crypto/ssh"
 	"golang.org/x/net/websocket"
@@ -4418,6 +4419,35 @@ func TestTTYGuestRunInterruptCancelsContext(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("interrupted TTY guest run did not return")
+	}
+}
+
+func TestHostPTYWinsizeValidatesBeforeConversion(t *testing.T) {
+	winsize, err := hostPTYWinsize(0, 0)
+	if err != nil {
+		t.Fatalf("default winsize: %v", err)
+	}
+	if winsize.Cols != 80 || winsize.Rows != 24 {
+		t.Fatalf("default winsize = %+v", winsize)
+	}
+
+	winsize, err = hostPTYWinsize(terminal.MaxTerminalDimension, terminal.MaxTerminalDimension)
+	if err != nil {
+		t.Fatalf("maximum winsize: %v", err)
+	}
+	if int(winsize.Cols) != terminal.MaxTerminalDimension || int(winsize.Rows) != terminal.MaxTerminalDimension {
+		t.Fatalf("maximum winsize wrapped: %+v", winsize)
+	}
+
+	for _, size := range [][2]int{
+		{-1, 24},
+		{80, -1},
+		{terminal.MaxTerminalDimension + 1, 24},
+		{80, terminal.MaxTerminalDimension + 1},
+	} {
+		if _, err := hostPTYWinsize(size[0], size[1]); err == nil {
+			t.Fatalf("hostPTYWinsize(%d, %d) returned no error", size[0], size[1])
+		}
 	}
 }
 

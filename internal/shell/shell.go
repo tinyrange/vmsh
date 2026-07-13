@@ -5162,16 +5162,12 @@ func startPersistentHostShell(cwd string, env []string, cols, rows int, prelude 
 	}
 	defer controlWrite.Close()
 	cmd.ExtraFiles = []*os.File{controlWrite}
-	if cols <= 0 {
-		cols = 80
+	winsize, err := hostPTYWinsize(cols, rows)
+	if err != nil {
+		_ = controlRead.Close()
+		return nil, err
 	}
-	if rows <= 0 {
-		rows = 24
-	}
-	tty, err := pty.StartWithSize(cmd, &pty.Winsize{
-		Cols: uint16(cols),
-		Rows: uint16(rows),
-	})
+	tty, err := pty.StartWithSize(cmd, winsize)
 	if err != nil {
 		_ = controlRead.Close()
 		return nil, err
@@ -6799,13 +6795,25 @@ func resizeHostPTY(out *os.File, stdout io.Writer) {
 		return
 	}
 	cols, rows, err := terminal.Size(file)
-	if err != nil || cols <= 0 || rows <= 0 {
+	if err != nil {
+		return
+	}
+	winsize, err := hostPTYWinsize(cols, rows)
+	if err != nil {
 		return
 	}
 	if recorder := terminalWriterRecorder(stdout); recorder != nil {
 		recorder.recordResize(cols, rows)
 	}
-	_ = pty.Setsize(out, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+	_ = pty.Setsize(out, winsize)
+}
+
+func hostPTYWinsize(cols, rows int) (*pty.Winsize, error) {
+	cols, rows, err := terminal.NormalizeDimensions(cols, rows)
+	if err != nil {
+		return nil, err
+	}
+	return &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)}, nil
 }
 
 func writeHostPTYSignal(out *os.File, name string) {

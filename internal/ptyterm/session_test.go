@@ -2,6 +2,7 @@ package ptyterm
 
 import (
 	"context"
+	"io"
 	"runtime"
 	"strconv"
 	"strings"
@@ -77,6 +78,45 @@ func TestSessionRoutesStdinAndResize(t *testing.T) {
 		t.Fatalf("stdin bytes = %d, want 1", snap.BytesStdin)
 	}
 }
+
+func TestSessionResizeValidatesDimensionsBeforePTYConversion(t *testing.T) {
+	var resized Size
+	s := &Session{
+		pty: &stubPTY{},
+		emu: NewEmulator(Size{Cols: 80, Rows: 24}, 0),
+		resizePTY: func(size Size) error {
+			resized = size
+			return nil
+		},
+	}
+
+	for _, size := range []Size{
+		{Cols: -1, Rows: 24},
+		{Cols: 80, Rows: -1},
+		{Cols: MaxTerminalDimension + 1, Rows: 24},
+		{Cols: 80, Rows: MaxTerminalDimension + 1},
+	} {
+		if err := s.Resize(size); err == nil {
+			t.Fatalf("resize %+v returned no error", size)
+		}
+		if resized != (Size{}) {
+			t.Fatalf("invalid resize %+v reached PTY as %+v", size, resized)
+		}
+	}
+
+	if err := s.Resize(Size{}); err != nil {
+		t.Fatalf("resize with defaults: %v", err)
+	}
+	if resized != (Size{Cols: 80, Rows: 24}) {
+		t.Fatalf("zero resize reached PTY as %+v, want defaults", resized)
+	}
+}
+
+type stubPTY struct{}
+
+func (*stubPTY) Read([]byte) (int, error)    { return 0, io.EOF }
+func (*stubPTY) Write(p []byte) (int, error) { return len(p), nil }
+func (*stubPTY) Close() error                { return nil }
 
 func TestSessionExitCodeForFailingCommand(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
