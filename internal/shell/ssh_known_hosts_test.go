@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -115,6 +116,9 @@ func TestSSHKnownHostsRejectsChangedKeyUnderLock(t *testing.T) {
 }
 
 func TestSSHKnownHostsPreservesExistingMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not enforce Unix file permission bits")
+	}
 	path := filepath.Join(t.TempDir(), "known_hosts")
 	if err := os.WriteFile(path, nil, 0o640); err != nil {
 		t.Fatalf("create known_hosts: %v", err)
