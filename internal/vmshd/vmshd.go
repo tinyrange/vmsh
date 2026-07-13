@@ -297,8 +297,49 @@ type Server struct {
 	jobs     *hostJobRunner
 	shells   *hostShellManager
 	balloon  *balloonController
+	routeMu  sync.RWMutex
+	routes   []apiRoute
 
 	startedAt time.Time
+}
+
+type apiRoute struct {
+	Method string
+	Path   string
+}
+
+type trackedServeMux struct {
+	*http.ServeMux
+	routes []apiRoute
+}
+
+func (m *trackedServeMux) HandleFunc(pattern string, handler http.HandlerFunc) {
+	m.record(pattern)
+	m.ServeMux.HandleFunc(pattern, handler)
+}
+
+func (m *trackedServeMux) Handle(pattern string, handler http.Handler) {
+	m.record(pattern)
+	m.ServeMux.Handle(pattern, handler)
+}
+
+func (m *trackedServeMux) record(pattern string) {
+	method, path, ok := strings.Cut(pattern, " ")
+	if ok {
+		m.routes = append(m.routes, apiRoute{Method: method, Path: path})
+	}
+}
+
+func (s *Server) setAPIRoutes(routes []apiRoute) {
+	s.routeMu.Lock()
+	s.routes = append([]apiRoute(nil), routes...)
+	s.routeMu.Unlock()
+}
+
+func (s *Server) apiRoutes() []apiRoute {
+	s.routeMu.RLock()
+	defer s.routeMu.RUnlock()
+	return append([]apiRoute(nil), s.routes...)
 }
 
 type hostJobRunner struct {
@@ -454,7 +495,8 @@ func NewServer(token string) *Server {
 	}
 }
 
-func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView) {
+func (s *Server) RegisterHandlers(rawMux *http.ServeMux, runtime ccvmd.RuntimeView) {
+	mux := &trackedServeMux{ServeMux: rawMux}
 	mux.HandleFunc("GET /vmsh/protocol", func(w http.ResponseWriter, r *http.Request) {
 		exePath, _ := os.Executable()
 		writeJSON(w, http.StatusOK, vmshdprotocol.NewInfo(
@@ -647,6 +689,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			s.serveTerminalStream(ws)
 		},
 	})
+	s.setAPIRoutes(mux.routes)
 }
 
 func (s *Server) finishSessionCleanups(cleanups []sessionCleanup, runtime ccvmd.RuntimeView) {

@@ -419,6 +419,11 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+      x-websocket:
+        clientMessages:
+          $ref: "#/components/schemas/TerminalStreamMessage"
+        serverMessages:
+          $ref: "#/components/schemas/TerminalStreamMessage"
   /vmsh/jobs:
     get:
       tags: [Jobs]
@@ -501,8 +506,7 @@ paths:
           content:
             application/x-ndjson:
               schema:
-                type: string
-                description: Newline-delimited Event JSON objects.
+                $ref: "#/components/schemas/Event"
         "401":
           $ref: "#/components/responses/Unauthorized"
 components:
@@ -1188,10 +1192,3 @@ components:
       properties:
         error:
           type: string
-        code:
-          type: string
-          description: Optional future machine-readable error code.
-        details:
-          type: object
-          additionalProperties: true
-          description: Optional future structured error details.
