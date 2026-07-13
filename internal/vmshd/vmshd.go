@@ -22,6 +22,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/tinyrange/vmsh/internal/backend"
+	"github.com/tinyrange/vmsh/internal/group"
 	"github.com/tinyrange/vmsh/internal/vmshdprotocol"
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/ccvmd"
@@ -340,6 +341,10 @@ func Main(args []string) {
 
 func Run(args []string) (bool, error) {
 	statePath, args := scanStatePathArg(args)
+	groupConfigPath, args, err := scanValueArg(args, "group-config")
+	if err != nil {
+		return false, err
+	}
 	cacheDir, err := resolveCacheDir(scanCacheDir(args))
 	if err != nil {
 		return false, err
@@ -351,6 +356,31 @@ func Run(args []string) (bool, error) {
 	}
 
 	srv := NewServer(token)
+	var runtimeMu sync.RWMutex
+	var groupRuntime ccvmd.RuntimeView
+	var groupServer *group.Server
+	if groupConfigPath != "" {
+		config, err := group.LoadServerConfig(groupConfigPath, func() []client.InstanceState {
+			runtimeMu.RLock()
+			defer runtimeMu.RUnlock()
+			if groupRuntime == nil {
+				return nil
+			}
+			return runtimeInstanceStatuses(groupRuntime)
+		})
+		if err != nil {
+			return false, err
+		}
+		groupServer, err = group.Listen(config)
+		if err != nil {
+			return false, err
+		}
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = groupServer.Close(ctx)
+		}()
+	}
 	args, err = ensureLoopbackAddrArg(args)
 	if err != nil {
 		return false, err
@@ -377,6 +407,9 @@ func Run(args []string) (bool, error) {
 			})
 		},
 		RegisterHandlers: func(mux *http.ServeMux, runtime ccvmd.RuntimeView) {
+			runtimeMu.Lock()
+			groupRuntime = runtime
+			runtimeMu.Unlock()
 			srv.RegisterHandlers(mux, runtime)
 		},
 		NormalizeCreateRequest: func(req *client.CreateInstanceRequest, runtime ccvmd.RuntimeView) error {
@@ -393,6 +426,38 @@ func Run(args []string) (bool, error) {
 		},
 		WrapHandler: srv.Authenticate,
 	})
+}
+
+func scanValueArg(args []string, name string) (string, []string, error) {
+	short, long := "-"+name, "--"+name
+	remaining := make([]string, 0, len(args))
+	var value string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == short || arg == long {
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return "", nil, fmt.Errorf("%s requires a value", arg)
+			}
+			if value != "" {
+				return "", nil, fmt.Errorf("%s may only be specified once", long)
+			}
+			value = args[i+1]
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, short+"=") || strings.HasPrefix(arg, long+"=") {
+			if value != "" {
+				return "", nil, fmt.Errorf("%s may only be specified once", long)
+			}
+			_, value, _ = strings.Cut(arg, "=")
+			if value == "" {
+				return "", nil, fmt.Errorf("%s requires a value", long)
+			}
+			continue
+		}
+		remaining = append(remaining, arg)
+	}
+	return value, remaining, nil
 }
 
 func ensureLoopbackAddrArg(args []string) ([]string, error) {
