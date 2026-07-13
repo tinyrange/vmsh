@@ -1,7 +1,9 @@
 package backend
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -139,6 +141,80 @@ func TestEnsureStableVMSHDCopyCreatesExecutableCopy(t *testing.T) {
 		if info.Mode().Perm()&0o111 == 0 {
 			t.Fatalf("stable copy mode = %o, want executable", info.Mode().Perm())
 		}
+	}
+}
+
+func TestReplaceFileFailurePreservesCurrentExecutable(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, HostExecutableName("vmshd"))
+	previous := []byte("known-good-executable")
+	if err := os.WriteFile(dst, previous, 0o755); err != nil {
+		t.Fatalf("write current executable: %v", err)
+	}
+	missingSource := filepath.Join(dir, "missing-replacement")
+	if err := replaceFile(missingSource, dst); err == nil {
+		t.Fatal("replacement with a missing source succeeded")
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read current executable after failed replacement: %v", err)
+	}
+	if !bytes.Equal(got, previous) {
+		t.Fatalf("current executable after failed replacement = %q, want previous bytes", got)
+	}
+}
+
+func TestReplaceFileAtomicallyPublishesCompleteExecutable(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, HostExecutableName("vmshd"))
+	oldContents := bytes.Repeat([]byte("o"), 64*1024)
+	newContents := bytes.Repeat([]byte("n"), 64*1024)
+	if err := os.WriteFile(dst, oldContents, 0o755); err != nil {
+		t.Fatalf("write current executable: %v", err)
+	}
+
+	stop := make(chan struct{})
+	readErr := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				readErr <- nil
+				return
+			default:
+			}
+			got, err := os.ReadFile(dst)
+			if err != nil {
+				readErr <- err
+				return
+			}
+			if !bytes.Equal(got, oldContents) && !bytes.Equal(got, newContents) {
+				readErr <- fmt.Errorf("observed partial executable with %d bytes", len(got))
+				return
+			}
+		}
+	}()
+	src := filepath.Join(dir, "replacement")
+	if err := os.WriteFile(src, newContents, 0o755); err != nil {
+		close(stop)
+		<-readErr
+		t.Fatalf("write replacement: %v", err)
+	}
+	if err := replaceFile(src, dst); err != nil {
+		close(stop)
+		<-readErr
+		t.Fatalf("replace executable: %v", err)
+	}
+	close(stop)
+	if err := <-readErr; err != nil {
+		t.Fatalf("launcher observation during replacement: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read replacement: %v", err)
+	}
+	if !bytes.Equal(got, newContents) {
+		t.Fatalf("replacement contents have %d bytes, want complete new executable", len(got))
 	}
 }
 
