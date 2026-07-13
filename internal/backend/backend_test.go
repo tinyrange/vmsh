@@ -185,6 +185,12 @@ func TestReplaceFileAtomicallyPublishesCompleteExecutable(t *testing.T) {
 			}
 			got, err := os.ReadFile(dst)
 			if err != nil {
+				if runtime.GOOS == "windows" {
+					// Replacing a file can briefly deny new opens on Windows;
+					// the durable contract is that any successful open sees
+					// one complete executable, never a partial write.
+					continue
+				}
 				readErr <- err
 				return
 			}
