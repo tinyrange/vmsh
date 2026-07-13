@@ -4509,53 +4509,50 @@ func (s *shellState) copyGuestToLocal(ctx commandContext, src, dst copyTargetPat
 	if err := s.ensureGuestCopyReady(ctx, stderr); err != nil {
 		return err
 	}
-	var tarData bytes.Buffer
-	var exitSeen bool
-	var exitCode int
-	var eventErr error
-	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
-	defer stopInterrupts()
-	progress.Phase("downloading")
-	if err := s.execStreamInContext(runCtx, backendVMID(ctx), client.ExecRequest{
-		Kind:  "fs_archive",
-		Image: localImageName(ctx.Image, ctx.Arch),
-		Path:  src.path,
-		User:  guestRunUser(ctx),
-	}, nil, func(event client.ExecEvent) error {
-		switch event.Kind {
-		case "stdout", "output":
-			data := execEventBytes(event)
-			_, _ = tarData.Write(data)
-			progress.AddBytes(len(data))
-		case "stderr":
-			writeExecEventOutput(stderr, event)
-		case "error":
-			eventErr = fmt.Errorf("%s", firstNonEmpty(event.Error, execEventText(event)))
-		case "exit":
-			exitSeen = true
-			exitCode = event.ExitCode
-		}
-		return nil
-	}); err != nil {
+	progress.Phase("downloading and extracting")
+	return streamTarToHost(dst, progress, func(archive io.Writer) error {
+		var exitSeen bool
+		var exitCode int
+		var eventErr error
+		runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+		defer stopInterrupts()
+		streamErr := s.execStreamInContext(runCtx, backendVMID(ctx), client.ExecRequest{
+			Kind:  "fs_archive",
+			Image: localImageName(ctx.Image, ctx.Arch),
+			Path:  src.path,
+			User:  guestRunUser(ctx),
+		}, nil, func(event client.ExecEvent) error {
+			switch event.Kind {
+			case "stdout", "output":
+				_, err := archive.Write(execEventBytes(event))
+				return err
+			case "stderr":
+				writeExecEventOutput(stderr, event)
+			case "error":
+				eventErr = fmt.Errorf("%s", firstNonEmpty(event.Error, execEventText(event)))
+			case "exit":
+				exitSeen = true
+				exitCode = event.ExitCode
+			}
+			return nil
+		})
 		if interrupted.Load() {
 			return persistentShellExit{code: 130}
 		}
-		return err
-	}
-	if interrupted.Load() {
-		return persistentShellExit{code: 130}
-	}
-	if eventErr != nil {
-		return eventErr
-	}
-	if exitSeen && exitCode != 0 {
-		return persistentShellExit{code: exitCode}
-	}
-	if !exitSeen {
-		return fmt.Errorf("guest copy did not report completion")
-	}
-	progress.Phase("extracting")
-	return extractTarToHost(bytes.NewReader(tarData.Bytes()), dst)
+		if streamErr != nil {
+			return streamErr
+		}
+		if eventErr != nil {
+			return eventErr
+		}
+		if exitSeen && exitCode != 0 {
+			return persistentShellExit{code: exitCode}
+		}
+		if !exitSeen {
+			return fmt.Errorf("guest copy did not report completion")
+		}
+		return nil
+	})
 }
 
 func (s *shellState) ensureGuestCopyReady(ctx commandContext, stderr io.Writer) error {
@@ -4696,29 +4693,52 @@ func extractTarToHost(r io.Reader, dst copyTargetPath) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
-			file, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(header.Mode).Perm())
+			file, err := os.CreateTemp(filepath.Dir(target), "."+filepath.Base(target)+".vmsh-copy-")
 			if err != nil {
 				return err
 			}
+			staged := file.Name()
 			_, copyErr := io.Copy(file, tr)
 			closeErr := file.Close()
 			if copyErr != nil {
+				_ = os.Remove(staged)
 				return copyErr
 			}
 			if closeErr != nil {
+				_ = os.Remove(staged)
 				return closeErr
 			}
 			perm := os.FileMode(header.Mode).Perm()
-			if err := os.Chmod(target, perm); err != nil {
+			if err := os.Chmod(staged, perm); err != nil {
+				_ = os.Remove(staged)
 				return err
 			}
-			if err := os.Chtimes(target, header.ModTime, header.ModTime); err != nil {
+			if err := os.Chtimes(staged, header.ModTime, header.ModTime); err != nil {
+				_ = os.Remove(staged)
+				return err
+			}
+			if err := os.Rename(staged, target); err != nil {
+				_ = os.Remove(staged)
 				return err
 			}
 		default:
 			continue
 		}
 	}
+}
+
+func streamTarToHost(dst copyTargetPath, progress *copyProgress, produce func(io.Writer) error) error {
+	reader, writer := io.Pipe()
+	extractDone := make(chan error, 1)
+	go func() {
+		err := extractTarToHost(reader, dst)
+		_ = reader.CloseWithError(err)
+		extractDone <- err
+	}()
+	produceErr := produce(copyProgressWriter{w: writer, progress: progress})
+	closeErr := writer.Close()
+	extractErr := <-extractDone
+	return errors.Join(produceErr, closeErr, extractErr)
 }
 
 func ensureHostTarTargetCompatible(target string, incomingDir bool) error {
