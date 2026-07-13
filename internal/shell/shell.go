@@ -4592,9 +4592,8 @@ func writePathTar(w io.Writer, src, rootName string) error {
 		return err
 	}
 	tw := tar.NewWriter(w)
-	defer tw.Close()
 	rootName = filepath.ToSlash(filepath.Base(rootName))
-	return filepath.WalkDir(src, func(filePath string, _ os.DirEntry, walkErr error) error {
+	walkErr := filepath.WalkDir(src, func(filePath string, _ os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -4648,6 +4647,7 @@ func writePathTar(w io.Writer, src, rootName string) error {
 		}
 		return closeErr
 	})
+	return errors.Join(walkErr, tw.Close())
 }
 
 func extractTarToHost(r io.Reader, dst copyTargetPath) error {
