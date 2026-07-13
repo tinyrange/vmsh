@@ -83,6 +83,7 @@ type shellState struct {
 	guestShell         *persistentGuestShell
 	sshShells          map[string]*persistentSSHShell
 	sshMu              sync.Mutex
+	sshStderrMu        sync.Mutex
 	sshClients         map[string]*persistentSSHClient
 	lastCode           int
 	promptOut          io.Writer
@@ -2584,6 +2585,7 @@ func (s *shellState) runPipeline(base commandContext, segments []string, stdout,
 	if len(segments) < 2 {
 		return fmt.Errorf("pipeline requires at least two commands")
 	}
+	stderr = s.serializedSSHStderr(stderr)
 	stages := make([]pipelineStage, 0, len(segments))
 	for i, segment := range segments {
 		stage, err := s.preparePipelineStage(base, i, segment, stderr)
