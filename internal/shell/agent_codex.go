@@ -1314,7 +1314,7 @@ func updateVMShCodexLink(standaloneRoot, target, releaseName string) error {
 	if err := os.Symlink(filepath.Join("..", "..", "releases", releaseName), tmp); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, link); err != nil {
+	if err := replaceCodexActivationLink(tmp, link); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
