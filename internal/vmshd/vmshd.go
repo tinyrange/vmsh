@@ -286,7 +286,13 @@ type eventSubscriber struct {
 type streamRegistry struct {
 	mu      sync.Mutex
 	next    int
-	streams map[string]StreamSummary
+	streams map[string]streamRecord
+}
+
+type streamRecord struct {
+	summary    StreamSummary
+	frontendID string
+	revoke     func()
 }
 
 type Server struct {
@@ -495,6 +501,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			writeSessionError(w, err)
 			return
 		}
+		s.streams.RevokeFrontend(frontend.ID)
 		s.finishSessionCleanups(cleanups, runtime)
 		s.events.Publish(Event{Kind: "frontend_closed", Frontend: &frontend})
 		writeJSON(w, http.StatusOK, frontend)
@@ -551,6 +558,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			return
 		}
 		s.jobs.Cancel(jobIDs)
+		s.streams.RevokeSession(session.ID)
 		s.shells.Close(session.ID)
 		s.events.Publish(Event{Kind: "session_deleted", Session: &session})
 		writeJSON(w, http.StatusOK, session)
@@ -580,6 +588,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			writeSessionError(w, err)
 			return
 		}
+		s.streams.RevokeAttachment(session.ID, req.AttachmentID)
 		s.events.Publish(Event{Kind: "session_detached", Session: &session})
 		writeJSON(w, http.StatusOK, session)
 	})
@@ -651,6 +660,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 
 func (s *Server) finishSessionCleanups(cleanups []sessionCleanup, runtime ccvmd.RuntimeView) {
 	for _, cleanup := range cleanups {
+		s.streams.RevokeSession(cleanup.Session.ID)
 		s.jobs.Cancel(cleanup.JobIDs)
 		s.shells.Close(cleanup.Session.ID)
 		for _, vmID := range cleanup.VMIDs {
@@ -1141,7 +1151,9 @@ func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 		_ = websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "error"})
 		return
 	}
-	stream, closeStream := s.streams.Open("terminal", session.ID, attachment.ID)
+	stream, closeStream := s.streams.Open("terminal", session.ID, attachment.ID, attachment.FrontendID, func() {
+		_ = ws.Close()
+	})
 	defer func() {
 		closeStream()
 		s.events.Publish(Event{Kind: "terminal_stream_closed", Session: &session, Attachment: &attachment})
@@ -1451,10 +1463,10 @@ func newEventHub() *eventHub {
 }
 
 func newStreamRegistry() *streamRegistry {
-	return &streamRegistry{streams: map[string]StreamSummary{}}
+	return &streamRegistry{streams: map[string]streamRecord{}}
 }
 
-func (r *streamRegistry) Open(kind, sessionID, attachmentID string) (StreamSummary, func()) {
+func (r *streamRegistry) Open(kind, sessionID, attachmentID, frontendID string, revoke func()) (StreamSummary, func()) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.next++
@@ -1466,11 +1478,47 @@ func (r *streamRegistry) Open(kind, sessionID, attachmentID string) (StreamSumma
 		AttachmentID: strings.TrimSpace(attachmentID),
 		ConnectedAt:  time.Now(),
 	}
-	r.streams[stream.ID] = stream
+	r.streams[stream.ID] = streamRecord{summary: stream, frontendID: strings.TrimSpace(frontendID), revoke: revoke}
 	return stream, func() {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		delete(r.streams, stream.ID)
+	}
+}
+
+func (r *streamRegistry) RevokeAttachment(sessionID, attachmentID string) {
+	r.revoke(func(record streamRecord) bool {
+		return record.summary.SessionID == strings.TrimSpace(sessionID) && record.summary.AttachmentID == strings.TrimSpace(attachmentID)
+	})
+}
+
+func (r *streamRegistry) RevokeSession(sessionID string) {
+	r.revoke(func(record streamRecord) bool {
+		return record.summary.SessionID == strings.TrimSpace(sessionID)
+	})
+}
+
+func (r *streamRegistry) RevokeFrontend(frontendID string) {
+	r.revoke(func(record streamRecord) bool {
+		return record.frontendID != "" && record.frontendID == strings.TrimSpace(frontendID)
+	})
+}
+
+func (r *streamRegistry) revoke(matches func(streamRecord) bool) {
+	r.mu.Lock()
+	var revocations []func()
+	for id, record := range r.streams {
+		if !matches(record) {
+			continue
+		}
+		delete(r.streams, id)
+		if record.revoke != nil {
+			revocations = append(revocations, record.revoke)
+		}
+	}
+	r.mu.Unlock()
+	for _, revoke := range revocations {
+		revoke()
 	}
 }
 
@@ -1484,7 +1532,7 @@ func (r *streamRegistry) List() []StreamSummary {
 	sort.Strings(ids)
 	out := make([]StreamSummary, 0, len(ids))
 	for _, id := range ids {
-		out = append(out, r.streams[id])
+		out = append(out, r.streams[id].summary)
 	}
 	return out
 }
