@@ -24,6 +24,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/tinyrange/vmsh/internal/backend"
 	"github.com/tinyrange/vmsh/internal/group"
+	"github.com/tinyrange/vmsh/internal/terminal"
 	"github.com/tinyrange/vmsh/internal/vmshdprotocol"
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/ccvmd"
@@ -1143,7 +1144,9 @@ func (m *hostShellManager) Start(sessionID, requestedCWD string, term *Terminal)
 	m.mu.Lock()
 	if shell := m.shells[sessionID]; shell != nil && shell.Running() {
 		m.mu.Unlock()
-		_ = shell.SetSize(term)
+		if err := shell.SetSize(term); err != nil {
+			return nil, err
+		}
 		return shell, nil
 	}
 	delete(m.shells, sessionID)
@@ -1163,7 +1166,11 @@ func (m *hostShellManager) Start(sessionID, requestedCWD string, term *Terminal)
 	configureHostShellCommand(cmd)
 	cmd.Dir = cwd
 	cmd.Env = append(os.Environ(), "VMSH_ACTIVE=1")
-	tty, err := pty.StartWithSize(cmd, terminalWinsize(term))
+	winsize, err := terminalWinsize(term)
+	if err != nil {
+		return nil, err
+	}
+	tty, err := pty.StartWithSize(cmd, winsize)
 	if err != nil {
 		return nil, err
 	}
@@ -1248,7 +1255,11 @@ func (s *hostShell) SetSize(term *Terminal) error {
 	if s == nil || s.tty == nil || term == nil {
 		return nil
 	}
-	return pty.Setsize(s.tty, terminalWinsize(term))
+	winsize, err := terminalWinsize(term)
+	if err != nil {
+		return err
+	}
+	return pty.Setsize(s.tty, winsize)
 }
 
 func (s *hostShell) Write(data []byte) error {
@@ -1330,18 +1341,20 @@ func (s *hostShell) closeDone() {
 	})
 }
 
-func terminalWinsize(term *Terminal) *pty.Winsize {
-	rows := uint16(24)
-	cols := uint16(80)
+const maxTerminalDimension = terminal.MaxTerminalDimension
+
+func terminalWinsize(term *Terminal) (*pty.Winsize, error) {
+	rows := 0
+	cols := 0
 	if term != nil {
-		if term.Rows > 0 {
-			rows = uint16(term.Rows)
-		}
-		if term.Cols > 0 {
-			cols = uint16(term.Cols)
-		}
+		rows = term.Rows
+		cols = term.Cols
 	}
-	return &pty.Winsize{Rows: rows, Cols: cols}
+	cols, rows, err := terminal.NormalizeDimensions(cols, rows)
+	if err != nil {
+		return nil, err
+	}
+	return &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)}, nil
 }
 
 func hostShellCommand() string {
@@ -2276,6 +2289,11 @@ func (r *sessionRegistry) Attach(id string, req AttachSessionRequest) (Session, 
 	if mode != "interactive" && mode != "observer" {
 		return Session{}, ClientAttachment{}, sessionError{status: http.StatusBadRequest, err: "unsupported attachment mode"}
 	}
+	if req.Terminal != nil {
+		if err := validateTerminal(*req.Terminal); err != nil {
+			return Session{}, ClientAttachment{}, sessionError{status: http.StatusBadRequest, err: err.Error()}
+		}
+	}
 	frontendID := strings.TrimSpace(req.FrontendID)
 	if frontendID != "" {
 		frontend, ok := r.frontends[frontendID]
@@ -2296,7 +2314,7 @@ func (r *sessionRegistry) Attach(id string, req AttachSessionRequest) (Session, 
 		ID:         fmt.Sprintf("attach_%08x", r.nextAttach),
 		FrontendID: frontendID,
 		Mode:       mode,
-		Terminal:   normalizeTerminal(req.Terminal),
+		Terminal:   cloneTerminal(req.Terminal),
 		AttachedAt: now,
 		UpdatedAt:  now,
 	}
@@ -2384,12 +2402,15 @@ func (r *sessionRegistry) UpdateTerminal(id, attachmentID string, term Terminal)
 	if attachmentID == "" {
 		return Session{}, ClientAttachment{}, sessionError{status: http.StatusBadRequest, err: "attachment id is required"}
 	}
+	if err := validateTerminal(term); err != nil {
+		return Session{}, ClientAttachment{}, sessionError{status: http.StatusBadRequest, err: err.Error()}
+	}
 	for i, attachment := range session.Attachments {
 		if attachment.ID != attachmentID {
 			continue
 		}
 		now := time.Now()
-		attachment.Terminal = normalizeTerminal(&term)
+		attachment.Terminal = cloneTerminal(&term)
 		attachment.UpdatedAt = now
 		session.Attachments[i] = attachment
 		session.UpdatedAt = now
@@ -2778,18 +2799,17 @@ func writeSessionError(w http.ResponseWriter, err error) {
 	writeJSON(w, http.StatusInternalServerError, client.ErrorResponse{Error: err.Error()})
 }
 
-func normalizeTerminal(term *Terminal) *Terminal {
+func cloneTerminal(term *Terminal) *Terminal {
 	if term == nil {
 		return nil
 	}
 	out := *term
-	if out.Cols < 0 {
-		out.Cols = 0
-	}
-	if out.Rows < 0 {
-		out.Rows = 0
-	}
 	return &out
+}
+
+func validateTerminal(term Terminal) error {
+	_, _, err := terminal.NormalizeDimensions(term.Cols, term.Rows)
+	return err
 }
 
 func decodeOptionalJSON(r *http.Request, dst any) error {

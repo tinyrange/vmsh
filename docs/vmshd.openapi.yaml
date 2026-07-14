@@ -1058,9 +1058,11 @@ components:
         cols:
           type: integer
           minimum: 0
+          maximum: 32767
         rows:
           type: integer
           minimum: 0
+          maximum: 32767
     TerminalStreamMessage:
       type: object
       additionalProperties: true
