@@ -492,7 +492,7 @@ func TestStartVMSHDSessionCreatesFrontendSessionAndClosesFrontend(t *testing.T) 
 		Kind:      vmshd.Kind,
 		Addr:      strings.TrimPrefix(srv.URL, "http://"),
 		TokenPath: tokenPath,
-	}, nil, vmshdSessionMetadata("/work", commandContext{Mode: modeVM, VMID: "dev", Image: "debian", Isolated: true}), commandContext{Mode: modeVM, VMID: "dev", Image: "debian", Isolated: true}, false)
+	}, nil, vmshdSessionMetadata("/work", commandContext{Mode: modeVM, VMID: "dev", Image: "debian", Isolated: true}), false)
 	if err != nil {
 		t.Fatalf("start vmshd session: %v", err)
 	}
@@ -800,8 +800,6 @@ func TestVMSHDSessionPublishUsesCurrentContext(t *testing.T) {
 	sh.vmshd = &vmshdSessionReporter{
 		client:    httpClient,
 		sessionID: "sess_1",
-		hostCWD:   "/old",
-		context:   commandContext{Mode: modeHost},
 	}
 
 	sh.publishVMSHDSessionState()
@@ -815,6 +813,97 @@ func TestVMSHDSessionPublishUsesCurrentContext(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for vmshd update")
+	}
+}
+
+func TestVMSHDSessionReporterSerializesImmutableSnapshots(t *testing.T) {
+	var activeHandlers atomic.Int32
+	var maxHandlers atomic.Int32
+	requests := make(chan vmshd.UpdateSessionRequest, 24)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/sessions/sess_1", func(w http.ResponseWriter, r *http.Request) {
+		active := activeHandlers.Add(1)
+		for {
+			maximum := maxHandlers.Load()
+			if active <= maximum || maxHandlers.CompareAndSwap(maximum, active) {
+				break
+			}
+		}
+		defer activeHandlers.Add(-1)
+		var req vmshd.UpdateSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode update request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		time.Sleep(time.Millisecond)
+		requests <- req
+		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", Name: "main", State: "attached"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{
+		Addr:      strings.TrimPrefix(srv.URL, "http://"),
+		TokenPath: tokenPath,
+	})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	reporter := &vmshdSessionReporter{client: httpClient, sessionID: "sess_1"}
+
+	const publications = 24
+	var activeSnapshots atomic.Int32
+	var maxSnapshots atomic.Int32
+	var wg sync.WaitGroup
+	for generation := 1; generation <= publications; generation++ {
+		generation := generation
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reporter.publish(func() vmshd.UpdateSessionRequest {
+				active := activeSnapshots.Add(1)
+				for {
+					maximum := maxSnapshots.Load()
+					if active <= maximum || maxSnapshots.CompareAndSwap(maximum, active) {
+						break
+					}
+				}
+				defer activeSnapshots.Add(-1)
+				return vmshd.UpdateSessionRequest{
+					HostCWD: fmt.Sprintf("/generation/%d", generation),
+					SelectedContext: &vmshd.SessionContext{
+						Name: fmt.Sprintf("generation-%d", generation),
+					},
+					Jobs: []vmshd.JobSummary{{ID: generation}},
+				}
+			})
+		}()
+	}
+	wg.Wait()
+	close(requests)
+	if maxSnapshots.Load() != 1 {
+		t.Fatalf("concurrent snapshot builders = %d, want 1", maxSnapshots.Load())
+	}
+	if maxHandlers.Load() != 1 {
+		t.Fatalf("concurrent session updates = %d, want 1", maxHandlers.Load())
+	}
+	seen := make(map[int]bool, publications)
+	for req := range requests {
+		if len(req.Jobs) != 1 || req.SelectedContext == nil {
+			t.Fatalf("incomplete session snapshot = %+v", req)
+		}
+		generation := req.Jobs[0].ID
+		if req.HostCWD != fmt.Sprintf("/generation/%d", generation) || req.SelectedContext.Name != fmt.Sprintf("generation-%d", generation) {
+			t.Fatalf("torn session snapshot = %+v", req)
+		}
+		seen[generation] = true
+	}
+	if len(seen) != publications {
+		t.Fatalf("published generations = %d, want %d", len(seen), publications)
 	}
 }
 
@@ -3558,8 +3647,6 @@ func TestStartBackgroundHostJobUsesVMSHD(t *testing.T) {
 	sh.vmshd = &vmshdSessionReporter{
 		client:    httpClient,
 		sessionID: "sess_1",
-		hostCWD:   sh.hostCWD,
-		context:   sh.context,
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -3634,8 +3721,6 @@ func TestStartBackgroundVMJobUsesVMSHD(t *testing.T) {
 	sh.vmshd = &vmshdSessionReporter{
 		client:    httpClient,
 		sessionID: "sess_1",
-		hostCWD:   sh.hostCWD,
-		context:   sh.context,
 	}
 	ctx := commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", CWD: "/repo", User: "app"}
 
@@ -3699,7 +3784,7 @@ func TestStartBackgroundSSHJobUsesVMSHDForHostOrigin(t *testing.T) {
 		t.Fatalf("new vmshd client: %v", err)
 	}
 	sh := newUnitShell(t, newRecordingShellAPI())
-	sh.vmshd = &vmshdSessionReporter{client: httpClient, sessionID: "sess_1", hostCWD: sh.hostCWD, context: sh.context}
+	sh.vmshd = &vmshdSessionReporter{client: httpClient, sessionID: "sess_1"}
 	ctx := commandContext{Mode: modeSSH, SSHHost: "app.example", User: "me", CWD: "/srv/app"}
 
 	var stdout, stderr bytes.Buffer
@@ -3785,7 +3870,7 @@ func TestVMSHDHostJobControlUsesDaemonState(t *testing.T) {
 		t.Fatalf("new vmshd client: %v", err)
 	}
 	sh := newUnitShell(t, newRecordingShellAPI())
-	sh.vmshd = &vmshdSessionReporter{client: httpClient, sessionID: "sess_1", hostCWD: sh.hostCWD, context: sh.context}
+	sh.vmshd = &vmshdSessionReporter{client: httpClient, sessionID: "sess_1"}
 	sh.jobs = append(sh.jobs, shellJob{
 		ID:          9,
 		Context:     commandContext{Mode: modeHost},
@@ -6785,7 +6870,7 @@ func TestCopyPathPublishesVMSHDCopyState(t *testing.T) {
 		t.Fatalf("new vmshd client: %v", err)
 	}
 	sh := newUnitShell(t, newRecordingShellAPI())
-	sh.vmshd = &vmshdSessionReporter{client: httpClient, sessionID: "sess_1", hostCWD: sh.hostCWD, context: sh.context}
+	sh.vmshd = &vmshdSessionReporter{client: httpClient, sessionID: "sess_1"}
 	if err := os.WriteFile(filepath.Join(sh.hostCWD, "local.txt"), []byte("copy-data"), 0o644); err != nil {
 		t.Fatalf("write local source: %v", err)
 	}
