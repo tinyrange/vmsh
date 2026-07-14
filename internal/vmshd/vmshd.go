@@ -1388,7 +1388,12 @@ func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 		if err := websocket.JSON.Receive(ws, &msg); err != nil {
 			return
 		}
-		switch strings.TrimSpace(msg.Kind) {
+		kind := strings.TrimSpace(msg.Kind)
+		if attachment.Mode == "observer" && kind != "close" {
+			_ = send(TerminalStreamMessage{Kind: "error"})
+			continue
+		}
+		switch kind {
 		case "resize":
 			if msg.Terminal == nil {
 				_ = send(TerminalStreamMessage{Kind: "error"})
