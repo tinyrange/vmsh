@@ -162,7 +162,9 @@ func (m *trustedManager) close() {
 	}
 }
 
-func (m *trustedManager) register(mux *http.ServeMux, runtime ccvmd.RuntimeView) {
+func (m *trustedManager) register(mux interface {
+	HandleFunc(string, http.HandlerFunc)
+}, runtime ccvmd.RuntimeView) {
 	mux.HandleFunc("GET /vmsh/trust", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, m.list())
 	})
