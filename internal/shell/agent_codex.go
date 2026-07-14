@@ -1330,35 +1330,12 @@ func extractTarSafeWithLimits(r io.Reader, dst string, limits tarExtractionLimit
 }
 
 func withCodexInstallLock(standaloneRoot string, fn func() error) error {
-	lockDir := filepath.Join(standaloneRoot, "vmsh-install.lock.d")
-	deadline := time.Now().Add(2 * time.Minute)
-	for {
-		err := os.Mkdir(lockDir, 0o700)
-		if err == nil {
-			_ = os.WriteFile(filepath.Join(lockDir, "started_at"), []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0o600)
-			defer os.RemoveAll(lockDir)
-			return fn()
-		}
-		if !os.IsExist(err) {
-			return err
-		}
-		if codexLockStale(lockDir, 10*time.Minute) {
-			_ = os.RemoveAll(lockDir)
-			continue
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for Codex install lock")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func codexLockStale(lockDir string, staleAfter time.Duration) bool {
-	info, err := os.Stat(lockDir)
+	lock, err := acquireCodexFileLock(filepath.Join(standaloneRoot, "vmsh-install.lock"), 2*time.Minute)
 	if err != nil {
-		return true
+		return err
 	}
-	return time.Since(info.ModTime()) > staleAfter
+	defer lock.Release()
+	return fn()
 }
 
 func updateVMShCodexLink(standaloneRoot, target, releaseName string) error {
