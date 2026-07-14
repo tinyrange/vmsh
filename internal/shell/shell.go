@@ -172,7 +172,7 @@ type shellCopy struct {
 }
 
 type vmshdSessionReporter struct {
-	publishMu    sync.Mutex
+	mu           sync.Mutex
 	client       *vmshd.HTTPClient
 	frontendID   string
 	sessionID    string
@@ -180,6 +180,8 @@ type vmshdSessionReporter struct {
 	detached     bool
 	startedAt    time.Time
 	startedKnown bool
+	pending      *vmshd.UpdateSessionRequest
+	publishErr   error
 }
 
 type hostShellInit struct {
@@ -1094,7 +1096,7 @@ type shellToken struct {
 	End   int
 }
 
-func Run(args []string) error {
+func Run(args []string) (retErr error) {
 	fs := flag.NewFlagSet("vmsh", flag.ExitOnError)
 	ccvmPath := fs.String("ccvm", "", "Path to ccvm binary")
 	cacheDir := fs.String("cache-dir", "", "Cache directory")
@@ -1263,7 +1265,11 @@ func Run(args []string) error {
 			return err
 		}
 		sh.vmshd = reporter
-		defer stopVMSHDSession()
+		defer func() {
+			if err := stopVMSHDSession(); err != nil {
+				retErr = errors.Join(retErr, err)
+			}
+		}()
 	}
 	if *startVM {
 		if err := sh.startVM(sh.context.VMID, sh.context, stderr); err != nil {
@@ -1320,9 +1326,9 @@ func daemonDisplayName(state backend.DaemonState, launch backend.CCVMLaunch) str
 	return "ccvm"
 }
 
-func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmshd.UpdateSessionRequest, systemSession bool) (*vmshdSessionReporter, func(), error) {
+func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmshd.UpdateSessionRequest, systemSession bool) (*vmshdSessionReporter, func() error, error) {
 	if state.Kind != vmshd.Kind {
-		return nil, func() {}, nil
+		return nil, func() error { return nil }, nil
 	}
 	client, err := vmshd.NewHTTPClient(state)
 	if err != nil {
@@ -1332,8 +1338,9 @@ func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmsh
 	if err != nil {
 		return nil, nil, err
 	}
-	closeFrontend := func() {
-		_, _ = client.CloseFrontend(frontend.ID)
+	closeFrontend := func() error {
+		_, err := client.CloseFrontend(frontend.ID)
+		return err
 	}
 	scope := "frontend"
 	if systemSession {
@@ -1341,11 +1348,11 @@ func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmsh
 	}
 	session, err := client.CreateSession(vmshd.CreateSessionRequest{Name: "main", FrontendID: frontend.ID, Scope: scope})
 	if err != nil {
-		closeFrontend()
+		_ = closeFrontend()
 		return nil, nil, err
 	}
 	if _, err := client.UpdateSession(session.ID, metadata); err != nil {
-		closeFrontend()
+		_ = closeFrontend()
 		return nil, nil, err
 	}
 	attachReq := vmshd.AttachSessionRequest{FrontendID: frontend.ID, Mode: "interactive"}
@@ -1357,7 +1364,7 @@ func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmsh
 	}
 	attached, err := client.AttachSession(session.ID, attachReq)
 	if err != nil {
-		closeFrontend()
+		_ = closeFrontend()
 		return nil, nil, err
 	}
 	reporter := &vmshdSessionReporter{
@@ -1371,8 +1378,8 @@ func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmsh
 		reporter.startedAt = status.StartedAt
 		reporter.startedKnown = true
 	}
-	return reporter, func() {
-		closeFrontend()
+	return reporter, func() error {
+		return reporter.close()
 	}, nil
 }
 
@@ -1560,14 +1567,57 @@ func jobStatus(job shellJob) string {
 	return "done"
 }
 
-func (r *vmshdSessionReporter) publish(snapshot func() vmshd.UpdateSessionRequest) {
+func (r *vmshdSessionReporter) publish(snapshot func() vmshd.UpdateSessionRequest) error {
 	if r == nil || r.client == nil || strings.TrimSpace(r.sessionID) == "" {
-		return
+		return nil
 	}
-	r.publishMu.Lock()
-	defer r.publishMu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	req := snapshot()
-	_, _ = r.client.UpdateSession(r.sessionID, req)
+	r.pending = &req
+	_, err := r.client.UpdateSession(r.sessionID, req)
+	r.publishErr = err
+	if err == nil {
+		r.pending = nil
+	}
+	return err
+}
+
+func (r *vmshdSessionReporter) flush() error {
+	if r == nil || r.client == nil || strings.TrimSpace(r.sessionID) == "" {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pending == nil {
+		return nil
+	}
+	_, err := r.client.UpdateSession(r.sessionID, *r.pending)
+	r.publishErr = err
+	if err == nil {
+		r.pending = nil
+	}
+	return err
+}
+
+func (r *vmshdSessionReporter) publicationError() error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.publishErr
+}
+
+func (r *vmshdSessionReporter) close() error {
+	if r == nil || r.client == nil {
+		return nil
+	}
+	if err := r.flush(); err != nil {
+		return fmt.Errorf("publish final vmshd session state: %w", err)
+	}
+	_, err := r.client.CloseFrontend(r.frontendID)
+	return err
 }
 
 func (r *vmshdSessionReporter) bridgeTerminalStream(ctx context.Context, in *os.File, stdout, stderr io.Writer) error {
@@ -9592,6 +9642,9 @@ func (s *shellState) printSessions(w io.Writer) error {
 		}
 		if row.Current {
 			parts = append(parts, "[current]")
+			if publishErr := s.vmshd.publicationError(); publishErr != nil {
+				parts = append(parts, "publication=degraded", "publication_error="+strconv.Quote(publishErr.Error()))
+			}
 		}
 		if _, err := fmt.Fprintln(w, strings.Join(parts, " ")); err != nil {
 			return err
