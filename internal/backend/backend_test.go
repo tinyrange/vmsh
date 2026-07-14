@@ -2,9 +2,11 @@ package backend
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -576,6 +578,54 @@ func TestConnectCCVMWithOptionsStartsPrivateDaemonForIncompatibleVMSHD(t *testin
 	}
 	if err := api.HealthCheck(); err != nil {
 		t.Fatalf("private daemon health check: %v", err)
+	}
+}
+
+func TestReclaimPrivateDaemonCachesKeepsActiveAndRemovesStale(t *testing.T) {
+	const token = "secret"
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", requireBearer(token, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cache := t.TempDir()
+	parent := filepath.Join(cache, "private")
+	active := filepath.Join(parent, "vmshd-active")
+	stale := filepath.Join(parent, "vmshd-stale")
+	unknown := filepath.Join(parent, "vmshd-unknown")
+	for _, dir := range []string{active, stale, unknown} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("create private cache: %v", err)
+		}
+	}
+	activeToken := filepath.Join(active, "token")
+	if err := os.WriteFile(activeToken, []byte(token+"\n"), 0o600); err != nil {
+		t.Fatalf("write active token: %v", err)
+	}
+	if err := WriteDaemonState(filepath.Join(active, "owner.json"), DaemonState{Addr: strings.TrimPrefix(srv.URL, "http://"), TokenPath: activeToken}); err != nil {
+		t.Fatalf("write active owner: %v", err)
+	}
+	staleToken := filepath.Join(stale, "token")
+	if err := os.WriteFile(staleToken, []byte(token+"\n"), 0o600); err != nil {
+		t.Fatalf("write stale token: %v", err)
+	}
+	if err := WriteDaemonState(filepath.Join(stale, "owner.json"), DaemonState{Addr: "127.0.0.1:1", TokenPath: staleToken}); err != nil {
+		t.Fatalf("write stale owner: %v", err)
+	}
+
+	if err := reclaimStalePrivateDaemonCaches(cache); err != nil {
+		t.Fatalf("reclaim caches: %v", err)
+	}
+	if _, err := os.Stat(active); err != nil {
+		t.Fatalf("active cache removed: %v", err)
+	}
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale cache still exists: %v", err)
+	}
+	if _, err := os.Stat(unknown); err != nil {
+		t.Fatalf("unknown cache removed: %v", err)
 	}
 }
 
