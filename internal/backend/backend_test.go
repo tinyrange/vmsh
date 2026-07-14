@@ -2,6 +2,8 @@ package backend
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"j5.nz/cc/client"
 )
@@ -910,6 +913,46 @@ func TestStartDaemonLeaseUsesShortTimeout(t *testing.T) {
 	if len(api.released) != 1 || api.released[0] != "lease" {
 		t.Fatalf("released leases = %q", api.released)
 	}
+}
+
+func TestStartDaemonLeaseReportsFeedAndReleaseFailures(t *testing.T) {
+	t.Setenv("VMSH_DAEMON_WATCHDOG_TIMEOUT", "30ms")
+	api := &failingWatchdogAPI{}
+	reported := make(chan error, 4)
+	stop, err := StartDaemonLease(api, func(err error) { reported <- err })
+	if err != nil {
+		t.Fatalf("start lease: %v", err)
+	}
+	var feedErr error
+	select {
+	case feedErr = <-reported:
+	case <-time.After(time.Second):
+		t.Fatal("feed failure was not reported")
+	}
+	var leaseErr *WatchdogLeaseError
+	if !errors.As(feedErr, &leaseErr) || leaseErr.Operation != "feed failed" {
+		t.Fatalf("feed error = %v", feedErr)
+	}
+	stop()
+	select {
+	case err := <-reported:
+		if !errors.As(err, &leaseErr) || leaseErr.Operation != "release failed" {
+			t.Fatalf("release error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("release failure was not reported")
+	}
+}
+
+type failingWatchdogAPI struct{}
+
+func (*failingWatchdogAPI) CreateWatchdogLease(req client.WatchdogLeaseRequest) (client.WatchdogLeaseResponse, error) {
+	return client.WatchdogLeaseResponse{LeaseID: "lease", TimeoutSeconds: req.TimeoutSeconds}, nil
+}
+
+func (*failingWatchdogAPI) FeedWatchdogLease(string) error { return fmt.Errorf("feed unavailable") }
+func (*failingWatchdogAPI) ReleaseWatchdogLease(string) error {
+	return fmt.Errorf("release unavailable")
 }
 
 type recordingWatchdogAPI struct {
