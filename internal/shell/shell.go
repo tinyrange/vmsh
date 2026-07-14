@@ -4723,6 +4723,12 @@ func writePathTar(w io.Writer, src, rootName string) error {
 }
 
 func extractTarToHost(r io.Reader, dst copyTargetPath) error {
+	return extractTarToHostRooted(r, dst)
+}
+
+// extractTarToHostLegacy is retained on the aggregate branch so the streaming
+// implementation from the other pull request can merge independently.
+func extractTarToHostLegacy(r io.Reader, dst copyTargetPath) error {
 	mode := hostCopyDestMode(dst.path, dst.directory)
 	tr := tar.NewReader(r)
 	var dirs []tarDirMtime
@@ -4868,21 +4874,6 @@ func hostCopyDestMode(dst string, directoryHint bool) copyDestMode {
 		return copyDestIntoDir
 	}
 	return copyDestExact
-}
-
-func hostTarTarget(dst string, mode copyDestMode, name string) (string, error) {
-	cleanName := path.Clean(strings.TrimPrefix(filepath.ToSlash(name), "/"))
-	if cleanName == "." || strings.HasPrefix(cleanName, "../") || cleanName == ".." {
-		return "", fmt.Errorf("unsafe tar path %q", name)
-	}
-	if mode == copyDestIntoDir {
-		return filepath.Join(dst, filepath.FromSlash(cleanName)), nil
-	}
-	parts := strings.SplitN(cleanName, "/", 2)
-	if len(parts) == 1 {
-		return dst, nil
-	}
-	return filepath.Join(dst, filepath.FromSlash(parts[1])), nil
 }
 
 func copyHostDir(src, dst string, mode os.FileMode) error {
