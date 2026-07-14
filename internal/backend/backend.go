@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -50,13 +51,14 @@ type API interface {
 }
 
 type DaemonState struct {
-	Addr       string `json:"addr"`
-	Socket     string `json:"socket,omitempty"`
-	Kind       string `json:"kind,omitempty"`
-	Version    int    `json:"version,omitempty"`
-	APIVersion string `json:"api_version,omitempty"`
-	TokenPath  string `json:"token_path,omitempty"`
-	LaunchKey  string `json:"launch_key,omitempty"`
+	Addr            string `json:"addr"`
+	Socket          string `json:"socket,omitempty"`
+	Kind            string `json:"kind,omitempty"`
+	Version         int    `json:"version,omitempty"`
+	APIVersion      string `json:"api_version,omitempty"`
+	TokenPath       string `json:"token_path,omitempty"`
+	LaunchKey       string `json:"launch_key,omitempty"`
+	PrivateCacheDir string `json:"private_cache_dir,omitempty"`
 }
 
 type CCVMLaunch struct {
@@ -212,6 +214,9 @@ func ConnectCCVM(launch CCVMLaunch, cacheDir, statePath string) (*client.Client,
 }
 
 func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts ConnectOptions) (*client.Client, error) {
+	if err := reclaimStalePrivateDaemonCaches(cacheDir); err != nil {
+		return nil, fmt.Errorf("reclaim private daemon caches: %w", err)
+	}
 	launchKey := DaemonLaunchKey(launch)
 	var preservedState *DaemonState
 	var incompatibility error
@@ -263,23 +268,37 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 	}
 	started, err := startDaemonProcess(launch, startCacheDir)
 	if err != nil {
+		if preservedState != nil {
+			_ = os.RemoveAll(startCacheDir)
+		}
 		return nil, fmt.Errorf("start ccvm daemon %s with cache %s: %w", CCVMLaunchName(launch), startCacheDir, err)
+	}
+	removeFailedPrivateCache := func() {
+		if preservedState != nil {
+			_ = os.RemoveAll(startCacheDir)
+		}
 	}
 
 	var hello client.ServerHello
 	if err := json.NewDecoder(started.stdout).Decode(&hello); err != nil {
 		started.stop()
+		removeFailedPrivateCache()
 		return nil, fmt.Errorf("ccvm daemon did not send a startup banner from %s: %w", CCVMLaunchName(launch), err)
 	}
 	if err := ValidateServerHello(hello, cacheDir); err != nil {
 		started.stop()
+		removeFailedPrivateCache()
 		return nil, err
 	}
 	state := normalizeDaemonState(DaemonState{Addr: hello.Addr, Kind: hello.Kind, TokenPath: hello.TokenPath, LaunchKey: launchKey})
+	if preservedState != nil {
+		state.PrivateCacheDir = startCacheDir
+	}
 	writeState := preservedState == nil
 	if writeState {
 		if err := WriteDaemonState(statePath, state); err != nil {
 			started.stop()
+			removeFailedPrivateCache()
 			return nil, fmt.Errorf("write daemon state %s for %s: %w", statePath, hello.Addr, err)
 		}
 	}
@@ -289,6 +308,7 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 			_ = os.Remove(statePath)
 		}
 		started.stop()
+		removeFailedPrivateCache()
 		return nil, fmt.Errorf("read daemon auth token: %w", err)
 	}
 	if err := api.HealthCheck(); err != nil {
@@ -296,6 +316,7 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 			_ = os.Remove(statePath)
 		}
 		started.stop()
+		removeFailedPrivateCache()
 		return nil, fmt.Errorf("ccvm daemon started at %s but health check failed: %w", hello.Addr, err)
 	}
 	if strings.TrimSpace(state.Kind) == "vmshd" && !apiCompatible(api, state) {
@@ -303,12 +324,64 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 			_ = os.Remove(statePath)
 		}
 		started.stop()
+		removeFailedPrivateCache()
 		return nil, fmt.Errorf("vmshd daemon started at %s but required routes are unavailable", hello.Addr)
+	}
+	if state.PrivateCacheDir != "" {
+		if err := WriteDaemonState(filepath.Join(state.PrivateCacheDir, "owner.json"), state); err != nil {
+			started.stop()
+			_ = os.RemoveAll(state.PrivateCacheDir)
+			return nil, fmt.Errorf("write private daemon owner manifest: %w", err)
+		}
 	}
 	if opts.OnStart != nil {
 		opts.OnStart(state)
 	}
 	return api, nil
+}
+
+func reclaimStalePrivateDaemonCaches(cacheDir string) error {
+	parent := filepath.Join(cacheDir, "private")
+	entries, err := os.ReadDir(parent)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "vmshd-") {
+			continue
+		}
+		dir := filepath.Join(parent, entry.Name())
+		state, err := ReadDaemonState(filepath.Join(dir, "owner.json"))
+		if err != nil {
+			continue
+		}
+		api := NewClient(state.Addr)
+		if ApplyDaemonStateAuth(api, state) == nil && api.HealthCheck() == nil {
+			continue
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func RemovePrivateDaemonCacheWhenStopped(api *client.Client, dir string) error {
+	dir = strings.TrimSpace(dir)
+	if api == nil || dir == "" {
+		return nil
+	}
+	deadline := time.Now().Add(daemonWatchdogTimeout())
+	for api.HealthCheck() == nil {
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("private daemon remained active after its watchdog lease was released")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return os.RemoveAll(dir)
 }
 
 func privateDaemonCacheDir(cacheDir string) (string, error) {

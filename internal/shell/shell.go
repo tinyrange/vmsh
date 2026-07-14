@@ -1183,11 +1183,18 @@ func Run(args []string) error {
 		}
 	}
 	caps, _ := api.Capabilities()
-	stopLease, err := backend.StartDaemonLease(api)
+	stopLeaseOnce, err := backend.StartDaemonLease(api)
 	if err != nil {
 		return err
 	}
-	defer stopLease()
+	var stopLeaseGuard sync.Once
+	stopLease := func() { stopLeaseGuard.Do(stopLeaseOnce) }
+	defer func() {
+		stopLease()
+		if err := backend.RemovePrivateDaemonCacheWhenStopped(api, daemonState.PrivateCacheDir); err != nil {
+			fmt.Fprintf(stderr, "vmsh: warning: remove private daemon cache: %v\n", err)
+		}
+	}()
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
