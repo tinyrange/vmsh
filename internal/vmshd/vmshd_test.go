@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tinyrange/vmsh/internal/vmshdprotocol"
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
 )
@@ -264,6 +265,53 @@ func TestAuthenticateRejectsUnsupportedFrontendMutation(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusUpgradeRequired {
 		t.Fatalf("status = %d, want %d", rr.Code, http.StatusUpgradeRequired)
+	}
+}
+
+func TestAuthenticateRejectsUnsupportedTerminalWebSocketUpgrade(t *testing.T) {
+	srv := NewServer("secret")
+	var called bool
+	handler := srv.Authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusSwitchingProtocols)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/vmsh/sessions/sess_1/attachments/attach_1/stream", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Connection", "keep-alive, Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set(vmshdprotocol.HeaderProtocol, "2")
+	req.Header.Set(vmshdprotocol.HeaderMinProtocol, "2")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+
+	if called {
+		t.Fatal("incompatible WebSocket upgrade reached the terminal handler")
+	}
+	if recorder.Code != http.StatusUpgradeRequired {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUpgradeRequired)
+	}
+	if got := recorder.Header().Get(vmshdprotocol.HeaderProtocol); got != fmt.Sprint(vmshdprotocol.Current) {
+		t.Fatalf("supported current protocol = %q, want %d", got, vmshdprotocol.Current)
+	}
+	if got := recorder.Header().Get(vmshdprotocol.HeaderMinProtocol); got != fmt.Sprint(vmshdprotocol.Minimum) {
+		t.Fatalf("supported minimum protocol = %q, want %d", got, vmshdprotocol.Minimum)
+	}
+}
+
+func TestAuthenticateKeepsReadOnlyGetAvailableToUnsupportedFrontend(t *testing.T) {
+	srv := NewServer("secret")
+	handler := srv.Authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/vmsh/status", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set(vmshdprotocol.HeaderProtocol, "2")
+	req.Header.Set(vmshdprotocol.HeaderMinProtocol, "2")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNoContent)
 	}
 }
 

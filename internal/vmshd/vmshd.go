@@ -1540,6 +1540,8 @@ func (s *Server) Authenticate(next http.Handler) http.Handler {
 			return
 		}
 		if err := compatibleFrontendRequest(r); err != nil {
+			w.Header().Set(vmshdprotocol.HeaderProtocol, strconv.Itoa(vmshdprotocol.Current))
+			w.Header().Set(vmshdprotocol.HeaderMinProtocol, strconv.Itoa(vmshdprotocol.Minimum))
 			writeJSON(w, http.StatusUpgradeRequired, client.ErrorResponse{Error: err.Error()})
 			return
 		}
@@ -1566,12 +1568,29 @@ func compatibleFrontendRequest(r *http.Request) error {
 }
 
 func frontendProtocolReadOnly(r *http.Request) bool {
+	if websocketUpgradeRequest(r) {
+		return false
+	}
 	switch r.Method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
 		return true
 	default:
 		return false
 	}
+}
+
+func websocketUpgradeRequest(r *http.Request) bool {
+	if r == nil || !strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket") {
+		return false
+	}
+	for _, value := range r.Header.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "upgrade") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func protocolVersionFromRequest(r *http.Request, header string) int {
