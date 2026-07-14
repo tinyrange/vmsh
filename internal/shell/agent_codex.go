@@ -285,7 +285,9 @@ func ensureHostCodexRelease(hostCodexHome, target string, opts codexAgentOptions
 	releasesDir := filepath.Join(standaloneRoot, "releases")
 	if release == "latest" && !opts.Update {
 		if installed, ok := newestInstalledCodexRelease(releasesDir, target); ok {
-			_ = updateVMShCodexLink(standaloneRoot, target, installed.Name)
+			if err := updateVMShCodexLink(standaloneRoot, target, installed.Name); err != nil {
+				return codexHostRelease{}, fmt.Errorf("activate Codex release %s: %w", installed.Name, err)
+			}
 			installed.CodexGuestBin = codexGuestBinaryPath(installed)
 			return installed, nil
 		}
@@ -301,7 +303,9 @@ func ensureHostCodexRelease(hostCodexHome, target string, opts codexAgentOptions
 		}
 		if codexReleaseDirComplete(installed.ReleaseDir, release, target) {
 			installed.CodexRelPath = codexReleaseBinaryRelPath(installed.ReleaseDir)
-			_ = updateVMShCodexLink(standaloneRoot, target, installed.Name)
+			if err := updateVMShCodexLink(standaloneRoot, target, installed.Name); err != nil {
+				return codexHostRelease{}, fmt.Errorf("activate Codex release %s: %w", installed.Name, err)
+			}
 			installed.CodexGuestBin = codexGuestBinaryPath(installed)
 			return installed, nil
 		}
@@ -344,7 +348,9 @@ func ensureHostCodexRelease(hostCodexHome, target string, opts codexAgentOptions
 	if err != nil {
 		return codexHostRelease{}, err
 	}
-	_ = updateVMShCodexLink(standaloneRoot, target, installed.Name)
+	if err := updateVMShCodexLink(standaloneRoot, target, installed.Name); err != nil {
+		return codexHostRelease{}, fmt.Errorf("activate Codex release %s: %w", installed.Name, err)
+	}
 	installed.CodexGuestBin = codexGuestBinaryPath(installed)
 	return installed, nil
 }
@@ -411,6 +417,10 @@ func codexReleaseDirComplete(releaseDir, expectedVersion, expectedTarget string)
 	if filepath.Base(releaseDir) != expectedVersion+"-"+expectedTarget {
 		return false
 	}
+	return codexReleaseContentsComplete(releaseDir, expectedTarget)
+}
+
+func codexReleaseContentsComplete(releaseDir, expectedTarget string) bool {
 	if !isExecutable(filepath.Join(releaseDir, "bin", "codex")) {
 		return false
 	}
@@ -1058,7 +1068,7 @@ func installCodexPackageRelease(release codexGitHubRelease, releasesDir, version
 		return err
 	}
 	releaseDir := filepath.Join(releasesDir, version+"-"+target)
-	return extractCodexPackageArchive(releaseDir, archivePath)
+	return extractCodexPackageArchive(releaseDir, archivePath, version, target)
 }
 
 func findCodexReleaseAsset(release codexGitHubRelease, name string) (codexGitHubAsset, bool) {
@@ -1169,7 +1179,7 @@ func codexPackageArchiveDigest(checksumPath, assetName string) (string, error) {
 	return "", fmt.Errorf("checksum manifest does not include %s", assetName)
 }
 
-func extractCodexPackageArchive(releaseDir, archivePath string) error {
+func extractCodexPackageArchive(releaseDir, archivePath, version, target string) error {
 	stage := filepath.Join(filepath.Dir(releaseDir), ".staging."+filepath.Base(releaseDir)+"."+strconv.FormatInt(time.Now().UnixNano(), 10))
 	if err := os.RemoveAll(stage); err != nil {
 		return err
@@ -1216,13 +1226,38 @@ func extractCodexPackageArchive(releaseDir, archivePath string) error {
 			return err
 		}
 	}
-	if err := os.RemoveAll(releaseDir); err != nil {
-		return err
+	if !codexReleaseContentsComplete(stage, target) {
+		return fmt.Errorf("staged Codex release %s-%s is incomplete", version, target)
 	}
-	if err := os.Rename(stage, releaseDir); err != nil {
+	if err := publishCodexRelease(stage, releaseDir, os.Rename, os.RemoveAll); err != nil {
 		return err
 	}
 	cleanupStage = false
+	return nil
+}
+
+func publishCodexRelease(stage, releaseDir string, rename func(string, string) error, removeAll func(string) error) error {
+	backup := filepath.Join(filepath.Dir(releaseDir), ".rollback."+filepath.Base(releaseDir)+"."+strconv.FormatInt(time.Now().UnixNano(), 10))
+	hadPrevious := false
+	if _, err := os.Lstat(releaseDir); err == nil {
+		if err := rename(releaseDir, backup); err != nil {
+			return fmt.Errorf("preserve previous Codex release: %w", err)
+		}
+		hadPrevious = true
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := rename(stage, releaseDir); err != nil {
+		if hadPrevious {
+			if restoreErr := rename(backup, releaseDir); restoreErr != nil {
+				return fmt.Errorf("publish Codex release: %v (restore previous release: %w)", err, restoreErr)
+			}
+		}
+		return fmt.Errorf("publish Codex release: %w", err)
+	}
+	if hadPrevious {
+		_ = removeAll(backup)
+	}
 	return nil
 }
 
@@ -1337,7 +1372,7 @@ func updateVMShCodexLink(standaloneRoot, target, releaseName string) error {
 	if err := os.Symlink(filepath.Join("..", "..", "releases", releaseName), tmp); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, link); err != nil {
+	if err := replaceCodexActivationLink(tmp, link); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
