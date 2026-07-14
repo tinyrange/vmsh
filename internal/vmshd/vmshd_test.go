@@ -118,6 +118,61 @@ func TestHostShellCommandRejectsNonExecutableConfiguration(t *testing.T) {
 	}
 }
 
+func TestHostShellStartsInVerifiedSessionCWD(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix shell fixture")
+	}
+	bin := t.TempDir()
+	shellPath := filepath.Join(bin, "zsh")
+	script := "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    pwd) pwd ;;\n    exit) exit 0 ;;\n  esac\ndone\n"
+	if err := os.WriteFile(shellPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write shell fixture: %v", err)
+	}
+	t.Setenv("PATH", bin)
+	requestedCWD := t.TempDir()
+	cwd, err := filepath.EvalSymlinks(requestedCWD)
+	if err != nil {
+		t.Fatalf("resolve cwd fixture: %v", err)
+	}
+	manager := newHostShellManager()
+	shell, err := manager.Start("sess_cwd", requestedCWD, nil)
+	if err != nil {
+		t.Fatalf("start host shell: %v", err)
+	}
+	t.Cleanup(func() { manager.Close("sess_cwd") })
+	if shell.cwd != cwd || shell.cmd.Dir != cwd {
+		t.Fatalf("shell cwd=%q cmd.Dir=%q, want %q", shell.cwd, shell.cmd.Dir, cwd)
+	}
+	output, unsubscribe := shell.Subscribe()
+	defer unsubscribe()
+	if err := shell.Write([]byte("pwd\n")); err != nil {
+		t.Fatalf("write pwd: %v", err)
+	}
+	var received bytes.Buffer
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case chunk := <-output:
+			received.Write(chunk)
+			for _, line := range strings.Split(strings.ReplaceAll(received.String(), "\r\n", "\n"), "\n") {
+				if strings.TrimSpace(line) == cwd {
+					return
+				}
+			}
+		case <-deadline:
+			t.Fatalf("pwd output lines = %q, want cwd %q", received.String(), cwd)
+		}
+	}
+}
+
+func TestHostShellRejectsMissingSessionCWD(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	_, err := newHostShellManager().Start("sess_missing_cwd", missing, nil)
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("start error = %v, want missing cwd", err)
+	}
+}
+
 func TestAuthenticateRequiresBearerToken(t *testing.T) {
 	srv := NewServer("secret")
 	handler := srv.Authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

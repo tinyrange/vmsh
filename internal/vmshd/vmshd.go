@@ -362,6 +362,7 @@ type hostShellManager struct {
 
 type hostShell struct {
 	sessionID   string
+	cwd         string
 	cmd         *exec.Cmd
 	tty         *os.File
 	done        chan struct{}
@@ -1091,7 +1092,7 @@ func newHostShellManager() *hostShellManager {
 	return &hostShellManager{shells: map[string]*hostShell{}}
 }
 
-func (m *hostShellManager) Start(sessionID string, term *Terminal) (*hostShell, error) {
+func (m *hostShellManager) Start(sessionID, requestedCWD string, term *Terminal) (*hostShell, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return nil, fmt.Errorf("session id is required")
@@ -1105,6 +1106,10 @@ func (m *hostShellManager) Start(sessionID string, term *Terminal) (*hostShell, 
 	delete(m.shells, sessionID)
 	m.mu.Unlock()
 
+	cwd, err := verifiedHostShellCWD(requestedCWD)
+	if err != nil {
+		return nil, err
+	}
 	shellPath := hostShellCommand()
 	cmd := exec.Command(shellPath)
 	if runtime.GOOS != "windows" {
@@ -1113,6 +1118,7 @@ func (m *hostShellManager) Start(sessionID string, term *Terminal) (*hostShell, 
 		cmd.Args[0] = "-" + filepath.Base(shellPath)
 	}
 	configureHostShellCommand(cmd)
+	cmd.Dir = cwd
 	cmd.Env = append(os.Environ(), "VMSH_ACTIVE=1")
 	tty, err := pty.StartWithSize(cmd, terminalWinsize(term))
 	if err != nil {
@@ -1120,6 +1126,7 @@ func (m *hostShellManager) Start(sessionID string, term *Terminal) (*hostShell, 
 	}
 	shell := &hostShell{
 		sessionID:   sessionID,
+		cwd:         cwd,
 		cmd:         cmd,
 		tty:         tty,
 		done:        make(chan struct{}),
@@ -1141,6 +1148,33 @@ func (m *hostShellManager) Start(sessionID string, term *Terminal) (*hostShell, 
 		m.mu.Unlock()
 	}()
 	return shell, nil
+}
+
+func verifiedHostShellCWD(requested string) (string, error) {
+	cwd := strings.TrimSpace(requested)
+	if cwd == "" {
+		var err error
+		cwd, err = os.Getwd()
+		if err != nil {
+			return "", err
+		}
+	}
+	cwd, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", err
+	}
+	cwd, err = filepath.EvalSymlinks(cwd)
+	if err != nil {
+		return "", fmt.Errorf("resolve host shell cwd: %w", err)
+	}
+	info, err := os.Stat(cwd)
+	if err != nil {
+		return "", fmt.Errorf("validate host shell cwd: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("host shell cwd is not a directory: %s", cwd)
+	}
+	return cwd, nil
 }
 
 func (m *hostShellManager) Close(sessionID string) {
@@ -1284,14 +1318,6 @@ func hostShellCommand() string {
 	return "/bin/sh"
 }
 
-func currentWorkingDirectory() string {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return ""
-	}
-	return cwd
-}
-
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -1338,7 +1364,7 @@ func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 	if err := send(TerminalStreamMessage{Kind: "attached", Stream: &stream}); err != nil {
 		return
 	}
-	shell, err := s.shells.Start(session.ID, attachment.Terminal)
+	shell, err := s.shells.Start(session.ID, session.HostCWD, attachment.Terminal)
 	if err != nil {
 		_ = send(TerminalStreamMessage{Kind: "error"})
 		return
@@ -1348,7 +1374,7 @@ func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 		Kind:    "host",
 		Name:    "host",
 		Context: "host",
-		CWD:     firstNonEmpty(strings.TrimSpace(session.HostCWD), currentWorkingDirectory()),
+		CWD:     shell.cwd,
 		State:   "open",
 	})
 	go func(sessionID, cwd string) {
@@ -1361,7 +1387,7 @@ func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 			CWD:     cwd,
 			State:   "closed",
 		})
-	}(session.ID, firstNonEmpty(strings.TrimSpace(session.HostCWD), currentWorkingDirectory()))
+	}(session.ID, shell.cwd)
 	output, outputDone, unsubscribe := shell.Subscribe()
 	defer unsubscribe()
 	sendErr := make(chan error, 1)
