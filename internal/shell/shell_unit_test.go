@@ -817,6 +817,82 @@ func TestVMSHDSessionPublishUsesCurrentContext(t *testing.T) {
 	}
 }
 
+func TestVMSHDSessionPublicationRetriesNewestSnapshot(t *testing.T) {
+	var requests []vmshd.UpdateSessionRequest
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/sessions/sess_1", func(w http.ResponseWriter, r *http.Request) {
+		var req vmshd.UpdateSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode update request: %v", err)
+		}
+		requests = append(requests, req)
+		if len(requests) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(client.ErrorResponse{Error: "temporarily unavailable"})
+			return
+		}
+		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", State: "attached"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{Addr: strings.TrimPrefix(srv.URL, "http://"), TokenPath: tokenPath})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	reporter := &vmshdSessionReporter{client: httpClient, sessionID: "sess_1", context: commandContext{Mode: modeHost}}
+	first := []vmshd.JobSummary{{ID: 1, Status: "running"}}
+	if err := reporter.publish(first, nil, nil, nil, nil); err == nil || reporter.publicationError() == nil {
+		t.Fatal("failed publication was not retained")
+	}
+	newest := []vmshd.JobSummary{{ID: 1, Status: "done"}, {ID: 2, Status: "running"}}
+	if err := reporter.publish(newest, nil, nil, nil, nil); err != nil {
+		t.Fatalf("retry newest snapshot: %v", err)
+	}
+	if reporter.publicationError() != nil {
+		t.Fatalf("publication remains degraded: %v", reporter.publicationError())
+	}
+	if len(requests) != 2 || !reflect.DeepEqual(requests[1].Jobs, newest) {
+		t.Fatalf("published requests = %+v, want newest jobs %+v", requests, newest)
+	}
+}
+
+func TestVMSHDSessionCloseRefusesUnacknowledgedSnapshot(t *testing.T) {
+	var frontendCloses int
+	mux := http.NewServeMux()
+	mux.HandleFunc("PATCH /vmsh/sessions/sess_1", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(client.ErrorResponse{Error: "temporarily unavailable"})
+	})
+	mux.HandleFunc("DELETE /vmsh/frontends/fe_1", func(w http.ResponseWriter, r *http.Request) {
+		frontendCloses++
+		writeJSONForShellTest(w, vmshd.FrontendSummary{ID: "fe_1", State: "closed"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{Addr: strings.TrimPrefix(srv.URL, "http://"), TokenPath: tokenPath})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	reporter := &vmshdSessionReporter{client: httpClient, frontendID: "fe_1", sessionID: "sess_1", context: commandContext{Mode: modeHost}}
+	if err := reporter.publish([]vmshd.JobSummary{{ID: 1, Status: "running"}}, nil, nil, nil, nil); err == nil {
+		t.Fatal("publication unexpectedly succeeded")
+	}
+	if err := reporter.close(); err == nil {
+		t.Fatal("close unexpectedly accepted unacknowledged state")
+	}
+	if frontendCloses != 0 {
+		t.Fatalf("frontend closes = %d, want 0", frontendCloses)
+	}
+}
+
 func writeJSONForShellTest(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
