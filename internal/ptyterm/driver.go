@@ -1,6 +1,7 @@
 package ptyterm
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -53,6 +54,17 @@ func (d *Driver) Text(text string) error {
 	return d.Send(Input(text))
 }
 
+// Type writes text one rune at a time, following the same input path as
+// individual keyboard events. SetDelay can be used to pace the keystrokes.
+func (d *Driver) Type(text string) error {
+	for _, r := range text {
+		if err := d.Send(Input(string(r))); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (d *Driver) Key(key Key) error {
 	return d.Send(key.Input())
 }
@@ -73,6 +85,9 @@ func (d *Driver) Wait(ctx context.Context, predicate func(Snapshot) bool) (Snaps
 		if predicate(snap) {
 			return snap, nil
 		}
+		if snap.Exited {
+			return snap, fmt.Errorf("process exited before terminal condition (code %d): %s", snap.ExitCode, snap.ExitError)
+		}
 		select {
 		case <-ctx.Done():
 			return snap, ctx.Err()
@@ -89,6 +104,43 @@ func (d *Driver) WaitLine(ctx context.Context, text string) (Snapshot, error) {
 			}
 		}
 		return false
+	})
+}
+
+func (d *Driver) WaitLineExact(ctx context.Context, text string) (Snapshot, error) {
+	return d.Wait(ctx, func(snap Snapshot) bool {
+		for _, line := range append(append([]string{}, snap.History...), snap.Lines...) {
+			if line == text {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func (d *Driver) WaitTitle(ctx context.Context, title string) (Snapshot, error) {
+	return d.Wait(ctx, func(snap Snapshot) bool {
+		return snap.Title == title
+	})
+}
+
+func (d *Driver) WaitRaw(ctx context.Context, sequence []byte) (Snapshot, error) {
+	return d.Wait(ctx, func(snap Snapshot) bool {
+		return bytes.Contains(snap.RawTail, sequence)
+	})
+}
+
+func (d *Driver) WaitRawAfter(ctx context.Context, position int64, sequence []byte) (Snapshot, error) {
+	return d.Wait(ctx, func(snap Snapshot) bool {
+		tailStart := snap.BytesRead - int64(len(snap.RawTail))
+		start := position - tailStart
+		if start < 0 {
+			start = 0
+		}
+		if start > int64(len(snap.RawTail)) {
+			return false
+		}
+		return bytes.Contains(snap.RawTail[start:], sequence)
 	})
 }
 

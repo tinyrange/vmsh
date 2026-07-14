@@ -20,6 +20,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/tinyrange/vmsh/internal/backend"
+	"github.com/tinyrange/vmsh/internal/ptyterm"
 	"j5.nz/cc/client"
 )
 
@@ -407,6 +408,183 @@ func TestVMIntegrationInteractivePasteCopiesDirectoryMetadataHostToVMToHost(t *t
 	assertCopiedMetadataTree(t, src, dst)
 }
 
+func TestVMIntegrationInteractiveUIDrivesKeyboardAndRoutesCommands(t *testing.T) {
+	env := newVMIntegrationTestEnv(t)
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, ".zshrc"), nil, 0o600); err != nil {
+		t.Fatalf("create isolated zsh startup file: %v", err)
+	}
+
+	vmsh := buildVMIntegrationVMSH(t)
+	hostCWD := t.TempDir()
+	nestedCWD := filepath.Join(hostCWD, "nested")
+	if err := os.Mkdir(nestedCWD, 0o755); err != nil {
+		t.Fatalf("create nested UI cwd: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), vmIntegrationLongTimeout())
+	defer cancel()
+	session, err := ptyterm.Start(ctx, ptyterm.Options{
+		Command: []string{vmsh, "-ccvm", buildVMIntegrationCCVM(t), "-cache-dir", env.cacheDir},
+		Dir:     hostCWD,
+		Env: []string{
+			"HOME=" + home,
+			"SHELL=/bin/sh",
+			"TERM=xterm-256color",
+			"NO_COLOR=1",
+			"TERMUI_REDUCED_MOTION=1",
+			"CCX3_VM_BOOT_TIMEOUT=" + vmIntegrationTimeoutSeconds(),
+			"VMSH_VM_BOOT_TIMEOUT=" + vmIntegrationTimeoutSeconds(),
+		},
+		Size:         ptyterm.Size{Cols: 120, Rows: 30},
+		HistoryLimit: 500,
+	})
+	if err != nil {
+		t.Fatalf("start vmsh UI in PTY: %v", err)
+	}
+	defer session.Close()
+	driver := ptyterm.NewDriver(session)
+	driver.SetDelay(time.Millisecond)
+
+	waitUIRaw(t, ctx, driver, []byte("\x1b[?2004h"), session)
+	waitUITitle(t, ctx, driver, "vmsh host:"+filepath.Base(hostCWD), session)
+
+	typeUI(t, driver, "cd nestedd", session)
+	keyUI(t, driver, ptyterm.KeyBackspace, session)
+	position := enterUI(t, driver, session)
+	waitUITitle(t, ctx, driver, "vmsh host:nested", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
+	typeUI(t, driver, "printf 'VMSH_UI_CWD=%s\\n' \"$PWD\"", session)
+	position = enterUI(t, driver, session)
+	waitUILine(t, ctx, driver, "VMSH_UI_CWD="+nestedCWD, session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
+	typeUI(t, driver, "export VMSH_UI_VALUE=from-ui", session)
+	position = enterUI(t, driver, session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
+	typeUI(t, driver, "printf 'VMSH_UI_HOST=%s\\n' \"$VMSH_UI_VALUE\"", session)
+	keyUI(t, driver, ptyterm.KeyHome, session)
+	typeUI(t, driver, "@host ", session)
+	keyUI(t, driver, ptyterm.KeyEnd, session)
+	position = enterUI(t, driver, session)
+	waitUILine(t, ctx, driver, "VMSH_UI_HOST=from-ui", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
+	typeUI(t, driver, "@hos", session)
+	keyUI(t, driver, ptyterm.KeyTab, session)
+	typeUI(t, driver, " printf 'VMSH_UI_TAB=1\\n'", session)
+	position = enterUI(t, driver, session)
+	waitUILine(t, ctx, driver, "VMSH_UI_TAB=1", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
+	typeUI(t, driver, "pwd", session)
+	position = enterUI(t, driver, session)
+	waitUILineCount(t, ctx, driver, nestedCWD, 1, session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+	keyUI(t, driver, ptyterm.KeyUp, session)
+	position = enterUI(t, driver, session)
+	waitUILineCount(t, ctx, driver, nestedCWD, 2, session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
+	cancelledPath := filepath.Join(nestedCWD, ".vmsh-ui-cancelled")
+	typeUI(t, driver, "touch .vmsh-ui-cancelled", session)
+	position = session.Snapshot().BytesRead
+	inputUI(t, driver, ptyterm.Ctrl('c'), session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+	typeUI(t, driver, "test ! -e .vmsh-ui-cancelled && printf 'VMSH_UI_CANCELLED=1\\n'", session)
+	position = enterUI(t, driver, session)
+	waitUILine(t, ctx, driver, "VMSH_UI_CANCELLED=1", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+	if _, err := os.Stat(cancelledPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Ctrl-C input created cancelled marker: %v; %s", err, uiSnapshotSummary(session.Snapshot()))
+	}
+
+	inputUI(t, driver, ptyterm.Ctrl('d'), session)
+	if result := session.Wait(ctx); result.Err != nil || result.ExitCode != 0 {
+		t.Fatalf("vmsh UI exit = %+v; %s", result, uiSnapshotSummary(session.Snapshot()))
+	}
+}
+
+func typeUI(t *testing.T, driver *ptyterm.Driver, text string, session *ptyterm.Session) {
+	t.Helper()
+	if err := driver.Type(text); err != nil {
+		t.Fatalf("type vmsh UI input %q: %v; %s", text, err, uiSnapshotSummary(session.Snapshot()))
+	}
+}
+
+func keyUI(t *testing.T, driver *ptyterm.Driver, key ptyterm.Key, session *ptyterm.Session) {
+	t.Helper()
+	if err := driver.Key(key); err != nil {
+		t.Fatalf("send vmsh UI key %q: %v; %s", key, err, uiSnapshotSummary(session.Snapshot()))
+	}
+}
+
+func inputUI(t *testing.T, driver *ptyterm.Driver, input ptyterm.Input, session *ptyterm.Session) {
+	t.Helper()
+	if err := driver.Send(input); err != nil {
+		t.Fatalf("send vmsh UI input %q: %v; %s", input, err, uiSnapshotSummary(session.Snapshot()))
+	}
+}
+
+func enterUI(t *testing.T, driver *ptyterm.Driver, session *ptyterm.Session) int64 {
+	t.Helper()
+	position := session.Snapshot().BytesRead
+	keyUI(t, driver, ptyterm.KeyEnter, session)
+	return position
+}
+
+func waitUIRaw(t *testing.T, ctx context.Context, driver *ptyterm.Driver, sequence []byte, session *ptyterm.Session) {
+	t.Helper()
+	if _, err := driver.WaitRaw(ctx, sequence); err != nil {
+		t.Fatalf("wait for vmsh UI terminal sequence %q: %v; %s", sequence, err, uiSnapshotSummary(session.Snapshot()))
+	}
+}
+
+func waitUIPromptAfter(t *testing.T, ctx context.Context, driver *ptyterm.Driver, position int64, session *ptyterm.Session) {
+	t.Helper()
+	if _, err := driver.WaitRawAfter(ctx, position, []byte("\x1b[?2004h")); err != nil {
+		t.Fatalf("wait for vmsh UI editor after output byte %d: %v; %s", position, err, uiSnapshotSummary(session.Snapshot()))
+	}
+}
+
+func waitUITitle(t *testing.T, ctx context.Context, driver *ptyterm.Driver, title string, session *ptyterm.Session) {
+	t.Helper()
+	if _, err := driver.WaitTitle(ctx, title); err != nil {
+		t.Fatalf("wait for vmsh UI title %q: %v; %s", title, err, uiSnapshotSummary(session.Snapshot()))
+	}
+}
+
+func waitUILine(t *testing.T, ctx context.Context, driver *ptyterm.Driver, line string, session *ptyterm.Session) {
+	t.Helper()
+	if _, err := driver.WaitLineExact(ctx, line); err != nil {
+		t.Fatalf("wait for vmsh UI line %q: %v; %s", line, err, uiSnapshotSummary(session.Snapshot()))
+	}
+}
+
+func waitUILineCount(t *testing.T, ctx context.Context, driver *ptyterm.Driver, line string, count int, session *ptyterm.Session) {
+	t.Helper()
+	if _, err := driver.Wait(ctx, func(snap ptyterm.Snapshot) bool {
+		seen := 0
+		for _, got := range append(append([]string{}, snap.History...), snap.Lines...) {
+			if got == line {
+				seen++
+			}
+		}
+		return seen >= count
+	}); err != nil {
+		t.Fatalf("wait for %d vmsh UI lines %q: %v; %s", count, line, err, uiSnapshotSummary(session.Snapshot()))
+	}
+}
+
+func uiSnapshotSummary(snap ptyterm.Snapshot) string {
+	raw := snap.RawTail
+	if len(raw) > 2000 {
+		raw = raw[len(raw)-2000:]
+	}
+	return fmt.Sprintf("title=%q exited=%v code=%d lines=%q history=%q raw_tail=%q", snap.Title, snap.Exited, snap.ExitCode, snap.Lines, snap.History, raw)
+}
+
 func TestVMIntegrationManagesVMAndImages(t *testing.T) {
 	env := newVMIntegrationTestEnv(t)
 	sh := env.newShell(t)
@@ -645,14 +823,10 @@ func newVMIntegrationTestEnv(t *testing.T) *vmIntegrationTestEnv {
 	cacheDir := filepath.Join(cacheParent, "cache")
 	statePath := filepath.Join(cacheDir, "ccvm.json")
 	ccvm := buildVMIntegrationCCVM(t)
-	api, err := backend.ConnectCCVM(backend.CCVMLaunch{
-		Path: ccvm,
-		Env: []string{
-			"CCX3_OCI_SHARED_CACHE_DIR=" + filepath.Join(cacheDir, "oci-shared"),
-			"CCX3_VM_BOOT_TIMEOUT=" + bootTimeout,
-			"VMSH_VM_BOOT_TIMEOUT=" + bootTimeout,
-		},
-	}, cacheDir, statePath)
+	// Keep the daemon's launch identity identical to the real vmsh frontend so
+	// process-level UI tests reuse this daemon instead of starting a private one.
+	t.Setenv("CCX3_OCI_SHARED_CACHE_DIR", filepath.Join(cacheDir, "oci-shared"))
+	api, err := backend.ConnectCCVM(backend.CCVMLaunch{Path: ccvm}, cacheDir, statePath)
 	if err != nil {
 		t.Fatalf("start ccvm daemon: %v", err)
 	}

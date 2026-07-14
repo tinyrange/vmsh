@@ -132,33 +132,33 @@ func (e *Editor) readRune(first byte) (keyEvent, bool, error) {
 
 func (e *Editor) readEscape(ctx context.Context) (keyEvent, bool, error) {
 	seq := e.readAvailable(32, 2*time.Millisecond)
-	switch {
-	case seq == "[D" || seq == "OD":
-		return keyEvent{key: keyLeft}, true, nil
-	case seq == "[C" || seq == "OC":
-		return keyEvent{key: keyRight}, true, nil
-	case seq == "[A" || seq == "OA":
-		return keyEvent{key: keyUp}, true, nil
-	case seq == "[B" || seq == "OB":
-		return keyEvent{key: keyDown}, true, nil
-	case seq == "[H" || seq == "OH" || seq == "[1~":
-		return keyEvent{key: keyHome}, true, nil
-	case seq == "[F" || seq == "OF" || seq == "[4~":
-		return keyEvent{key: keyEnd}, true, nil
-	case seq == "[3~":
-		return keyEvent{key: keyDelete}, true, nil
-	case seq == "[5~":
-		return keyEvent{key: keyPageUp}, true, nil
-	case seq == "[6~":
-		return keyEvent{key: keyPageDown}, true, nil
-	case strings.HasPrefix(seq, "[200~"):
+	if strings.HasPrefix(seq, "[200~") {
 		text, err := e.readUntilPasteEnd(ctx, strings.TrimPrefix(seq, "[200~"))
 		return keyEvent{key: keyPaste, text: text}, true, err
-	case seq == "[201~":
-		return keyEvent{key: keyUnknown}, true, nil
-	default:
-		return keyEvent{key: keyEscape}, true, nil
 	}
+	for _, binding := range []struct {
+		key       key
+		sequences []string
+	}{
+		{key: keyLeft, sequences: []string{"[D", "OD"}},
+		{key: keyRight, sequences: []string{"[C", "OC"}},
+		{key: keyUp, sequences: []string{"[A", "OA"}},
+		{key: keyDown, sequences: []string{"[B", "OB"}},
+		{key: keyHome, sequences: []string{"[H", "OH", "[1~"}},
+		{key: keyEnd, sequences: []string{"[F", "OF", "[4~"}},
+		{key: keyDelete, sequences: []string{"[3~"}},
+		{key: keyPageUp, sequences: []string{"[5~"}},
+		{key: keyPageDown, sequences: []string{"[6~"}},
+		{key: keyUnknown, sequences: []string{"[201~"}},
+	} {
+		for _, sequence := range binding.sequences {
+			if strings.HasPrefix(seq, sequence) {
+				e.unreadBytes([]byte(strings.TrimPrefix(seq, sequence)))
+				return keyEvent{key: binding.key}, true, nil
+			}
+		}
+	}
+	return keyEvent{key: keyEscape}, true, nil
 }
 
 func (e *Editor) readAvailable(max int, quiet time.Duration) string {

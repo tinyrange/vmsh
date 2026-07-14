@@ -102,6 +102,32 @@ func TestReadLinePreparedWaitsForBracketedPasteEnd(t *testing.T) {
 	}
 }
 
+func TestReadLinePreparedPreservesTextAfterNavigationKeys(t *testing.T) {
+	out, err := os.CreateTemp("", "termui-editor-navigation-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(out.Name())
+	defer out.Close()
+	caps := terminal.Capabilities{Mode: terminal.ModeDynamicInteractive, Width: 80, Height: 24}
+	ed := New(Options{
+		In:           os.Stdin,
+		Out:          out,
+		Reader:       bytes.NewBufferString("tail\x1b[Hhead \x1b[F\n"),
+		Capabilities: &caps,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := ed.ReadLinePrepared(ctx, "> ")
+	if err != nil {
+		t.Fatalf("ReadLinePrepared: %v", err)
+	}
+	if got != "head tail" {
+		t.Fatalf("line = %q, want %q", got, "head tail")
+	}
+}
+
 type delayedReader struct {
 	first     []byte
 	second    []byte
