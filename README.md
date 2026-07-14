@@ -76,6 +76,7 @@ sh -lc 'uname -m && whoami'
   signs `ccvm` on macOS, and can launch the built `vmsh`.
 - `.github/workflows/release.yml`: tag-triggered single-binary releases for
   Linux, Windows, and signed macOS ARM64.
+- `docs/design`: accepted plans for cross-cutting vmsh features.
 
 ## Getting Started
 
