@@ -1207,6 +1207,12 @@ func Run(args []string) (retErr error) {
 	if err != nil {
 		return err
 	}
+	promptInput := os.Stdin
+	closePromptInput := func() {}
+	if *script == "" {
+		promptInput, closePromptInput = openPromptInput(os.Stdin)
+		defer closePromptInput()
+	}
 	initialContext := defaultContext(strings.TrimSpace(*vmID), strings.TrimSpace(*image), caps.SupportsNestedVirt)
 	sh := &shellState{
 		api:        api,
@@ -1224,16 +1230,16 @@ func Run(args []string) (retErr error) {
 		env:        map[string]string{},
 		aliases:    map[string]string{},
 		confirmPull: func(source string, stderr io.Writer) (bool, error) {
-			return promptPullConfirmation(os.Stdin, stderr, source)
+			return promptPullConfirmation(promptInput, stderr, source)
 		},
 		confirmVMRestart: func(id string, stderr io.Writer) (bool, error) {
-			return promptVMRestartConfirmation(os.Stdin, stderr, id)
+			return promptVMRestartConfirmation(promptInput, stderr, id)
 		},
 		confirmSSHHost: func(cfg resolvedSSHConfig, hostname string, remote net.Addr, key ssh.PublicKey) (bool, error) {
-			return promptSSHHostKeyConfirmation(os.Stdin, stderr, cfg, hostname, remote, key)
+			return promptSSHHostKeyConfirmation(promptInput, stderr, cfg, hostname, remote, key)
 		},
 		confirmExit: func(resources []exitResource, stderr io.Writer) (bool, error) {
-			return promptExitConfirmation(os.Stdin, stderr, resources)
+			return promptExitConfirmation(promptInput, stderr, resources)
 		},
 		confirmSystemd: func(stderr io.Writer) (bool, error) {
 			return promptSystemdUserUnitConfirmation(os.Stdin, stderr)
@@ -1241,10 +1247,10 @@ func Run(args []string) (retErr error) {
 		hasSystemdUser:     defaultSystemdUserAvailable,
 		installSystemdUser: installSystemdUserUnit,
 		sshPassword: func(cfg resolvedSSHConfig) (string, error) {
-			return promptSSHPassword(os.Stdin, stderr, cfg)
+			return promptSSHPassword(promptInput, stderr, cfg)
 		},
 		sshKeyboardAuth: func(cfg resolvedSSHConfig, name, instruction string, questions []string, echos []bool) ([]string, error) {
-			return promptSSHKeyboardInteractive(os.Stdin, stderr, cfg, name, instruction, questions, echos)
+			return promptSSHKeyboardInteractive(promptInput, stderr, cfg, name, instruction, questions, echos)
 		},
 		sshBanner: func(cfg resolvedSSHConfig, message string) error {
 			_, err := fmt.Fprint(stderr, message)
@@ -6618,18 +6624,35 @@ func (s *shellState) startGuestInputForwarding(tty, forwardStdin bool, inputs ch
 	return stopGuestInputForwarding(restore, func() {
 		close(done)
 		cancelRead()
-		producers.Wait()
-	}), nil
+	}, producers.Wait), nil
 }
 
-func stopGuestInputForwarding(restore func(), stopProducers func()) func() {
+func stopGuestInputForwarding(restore func(), cancelProducers func(), waitProducers func()) func() {
+	return stopPTYForwarding(restore, cancelProducers, waitProducers)
+}
+
+func stopPTYForwarding(restore func(), cancelProducers func(), waitProducers func()) func() {
+	var stopOnce sync.Once
 	return func() {
-		if stopProducers != nil {
-			stopProducers()
-		}
-		if restore != nil {
-			restore()
-		}
+		stopOnce.Do(func() {
+			if cancelProducers != nil {
+				cancelProducers()
+			}
+			if waitProducers != nil {
+				done := make(chan struct{})
+				go func() {
+					waitProducers()
+					close(done)
+				}()
+				select {
+				case <-done:
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+			if restore != nil {
+				restore()
+			}
+		})
 	}
 }
 
@@ -6773,15 +6796,10 @@ func (s *shellState) startHostPTYForwarding(tty bool, session *persistentHostShe
 		forwardHostPTYSignals(session.tty, done, tty, stdout, stderr, interrupted, onInterrupt...)
 	}()
 
-	var stopOnce sync.Once
-	stop := func() {
-		stopOnce.Do(func() {
-			close(done)
-			cancelRead()
-			producers.Wait()
-			restore()
-		})
-	}
+	stop := stopPTYForwarding(restore, func() {
+		close(done)
+		cancelRead()
+	}, producers.Wait)
 	return stop, interrupted, nil
 }
 
