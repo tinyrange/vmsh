@@ -29,6 +29,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/tinyrange/vmsh/internal/backend"
+	"github.com/tinyrange/vmsh/internal/group"
 	"github.com/tinyrange/vmsh/internal/ptymux"
 	"github.com/tinyrange/vmsh/internal/terminal"
 	"github.com/tinyrange/vmsh/internal/termui/editor"
@@ -59,6 +60,7 @@ const (
 )
 
 var userCacheDir = os.UserCacheDir
+var userConfigDir = os.UserConfigDir
 var execProcess = syscall.Exec
 
 type shellMode string
@@ -116,6 +118,8 @@ type shellState struct {
 	tmuxExec           func([]string) error
 	interruptSignals   <-chan os.Signal
 	evaluatingPaste    bool
+	groupName          string
+	groupSnapshot      *group.Snapshot
 }
 
 type shellExecRequest struct {
@@ -378,7 +382,7 @@ func (c *vmshCompleter) shellSSHSessionContext(name string) (commandContext, boo
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@agent", "@alias", "@copy", "@detach", "@exec", "@help", "@host", "@install", "@jobs", "@mux", "@permissions", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux", "@trust", "@version"}
+	words := []string{"@agent", "@alias", "@connect", "@copy", "@detach", "@exec", "@help", "@host", "@install", "@jobs", "@mux", "@permissions", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux", "@trust", "@version"}
 	if c.shell != nil {
 		for _, name := range c.shell.sshSessionNames() {
 			words = append(words, "@"+name)
@@ -3320,6 +3324,11 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("usage: @permissions [VM]")
 		}
 		return s.printPermissions(strings.TrimSpace(at.Command), stdout)
+	case "connect":
+		if len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @connect <group|local>")
+		}
+		return s.connectGroup(strings.TrimSpace(at.Command), stdout)
 	case "exec":
 		if len(at.Options.OptionFields) != 0 {
 			return fmt.Errorf("usage: @exec [cmd]")
@@ -9051,6 +9060,11 @@ func (s *shellState) drawPromptStatus(stdout io.Writer) {
 }
 
 func (s *shellState) printStatus(w io.Writer) error {
+	if s.groupSnapshot != nil {
+		if _, err := fmt.Fprintf(w, "group: %s id=%s generation=%d nodes=%d unavailable=%d\n", s.groupName, s.groupSnapshot.GroupID, s.groupSnapshot.Generation, len(s.groupSnapshot.Inventories), len(s.groupSnapshot.Unavailable)); err != nil {
+			return err
+		}
+	}
 	chain := s.activeContextChain()
 	if _, err := fmt.Fprintln(w, "context chain:"); err != nil {
 		return err
@@ -9376,7 +9390,53 @@ func (s *shellState) printVMs(w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	return s.printSessionTree(w, states, s.sshSessionStates(), s.sshConnectionStates())
+	if err := s.printSessionTree(w, states, s.sshSessionStates(), s.sshConnectionStates()); err != nil {
+		return err
+	}
+	if s.groupSnapshot == nil {
+		return nil
+	}
+	for _, node := range s.groupSnapshot.Inventories {
+		for _, state := range node.Inventory.VMs {
+			if _, err := fmt.Fprintf(w, "%s/%s vm %s\n", node.Node.Name, firstNonEmpty(strings.TrimSpace(state.ID), "default"), emptyText(state.Status, "unknown")); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *shellState) connectGroup(name string, w io.Writer) error {
+	if name == "" {
+		return fmt.Errorf("usage: @connect <group|local>")
+	}
+	if name == "local" || name == "-d" {
+		s.groupName = ""
+		s.groupSnapshot = nil
+		return nil
+	}
+	for _, char := range name {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '-' || char == '_' {
+			continue
+		}
+		return fmt.Errorf("group name must contain only URL-safe characters")
+	}
+	configRoot, err := userConfigDir()
+	if err != nil {
+		return fmt.Errorf("resolve user config directory: %w", err)
+	}
+	config, err := group.LoadClientConfig(filepath.Join(configRoot, "vmsh", "groups", name, "frontend.json"))
+	if err != nil {
+		return err
+	}
+	snapshot, err := group.Fetch(context.Background(), config)
+	if err != nil {
+		return err
+	}
+	s.groupName = name
+	s.groupSnapshot = &snapshot
+	_, err = fmt.Fprintf(w, "connected to %s (%d available, %d unavailable)\n", name, len(snapshot.Inventories), len(snapshot.Unavailable))
+	return err
 }
 
 func (s *shellState) changeTrust(command string, w io.Writer) error {
@@ -10129,10 +10189,11 @@ func (s *shellState) help(w io.Writer) error {
 @<image> [opts] [cmd]    select/create the default system for an image, or run cmd in it
 @<name> --from SOURCE    create/select a named system from image, library/image, or ssh:host
 @host [cmd]              run cmd on the host, or make host current if cmd is omitted
-@ssh [--from origin] HOST [cmd]  connect from host by default; origin may be @host, current, a VM, or an SSH session
-@trust VM --grant PROFILE  attach a profile-bound host-call gateway to a stable VM
-@trust VM --revoke PROFILE revoke the VM grant immediately
-@permissions [VM]       show trusted-context grants
+	@connect GROUP           activate read-only inventory from an enrolled group; use local to deactivate
+	@ssh [--from origin] HOST [cmd]  connect from host by default; origin may be @host, current, a VM, or an SSH session
+	@trust VM --grant PROFILE  attach a profile-bound host-call gateway to a stable VM
+	@trust VM --revoke PROFILE revoke the VM grant immediately
+	@permissions [VM]       show trusted-context grants
 @ [opts] [cmd]           update or use the current context
 @sudo [cmd]              open a root VM subshell, or run cmd as root in the current VM
 @exec [cmd]              replace vmsh with your normal shell, or exec cmd on the host
