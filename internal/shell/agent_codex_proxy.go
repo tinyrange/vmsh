@@ -28,6 +28,14 @@ const (
 	codexAgentProxyChatGPTBase = "https://chatgpt.com/backend-api/codex"
 	codexAgentProxyRefreshURL  = "https://auth.openai.com/oauth/token"
 	codexAgentProxyClientID    = "app_EMoamEEZ73f0CkXaXp7hrann"
+
+	// Codex requests are buffered so an authentication refresh can replay them.
+	// This is comfortably above the protocol's normal JSON payloads while keeping
+	// an untrusted guest from turning replay support into unbounded host memory.
+	codexAgentProxyMaxRequestBytes = 64 << 20
+	// Match the existing two-minute Codex request budget, but apply it only until
+	// response headers arrive so valid streaming responses remain unbounded.
+	codexAgentProxyResponseHeaderTimeout = 2 * time.Minute
 )
 
 var (
@@ -38,10 +46,11 @@ var (
 )
 
 type codexAgentProxy struct {
-	server *http.Server
-	ln     net.Listener
-	token  string
-	auth   *codexAgentProxyAuthStore
+	server          *http.Server
+	ln              net.Listener
+	token           string
+	auth            *codexAgentProxyAuthStore
+	maxRequestBytes int64
 }
 
 type codexAgentProxyAuthStore struct {
@@ -159,9 +168,18 @@ func (p *codexAgentProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	body, err := io.ReadAll(r.Body)
+	maxRequestBytes := p.maxRequestBytes
+	if maxRequestBytes <= 0 {
+		maxRequestBytes = codexAgentProxyMaxRequestBytes
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
 	if err != nil {
 		debugCodexAgentProxyf(requestID, "read request body failed method=%s path=%s err=%v", r.Method, r.URL.Path, err)
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "read request body", http.StatusBadRequest)
 		return
 	}
@@ -538,12 +556,17 @@ func (w codexAgentProxyFlushWriter) Write(p []byte) (int, error) {
 }
 
 func codexAgentProxyRoundTripper() http.RoundTripper {
+	return codexAgentProxyRoundTripperWithResponseHeaderTimeout(codexAgentProxyResponseHeaderTimeout)
+}
+
+func codexAgentProxyRoundTripperWithResponseHeaderTimeout(timeout time.Duration) http.RoundTripper {
 	transport, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
 		return http.DefaultTransport
 	}
 	clone := transport.Clone()
 	clone.DisableCompression = true
+	clone.ResponseHeaderTimeout = timeout
 	return clone
 }
 
