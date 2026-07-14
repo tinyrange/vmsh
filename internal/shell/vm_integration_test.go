@@ -549,6 +549,150 @@ func TestVMIntegrationInteractiveUIDrivesKeyboardAndRoutesCommands(t *testing.T)
 	}
 }
 
+func TestVMIntegrationInteractiveUIRoutesCommandsAcrossVMs(t *testing.T) {
+	env := newVMIntegrationTestEnv(t)
+	for _, id := range []string{"ui-linux", "freebsd"} {
+		id := id
+		t.Cleanup(func() { _ = env.api.ShutdownInstanceWithID(id) })
+	}
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, ".zshrc"), nil, 0o600); err != nil {
+		t.Fatalf("create isolated zsh startup file: %v", err)
+	}
+	hostCWD := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), vmIntegrationLongTimeout())
+	defer cancel()
+	session, err := ptyterm.Start(ctx, ptyterm.Options{
+		Command: []string{buildVMIntegrationVMSH(t), "-ccvm", buildVMIntegrationCCVM(t), "-cache-dir", env.cacheDir},
+		Dir:     hostCWD,
+		Env: []string{
+			"HOME=" + home,
+			"SHELL=/bin/sh",
+			"TERM=xterm-256color",
+			"NO_COLOR=1",
+			"TERMUI_REDUCED_MOTION=1",
+			"CCX3_VM_BOOT_TIMEOUT=" + vmIntegrationTimeoutSeconds(),
+			"VMSH_VM_BOOT_TIMEOUT=" + vmIntegrationTimeoutSeconds(),
+		},
+		Size:         ptyterm.Size{Cols: 120, Rows: 30},
+		HistoryLimit: 1000,
+	})
+	if err != nil {
+		t.Fatalf("start vmsh cross-VM UI in PTY: %v", err)
+	}
+	defer session.Close()
+	driver := ptyterm.NewDriver(session)
+	driver.SetDelay(time.Millisecond)
+	waitUIRaw(t, ctx, driver, []byte("\x1b[?2004h"), session)
+
+	typeUI(t, driver, "@ui-linux --from "+env.image+" --memory 768 --cpus 1 --no-network", session)
+	position := enterUI(t, driver, session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+	typeUI(t, driver, "printf 'VMSH_UI_LINUX=%s:%s\\n' \"$(uname -s)\" \"$(id -u)\"", session)
+	position = enterUI(t, driver, session)
+	waitUILine(t, ctx, driver, "VMSH_UI_LINUX=Linux:1000", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+	typeUI(t, driver, "export VMSH_UI_GUEST_STATE=linux", session)
+	position = enterUI(t, driver, session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+	typeUI(t, driver, "printf 'VMSH_UI_LINUX_STATE=%s\\n' \"$VMSH_UI_GUEST_STATE\"", session)
+	position = enterUI(t, driver, session)
+	waitUILine(t, ctx, driver, "VMSH_UI_LINUX_STATE=linux", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
+	driver.SetDelay(0)
+	position = session.Snapshot().BytesRead
+	inputUI(t, driver, ptyterm.Input("\x1b[99~printf 'VMSH_UI_LINUX_ESCAPE_TAIL=1\\n'\r"), session)
+	waitUILine(t, ctx, driver, "VMSH_UI_LINUX_ESCAPE_TAIL=1", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
+	position = session.Snapshot().BytesRead
+	inputUI(t, driver, ptyterm.Input("\x1b[200~printf 'VMSH_UI_LINUX_PASTE_ONE=1\\n'\nprintf 'VMSH_UI_LINUX_PASTE_TWO=2\\n'\x1b[201~\r"), session)
+	waitUILine(t, ctx, driver, "VMSH_UI_LINUX_PASTE_ONE=1", session)
+	waitUILine(t, ctx, driver, "VMSH_UI_LINUX_PASTE_TWO=2", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
+	typeUI(t, driver, "printf 'VMSH_UI_LINUX_UTF8=%s\\n' 'éX界'", session)
+	for range 3 {
+		keyUI(t, driver, ptyterm.KeyLeft, session)
+	}
+	keyUI(t, driver, ptyterm.KeyDelete, session)
+	keyUI(t, driver, ptyterm.KeyEnd, session)
+	position = enterUI(t, driver, session)
+	waitUILine(t, ctx, driver, "VMSH_UI_LINUX_UTF8=é界", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
+	typeUI(t, driver, "sh -c 'printf \"VMSH_UI_LINUX_RUNNING=1\\n\"; sleep 30; touch /tmp/vmsh-ui-linux-completed'", session)
+	enterUI(t, driver, session)
+	waitUILine(t, ctx, driver, "VMSH_UI_LINUX_RUNNING=1", session)
+	position = session.Snapshot().BytesRead
+	inputUI(t, driver, ptyterm.Ctrl('c'), session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+	typeUI(t, driver, "test ! -e /tmp/vmsh-ui-linux-completed && printf 'VMSH_UI_LINUX_INTERRUPTED=1\\n'", session)
+	position = enterUI(t, driver, session)
+	waitUILine(t, ctx, driver, "VMSH_UI_LINUX_INTERRUPTED=1", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
+	typeUI(t, driver, "@host", session)
+	position = enterUI(t, driver, session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+	typeUI(t, driver, "printf 'VMSH_UI_BACK_ON_HOST=1\\n'", session)
+	position = enterUI(t, driver, session)
+	waitUILine(t, ctx, driver, "VMSH_UI_BACK_ON_HOST=1", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
+	if os.Getenv("VMSH_TEST_FREEBSD") != "" {
+		typeUI(t, driver, "@freebsd --memory 1024 --cpus 1", session)
+		position = enterUI(t, driver, session)
+		waitUIPromptAfter(t, ctx, driver, position, session)
+		typeUI(t, driver, "printf 'VMSH_UI_FREEBSD=%s:%s\\n' \"$(uname -s)\" \"$(id -u)\"", session)
+		position = enterUI(t, driver, session)
+		waitUILine(t, ctx, driver, "VMSH_UI_FREEBSD=FreeBSD:0", session)
+		waitUIPromptAfter(t, ctx, driver, position, session)
+		typeUI(t, driver, "export VMSH_UI_GUEST_STATE=freebsd", session)
+		position = enterUI(t, driver, session)
+		waitUIPromptAfter(t, ctx, driver, position, session)
+		typeUI(t, driver, "printf 'VMSH_UI_FREEBSD_STATE=%s\\n' \"$VMSH_UI_GUEST_STATE\"", session)
+		position = enterUI(t, driver, session)
+		waitUILine(t, ctx, driver, "VMSH_UI_FREEBSD_STATE=freebsd", session)
+		waitUIPromptAfter(t, ctx, driver, position, session)
+
+		typeUI(t, driver, "sh -c 'printf \"VMSH_UI_FREEBSD_RUNNING=1\\n\"; sleep 30; touch /tmp/vmsh-ui-freebsd-completed'", session)
+		enterUI(t, driver, session)
+		waitUILine(t, ctx, driver, "VMSH_UI_FREEBSD_RUNNING=1", session)
+		position = session.Snapshot().BytesRead
+		inputUI(t, driver, ptyterm.Ctrl('c'), session)
+		waitUIPromptAfter(t, ctx, driver, position, session)
+		typeUI(t, driver, "test ! -e /tmp/vmsh-ui-freebsd-completed && printf 'VMSH_UI_FREEBSD_INTERRUPTED=1\\n'", session)
+		position = enterUI(t, driver, session)
+		waitUILine(t, ctx, driver, "VMSH_UI_FREEBSD_INTERRUPTED=1", session)
+		waitUIPromptAfter(t, ctx, driver, position, session)
+	}
+
+	typeUI(t, driver, "@host", session)
+	position = enterUI(t, driver, session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+	for _, id := range []string{"ui-linux", "freebsd"} {
+		if id == "freebsd" && os.Getenv("VMSH_TEST_FREEBSD") == "" {
+			continue
+		}
+		typeUI(t, driver, "@stop "+id, session)
+		position = enterUI(t, driver, session)
+		waitUIPromptAfter(t, ctx, driver, position, session)
+		state, err := env.api.InstanceStatusOf(id)
+		if err != nil {
+			t.Fatalf("status of %s after UI stop: %v", id, err)
+		}
+		if state.Status != "stopped" {
+			t.Fatalf("status of %s after UI stop = %q, want stopped", id, state.Status)
+		}
+	}
+	inputUI(t, driver, ptyterm.Ctrl('d'), session)
+	if result := session.Wait(ctx); result.Err != nil || result.ExitCode != 0 {
+		t.Fatalf("cross-VM vmsh UI exit = %+v; %s", result, uiSnapshotSummary(session.Snapshot()))
+	}
+}
+
 func typeUI(t *testing.T, driver *ptyterm.Driver, text string, session *ptyterm.Session) {
 	t.Helper()
 	if err := driver.Type(text); err != nil {
