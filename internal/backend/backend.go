@@ -162,11 +162,7 @@ func EnsureStableVMSHDCopy(exePath, cacheDir string) (string, error) {
 }
 
 func replaceFile(src, dst string) error {
-	if err := os.Rename(src, dst); err == nil {
-		return nil
-	}
-	_ = os.Remove(dst)
-	return os.Rename(src, dst)
+	return platformReplaceFile(src, dst)
 }
 
 func sameFileContents(a, b string) bool {
