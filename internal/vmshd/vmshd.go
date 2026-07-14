@@ -78,6 +78,7 @@ type Session struct {
 	Jobs            []JobSummary       `json:"jobs,omitempty"`
 	Copies          []CopySummary      `json:"copies,omitempty"`
 	Attachments     []ClientAttachment `json:"attached_clients"`
+	Cleanup         *CleanupStatus     `json:"cleanup,omitempty"`
 	CreatedAt       time.Time          `json:"created_at"`
 	UpdatedAt       time.Time          `json:"updated_at"`
 }
@@ -98,8 +99,25 @@ type SessionSummary struct {
 	Jobs            []JobSummary       `json:"jobs,omitempty"`
 	Copies          []CopySummary      `json:"copies,omitempty"`
 	AttachedClients []ClientAttachment `json:"attached_clients"`
+	Cleanup         *CleanupStatus     `json:"cleanup,omitempty"`
 	CreatedAt       time.Time          `json:"created_at"`
 	UpdatedAt       time.Time          `json:"updated_at"`
+}
+
+type CleanupStatus struct {
+	Attempts  int                `json:"attempts"`
+	Failures  []VMCleanupFailure `json:"failures"`
+	UpdatedAt time.Time          `json:"updated_at"`
+}
+
+type VMCleanupFailure struct {
+	VMID  string `json:"vm_id"`
+	Error string `json:"error"`
+}
+
+type CleanupErrorResponse struct {
+	Error    string    `json:"error"`
+	Sessions []Session `json:"sessions"`
 }
 
 type SessionContext struct {
@@ -495,7 +513,11 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			writeSessionError(w, err)
 			return
 		}
-		s.finishSessionCleanups(cleanups, runtime)
+		failed := s.finishSessionCleanups(cleanups, runtime)
+		if len(failed) != 0 {
+			writeJSON(w, http.StatusConflict, CleanupErrorResponse{Error: "frontend closed with pending session cleanup", Sessions: failed})
+			return
+		}
 		s.events.Publish(Event{Kind: "frontend_closed", Frontend: &frontend})
 		writeJSON(w, http.StatusOK, frontend)
 	})
@@ -545,15 +567,17 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 		writeJSON(w, http.StatusOK, session)
 	})
 	mux.HandleFunc("DELETE /vmsh/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
-		session, jobIDs, ok := s.registry.Delete(r.PathValue("id"))
+		session, jobIDs, ok := s.registry.BeginDelete(r.PathValue("id"))
 		if !ok {
 			writeJSON(w, http.StatusNotFound, client.ErrorResponse{Error: "session not found"})
 			return
 		}
-		s.jobs.Cancel(jobIDs)
-		s.shells.Close(session.ID)
-		s.events.Publish(Event{Kind: "session_deleted", Session: &session})
-		writeJSON(w, http.StatusOK, session)
+		result := s.finishSessionCleanup(sessionCleanup{Session: session, JobIDs: jobIDs, VMIDs: sessionVMIDs(session)}, runtime)
+		if result.State == "cleanup_failed" {
+			writeJSON(w, http.StatusConflict, CleanupErrorResponse{Error: "session cleanup failed", Sessions: []Session{result}})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("POST /vmsh/sessions/{id}/attach", func(w http.ResponseWriter, r *http.Request) {
 		var req AttachSessionRequest
@@ -649,18 +673,33 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 	})
 }
 
-func (s *Server) finishSessionCleanups(cleanups []sessionCleanup, runtime ccvmd.RuntimeView) {
+func (s *Server) finishSessionCleanups(cleanups []sessionCleanup, runtime ccvmd.RuntimeView) []Session {
+	var failed []Session
 	for _, cleanup := range cleanups {
-		s.jobs.Cancel(cleanup.JobIDs)
-		s.shells.Close(cleanup.Session.ID)
-		for _, vmID := range cleanup.VMIDs {
-			if err := runtimeShutdownInstance(runtime, vmID); err != nil {
-				continue
-			}
+		result := s.finishSessionCleanup(cleanup, runtime)
+		if result.State == "cleanup_failed" {
+			failed = append(failed, result)
 		}
-		session := cleanup.Session
-		s.events.Publish(Event{Kind: "session_deleted", Session: &session})
 	}
+	return failed
+}
+
+func (s *Server) finishSessionCleanup(cleanup sessionCleanup, runtime ccvmd.RuntimeView) Session {
+	s.jobs.Cancel(cleanup.JobIDs)
+	s.shells.Close(cleanup.Session.ID)
+	failures := make([]VMCleanupFailure, 0)
+	for _, vmID := range cleanup.VMIDs {
+		if err := runtimeShutdownInstance(runtime, vmID); err != nil {
+			failures = append(failures, VMCleanupFailure{VMID: vmID, Error: err.Error()})
+		}
+	}
+	session, complete := s.registry.FinishDelete(cleanup.Session.ID, failures)
+	if complete {
+		s.events.Publish(Event{Kind: "session_deleted", Session: &session})
+	} else {
+		s.events.Publish(Event{Kind: "session_cleanup_failed", Session: &session})
+	}
+	return session
 }
 
 func (s *Server) startJob(sessionID string, req StartHostJobRequest, runtime ccvmd.RuntimeView) (JobSummary, error) {
@@ -1657,9 +1696,7 @@ func (r *sessionRegistry) CloseFrontend(id string) (FrontendSummary, []sessionCl
 				JobIDs:  r.jobIDsLocked(sessionID),
 				VMIDs:   sessionVMIDs(session),
 			})
-			delete(r.sessions, sessionID)
-			delete(r.jobs, sessionID)
-			delete(r.hostShells, sessionID)
+			r.sessions[sessionID] = session
 			continue
 		}
 		if session.FrontendID == id {
@@ -1812,7 +1849,7 @@ func (r *sessionRegistry) Update(id string, req UpdateSessionRequest) (Session, 
 	return cloneSession(session), nil
 }
 
-func (r *sessionRegistry) Delete(id string) (Session, []int, bool) {
+func (r *sessionRegistry) BeginDelete(id string) (Session, []int, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	id = strings.TrimSpace(id)
@@ -1826,10 +1863,47 @@ func (r *sessionRegistry) Delete(id string) (Session, []int, bool) {
 	session.State = "closing"
 	session.UpdatedAt = time.Now()
 	jobIDs := r.jobIDsLocked(id)
-	delete(r.sessions, id)
-	delete(r.jobs, id)
-	delete(r.hostShells, id)
+	r.sessions[id] = session
 	return cloneSession(session), jobIDs, true
+}
+
+func (r *sessionRegistry) FinishDelete(id string, failures []VMCleanupFailure) (Session, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id = strings.TrimSpace(id)
+	session, ok := r.sessions[id]
+	if !ok {
+		return Session{}, true
+	}
+	if len(failures) == 0 {
+		session.State = "closing"
+		session.UpdatedAt = time.Now()
+		delete(r.sessions, id)
+		delete(r.jobs, id)
+		delete(r.hostShells, id)
+		return cloneSession(session), true
+	}
+	failed := make(map[string]bool, len(failures))
+	for _, failure := range failures {
+		failed[failure.VMID] = true
+	}
+	refs := make([]VMRef, 0, len(failures))
+	for _, ref := range session.VMRefs {
+		vmID := firstNonEmpty(strings.TrimSpace(ref.BackendID), strings.TrimSpace(ref.ID))
+		if failed[vmID] {
+			refs = append(refs, ref)
+		}
+	}
+	attempts := 1
+	if session.Cleanup != nil {
+		attempts = session.Cleanup.Attempts + 1
+	}
+	session.VMRefs = refs
+	session.State = "cleanup_failed"
+	session.Cleanup = &CleanupStatus{Attempts: attempts, Failures: append([]VMCleanupFailure(nil), failures...), UpdatedAt: time.Now()}
+	session.UpdatedAt = session.Cleanup.UpdatedAt
+	r.sessions[id] = session
+	return cloneSession(session), false
 }
 
 func markDaemonJobsCanceling(jobs []JobSummary) {
@@ -2018,6 +2092,7 @@ func (r *sessionRegistry) List() []SessionSummary {
 			Jobs:            cloneJobSummaries(session.Jobs),
 			Copies:          cloneCopySummaries(session.Copies),
 			AttachedClients: cloneAttachments(session.Attachments),
+			Cleanup:         cloneCleanupStatus(session.Cleanup),
 			CreatedAt:       session.CreatedAt,
 			UpdatedAt:       session.UpdatedAt,
 		})
@@ -2198,7 +2273,17 @@ func cloneSession(session Session) Session {
 	session.SSHShells = cloneShellHandles(session.SSHShells)
 	session.Jobs = cloneJobSummaries(session.Jobs)
 	session.Copies = cloneCopySummaries(session.Copies)
+	session.Cleanup = cloneCleanupStatus(session.Cleanup)
 	return session
+}
+
+func cloneCleanupStatus(status *CleanupStatus) *CleanupStatus {
+	if status == nil {
+		return nil
+	}
+	cloned := *status
+	cloned.Failures = append([]VMCleanupFailure(nil), status.Failures...)
+	return &cloned
 }
 
 func cloneAttachments(attachments []ClientAttachment) []ClientAttachment {

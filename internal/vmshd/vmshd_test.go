@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -529,6 +531,89 @@ func TestFrontendCloseCleansEphemeralSessionsAndKeepsPersistedSessions(t *testin
 	}
 	if srv.jobs.CancelOne(job.ID) {
 		t.Fatalf("daemon job was not canceled during frontend cleanup")
+	}
+}
+
+func TestSessionDeleteRetainsFailedVMOwnershipForRetry(t *testing.T) {
+	srv := NewServer("secret")
+	session := mustCreateRegistrySession(t, srv.registry, "main")
+	if _, err := srv.registry.Update(session.ID, UpdateSessionRequest{VMRefs: []VMRef{
+		{ID: "one", BackendID: "vm-one"},
+		{ID: "two", BackendID: "vm-two"},
+	}}); err != nil {
+		t.Fatalf("add VM refs: %v", err)
+	}
+
+	var shutdowns []string
+	failTwo := true
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, fakeRuntimeView{shutdown: func(_ context.Context, id string) error {
+		shutdowns = append(shutdowns, id)
+		if id == "vm-two" && failTwo {
+			return errors.New("backend unavailable")
+		}
+		return nil
+	}})
+
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/vmsh/sessions/"+session.ID, nil))
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("first delete status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var cleanupErr CleanupErrorResponse
+	if err := json.NewDecoder(rr.Body).Decode(&cleanupErr); err != nil {
+		t.Fatalf("decode cleanup failure: %v", err)
+	}
+	if len(cleanupErr.Sessions) != 1 || cleanupErr.Sessions[0].State != "cleanup_failed" || cleanupErr.Sessions[0].Cleanup == nil {
+		t.Fatalf("cleanup response = %+v", cleanupErr)
+	}
+	pending := cleanupErr.Sessions[0]
+	if pending.Cleanup.Attempts != 1 || len(pending.Cleanup.Failures) != 1 || pending.Cleanup.Failures[0].VMID != "vm-two" || len(pending.VMRefs) != 1 || pending.VMRefs[0].BackendID != "vm-two" {
+		t.Fatalf("pending cleanup = %+v", pending)
+	}
+	stored, ok := srv.registry.Get(session.ID)
+	if !ok || stored.State != "cleanup_failed" || len(stored.VMRefs) != 1 || stored.VMRefs[0].BackendID != "vm-two" {
+		t.Fatalf("stored cleanup tombstone = %+v, exists=%v", stored, ok)
+	}
+
+	failTwo = false
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/vmsh/sessions/"+session.ID, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("retry delete status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if _, ok := srv.registry.Get(session.ID); ok {
+		t.Fatal("session ownership remains after confirmed shutdown")
+	}
+	wantShutdowns := []string{"vm-one", "vm-two", "vm-two"}
+	if !reflect.DeepEqual(shutdowns, wantShutdowns) {
+		t.Fatalf("shutdowns = %v, want %v", shutdowns, wantShutdowns)
+	}
+}
+
+func TestFrontendCloseRetainsSessionWhenVMShutdownFails(t *testing.T) {
+	srv := NewServer("secret")
+	frontend := srv.registry.RegisterFrontend(RegisterFrontendRequest{Name: "vmsh"})
+	session, err := srv.registry.Create(CreateSessionRequest{Name: "ephemeral", FrontendID: frontend.ID, Scope: "frontend"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := srv.registry.Update(session.ID, UpdateSessionRequest{VMRefs: []VMRef{{ID: "dev", BackendID: "dev-isolated"}}}); err != nil {
+		t.Fatalf("add VM ref: %v", err)
+	}
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, fakeRuntimeView{shutdown: func(context.Context, string) error {
+		return errors.New("backend unavailable")
+	}})
+
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/vmsh/frontends/"+frontend.ID, nil))
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("frontend close status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	pending, ok := srv.registry.Get(session.ID)
+	if !ok || pending.State != "cleanup_failed" || pending.Cleanup == nil || len(pending.VMRefs) != 1 || pending.VMRefs[0].BackendID != "dev-isolated" {
+		t.Fatalf("pending frontend cleanup = %+v, exists=%v", pending, ok)
 	}
 }
 
