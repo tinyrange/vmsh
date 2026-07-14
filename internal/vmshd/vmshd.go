@@ -1888,9 +1888,8 @@ func (r *sessionRegistry) CloseFrontend(id string) (FrontendSummary, []sessionCl
 		}
 		if session.FrontendID == id {
 			session.FrontendID = ""
-			if session.Scope == "system" {
-				session.DetachOnClose = true
-			}
+			session.Scope = "system"
+			session.DetachOnClose = true
 			changed = true
 		}
 		if len(session.Attachments) != 0 {
@@ -1953,6 +1952,9 @@ func (r *sessionRegistry) Create(req CreateSessionRequest) (Session, error) {
 		}
 	}
 	scope := normalizeSessionScope(req.Scope, frontendID)
+	if scope == "frontend" && frontendID == "" {
+		return Session{}, sessionError{status: http.StatusBadRequest, err: "frontend-scoped session requires a live frontend owner"}
+	}
 	detachOnClose := scope == "system"
 	if req.DetachOnClose != nil {
 		detachOnClose = *req.DetachOnClose
@@ -2179,6 +2181,13 @@ func (r *sessionRegistry) Persist(id string, req PersistSessionRequest) (Session
 	}
 	if scope != "system" && scope != "frontend" {
 		return Session{}, sessionError{status: http.StatusBadRequest, err: "unsupported session scope"}
+	}
+	if scope == "frontend" {
+		frontendID := strings.TrimSpace(session.FrontendID)
+		frontend, ok := r.frontends[frontendID]
+		if frontendID == "" || !ok || frontend.State != "open" {
+			return Session{}, sessionError{status: http.StatusBadRequest, err: "frontend-scoped session requires a live frontend owner"}
+		}
 	}
 	session.Scope = scope
 	session.DetachOnClose = scope == "system"
