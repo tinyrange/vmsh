@@ -1509,7 +1509,7 @@ func (s *shellState) sshHostKeyCallback(cfg resolvedSSHConfig) (ssh.HostKeyCallb
 		case "yes", "on":
 			return err
 		case "accept-new":
-			return addSSHKnownHost(hostname, key)
+			return addSSHKnownHost(hostname, remote, key)
 		}
 		if s.confirmSSHHost == nil {
 			return err
@@ -1521,25 +1521,48 @@ func (s *shellState) sshHostKeyCallback(cfg resolvedSSHConfig) (ssh.HostKeyCallb
 		if !ok {
 			return fmt.Errorf("ssh host key rejected for %s", hostname)
 		}
-		return addSSHKnownHost(hostname, key)
+		return addSSHKnownHost(hostname, remote, key)
 	}, nil
 }
 
-func addSSHKnownHost(hostname string, key ssh.PublicKey) error {
+func addSSHKnownHost(hostname string, remote net.Addr, key ssh.PublicKey) error {
 	file := sshUserKnownHostsPath()
 	if file == "" {
 		return fmt.Errorf("no writable SSH known_hosts path configured")
 	}
+	return addSSHKnownHostFile(file, hostname, remote, key)
+}
+
+func addSSHKnownHostFile(file, hostname string, remote net.Addr, key ssh.PublicKey) error {
 	if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(file, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	_, err = fmt.Fprintln(f, knownhosts.Line([]string{hostname}, key))
-	return err
+	return withSSHKnownHostsLock(file, func() error {
+		f, err := os.OpenFile(file, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		callback, err := knownhosts.New(file)
+		if err != nil {
+			return err
+		}
+		if err := callback(hostname, remote, key); err == nil {
+			return nil
+		} else {
+			var keyErr *knownhosts.KeyError
+			if !errors.As(err, &keyErr) || len(keyErr.Want) != 0 {
+				return err
+			}
+		}
+
+		record := knownhosts.Line([]string{hostname}, key) + "\n"
+		if _, err := io.WriteString(f, record); err != nil {
+			return err
+		}
+		return f.Sync()
+	})
 }
 
 func sshUserKnownHostsPath() string {
