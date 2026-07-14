@@ -3385,6 +3385,31 @@ func TestContextSwitchingPreservesSeparateEnvironment(t *testing.T) {
 	}
 }
 
+func TestMalformedExportDoesNotRunInCurrentContext(t *testing.T) {
+	for _, line := range []string{
+		`export VMSH_SCOPE='unterminated`,
+		`export VMSH_SCOPE=value\`,
+	} {
+		t.Run(line, func(t *testing.T) {
+			api := newRecordingShellAPI("alpine")
+			api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "alpine"}
+			sh := newUnitShell(t, api)
+			sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "alpine"}
+			sh.env["PRESERVED"] = "before"
+
+			if err := sh.eval(line, io.Discard, io.Discard); err == nil {
+				t.Fatal("malformed export returned no error")
+			}
+			if len(api.runs) != 0 {
+				t.Fatalf("malformed export dispatched to VM: %+v", api.runs)
+			}
+			if !reflect.DeepEqual(sh.env, map[string]string{"PRESERVED": "before"}) {
+				t.Fatalf("environment changed after malformed export: %#v", sh.env)
+			}
+		})
+	}
+}
+
 func TestJobsMarkedLostWhenParentStops(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu"}

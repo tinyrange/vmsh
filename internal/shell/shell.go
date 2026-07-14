@@ -2808,12 +2808,12 @@ func (s *shellState) runPipelineStage(ctx context.Context, pipeline *pipelineRun
 }
 
 func (s *shellState) evalExport(line string) (bool, error) {
-	fields, err := splitShellFields(line)
-	if err != nil {
+	if line != "export" && !strings.HasPrefix(line, "export ") && !strings.HasPrefix(line, "export\t") {
 		return false, nil
 	}
-	if len(fields) == 0 || fields[0] != "export" {
-		return false, nil
+	fields, err := splitShellFields(line)
+	if err != nil {
+		return true, err
 	}
 	if s.env == nil {
 		s.env = map[string]string{}
