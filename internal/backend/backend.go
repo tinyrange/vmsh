@@ -662,7 +662,23 @@ func ReadDaemonToken(path string) (string, error) {
 	return token, nil
 }
 
-func StartDaemonLease(api watchdogAPI) (func(), error) {
+type WatchdogLeaseError struct {
+	Operation string
+	LeaseID   string
+	Err       error
+}
+
+func (e *WatchdogLeaseError) Error() string {
+	return fmt.Sprintf("watchdog lease %s %s: %v", e.LeaseID, e.Operation, e.Err)
+}
+
+func (e *WatchdogLeaseError) Unwrap() error { return e.Err }
+
+func StartDaemonLease(api watchdogAPI, onError ...func(error)) (func(), error) {
+	report := func(error) {}
+	if len(onError) > 0 && onError[0] != nil {
+		report = onError[0]
+	}
 	timeout := daemonWatchdogTimeout()
 	lease, err := api.CreateWatchdogLease(client.WatchdogLeaseRequest{TimeoutSeconds: timeout.Seconds()})
 	if err != nil {
@@ -679,14 +695,18 @@ func StartDaemonLease(api watchdogAPI) (func(), error) {
 			case <-done:
 				return
 			case <-ticker.C:
-				_ = api.FeedWatchdogLease(lease.LeaseID)
+				if err := api.FeedWatchdogLease(lease.LeaseID); err != nil {
+					report(&WatchdogLeaseError{Operation: "feed failed", LeaseID: lease.LeaseID, Err: err})
+				}
 			}
 		}
 	}()
 	return func() {
 		close(done)
 		<-stopped
-		_ = api.ReleaseWatchdogLease(lease.LeaseID)
+		if err := api.ReleaseWatchdogLease(lease.LeaseID); err != nil {
+			report(&WatchdogLeaseError{Operation: "release failed", LeaseID: lease.LeaseID, Err: err})
+		}
 	}, nil
 }
 
