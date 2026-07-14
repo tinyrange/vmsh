@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -873,6 +874,32 @@ func stubStartDaemonProcess(t *testing.T, banner string) func() {
 	}
 	return func() {
 		startDaemonProcess = old
+	}
+}
+
+func TestReadDaemonStartupBannerTimesOutAndStopsChild(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer writer.Close()
+	stopped := make(chan struct{})
+	var stopOnce sync.Once
+	started := &startedDaemonProcess{
+		stdout: reader,
+		stop: func() {
+			stopOnce.Do(func() {
+				close(stopped)
+				_ = writer.Close()
+			})
+		},
+	}
+
+	_, err := readDaemonStartupBanner(started, CCVMLaunch{Path: "/fake/ccvm"}, 20*time.Millisecond)
+	if !errors.Is(err, ErrDaemonStartupTimeout) {
+		t.Fatalf("startup error = %v, want timeout", err)
+	}
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("timed-out child was not stopped")
 	}
 }
 
