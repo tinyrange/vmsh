@@ -307,3 +307,66 @@ func writeModel(t *testing.T, e *Emulator, data []byte) {
 		t.Fatalf("write model n=%d err=%v", n, err)
 	}
 }
+
+func FuzzEmulatorArbitraryTerminalBytesPreserveSnapshotInvariants(f *testing.F) {
+	for _, seed := range [][]byte{
+		[]byte("plain\r\ntext"),
+		[]byte("\x1b[?1049h界\x1b[999;999H\x1b[?1049l"),
+		[]byte("\x1b[38;2;255;0;7mred\x1b]0;title\x07"),
+		[]byte("\x1b[2;4r\x1b[999999999999999999999A\x1b[3X"),
+		{0, 1, 2, 3, 0x1b, '[', '?', ';', ':', 0xff, 0xfe},
+	} {
+		f.Add(seed, uint8(80), uint8(24), uint8(20))
+	}
+	f.Fuzz(func(t *testing.T, data []byte, colsByte, rowsByte, historyByte uint8) {
+		if len(data) > 64<<10 {
+			t.Skip()
+		}
+		size := Size{Cols: int(colsByte%120) + 1, Rows: int(rowsByte%50) + 1}
+		historyLimit := int(historyByte % 100)
+		e := NewEmulator(size, historyLimit)
+		for offset := 0; offset < len(data); {
+			chunk := int(data[offset]%31) + 1
+			if offset+chunk > len(data) {
+				chunk = len(data) - offset
+			}
+			writeModel(t, e, data[offset:offset+chunk])
+			offset += chunk
+		}
+		assertSnapshotInvariants(t, e.Snapshot(), historyLimit, int64(len(data)))
+
+		resized := Size{Cols: size.Rows%97 + 1, Rows: size.Cols%37 + 1}
+		e.Resize(resized)
+		snapshot := e.Snapshot()
+		assertSnapshotInvariants(t, snapshot, historyLimit, int64(len(data)))
+		assertSnapshotInvariants(t, Restore(snapshot, historyLimit).Snapshot(), historyLimit, int64(len(data)))
+	})
+}
+
+func assertSnapshotInvariants(t *testing.T, snapshot Snapshot, historyLimit int, bytesRead int64) {
+	t.Helper()
+	if snapshot.Size.Cols < 1 || snapshot.Size.Rows < 1 {
+		t.Fatalf("invalid size: %+v", snapshot.Size)
+	}
+	if len(snapshot.Lines) != snapshot.Size.Rows || len(snapshot.Cells) != snapshot.Size.Rows {
+		t.Fatalf("rows: lines=%d cells=%d size=%+v", len(snapshot.Lines), len(snapshot.Cells), snapshot.Size)
+	}
+	for y, row := range snapshot.Cells {
+		if len(row) != snapshot.Size.Cols {
+			t.Fatalf("row %d has %d cells, want %d", y, len(row), snapshot.Size.Cols)
+		}
+	}
+	if snapshot.Cursor.X < 0 || snapshot.Cursor.X > snapshot.Size.Cols ||
+		snapshot.Cursor.Y < 0 || snapshot.Cursor.Y >= snapshot.Size.Rows {
+		t.Fatalf("cursor %+v outside size %+v", snapshot.Cursor, snapshot.Size)
+	}
+	if len(snapshot.History) > historyLimit {
+		t.Fatalf("history length %d exceeds limit %d", len(snapshot.History), historyLimit)
+	}
+	if snapshot.BytesRead != bytesRead {
+		t.Fatalf("bytes read = %d, want %d", snapshot.BytesRead, bytesRead)
+	}
+	if len(snapshot.RawTail) > 64<<10 {
+		t.Fatalf("raw tail length = %d", len(snapshot.RawTail))
+	}
+}

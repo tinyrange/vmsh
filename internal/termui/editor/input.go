@@ -131,9 +131,36 @@ func (e *Editor) readRune(first byte) (keyEvent, bool, error) {
 }
 
 func (e *Editor) readEscape(ctx context.Context) (keyEvent, bool, error) {
-	seq := e.readAvailable(32, 2*time.Millisecond)
-	if strings.HasPrefix(seq, "[200~") {
-		text, err := e.readUntilPasteEnd(ctx, strings.TrimPrefix(seq, "[200~"))
+	first, ok, err := e.readEscapeByte(ctx)
+	if err != nil {
+		return keyEvent{}, false, err
+	}
+	if !ok {
+		return keyEvent{key: keyEscape}, true, nil
+	}
+	if first != '[' && first != 'O' {
+		e.unreadBytes([]byte{first})
+		return keyEvent{key: keyEscape}, true, nil
+	}
+
+	seq := []byte{first}
+	for len(seq) < 32 {
+		b, ok, err := e.readEscapeByte(ctx)
+		if err != nil {
+			return keyEvent{}, false, err
+		}
+		if !ok {
+			return keyEvent{key: keyEscape}, true, nil
+		}
+		seq = append(seq, b)
+		if first == 'O' || b >= 0x40 && b <= 0x7e {
+			break
+		}
+	}
+
+	sequence := string(seq)
+	if sequence == "[200~" {
+		text, err := e.readUntilPasteEnd(ctx, "")
 		return keyEvent{key: keyPaste, text: text}, true, err
 	}
 	for _, binding := range []struct {
@@ -151,9 +178,8 @@ func (e *Editor) readEscape(ctx context.Context) (keyEvent, bool, error) {
 		{key: keyPageDown, sequences: []string{"[6~"}},
 		{key: keyUnknown, sequences: []string{"[201~"}},
 	} {
-		for _, sequence := range binding.sequences {
-			if strings.HasPrefix(seq, sequence) {
-				e.unreadBytes([]byte(strings.TrimPrefix(seq, sequence)))
+		for _, candidate := range binding.sequences {
+			if sequence == candidate {
 				return keyEvent{key: binding.key}, true, nil
 			}
 		}
@@ -161,22 +187,25 @@ func (e *Editor) readEscape(ctx context.Context) (keyEvent, bool, error) {
 	return keyEvent{key: keyEscape}, true, nil
 }
 
-func (e *Editor) readAvailable(max int, quiet time.Duration) string {
-	var out strings.Builder
-	deadline := time.Now().Add(quiet)
-	for out.Len() < max && time.Now().Before(deadline) {
+func (e *Editor) readEscapeByte(ctx context.Context) (byte, bool, error) {
+	deadline := time.NewTimer(25 * time.Millisecond)
+	defer deadline.Stop()
+	for {
 		b, n, err := e.readByte()
 		if n == 1 {
-			out.WriteByte(b)
-			deadline = time.Now().Add(quiet)
-			continue
+			return b, true, nil
 		}
-		if err != nil && !isAgain(err) {
-			break
+		if err != nil && !isAgain(err) && !errors.Is(err, io.EOF) {
+			return 0, false, err
 		}
-		time.Sleep(time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return 0, false, ctx.Err()
+		case <-deadline.C:
+			return 0, false, nil
+		case <-time.After(time.Millisecond):
+		}
 	}
-	return out.String()
 }
 
 func (e *Editor) readUntilPasteEnd(ctx context.Context, initial string) (string, error) {
