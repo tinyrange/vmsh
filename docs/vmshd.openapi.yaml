@@ -727,7 +727,7 @@ components:
     Status:
       type: object
       additionalProperties: true
-      required: [kind, status, sessions, active_streams, vms, started_at]
+      required: [kind, status, sessions, active_streams, vms, started_at, retention]
       properties:
         kind:
           type: string
@@ -756,6 +756,19 @@ components:
         started_at:
           type: string
           format: date-time
+        retention:
+          type: object
+          additionalProperties: false
+          required: [completed_jobs_per_session, job_log_bytes, sessions]
+          properties:
+            completed_jobs_per_session:
+              type: integer
+              minimum: 0
+            job_log_bytes:
+              type: integer
+              minimum: 0
+            sessions:
+              type: string
     Event:
       type: object
       additionalProperties: true
