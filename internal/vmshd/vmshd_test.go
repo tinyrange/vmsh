@@ -144,7 +144,7 @@ func TestHostShellStartsInVerifiedSessionCWD(t *testing.T) {
 	if shell.cwd != cwd || shell.cmd.Dir != cwd {
 		t.Fatalf("shell cwd=%q cmd.Dir=%q, want %q", shell.cwd, shell.cmd.Dir, cwd)
 	}
-	output, unsubscribe := shell.Subscribe()
+	output, _, unsubscribe := shell.Subscribe()
 	defer unsubscribe()
 	if err := shell.Write([]byte("pwd\n")); err != nil {
 		t.Fatalf("write pwd: %v", err)

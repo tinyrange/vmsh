@@ -4818,6 +4818,17 @@ func extractTarToHostLegacy(r io.Reader, dst copyTargetPath) error {
 	}
 }
 
+func hostTarTarget(dst string, mode copyDestMode, name string) (string, error) {
+	clean := filepath.Clean(filepath.FromSlash(name))
+	if clean == "." || filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("archive path escapes destination: %q", name)
+	}
+	if mode == copyDestExact {
+		return dst, nil
+	}
+	return filepath.Join(dst, clean), nil
+}
+
 func streamTarToHost(dst copyTargetPath, progress *copyProgress, produce func(io.Writer) error) error {
 	reader, writer := io.Pipe()
 	extractDone := make(chan error, 1)
