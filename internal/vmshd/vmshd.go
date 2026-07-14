@@ -32,6 +32,12 @@ const Kind = "vmshd"
 
 const maxJobLogBytes = 64 * 1024
 
+// Event streams send at least one frame inside the common 60 second idle
+// window used by HTTP intermediaries. Each write gets the same full interval;
+// a peer that cannot accept one small NDJSON frame is no longer healthy.
+const eventStreamHeartbeatInterval = 30 * time.Second
+const eventStreamWriteTimeout = 30 * time.Second
+
 type Status struct {
 	Kind      string                 `json:"kind"`
 	Status    string                 `json:"status"`
@@ -49,6 +55,8 @@ type Event struct {
 	Session    *Session          `json:"session,omitempty"`
 	Attachment *ClientAttachment `json:"attachment,omitempty"`
 	Job        *JobSummary       `json:"job,omitempty"`
+	After      string            `json:"after,omitempty"`
+	Refresh    string            `json:"refresh,omitempty"`
 	At         time.Time         `json:"at"`
 }
 
@@ -272,13 +280,15 @@ type sessionRegistry struct {
 
 type eventHub struct {
 	mu          sync.Mutex
-	next        int
+	nextEvent   int
+	nextSub     int
 	subscribers map[int]*eventSubscriber
 }
 
 type eventSubscriber struct {
 	id          int
 	ch          chan Event
+	done        chan struct{}
 	connectedAt time.Time
 	lastEventID string
 }
@@ -1232,32 +1242,64 @@ func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 }
 
 func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
+	s.streamEventsWithTiming(w, r, eventStreamHeartbeatInterval, eventStreamWriteTimeout)
+}
+
+func (s *Server) streamEventsWithTiming(w http.ResponseWriter, r *http.Request, heartbeatInterval, writeTimeout time.Duration) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeJSON(w, http.StatusInternalServerError, client.ErrorResponse{Error: "event streaming is not supported"})
 		return
 	}
-	events, unsubscribe := s.events.Subscribe()
+	events, disconnected, cursor, gap, unsubscribe := s.events.Subscribe(r.URL.Query().Get("after"))
 	defer unsubscribe()
 
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.WriteHeader(http.StatusOK)
-	connected := s.events.Event(Event{Kind: "connected"})
-	s.events.MarkDelivered(events, connected.ID)
-	if err := json.NewEncoder(w).Encode(connected); err != nil {
+	controller := http.NewResponseController(w)
+	encoder := json.NewEncoder(w)
+	write := func(event Event) error {
+		if err := controller.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+			return err
+		}
+		if err := encoder.Encode(event); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+	connected := Event{ID: cursor, Kind: "connected", At: time.Now()}
+	if err := write(connected); err != nil {
 		return
 	}
-	flusher.Flush()
+	s.events.MarkDelivered(events, connected.ID)
+	if gap {
+		if err := write(Event{ID: cursor, Kind: "gap", After: strings.TrimSpace(r.URL.Query().Get("after")), Refresh: "/vmsh/status", At: time.Now()}); err != nil {
+			return
+		}
+		s.events.MarkDelivered(events, cursor)
+		// End the stream so a frontend cannot apply queued pre-snapshot events
+		// after refreshing. It reconnects with this gap event's ID.
+		return
+	}
 
+	heartbeats := time.NewTicker(heartbeatInterval)
+	defer heartbeats.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
-		case event := <-events:
-			if err := json.NewEncoder(w).Encode(event); err != nil {
+		case <-disconnected:
+			return
+		case <-heartbeats.C:
+			if err := write(Event{ID: s.events.Cursor(), Kind: "heartbeat", At: time.Now()}); err != nil {
 				return
 			}
-			flusher.Flush()
+		case event := <-events:
+			if err := write(event); err != nil {
+				return
+			}
+			s.events.MarkDelivered(events, event.ID)
 		}
 	}
 }
@@ -1489,37 +1531,36 @@ func (r *streamRegistry) List() []StreamSummary {
 	return out
 }
 
-func (h *eventHub) Event(event Event) Event {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.nextEventLocked(event)
-}
-
 func (h *eventHub) Publish(event Event) {
-	event = h.Event(event)
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	event = h.nextEventLocked(event)
 	for _, sub := range h.subscribers {
 		select {
 		case sub.ch <- event:
-			sub.lastEventID = event.ID
 		default:
+			close(sub.done)
+			delete(h.subscribers, sub.id)
 		}
 	}
 }
 
-func (h *eventHub) Subscribe() (<-chan Event, func()) {
+func (h *eventHub) Subscribe(after string) (<-chan Event, <-chan struct{}, string, bool, func()) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.next++
-	id := h.next
+	h.nextSub++
+	id := h.nextSub
 	ch := make(chan Event, 16)
+	done := make(chan struct{})
+	cursor := h.cursorLocked()
+	after = strings.TrimSpace(after)
 	h.subscribers[id] = &eventSubscriber{
 		id:          id,
 		ch:          ch,
+		done:        done,
 		connectedAt: time.Now(),
 	}
-	return ch, func() {
+	return ch, done, cursor, after != "" && after != cursor, func() {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		sub := h.subscribers[id]
@@ -1527,8 +1568,18 @@ func (h *eventHub) Subscribe() (<-chan Event, func()) {
 		if sub == nil {
 			return
 		}
-		close(ch)
+		close(done)
 	}
+}
+
+func (h *eventHub) Cursor() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.cursorLocked()
+}
+
+func (h *eventHub) cursorLocked() string {
+	return fmt.Sprintf("evt_%08x", h.nextEvent)
 }
 
 func (h *eventHub) MarkDelivered(events <-chan Event, eventID string) {
@@ -1569,8 +1620,8 @@ func (h *eventHub) Streams() []StreamSummary {
 }
 
 func (h *eventHub) nextEventLocked(event Event) Event {
-	h.next++
-	event.ID = fmt.Sprintf("evt_%08x", h.next)
+	h.nextEvent++
+	event.ID = fmt.Sprintf("evt_%08x", h.nextEvent)
 	if event.At.IsZero() {
 		event.At = time.Now()
 	}
