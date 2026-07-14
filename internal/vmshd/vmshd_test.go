@@ -1258,6 +1258,85 @@ func TestStatusReportsActiveEventStreams(t *testing.T) {
 	})
 }
 
+func TestEventStreamReportsGapForStaleCursor(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, nil)
+	httpSrv := httptest.NewServer(srv.Authenticate(mux))
+	defer httpSrv.Close()
+
+	open := func(after string) (*http.Response, *bufio.Scanner) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, httpSrv.URL+"/vmsh/events?after="+after, nil)
+		if err != nil {
+			t.Fatalf("new event request: %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer secret")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("open event stream: %v", err)
+		}
+		return resp, bufio.NewScanner(resp.Body)
+	}
+
+	resp, scanner := open("")
+	initial := readEvent(t, scanner)
+	resp.Body.Close()
+	srv.events.Publish(Event{Kind: "session_updated"})
+
+	resp, scanner = open(initial.ID)
+	defer resp.Body.Close()
+	connected := readEvent(t, scanner)
+	gap := readEvent(t, scanner)
+	if gap.Kind != "gap" || gap.After != initial.ID || gap.ID != connected.ID || gap.Refresh != "/vmsh/status" {
+		t.Fatalf("gap event = %+v, connected=%+v", gap, connected)
+	}
+}
+
+func TestEventStreamHeartbeatKeepsIdleStreamActive(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /vmsh/events", func(w http.ResponseWriter, r *http.Request) {
+		srv.streamEventsWithTiming(w, r, 10*time.Millisecond, time.Second)
+	})
+	httpSrv := httptest.NewServer(srv.Authenticate(mux))
+	defer httpSrv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, httpSrv.URL+"/vmsh/events", nil)
+	if err != nil {
+		t.Fatalf("new event request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("open event stream: %v", err)
+	}
+	defer resp.Body.Close()
+	scanner := bufio.NewScanner(resp.Body)
+	connected := readEvent(t, scanner)
+	heartbeat := readEvent(t, scanner)
+	if heartbeat.Kind != "heartbeat" || heartbeat.ID != connected.ID || heartbeat.At.IsZero() {
+		t.Fatalf("heartbeat event = %+v, connected=%+v", heartbeat, connected)
+	}
+}
+
+func TestEventHubDisconnectsSubscriberInsteadOfDropping(t *testing.T) {
+	hub := newEventHub()
+	_, disconnected, _, _, unsubscribe := hub.Subscribe("")
+	defer unsubscribe()
+	for i := 0; i < 17; i++ {
+		hub.Publish(Event{Kind: "session_updated"})
+	}
+	select {
+	case <-disconnected:
+	case <-time.After(time.Second):
+		t.Fatal("full event subscriber was not disconnected")
+	}
+	if streams := hub.Streams(); len(streams) != 0 {
+		t.Fatalf("active streams = %+v", streams)
+	}
+}
+
 func TestEventStreamRequiresAuth(t *testing.T) {
 	srv := NewServer("secret")
 	mux := http.NewServeMux()
