@@ -316,7 +316,9 @@ type hostShell struct {
 	cmd         *exec.Cmd
 	tty         *os.File
 	done        chan struct{}
+	exited      chan struct{}
 	doneOnce    sync.Once
+	cleanupOnce sync.Once
 	mu          sync.Mutex
 	nextSub     int
 	subscribers map[int]chan []byte
@@ -948,6 +950,7 @@ func (m *hostShellManager) Start(sessionID string, term *Terminal) (*hostShell, 
 	m.mu.Unlock()
 
 	cmd := exec.Command(hostShellCommand())
+	configureHostShellCommand(cmd)
 	cmd.Env = append(os.Environ(), "VMSH_ACTIVE=1")
 	tty, err := pty.StartWithSize(cmd, terminalWinsize(term))
 	if err != nil {
@@ -958,6 +961,7 @@ func (m *hostShellManager) Start(sessionID string, term *Terminal) (*hostShell, 
 		cmd:         cmd,
 		tty:         tty,
 		done:        make(chan struct{}),
+		exited:      make(chan struct{}),
 		subscribers: map[int]chan []byte{},
 	}
 	m.mu.Lock()
@@ -966,6 +970,7 @@ func (m *hostShellManager) Start(sessionID string, term *Terminal) (*hostShell, 
 	go shell.readLoop()
 	go func() {
 		_ = cmd.Wait()
+		close(shell.exited)
 		shell.closeDone()
 		m.mu.Lock()
 		if m.shells[sessionID] == shell {
@@ -1062,11 +1067,11 @@ func (s *hostShell) Close() {
 	if s == nil {
 		return
 	}
-	_ = s.tty.Close()
-	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-	}
-	s.closeDone()
+	s.cleanupOnce.Do(func() {
+		_ = s.tty.Close()
+		terminateHostShellProcess(s.cmd, s.exited, 2*time.Second)
+		s.closeDone()
+	})
 }
 
 func (s *hostShell) closeDone() {
