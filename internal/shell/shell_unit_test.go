@@ -4151,6 +4151,57 @@ func TestImagePullInterruptReturnsStatus130(t *testing.T) {
 	}
 }
 
+func TestInterruptWatcherStopsWhenSignalChannelIsClosed(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	interrupts := make(chan os.Signal)
+	close(interrupts)
+	sh.interruptSignals = interrupts
+
+	started := make(chan func(), 1)
+	go func() {
+		stop, _ := sh.startInterruptWatcher(nil)
+		started <- stop
+	}()
+
+	var stop func()
+	select {
+	case stop = <-started:
+	case <-time.After(time.Second):
+		t.Fatal("interrupt watcher did not handle a closed signal channel")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		stop()
+		stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("interrupt watcher stop did not return")
+	}
+}
+
+func TestInterruptWatcherDoesNotConsumeSignalsAfterStop(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	interrupts := make(chan os.Signal, 1)
+	sh.interruptSignals = interrupts
+
+	stop, _ := sh.startInterruptWatcher(nil)
+	stop()
+	interrupts <- os.Interrupt
+
+	select {
+	case sig := <-interrupts:
+		if sig != os.Interrupt {
+			t.Fatalf("signal after stop = %v, want interrupt", sig)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stopped interrupt watcher consumed a signal")
+	}
+}
+
 func TestUbuntuPullUsesCloudRootFSTar(t *testing.T) {
 	api := newRecordingShellAPI()
 	var gotName string
