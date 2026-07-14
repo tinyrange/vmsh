@@ -129,6 +129,7 @@ func TestHostShellStartsInVerifiedSessionCWD(t *testing.T) {
 	if err := os.WriteFile(shellPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write shell fixture: %v", err)
 	}
+	t.Setenv("SHELL", shellPath)
 	t.Setenv("PATH", bin)
 	requestedCWD := t.TempDir()
 	cwd, err := filepath.EvalSymlinks(requestedCWD)
