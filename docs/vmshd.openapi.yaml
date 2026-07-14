@@ -72,6 +72,8 @@ tags:
     description: Daemon-owned background jobs.
   - name: Events
     description: NDJSON event stream.
+  - name: Trust
+    description: Explicit grants for trusted VM-to-host calls.
 paths:
   /vmsh/protocol:
     get:
@@ -509,6 +511,65 @@ paths:
                 $ref: "#/components/schemas/Event"
         "401":
           $ref: "#/components/responses/Unauthorized"
+  /vmsh/trust:
+    get:
+      tags: [Trust]
+      summary: List VM trust grants.
+      x-vmsh-status: current
+      responses:
+        "200":
+          description: Current trust grants.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TrustGrantInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Trust]
+      summary: Grant a VM a trusted-call profile.
+      x-vmsh-status: current
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TrustGrantRequest"
+      responses:
+        "200":
+          description: Created trust grant.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustGrantInfo"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /vmsh/trust/{vm}:
+    delete:
+      tags: [Trust]
+      summary: Revoke a VM trust grant.
+      x-vmsh-status: current
+      parameters:
+        - name: vm
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Revoked trust grant.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustGrantInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
 components:
   securitySchemes:
     bearerToken:
@@ -769,6 +830,50 @@ components:
               minimum: 0
             sessions:
               type: string
+    TrustGrantRequest:
+      type: object
+      additionalProperties: false
+      required: [vm_id, profile]
+      properties:
+        vm_id:
+          type: string
+        profile:
+          type: string
+    TrustGrantInfo:
+      type: object
+      additionalProperties: false
+      required: [vm_id, source_generation, profile, profile_digest, target_id, default_root_id, service_address, service_port, granted_at, revoked]
+      properties:
+        vm_id:
+          type: string
+        source_generation:
+          type: integer
+          minimum: 0
+        profile:
+          type: string
+        profile_digest:
+          type: string
+        target_id:
+          type: string
+        default_root_id:
+          type: string
+        action_deadlines:
+          type: object
+          additionalProperties:
+            type: string
+        service_address:
+          type: string
+        service_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        token:
+          type: string
+        granted_at:
+          type: string
+          format: date-time
+        revoked:
+          type: boolean
     Event:
       type: object
       additionalProperties: true
@@ -802,6 +907,10 @@ components:
           $ref: "#/components/schemas/ClientAttachment"
         job:
           $ref: "#/components/schemas/JobSummary"
+        after:
+          type: string
+        refresh:
+          type: string
         at:
           type: string
           format: date-time
@@ -939,12 +1048,38 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ClientAttachment"
+        cleanup:
+          $ref: "#/components/schemas/CleanupStatus"
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
+    CleanupStatus:
+      type: object
+      additionalProperties: false
+      required: [attempts, failures, updated_at]
+      properties:
+        attempts:
+          type: integer
+          minimum: 0
+        failures:
+          type: array
+          items:
+            $ref: "#/components/schemas/VMCleanupFailure"
+        updated_at:
+          type: string
+          format: date-time
+    VMCleanupFailure:
+      type: object
+      additionalProperties: false
+      required: [vm_id, error]
+      properties:
+        vm_id:
+          type: string
+        error:
+          type: string
     SessionScope:
       type: string
       enum: [frontend, system]
