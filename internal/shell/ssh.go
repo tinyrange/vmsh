@@ -2059,14 +2059,11 @@ func (s *shellState) copySSHToLocal(ctx commandContext, src, dst copyTargetPath,
 	if remoteDir == "." {
 		remoteDir = s.currentSSHCWD(ctx)
 	}
-	var archive bytes.Buffer
 	command := remoteCDCommand(remoteDir) + " && tar -cf - -- " + shellQuote(base)
-	progress.Phase("downloading")
-	if err := s.runSSHCommand(ctx, command, nil, copyProgressWriter{w: &archive, progress: progress}, stderr, false, false); err != nil {
-		return err
-	}
-	progress.Phase("extracting")
-	return extractTarToHost(bytes.NewReader(archive.Bytes()), dst)
+	progress.Phase("downloading and extracting")
+	return streamTarToHost(dst, progress, func(archive io.Writer) error {
+		return s.runSSHCommand(ctx, command, nil, archive, stderr, false, false)
+	})
 }
 
 func remoteMkdirCommand(dir string) string {

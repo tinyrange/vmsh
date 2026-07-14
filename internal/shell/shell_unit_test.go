@@ -6919,6 +6919,65 @@ func TestSSHCopyStreamsTarOverConnection(t *testing.T) {
 	}
 }
 
+func TestSSHCopyInterruptStopsRemoteArchiveAndExtractor(t *testing.T) {
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		tw := tar.NewWriter(stdout)
+		if err := tw.WriteHeader(&tar.Header{Name: "remote.bin", Mode: 0o600, Size: 1 << 30}); err != nil {
+			close(stopped)
+			return 1
+		}
+		close(started)
+		chunk := make([]byte, 32*1024)
+		for {
+			if _, err := tw.Write(chunk); err != nil {
+				close(stopped)
+				return 1
+			}
+		}
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	interrupts := make(chan os.Signal, 1)
+	sh.interruptSignals = interrupts
+	dst := filepath.Join(t.TempDir(), "remote.bin")
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sh.copySSHToLocal(
+			commandContext{Mode: modeSSH, SSHHost: "test-ssh-a"},
+			copyTargetPath{path: "/tmp/remote.bin"},
+			copyTargetPath{path: dst},
+			io.Discard,
+			nil,
+		)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("remote archive did not start")
+	}
+	interrupts <- os.Interrupt
+	select {
+	case err := <-errCh:
+		if got := sessionLastCode(err); got != 130 {
+			t.Fatalf("interrupted SSH copy code = %d, err = %v; want 130", got, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("interrupted SSH copy did not return")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("remote archive producer did not stop")
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("partial SSH destination exists or stat failed: %v", err)
+	}
+}
+
 func readSingleRegularTarPayload(r io.Reader) (string, error) {
 	tr := tar.NewReader(r)
 	var got string
@@ -7897,6 +7956,95 @@ func (w *failAfterWriter) Write(p []byte) (int, error) {
 	}
 	w.remaining -= len(p)
 	return len(p), nil
+}
+
+func TestStreamTarToHostExtractsBeforeProducerCompletes(t *testing.T) {
+	dst := filepath.Join(t.TempDir(), "copied.txt")
+	payload := []byte("streamed-payload")
+	observedDuringProduction := false
+	err := streamTarToHost(copyTargetPath{path: dst}, nil, func(w io.Writer) error {
+		tw := tar.NewWriter(w)
+		if err := tw.WriteHeader(&tar.Header{Name: "source.txt", Mode: 0o640, Size: int64(len(payload))}); err != nil {
+			return err
+		}
+		if _, err := tw.Write(payload); err != nil {
+			return err
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			got, err := os.ReadFile(dst)
+			if err == nil && bytes.Equal(got, payload) {
+				observedDuringProduction = true
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		return tw.Close()
+	})
+	if err != nil {
+		t.Fatalf("stream tar: %v", err)
+	}
+	if !observedDuringProduction {
+		t.Fatal("destination was not extracted while the producer was still active")
+	}
+	if got := readTestFile(t, dst); got != string(payload) {
+		t.Fatalf("copied payload = %q, want %q", got, payload)
+	}
+}
+
+func TestStreamTarToHostPreservesProducerAndExtractionErrors(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "copied.txt")
+	if err := os.WriteFile(dst, []byte("previous"), 0o600); err != nil {
+		t.Fatalf("write previous destination: %v", err)
+	}
+	producerErr := errors.New("remote archive failed")
+	err := streamTarToHost(copyTargetPath{path: dst}, nil, func(w io.Writer) error {
+		tw := tar.NewWriter(w)
+		if err := tw.WriteHeader(&tar.Header{Name: "source.txt", Mode: 0o640, Size: 1024}); err != nil {
+			return err
+		}
+		if _, err := tw.Write([]byte("partial")); err != nil {
+			return err
+		}
+		return producerErr
+	})
+	if !errors.Is(err, producerErr) {
+		t.Fatalf("stream error = %v, want producer error", err)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("stream error = %v, want truncated archive error", err)
+	}
+	if got := readTestFile(t, dst); got != "previous" {
+		t.Fatalf("destination after failed stream = %q, want previous content", got)
+	}
+	entries, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		t.Fatalf("read destination directory: %v", readErr)
+	}
+	if len(entries) != 1 || entries[0].Name() != "copied.txt" {
+		t.Fatalf("destination entries after failed stream = %v", entries)
+	}
+}
+
+func TestStreamTarToHostStopsProducerWhenExtractionFails(t *testing.T) {
+	dst := t.TempDir()
+	producerStopped := false
+	err := streamTarToHost(copyTargetPath{path: dst, directory: true}, nil, func(w io.Writer) error {
+		tw := tar.NewWriter(w)
+		if err := tw.WriteHeader(&tar.Header{Name: "../outside", Mode: 0o600, Size: 1024}); err != nil {
+			return err
+		}
+		_, writeErr := tw.Write(make([]byte, 1024))
+		producerStopped = writeErr != nil
+		return writeErr
+	})
+	if err == nil {
+		t.Fatal("stream accepted a traversal archive")
+	}
+	if !producerStopped {
+		t.Fatal("producer continued after the extractor rejected the archive")
+	}
 }
 
 func TestExtractTarToHostDirectoryDestinationSemantics(t *testing.T) {
