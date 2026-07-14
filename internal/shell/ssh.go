@@ -39,6 +39,24 @@ type persistentSSHClient struct {
 	client *ssh.Client
 }
 
+type sshStderrWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (w *sshStderrWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.w.Write(p)
+}
+
+func (s *shellState) serializedSSHStderr(w io.Writer) io.Writer {
+	if existing, ok := w.(*sshStderrWriter); ok && existing.mu == &s.sshStderrMu {
+		return existing
+	}
+	return &sshStderrWriter{mu: &s.sshStderrMu, w: w}
+}
+
 type persistentSSHShell struct {
 	mu             sync.Mutex
 	outputMu       sync.Mutex
@@ -215,6 +233,7 @@ func (s *shellState) runSSHSessionContext(runCtx context.Context, ctx commandCon
 	} else if tty {
 		session.Stdin = os.Stdin
 	}
+	stderr = s.serializedSSHStderr(stderr)
 	if tty {
 		session.Stdout = stdout
 		session.Stderr = stderr
@@ -290,6 +309,7 @@ func (s *shellState) sshPersistentShell(ctx commandContext, output, stderr io.Wr
 }
 
 func (s *shellState) startPersistentSSHShell(runCtx context.Context, ctx commandContext, client *persistentSSHClient, key string, output, stderr io.Writer) (*persistentSSHShell, error) {
+	stderr = s.serializedSSHStderr(stderr)
 	session, err := client.client.NewSession()
 	if err != nil {
 		s.dropSSHClient(client.key)
