@@ -2294,8 +2294,9 @@ func (e sessionError) Error() string {
 }
 
 func writeSessionError(w http.ResponseWriter, err error) {
-	if err, ok := err.(sessionError); ok {
-		writeJSON(w, err.status, client.ErrorResponse{Error: err.err})
+	var domainErr sessionError
+	if errors.As(err, &domainErr) {
+		writeJSON(w, domainErr.status, client.ErrorResponse{Error: domainErr.err})
 		return
 	}
 	writeJSON(w, http.StatusInternalServerError, client.ErrorResponse{Error: err.Error()})
