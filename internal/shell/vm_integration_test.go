@@ -399,7 +399,7 @@ func TestVMIntegrationInteractivePasteCopiesDirectoryMetadataHostToVMToHost(t *t
 		"@stop copy-pty-paste",
 		"@host echo VM_COPY_PASTE_DONE",
 	}, "\n")
-	session.write("\x1b[200~" + paste + "\x1b[201~")
+	session.write("\x1b[200~" + paste + "\x1b[201~\r")
 	session.expectOccurrences("VM_COPY_PASTE_DONE", 2, 60*time.Second)
 	waitForPath(t, filepath.Join(dst, "script.sh"), 60*time.Second, func() string {
 		return session.snapshot()
@@ -498,6 +498,49 @@ func TestVMIntegrationInteractiveUIDrivesKeyboardAndRoutesCommands(t *testing.T)
 	waitUIPromptAfter(t, ctx, driver, position, session)
 	if _, err := os.Stat(cancelledPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Ctrl-C input created cancelled marker: %v; %s", err, uiSnapshotSummary(session.Snapshot()))
+	}
+
+	// Send an unsupported terminal sequence and the complete command in one
+	// PTY write. The escape decoder must consume only the control sequence.
+	driver.SetDelay(0)
+	position = session.Snapshot().BytesRead
+	inputUI(t, driver, ptyterm.Input("\x1b[99~@host printf 'VMSH_UI_ESCAPE_TAIL=1\\n'\r"), session)
+	waitUILine(t, ctx, driver, "VMSH_UI_ESCAPE_TAIL=1", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
+	position = session.Snapshot().BytesRead
+	inputUI(t, driver, ptyterm.Input("\x1b[200~@host printf 'VMSH_UI_PASTE_ONE=1\\n'\n@host printf 'VMSH_UI_PASTE_TWO=2\\n'\x1b[201~\r"), session)
+	waitUILine(t, ctx, driver, "VMSH_UI_PASTE_ONE=1", session)
+	waitUILine(t, ctx, driver, "VMSH_UI_PASTE_TWO=2", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
+	if err := session.Resize(ptyterm.Size{Cols: 73, Rows: 17}); err != nil {
+		t.Fatalf("resize vmsh UI PTY: %v; %s", err, uiSnapshotSummary(session.Snapshot()))
+	}
+	resized := session.Snapshot()
+	if resized.Size != (ptyterm.Size{Cols: 73, Rows: 17}) || resized.LastResize == nil || *resized.LastResize != resized.Size {
+		t.Fatalf("resize state = size=%+v last=%+v; %s", resized.Size, resized.LastResize, uiSnapshotSummary(resized))
+	}
+	typeUI(t, driver, "@host stty size", session)
+	position = enterUI(t, driver, session)
+	waitUILine(t, ctx, driver, "17 73", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
+	inputUI(t, driver, ptyterm.Ctrl('l'), session)
+	typeUI(t, driver, "@host printf 'VMSH_UI_UTF8=%s\\n' 'é界'", session)
+	position = enterUI(t, driver, session)
+	waitUILine(t, ctx, driver, "VMSH_UI_UTF8=é界", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
+	runningMarker := filepath.Join(nestedCWD, ".vmsh-ui-running-completed")
+	typeUI(t, driver, "@host sh -c 'printf \"VMSH_UI_RUNNING=1\\n\"; sleep 30; touch "+runningMarker+"'", session)
+	enterUI(t, driver, session)
+	waitUILine(t, ctx, driver, "VMSH_UI_RUNNING=1", session)
+	position = session.Snapshot().BytesRead
+	inputUI(t, driver, ptyterm.Ctrl('c'), session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+	if _, err := os.Stat(runningMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("interrupted host command created completion marker: %v; %s", err, uiSnapshotSummary(session.Snapshot()))
 	}
 
 	inputUI(t, driver, ptyterm.Ctrl('d'), session)

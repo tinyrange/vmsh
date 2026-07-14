@@ -6782,6 +6782,13 @@ func (s *shellState) startHostPTYForwarding(tty bool, session *persistentHostShe
 	if session == nil || session.tty == nil {
 		return func() {}, interrupted, nil
 	}
+	// The persistent shell can sit idle while the outer terminal is resized,
+	// before its per-command signal forwarder exists. Synchronize the current
+	// size whenever a command takes ownership of the PTY; subsequent SIGWINCH
+	// events are handled by forwardHostPTYSignals below.
+	if tty {
+		resizeHostPTY(session.tty, stdout)
+	}
 
 	done := make(chan struct{})
 	restore := func() {}
