@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/tinyrange/vmsh/internal/backend"
+	"github.com/tinyrange/vmsh/internal/vmshdprotocol"
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/ccvmd"
 	"j5.nz/cc/client"
@@ -294,6 +296,7 @@ type Server struct {
 	streams  *streamRegistry
 	jobs     *hostJobRunner
 	shells   *hostShellManager
+	balloon  *balloonController
 
 	startedAt time.Time
 }
@@ -336,6 +339,7 @@ func Main(args []string) {
 }
 
 func Run(args []string) (bool, error) {
+	statePath, args := scanStatePathArg(args)
 	cacheDir, err := resolveCacheDir(scanCacheDir(args))
 	if err != nil {
 		return false, err
@@ -347,14 +351,94 @@ func Run(args []string) (bool, error) {
 	}
 
 	srv := NewServer(token)
+	args, err = ensureLoopbackAddrArg(args)
+	if err != nil {
+		return false, err
+	}
 	return ccvmd.RunServer(args, ccvmd.ServerOptions{
-		Kind:      Kind,
-		TokenPath: tokenPath,
+		Kind:       Kind,
+		TokenPath:  tokenPath,
+		Persistent: strings.TrimSpace(statePath) != "",
+		OnStartup: func(hello client.ServerHello) error {
+			if strings.TrimSpace(statePath) == "" {
+				return nil
+			}
+			exePath, err := os.Executable()
+			if err != nil {
+				return err
+			}
+			return backend.WriteDaemonState(statePath, backend.DaemonState{
+				Addr:      hello.Addr,
+				Kind:      Kind,
+				TokenPath: tokenPath,
+				LaunchKey: backend.DaemonLaunchKey(backend.CCVMLaunch{
+					Path: exePath,
+				}),
+			})
+		},
 		RegisterHandlers: func(mux *http.ServeMux, runtime ccvmd.RuntimeView) {
 			srv.RegisterHandlers(mux, runtime)
 		},
+		NormalizeCreateRequest: func(req *client.CreateInstanceRequest, runtime ccvmd.RuntimeView) error {
+			srv.normalizeCreateRequest(req, runtime)
+			return nil
+		},
+		NormalizeStartRequest: func(req *client.StartInstanceRequest, runtime ccvmd.RuntimeView) error {
+			srv.normalizeStartRequest(req, runtime)
+			return nil
+		},
+		NormalizeRunRequest: func(req *client.RunRequest, runtime ccvmd.RuntimeView) error {
+			srv.normalizeRunRequest(req, runtime)
+			return nil
+		},
 		WrapHandler: srv.Authenticate,
 	})
+}
+
+func ensureLoopbackAddrArg(args []string) ([]string, error) {
+	if addr, ok := addrArg(args); ok {
+		if !isLoopbackListenAddr(addr) {
+			return nil, fmt.Errorf("vmshd listen address must be loopback: %s", addr)
+		}
+		return args, nil
+	}
+	out := append([]string{}, args...)
+	return append(out, "-addr", "127.0.0.1:0"), nil
+}
+
+func hasAddrArg(args []string) bool {
+	_, ok := addrArg(args)
+	return ok
+}
+
+func addrArg(args []string) (string, bool) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "-addr" || arg == "--addr" {
+			if i+1 < len(args) {
+				return args[i+1], true
+			}
+			return "", true
+		}
+		if strings.HasPrefix(arg, "-addr=") || strings.HasPrefix(arg, "--addr=") {
+			_, value, _ := strings.Cut(arg, "=")
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return false
+	}
+	host = strings.Trim(strings.ToLower(host), "[]")
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func NewServer(token string) *Server {
@@ -365,11 +449,22 @@ func NewServer(token string) *Server {
 		streams:   newStreamRegistry(),
 		jobs:      newHostJobRunner(),
 		shells:    newHostShellManager(),
+		balloon:   newBalloonController(systemMemoryObserver{}),
 		startedAt: time.Now(),
 	}
 }
 
 func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView) {
+	mux.HandleFunc("GET /vmsh/protocol", func(w http.ResponseWriter, r *http.Request) {
+		exePath, _ := os.Executable()
+		writeJSON(w, http.StatusOK, vmshdprotocol.NewInfo(
+			Kind,
+			s.startedAt,
+			vmshdprotocol.ExecutableMode(exePath, os.Args[0], os.Getenv(backend.InternalVMSHDEnv) == "1"),
+			parseProtocolVersion(r.URL.Query().Get("frontend_min_protocol")),
+			parseProtocolVersion(r.URL.Query().Get("frontend_protocol")),
+		))
+	})
 	mux.HandleFunc("GET /vmsh/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, Status{
 			Kind:      Kind,
@@ -1005,7 +1100,12 @@ func hostShellCommand() string {
 	if runtime.GOOS == "windows" {
 		return firstNonEmpty(os.Getenv("COMSPEC"), "cmd.exe")
 	}
-	return firstNonEmpty(os.Getenv("SHELL"), "/bin/sh")
+	for _, name := range []string{"zsh", "bash", "sh"} {
+		if path, err := exec.LookPath(name); err == nil {
+			return path
+		}
+	}
+	return "/bin/sh"
 }
 
 func currentWorkingDirectory() string {
@@ -1023,6 +1123,14 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func parseProtocolVersion(value string) int {
+	version, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || version <= 0 {
+		return 0
+	}
+	return version
 }
 
 func (s *Server) serveTerminalStream(ws *websocket.Conn) {
@@ -1181,8 +1289,46 @@ func (s *Server) Authenticate(next http.Handler) http.Handler {
 			writeJSON(w, http.StatusUnauthorized, client.ErrorResponse{Error: "unauthorized"})
 			return
 		}
+		if err := compatibleFrontendRequest(r); err != nil {
+			writeJSON(w, http.StatusUpgradeRequired, client.ErrorResponse{Error: err.Error()})
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func compatibleFrontendRequest(r *http.Request) error {
+	if r == nil || frontendProtocolReadOnly(r) {
+		return nil
+	}
+	compat := vmshdprotocol.CompatibilityFor(
+		protocolVersionFromRequest(r, vmshdprotocol.HeaderMinProtocol),
+		protocolVersionFromRequest(r, vmshdprotocol.HeaderProtocol),
+	)
+	if compat.Compatible {
+		return nil
+	}
+	reason := strings.TrimSpace(compat.Reason)
+	if reason == "" {
+		reason = "incompatible"
+	}
+	return fmt.Errorf("incompatible vmsh frontend protocol: %s", reason)
+}
+
+func frontendProtocolReadOnly(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	default:
+		return false
+	}
+}
+
+func protocolVersionFromRequest(r *http.Request, header string) int {
+	if r == nil {
+		return 0
+	}
+	return parseProtocolVersion(r.Header.Get(header))
 }
 
 func validBearerToken(header, want string) bool {
@@ -1214,6 +1360,28 @@ func scanCacheDir(args []string) string {
 		}
 	}
 	return ""
+}
+
+func scanStatePathArg(args []string) (string, []string) {
+	out := make([]string, 0, len(args))
+	var statePath string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "-state-path" || arg == "--state-path" {
+			if i+1 < len(args) {
+				statePath = args[i+1]
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "-state-path=") || strings.HasPrefix(arg, "--state-path=") {
+			_, value, _ := strings.Cut(arg, "=")
+			statePath = value
+			continue
+		}
+		out = append(out, arg)
+	}
+	return strings.TrimSpace(statePath), out
 }
 
 func resolveCacheDir(arg string) (string, error) {

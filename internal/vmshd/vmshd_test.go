@@ -46,6 +46,22 @@ func TestTokenFileIsPrivate(t *testing.T) {
 	}
 }
 
+func TestHostShellCommandPrefersSupportedShellOverEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host shell lookup is Unix-specific")
+	}
+	dir := t.TempDir()
+	zsh := filepath.Join(dir, "zsh")
+	if err := os.WriteFile(zsh, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write zsh fixture: %v", err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("SHELL", "/usr/bin/fish")
+	if got := hostShellCommand(); got != zsh {
+		t.Fatalf("host shell command = %q, want %q", got, zsh)
+	}
+}
+
 func TestAuthenticateRequiresBearerToken(t *testing.T) {
 	srv := NewServer("secret")
 	handler := srv.Authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -107,6 +123,129 @@ func TestAuthenticateWrapsRuntimeAndVMSHRoutes(t *testing.T) {
 				t.Fatalf("status = %d, want %d", rr.Code, tc.status)
 			}
 		})
+	}
+}
+
+func TestAuthenticateAllowsLegacyCompatibleMutation(t *testing.T) {
+	srv := NewServer("secret")
+	handler := srv.Authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/vmsh/frontends", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusNoContent)
+	}
+}
+
+func TestAuthenticateRejectsUnsupportedFrontendMutation(t *testing.T) {
+	srv := NewServer("secret")
+	handler := srv.Authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/vmsh/frontends", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("X-VMSH-Frontend-Protocol", "2")
+	req.Header.Set("X-VMSH-Frontend-Min-Protocol", "2")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUpgradeRequired {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusUpgradeRequired)
+	}
+}
+
+func TestEnsureLoopbackAddrArg(t *testing.T) {
+	got, err := ensureLoopbackAddrArg([]string{"-cache-dir", "/tmp/cache"})
+	if err != nil {
+		t.Fatalf("ensure default addr: %v", err)
+	}
+	if !hasString(got, "-addr") || !hasString(got, "127.0.0.1:0") {
+		t.Fatalf("args = %q", got)
+	}
+	kept, err := ensureLoopbackAddrArg([]string{"--addr=localhost:1234"})
+	if err != nil {
+		t.Fatalf("keep explicit addr: %v", err)
+	}
+	if len(kept) != 1 || kept[0] != "--addr=localhost:1234" {
+		t.Fatalf("explicit addr changed: %q", kept)
+	}
+	if _, err := ensureLoopbackAddrArg([]string{"--addr=0.0.0.0:1234"}); err == nil {
+		t.Fatal("non-loopback addr was accepted")
+	}
+}
+
+func TestProtocolEndpointReportsCompatibility(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, fakeRuntimeView{})
+	handler := srv.Authenticate(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/vmsh/protocol?frontend_protocol=1&frontend_min_protocol=1", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
+	}
+	var info struct {
+		Kind     string `json:"kind"`
+		Protocol struct {
+			Name    string `json:"name"`
+			Current int    `json:"current"`
+			Minimum int    `json:"minimum"`
+		} `json:"protocol"`
+		Compatibility struct {
+			Compatible bool   `json:"compatible"`
+			Action     string `json:"action"`
+			Reason     string `json:"reason"`
+		} `json:"compatibility"`
+		Daemon struct {
+			Executable struct {
+				Mode string `json:"mode"`
+			} `json:"executable"`
+		} `json:"daemon"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&info); err != nil {
+		t.Fatalf("decode protocol: %v", err)
+	}
+	if info.Kind != Kind || info.Protocol.Name != "vmshd.frontend" || info.Protocol.Current != 1 || info.Protocol.Minimum != 1 {
+		t.Fatalf("protocol info = %+v", info)
+	}
+	if !info.Compatibility.Compatible || info.Compatibility.Action != "reuse" || info.Compatibility.Reason != "compatible" {
+		t.Fatalf("compatibility = %+v", info.Compatibility)
+	}
+	if info.Daemon.Executable.Mode == "" {
+		t.Fatal("executable mode was not reported")
+	}
+}
+
+func TestProtocolEndpointRefusesUnsupportedFrontendRange(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, fakeRuntimeView{})
+	handler := srv.Authenticate(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/vmsh/protocol?frontend_protocol=2&frontend_min_protocol=2", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
+	}
+	var info struct {
+		Compatibility struct {
+			Compatible bool   `json:"compatible"`
+			Action     string `json:"action"`
+			Reason     string `json:"reason"`
+		} `json:"compatibility"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&info); err != nil {
+		t.Fatalf("decode protocol: %v", err)
+	}
+	if info.Compatibility.Compatible || info.Compatibility.Action != "start-private-daemon" || info.Compatibility.Reason != "frontend-too-new" {
+		t.Fatalf("compatibility = %+v", info.Compatibility)
 	}
 }
 
@@ -1020,6 +1159,15 @@ func getJobsFromServer(t *testing.T, baseURL, token string) []JobSummary {
 		t.Fatalf("decode jobs: %v", err)
 	}
 	return jobs
+}
+
+func hasString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func requireEventually(t *testing.T, ok func() bool) {

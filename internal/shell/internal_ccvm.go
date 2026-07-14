@@ -1,5 +1,3 @@
-//go:build embed_ccvm
-
 package shell
 
 func bundledCCVMAvailable() bool {
@@ -7,5 +5,5 @@ func bundledCCVMAvailable() bool {
 }
 
 func defaultDaemonIdentity() string {
-	return "ccprod"
+	return "vmshd"
 }

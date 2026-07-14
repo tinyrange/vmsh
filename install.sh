@@ -65,6 +65,7 @@ detect_os() {
 	case "$(uname -s)" in
 		Linux) printf 'linux' ;;
 		Darwin) printf 'darwin' ;;
+		MINGW* | MSYS* | CYGWIN* | Windows_NT) printf 'windows' ;;
 		*) die "unsupported OS: $(uname -s)" ;;
 	esac
 }
@@ -91,16 +92,21 @@ os_name="${VMSH_OS:-$(detect_os)}"
 arch="${VMSH_ARCH:-$(detect_arch)}"
 
 case "${os_name}/${arch}" in
-	linux/amd64 | linux/arm64 | darwin/arm64) ;;
-	darwin/amd64) die "macOS amd64 is not published; supported targets are darwin/arm64, linux/arm64, linux/amd64" ;;
-	*) die "unsupported target ${os_name}/${arch}; supported targets are darwin/arm64, linux/arm64, linux/amd64" ;;
+	linux/amd64 | linux/arm64 | darwin/arm64 | windows/amd64 | windows/arm64) ;;
+	darwin/amd64) die "macOS amd64 is not published; supported targets are darwin/arm64, linux/arm64, linux/amd64, windows/arm64, windows/amd64" ;;
+	*) die "unsupported target ${os_name}/${arch}; supported targets are darwin/arm64, linux/arm64, linux/amd64, windows/arm64, windows/amd64" ;;
 esac
 
 if [ "$version" = "latest" ]; then
 	version="$(latest_version)"
 fi
 
-asset="vmsh_${version}_${os_name}_${arch}"
+exe=""
+if [ "$os_name" = "windows" ]; then
+	exe=".exe"
+fi
+
+asset="vmsh_${version}_${os_name}_${arch}${exe}"
 base_url="https://github.com/${repo}/releases/download/${version}"
 
 if has mktemp; then
@@ -136,7 +142,7 @@ if [ "$actual" != "$expected" ]; then
 fi
 
 mkdir -p "$install_dir"
-target="$install_dir/vmsh"
+target="$install_dir/vmsh${exe}"
 tmp_target="${target}.tmp.$$"
 cp "$binary" "$tmp_target"
 chmod 755 "$tmp_target"

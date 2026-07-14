@@ -24,14 +24,6 @@ type paths struct {
 	vmsh  string
 }
 
-type guestInitPayload struct {
-	name       string
-	goos       string
-	goarch     string
-	pkg        string
-	installRel string
-}
-
 var (
 	demoRunner        func(paths, []string) error
 	demoWantsHelpFunc func([]string) bool
@@ -243,14 +235,8 @@ func build(p paths) error {
 		return err
 	}
 
-	installedPayloads, err := buildGuestInitPayloads(p)
-	if err != nil {
-		return err
-	}
-	defer cleanupGuestInitPayloads(installedPayloads)
-
-	if err := step("build ccvm with embedded guest init", func() error {
-		return goBuild(p.ccDir, []string{"CGO_ENABLED=0"}, p.ccvm, "-tags", "embed_guestinit", "./cmd/ccvm")
+	if err := step("build ccvm", func() error {
+		return goBuild(p.ccDir, []string{"CGO_ENABLED=0"}, p.ccvm, "./cmd/ccvm")
 	}); err != nil {
 		return err
 	}
@@ -260,7 +246,11 @@ func build(p paths) error {
 		return err
 	}
 	if err := step("build vmsh", func() error {
-		return goBuild(p.root, nil, p.vmsh, "./cmd/vmsh")
+		args := []string{"./cmd/vmsh"}
+		if ldflags := vmshVersionLDFlags(p.root); ldflags != "" {
+			args = append([]string{"-ldflags", ldflags}, args...)
+		}
+		return goBuild(p.root, nil, p.vmsh, args...)
 	}); err != nil {
 		return err
 	}
@@ -282,67 +272,6 @@ func build(p paths) error {
 	logf("built vmsh: %s", p.vmsh)
 
 	return nil
-}
-
-func guestInitPayloads() []guestInitPayload {
-	payloads := []guestInitPayload{
-		{
-			name:       "linux/arm64 guest init",
-			goos:       "linux",
-			goarch:     "arm64",
-			pkg:        "./internal/cmd/init",
-			installRel: filepath.Join("internal", "guestinit", "guest-init-linux-arm64"),
-		},
-		{
-			name:       "linux/amd64 guest init",
-			goos:       "linux",
-			goarch:     "amd64",
-			pkg:        "./internal/cmd/init",
-			installRel: filepath.Join("internal", "guestinit", "guest-init-linux-amd64"),
-		},
-	}
-	for _, bsd := range []string{"openbsd", "freebsd", "netbsd"} {
-		for _, arch := range []string{"arm64", "amd64"} {
-			payloads = append(payloads, guestInitPayload{
-				name:       bsd + "/" + arch + " guest init",
-				goos:       bsd,
-				goarch:     arch,
-				pkg:        "./internal/cmd/" + bsd + "-init",
-				installRel: filepath.Join("internal", bsd, "guestinit", "guest-init-"+bsd+"-"+arch),
-			})
-		}
-	}
-	return payloads
-}
-
-func buildGuestInitPayloads(p paths) ([]string, error) {
-	var installed []string
-	for _, payload := range guestInitPayloads() {
-		out := filepath.Join(p.build, strings.ReplaceAll(payload.name, "/", "-"))
-		if err := step("build "+payload.name, func() error {
-			return goBuild(p.ccDir, []string{"CGO_ENABLED=0", "GOOS=" + payload.goos, "GOARCH=" + payload.goarch}, out, payload.pkg)
-		}); err != nil {
-			cleanupGuestInitPayloads(installed)
-			return nil, err
-		}
-		installPath := filepath.Join(p.ccDir, payload.installRel)
-		if err := step("install "+payload.name, func() error {
-			return copyFile(out, installPath, 0o644)
-		}); err != nil {
-			cleanupGuestInitPayloads(installed)
-			return nil, err
-		}
-		installed = append(installed, installPath)
-	}
-	return installed, nil
-}
-
-func cleanupGuestInitPayloads(paths []string) {
-	for _, path := range paths {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			logf("warning: remove generated guest init %s: %v", path, err)
-		}
-	}
 }
 
 func step(name string, fn func() error) error {
@@ -370,6 +299,41 @@ func formatDuration(d time.Duration) string {
 func goBuild(workDir string, env []string, output string, args ...string) error {
 	goArgs := append([]string{"build", "-o", output}, args...)
 	return command(workDir, env, "go", goArgs...)
+}
+
+func vmshVersionLDFlags(root string) string {
+	values := map[string]string{
+		"Release":   gitOutput(root, "describe", "--tags", "--dirty", "--always"),
+		"Commit":    gitOutput(root, "rev-parse", "HEAD"),
+		"Dirty":     fmt.Sprintf("%t", gitDirty(root)),
+		"BuildDate": time.Now().UTC().Format(time.RFC3339),
+	}
+	var parts []string
+	for _, key := range []string{"Release", "Commit", "Dirty", "BuildDate"} {
+		value := strings.TrimSpace(values[key])
+		if value == "" {
+			continue
+		}
+		parts = append(parts, "-X", "github.com/tinyrange/vmsh/internal/version."+key+"="+value)
+	}
+	return strings.Join(parts, " ")
+}
+
+func gitOutput(root string, args ...string) string {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func gitDirty(root string) bool {
+	cmd := exec.Command("git", "status", "--porcelain")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	return err == nil && strings.TrimSpace(string(out)) != ""
 }
 
 func command(workDir string, env []string, name string, args ...string) error {
@@ -421,10 +385,7 @@ func copyFile(src, dst string, mode os.FileMode) error {
 }
 
 func runVMSH(p paths, args []string) error {
-	vmshArgs := append([]string{"-ccvm", p.ccvm}, args...)
-	if !hasRecordArg(args) {
-		vmshArgs = append([]string{"-ccvm", p.ccvm, "-record-raw", filepath.Join(p.build, "session.raw.jsonl")}, args...)
-	}
+	vmshArgs := vmshRunArgs(p.build, args)
 	logf("run: %s %s", p.vmsh, strings.Join(vmshArgs, " "))
 	cmd := exec.Command(p.vmsh, vmshArgs...)
 	cmd.Dir = p.root
@@ -442,6 +403,14 @@ func runVMSH(p paths, args []string) error {
 		return err
 	}
 	return nil
+}
+
+func vmshRunArgs(buildDir string, args []string) []string {
+	vmshArgs := append([]string{}, args...)
+	if !hasRecordArg(args) {
+		vmshArgs = append([]string{"-record-raw", filepath.Join(buildDir, "session.raw.jsonl")}, args...)
+	}
+	return vmshArgs
 }
 
 func hasRecordArg(args []string) bool {

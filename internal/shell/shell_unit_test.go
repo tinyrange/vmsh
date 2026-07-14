@@ -42,6 +42,27 @@ import (
 	"j5.nz/cc/client"
 )
 
+func setupHostShellPath(t *testing.T, names ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	paths := map[string]string{}
+	for _, name := range names {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatalf("write shell fixture: %v", err)
+		}
+		paths[name] = path
+	}
+	t.Setenv("PATH", dir)
+	for _, name := range []string{"zsh", "bash", "sh"} {
+		if path := paths[name]; path != "" {
+			return path
+		}
+	}
+	t.Fatalf("no supported shell fixture in %v", names)
+	return ""
+}
+
 func TestShellCommandPassingBuildsGuestRunRequests(t *testing.T) {
 	api := newRecordingShellAPI("alpine", "alpine@amd64")
 	sh := newUnitShell(t, api)
@@ -181,7 +202,8 @@ func TestExecRequestDefaultsToInteractiveHostShell(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("@exec is Unix-only")
 	}
-	t.Setenv("SHELL", "/bin/zsh")
+	zsh := setupHostShellPath(t, "zsh")
+	t.Setenv("SHELL", "/usr/bin/fish")
 	t.Setenv("VMSH_ACTIVE", "1")
 	sh := newUnitShell(t, newRecordingShellAPI())
 
@@ -191,7 +213,7 @@ func TestExecRequestDefaultsToInteractiveHostShell(t *testing.T) {
 	if !errors.As(err, &req) {
 		t.Fatalf("@exec error = %v, want shellExecRequest", err)
 	}
-	if req.path != "/bin/zsh" {
+	if req.path != zsh {
 		t.Fatalf("@exec request path = %q", req.path)
 	}
 	if envHas(req.env, "VMSH_ACTIVE") {
@@ -206,7 +228,8 @@ func TestExecRequestRunsCommandThroughHostShell(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("@exec is Unix-only")
 	}
-	t.Setenv("SHELL", "/bin/zsh")
+	zsh := setupHostShellPath(t, "zsh")
+	t.Setenv("SHELL", "/usr/bin/fish")
 	sh := newUnitShell(t, newRecordingShellAPI())
 
 	var stdout, stderr bytes.Buffer
@@ -215,7 +238,7 @@ func TestExecRequestRunsCommandThroughHostShell(t *testing.T) {
 	if !errors.As(err, &req) {
 		t.Fatalf("@exec command error = %v, want shellExecRequest", err)
 	}
-	if req.path != "/bin/zsh" {
+	if req.path != zsh {
 		t.Fatalf("@exec command request path = %q", req.path)
 	}
 	if !slices.Contains(req.argv, "exec tmux attach -t work") {
@@ -312,8 +335,9 @@ func TestResolveCacheDirUsesDaemonIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve fallback cache: %v", err)
 	}
-	if fallbackDir != devDir {
-		t.Fatalf("fallback cache dir = %q, want %q", fallbackDir, devDir)
+	wantFallback := filepath.Join(userCache, "vmshd")
+	if fallbackDir != wantFallback {
+		t.Fatalf("fallback cache dir = %q, want %q", fallbackDir, wantFallback)
 	}
 }
 
@@ -1018,6 +1042,98 @@ func TestExitUsageRejectsUnknownArguments(t *testing.T) {
 	}
 }
 
+func TestVersionBuiltinReportsBuildIdentity(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@version", &stdout, &stderr); err != nil {
+		t.Fatalf("@version: %v", err)
+	}
+	fields := versionOutputFields(stdout.String())
+	if fields["version"] == "" || fields["dirty"] == "" || fields["platform"] == "" || fields["go"] == "" || fields["ccvm"] == "" {
+		t.Fatalf("version fields = %#v output:\n%s", fields, stdout.String())
+	}
+}
+
+func TestInstallBuiltinUpdatesStableDaemonCopy(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	src := filepath.Join(t.TempDir(), backend.HostExecutableName("vmsh"))
+	if err := os.WriteFile(src, []byte("vmsh-binary"), 0o755); err != nil {
+		t.Fatalf("write source binary: %v", err)
+	}
+	sh.vmshPath = src
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@install", &stdout, &stderr); err != nil {
+		t.Fatalf("@install: %v", err)
+	}
+	stablePath := filepath.Join(sh.rootCache, "bin", backend.HostExecutableName("vmshd"))
+	data, err := os.ReadFile(stablePath)
+	if err != nil {
+		t.Fatalf("read stable daemon copy: %v", err)
+	}
+	if string(data) != "vmsh-binary" {
+		t.Fatalf("stable daemon copy contents = %q", data)
+	}
+	if !strings.Contains(stdout.String(), "Manual start command:") {
+		t.Fatalf("@install output = %q", stdout.String())
+	}
+}
+
+func TestInstallBuiltinCanInstallSystemdUserUnit(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	src := filepath.Join(t.TempDir(), backend.HostExecutableName("vmsh"))
+	if err := os.WriteFile(src, []byte("vmsh-binary"), 0o755); err != nil {
+		t.Fatalf("write source binary: %v", err)
+	}
+	sh.vmshPath = src
+	sh.hasSystemdUser = func() bool { return true }
+	sh.confirmSystemd = func(io.Writer) (bool, error) { return true, nil }
+	var installedPath, installedCache string
+	sh.installSystemdUser = func(path, cache string) error {
+		installedPath = path
+		installedCache = cache
+		return nil
+	}
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@install", &stdout, &stderr); err != nil {
+		t.Fatalf("@install: %v", err)
+	}
+	wantPath := filepath.Join(sh.rootCache, "bin", backend.HostExecutableName("vmshd"))
+	if installedPath != wantPath || installedCache != sh.rootCache {
+		t.Fatalf("systemd install path/cache = %q %q, want %q %q", installedPath, installedCache, wantPath, sh.rootCache)
+	}
+	if !strings.Contains(stdout.String(), "vmshd.service") {
+		t.Fatalf("@install output = %q", stdout.String())
+	}
+}
+
+func TestVMSHDSystemdUnitUsesStableDaemonAndCache(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("systemd unit paths are POSIX-only")
+	}
+	unit := vmshdSystemdUnit("/tmp/vmsh dir/vmshd", "/tmp/cache dir")
+	if !strings.Contains(unit, `ExecStart="/tmp/vmsh dir/vmshd" -cache-dir "/tmp/cache dir" -state-path "/tmp/cache dir/vmshd.json"`) {
+		t.Fatalf("unit = %q", unit)
+	}
+}
+
+func versionOutputFields(out string) map[string]string {
+	fields := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+		if len(parts) >= 3 && parts[0] == "vmsh" && parts[1] == "version" {
+			fields["version"] = parts[2]
+			continue
+		}
+		if len(parts) >= 2 {
+			fields[parts[0]] = strings.Join(parts[1:], " ")
+		}
+	}
+	return fields
+}
+
 func hasExitResource(resources []exitResource, kind, name string) bool {
 	for _, resource := range resources {
 		if resource.Kind == kind && resource.Name == name {
@@ -1127,6 +1243,7 @@ func TestGuestPersistentShellRestartsEndedCachedSession(t *testing.T) {
 	ctx := commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu", Network: true}
 	req := client.RunRequest{Image: "ubuntu", WorkDir: "/host/project", TTY: true}
 	var starts atomic.Int32
+	releases := make(chan chan struct{}, 2)
 	api.runInteractive = func(id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 		starts.Add(1)
 		if onEvent != nil {
@@ -1134,12 +1251,17 @@ func TestGuestPersistentShellRestartsEndedCachedSession(t *testing.T) {
 				return err
 			}
 		}
+		release := make(chan struct{})
+		releases <- release
+		<-release
 		return nil
 	}
 	first, err := sh.guestPersistentShell(ctx, req, nil, nil)
 	if err != nil {
 		t.Fatalf("start first shell: %v", err)
 	}
+	firstRelease := <-releases
+	close(firstRelease)
 	deadline := time.After(2 * time.Second)
 	for !first.ended.Load() {
 		select {
@@ -1156,6 +1278,8 @@ func TestGuestPersistentShellRestartsEndedCachedSession(t *testing.T) {
 	if second == first {
 		t.Fatal("reused ended persistent guest shell")
 	}
+	secondRelease := <-releases
+	close(secondRelease)
 	if got := starts.Load(); got != 2 {
 		t.Fatalf("persistent shell starts = %d, want 2", got)
 	}
@@ -1412,6 +1536,37 @@ func TestStartVMUsesStartupSnapshotCacheForCompatibleAlpine(t *testing.T) {
 	}
 }
 
+func TestStartVMUsesSeparateStartupSnapshotCacheForDefaultMemory(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	sh := newUnitShell(t, api)
+
+	if err := sh.startVM("work", commandContext{Image: "alpine", CPUs: 1}, io.Discard); err != nil {
+		t.Fatalf("start VM: %v", err)
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	req := api.starts[0].req
+	explicitRoot, err := startupSnapshotRoot(sh.rootCache, client.StartInstanceRequest{
+		Image:    "alpine",
+		MemoryMB: startupSnapshotMemoryMB,
+		CPUs:     startupSnapshotCPUs,
+		Shares:   []client.ShareMount{startupSnapshotTestShare(t, sh)},
+	})
+	if err != nil {
+		t.Fatalf("explicit snapshot root: %v", err)
+	}
+	if req.SnapshotDir == "" {
+		t.Fatalf("snapshot dir is empty in request %+v", req)
+	}
+	if req.SnapshotDir == explicitRoot {
+		t.Fatalf("default-memory snapshot dir reused explicit 512 MB cache %q", req.SnapshotDir)
+	}
+	if req.MemoryMB != 0 {
+		t.Fatalf("memory_mb = %d, want daemon default to remain unspecified", req.MemoryMB)
+	}
+}
+
 func TestStartVMRestoresNewestStartupSnapshotForCompatibleAlpine(t *testing.T) {
 	api := newRecordingShellAPI("alpine")
 	sh := newUnitShell(t, api)
@@ -1440,6 +1595,70 @@ func TestStartVMRestoresNewestStartupSnapshotForCompatibleAlpine(t *testing.T) {
 	}
 	if req.RestoreSnapshot != newSnapshot {
 		t.Fatalf("restore snapshot = %q, want %q", req.RestoreSnapshot, newSnapshot)
+	}
+}
+
+func TestStartVMSkipsPersistedStartupSnapshotUntilDaemonRefresh(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	sh := newUnitShell(t, api)
+	sh.vmshd = &vmshdSessionReporter{startedAt: time.Unix(20, 0), startedKnown: true}
+	baseReq := startupSnapshotTestRequest(t, sh)
+	root, err := startupSnapshotRoot(sh.rootCache, baseReq)
+	if err != nil {
+		t.Fatalf("snapshot root: %v", err)
+	}
+	oldSnapshot := filepath.Join(root, "snapshot-20260101T000000.000000000Z")
+	writeStartupSnapshotManifest(t, oldSnapshot, time.Unix(10, 0))
+
+	if err := sh.startVM("work", commandContext{Image: "alpine", MemoryMB: 512, CPUs: 1}, io.Discard); err != nil {
+		t.Fatalf("start VM: %v", err)
+	}
+	req := api.starts[0].req
+	if req.SnapshotDir != root {
+		t.Fatalf("snapshot dir = %q, want %q", req.SnapshotDir, root)
+	}
+	if req.RestoreSnapshot != "" {
+		t.Fatalf("restore snapshot = %q, want cold boot before daemon refresh", req.RestoreSnapshot)
+	}
+	if startupSnapshotMarkerMatches(root, sh.vmshd.startedAt.UTC().Format(time.RFC3339Nano)) {
+		t.Fatalf("daemon marker was written without a fresh snapshot")
+	}
+}
+
+func TestStartVMRestoresStartupSnapshotAfterDaemonRefresh(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	sh := newUnitShell(t, api)
+	sh.vmshd = &vmshdSessionReporter{startedAt: time.Unix(20, 0), startedKnown: true}
+	baseReq := startupSnapshotTestRequest(t, sh)
+	root, err := startupSnapshotRoot(sh.rootCache, baseReq)
+	if err != nil {
+		t.Fatalf("snapshot root: %v", err)
+	}
+	oldSnapshot := filepath.Join(root, "snapshot-20260101T000000.000000000Z")
+	writeStartupSnapshotManifest(t, oldSnapshot, time.Unix(10, 0))
+	freshSnapshot := filepath.Join(root, "snapshot-20260102T000000.000000000Z")
+	api.startStream = func(ctx context.Context, id string, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
+		api.starts = append(api.starts, recordedStart{id: id, req: req})
+		if req.RestoreSnapshot == "" {
+			writeStartupSnapshotManifest(t, freshSnapshot, time.Unix(30, 0))
+		}
+		return client.InstanceState{ID: id, Status: "running"}, nil
+	}
+
+	if err := sh.startVM("work", commandContext{Image: "alpine", MemoryMB: 512, CPUs: 1}, io.Discard); err != nil {
+		t.Fatalf("first start VM: %v", err)
+	}
+	if api.starts[0].req.RestoreSnapshot != "" {
+		t.Fatalf("first restore snapshot = %q, want cold boot", api.starts[0].req.RestoreSnapshot)
+	}
+	if !startupSnapshotMarkerMatches(root, sh.vmshd.startedAt.UTC().Format(time.RFC3339Nano)) {
+		t.Fatalf("daemon marker was not written after fresh snapshot")
+	}
+	if err := sh.startVM("work", commandContext{Image: "alpine", MemoryMB: 512, CPUs: 1}, io.Discard); err != nil {
+		t.Fatalf("second start VM: %v", err)
+	}
+	if api.starts[1].req.RestoreSnapshot != freshSnapshot {
+		t.Fatalf("second restore snapshot = %q, want %q", api.starts[1].req.RestoreSnapshot, freshSnapshot)
 	}
 }
 
@@ -1526,6 +1745,25 @@ func startupSnapshotTestShare(t *testing.T, sh *shellState) client.ShareMount {
 		t.Fatalf("host share paths: %v", err)
 	}
 	return hostShareMount(hostRoot)
+}
+
+func writeStartupSnapshotManifest(t *testing.T, snapshot string, modTime time.Time) {
+	t.Helper()
+	if err := os.MkdirAll(snapshot, 0o755); err != nil {
+		t.Fatalf("create snapshot dir: %v", err)
+	}
+	manifest := filepath.Join(snapshot, "manifest.json")
+	if err := os.WriteFile(manifest, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write snapshot manifest: %v", err)
+	}
+	if !modTime.IsZero() {
+		if err := os.Chtimes(snapshot, modTime, modTime); err != nil {
+			t.Fatalf("set snapshot dir modtime: %v", err)
+		}
+		if err := os.Chtimes(manifest, modTime, modTime); err != nil {
+			t.Fatalf("set snapshot manifest modtime: %v", err)
+		}
+	}
 }
 
 func TestBareImageTargetUsesImageNameAsSystemName(t *testing.T) {
@@ -2949,7 +3187,7 @@ func TestCompletionsUseCachedImagesOptionsAndHostMappedPaths(t *testing.T) {
 
 	c := newVMSHCompleter(sh)
 	candidates, replaceLen, kind := c.Complete([]rune("@al"), len("@al"))
-	if kind != completionAt || replaceLen != len("@al") || !hasString(candidates, "pine") {
+	if kind != completionAt || replaceLen != len("@al") || !hasString(candidates, "@alpine") {
 		t.Fatalf("@ image completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 	if hasString(candidates, "blobs") {
@@ -2957,41 +3195,45 @@ func TestCompletionsUseCachedImagesOptionsAndHostMappedPaths(t *testing.T) {
 	}
 
 	candidates, replaceLen, kind = c.Complete([]rune("@alpine --n"), len("@alpine --n"))
-	if kind != completionOption || replaceLen != len("--n") || !hasString(candidates, "etwork") || !hasString(candidates, "ested") {
+	if kind != completionOption || replaceLen != len("--n") || !hasString(candidates, "--network") || !hasString(candidates, "--nested") {
 		t.Fatalf("option completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 	candidates, replaceLen, kind = c.Complete([]rune("@hello --from ub"), len("@hello --from ub"))
-	if kind != completionAt || replaceLen != len("ub") || !hasString(candidates, "untu") {
+	if kind != completionAt || replaceLen != len("ub") || !hasString(candidates, "ubuntu") {
 		t.Fatalf("--from source completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 	candidates, replaceLen, kind = c.Complete([]rune("@hello --from library/al"), len("@hello --from library/al"))
-	if kind != completionAt || replaceLen != len("library/al") || !hasString(candidates, "pine") {
+	if kind != completionAt || replaceLen != len("library/al") || !hasString(candidates, "library/alpine") {
 		t.Fatalf("--from library source completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 	candidates, replaceLen, kind = c.Complete([]rune("@agent --pr"), len("@agent --pr"))
-	if kind != completionOption || replaceLen != len("--pr") || !hasString(candidates, "oxy") {
+	if kind != completionOption || replaceLen != len("--pr") || !hasString(candidates, "--proxy") {
 		t.Fatalf("agent option completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 	candidates, replaceLen, kind = c.Complete([]rune("@ss"), len("@ss"))
-	if kind != completionAt || replaceLen != len("@ss") || !hasString(candidates, "h") {
+	if kind != completionAt || replaceLen != len("@ss") || !hasString(candidates, "@ssh") {
 		t.Fatalf("ssh target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 	candidates, replaceLen, kind = c.Complete([]rune("@sta"), len("@sta"))
-	if kind != completionAt || replaceLen != len("@sta") || !hasString(candidates, "tus") || !hasString(candidates, "rt") {
+	if kind != completionAt || replaceLen != len("@sta") || !hasString(candidates, "@status") || !hasString(candidates, "@start") {
 		t.Fatalf("status/start target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
+	candidates, replaceLen, kind = c.Complete([]rune("@ver"), len("@ver"))
+	if kind != completionAt || replaceLen != len("@ver") || !hasString(candidates, "@version") {
+		t.Fatalf("version target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
+	}
 	candidates, _, _ = c.Complete([]rune("@alpine --pr"), len("@alpine --pr"))
-	if hasString(candidates, "oxy") {
+	if hasString(candidates, "--proxy") {
 		t.Fatalf("non-agent option completion included proxy: %q", candidates)
 	}
 
 	candidates, replaceLen, kind = c.Complete([]rune("@rmi al"), len("@rmi al"))
-	if kind != completionAt || replaceLen != len("al") || !reflect.DeepEqual(candidates, []string{"pine"}) {
+	if kind != completionAt || replaceLen != len("al") || !reflect.DeepEqual(candidates, []string{"alpine"}) {
 		t.Fatalf("@rmi completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	candidates, replaceLen, kind = c.Complete([]rune("@restart wo"), len("@restart wo"))
-	if kind != completionAt || replaceLen != len("wo") || !hasString(candidates, "rk") {
+	if kind != completionAt || replaceLen != len("wo") || !hasString(candidates, "work") {
 		t.Fatalf("@restart target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 
@@ -3001,7 +3243,7 @@ func TestCompletionsUseCachedImagesOptionsAndHostMappedPaths(t *testing.T) {
 	}
 	sh.context = commandContext{Mode: modeVM, VMID: "vm", Image: "alpine", CWD: guestCWD}
 	candidates, replaceLen, kind = c.Complete([]rune("cat a"), len("cat a"))
-	if kind != completionPath || replaceLen != len("a") || !hasString(candidates, "lpha\\ dir/") {
+	if kind != completionPath || replaceLen != len("a") || !hasString(candidates, "alpha\\ dir/") {
 		t.Fatalf("host-mapped path completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 }
@@ -3015,8 +3257,41 @@ func TestPathCompletionAfterTrailingSlashAppendsChild(t *testing.T) {
 	c := newVMSHCompleter(sh)
 	line := []rune("cd dprojects/")
 	candidates, replaceLen, kind := c.Complete(line, len(line))
-	if kind != completionPath || replaceLen != 0 || !hasString(candidates, "vmsh/") {
+	if kind != completionPath || replaceLen != len("dprojects/") || !hasString(candidates, "dprojects/vmsh/") {
 		t.Fatalf("trailing slash path completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
+	}
+}
+
+func TestPathCompletionEscapesShellMetacharacters(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	name := "archive sample (v1).7z"
+	if err := os.WriteFile(filepath.Join(sh.hostCWD, name), []byte("archive"), 0o644); err != nil {
+		t.Fatalf("create completion fixture: %v", err)
+	}
+
+	c := newVMSHCompleter(sh)
+	line := []rune("7z x archive")
+	candidates, replaceLen, kind := c.Complete(line, len(line))
+	want := `archive\ sample\ \(v1\).7z`
+	if kind != completionPath || replaceLen != len("archive") || !reflect.DeepEqual(candidates, []string{want}) {
+		t.Fatalf("path completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
+	}
+}
+
+func TestTildePathCompletionPreservesTypedBase(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	if err := os.MkdirAll(filepath.Join(home, "dev", "projects"), 0o755); err != nil {
+		t.Fatalf("create completion fixture: %v", err)
+	}
+
+	c := newVMSHCompleter(sh)
+	line := []rune("cd ~/dev/pro")
+	candidates, replaceLen, kind := c.Complete(line, len(line))
+	if kind != completionPath || replaceLen != len("~/dev/pro") || !hasString(candidates, "~/dev/projects/") {
+		t.Fatalf("tilde path completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 }
 
@@ -3039,7 +3314,7 @@ func TestCompletionsUseCurrentCommandSegmentAndGuestCommands(t *testing.T) {
 
 	line := []rune("echo ok && vm")
 	candidates, replaceLen, kind := c.Complete(line, len(line))
-	if kind != completionCommand || replaceLen != len("vm") || !hasString(candidates, "tool") {
+	if kind != completionCommand || replaceLen != len("vm") || !hasString(candidates, "vmtool") {
 		t.Fatalf("guest command completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 	if len(api.runs) != 1 || api.runs[0].id != "default" {
@@ -3056,7 +3331,7 @@ func TestCompletionsUseCurrentCommandSegmentAndGuestCommands(t *testing.T) {
 	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "alpine"}
 	line = []rune("printf x | @host ec")
 	candidates, replaceLen, kind = c.Complete(line, len(line))
-	if kind != completionCommand || replaceLen != len("ec") || !hasString(candidates, "ho") {
+	if kind != completionCommand || replaceLen != len("ec") || !hasString(candidates, "echo") {
 		t.Fatalf("host command completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 }
@@ -3769,18 +4044,44 @@ func TestHostCommandInterruptIsNotFatal(t *testing.T) {
 	}
 	t.Cleanup(session.close)
 
+	startedPath := filepath.Join(t.TempDir(), "started")
 	var interrupted atomic.Bool
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- session.run("sleep 30", io.Discard, io.Discard, func() (func(), error) {
+		errCh <- session.run("printf started > "+shellQuote(startedPath)+"; sleep 30", io.Discard, io.Discard, func() (func(), error) {
 			go func() {
-				time.Sleep(100 * time.Millisecond)
+				deadline := time.Now().Add(2 * time.Second)
+				for {
+					if _, err := os.Stat(startedPath); err == nil {
+						break
+					}
+					if time.Now().After(deadline) {
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
 				interrupted.Store(true)
-				_, _ = session.tty.Write([]byte{0x03})
+				go session.close()
 			}()
 			return func() {}, nil
 		})
 	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(startedPath); err == nil {
+			break
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("host command returned before start marker: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("host command did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	select {
 	case err := <-errCh:
@@ -6903,7 +7204,7 @@ func TestSSHCompletionUsesConfigAndRemotePath(t *testing.T) {
 	sh := newUnitShell(t, newRecordingShellAPI())
 	c := newVMSHCompleter(sh)
 	candidates, replaceLen, kind := c.Complete([]rune("@ssh test-ssh-"), len("@ssh test-ssh-"))
-	if kind != completionAt || replaceLen != len("test-ssh-") || !hasString(candidates, "a") {
+	if kind != completionAt || replaceLen != len("test-ssh-") || !hasString(candidates, "test-ssh-a") {
 		t.Fatalf("ssh host completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 
@@ -6912,15 +7213,15 @@ func TestSSHCompletionUsesConfigAndRemotePath(t *testing.T) {
 		t.Fatalf("enter ssh context: %v\nstderr:\n%s", err, stderr.String())
 	}
 	candidates, replaceLen, kind = c.Complete([]rune("@test-ssh-"), len("@test-ssh-"))
-	if kind != completionAt || replaceLen != len("@test-ssh-") || !hasString(candidates, "a") {
+	if kind != completionAt || replaceLen != len("@test-ssh-") || !hasString(candidates, "@test-ssh-a") {
 		t.Fatalf("ssh session target completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 	candidates, replaceLen, kind = c.Complete([]rune("@stop test-ssh-"), len("@stop test-ssh-"))
-	if kind != completionAt || replaceLen != len("test-ssh-") || !hasString(candidates, "a") {
+	if kind != completionAt || replaceLen != len("test-ssh-") || !hasString(candidates, "test-ssh-a") {
 		t.Fatalf("stop completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 	candidates, replaceLen, kind = c.Complete([]rune("cat /tmp/fi"), len("cat /tmp/fi"))
-	if kind != completionPath || replaceLen != len("fi") || !hasString(candidates, "le") || !hasString(candidates, "folder/") {
+	if kind != completionPath || replaceLen != len("/tmp/fi") || !hasString(candidates, "/tmp/file") || !hasString(candidates, "/tmp/fifolder/") {
 		t.Fatalf("ssh path completion candidates=%q replace=%d kind=%q", candidates, replaceLen, kind)
 	}
 }
@@ -7724,6 +8025,9 @@ func newUnitShell(t *testing.T, api *recordingShellAPI) *shellState {
 		confirmVMRestart: func(string, io.Writer) (bool, error) {
 			return true, nil
 		},
+		confirmSystemd:     func(io.Writer) (bool, error) { return false, nil },
+		hasSystemdUser:     func() bool { return false },
+		installSystemdUser: func(string, string) error { return nil },
 	}
 	sh.completion = newVMSHCompleter(sh)
 	return sh
