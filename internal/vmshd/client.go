@@ -96,19 +96,19 @@ func (c *HTTPClient) StatusContext(ctx context.Context) (Status, error) {
 
 func (c *HTTPClient) GrantTrust(req TrustGrantRequest) (TrustGrantInfo, error) {
 	var info TrustGrantInfo
-	err := c.doJSON(http.MethodPost, "/vmsh/trust", req, &info)
+	err := c.doJSONContext(context.Background(), http.MethodPost, "/vmsh/trust", req, &info)
 	return info, err
 }
 
 func (c *HTTPClient) RevokeTrust(vmID string) (TrustGrantInfo, error) {
 	var info TrustGrantInfo
-	err := c.doJSON(http.MethodDelete, "/vmsh/trust/"+url.PathEscape(vmID), nil, &info)
+	err := c.doJSONContext(context.Background(), http.MethodDelete, "/vmsh/trust/"+url.PathEscape(vmID), nil, &info)
 	return info, err
 }
 
 func (c *HTTPClient) TrustGrants() ([]TrustGrantInfo, error) {
 	var grants []TrustGrantInfo
-	err := c.doJSON(http.MethodGet, "/vmsh/trust", nil, &grants)
+	err := c.doJSONContext(context.Background(), http.MethodGet, "/vmsh/trust", nil, &grants)
 	return grants, err
 }
 
