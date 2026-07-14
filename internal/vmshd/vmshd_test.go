@@ -1124,6 +1124,55 @@ func TestTerminalAttachmentStreamTracksActiveStreamAndResize(t *testing.T) {
 	})
 }
 
+func TestTerminalStreamRegistryAllowsOneWriterPerAttachment(t *testing.T) {
+	registry := newStreamRegistry()
+	first, closeFirst, err := registry.Open("terminal", "session", "attachment")
+	if err != nil || first.ID == "" {
+		t.Fatalf("open first stream: stream=%+v err=%v", first, err)
+	}
+	if _, _, err := registry.Open("terminal", "session", "attachment"); err == nil {
+		t.Fatal("second writer stream was accepted")
+	}
+	closeFirst()
+	if _, closeSecond, err := registry.Open("terminal", "session", "attachment"); err != nil {
+		t.Fatalf("reopen after close: %v", err)
+	} else {
+		closeSecond()
+	}
+}
+
+func TestHostShellSubscriberReceivesEveryOutputChunkUnderBackpressure(t *testing.T) {
+	shell := &hostShell{subscribers: map[int]*hostShellSubscriber{}}
+	output, done, unsubscribe := shell.Subscribe()
+	defer unsubscribe()
+
+	const chunks = 128
+	published := make(chan struct{})
+	go func() {
+		defer close(published)
+		for i := 0; i < chunks; i++ {
+			shell.publish([]byte{byte(i)})
+		}
+	}()
+	for i := 0; i < chunks; i++ {
+		select {
+		case data := <-output:
+			if len(data) != 1 || data[0] != byte(i) {
+				t.Fatalf("chunk %d = %v", i, data)
+			}
+		case <-done:
+			t.Fatalf("subscriber closed after %d chunks", i)
+		case <-time.After(time.Second):
+			t.Fatalf("timed out after %d chunks", i)
+		}
+	}
+	select {
+	case <-published:
+	case <-time.After(time.Second):
+		t.Fatal("publisher remained blocked after subscriber caught up")
+	}
+}
+
 func receiveTerminalDataUntil(t *testing.T, ws *websocket.Conn, marker string) string {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

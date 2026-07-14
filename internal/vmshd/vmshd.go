@@ -356,7 +356,13 @@ type hostShell struct {
 	doneOnce    sync.Once
 	mu          sync.Mutex
 	nextSub     int
-	subscribers map[int]chan []byte
+	subscribers map[int]*hostShellSubscriber
+}
+
+type hostShellSubscriber struct {
+	ch       chan []byte
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 func Main(args []string) {
@@ -1017,7 +1023,7 @@ func (m *hostShellManager) Start(sessionID string, term *Terminal) (*hostShell, 
 		cmd:         cmd,
 		tty:         tty,
 		done:        make(chan struct{}),
-		subscribers: map[int]chan []byte{},
+		subscribers: map[int]*hostShellSubscriber{},
 	}
 	m.mu.Lock()
 	m.shells[sessionID] = shell
@@ -1074,20 +1080,20 @@ func (s *hostShell) Write(data []byte) error {
 	return err
 }
 
-func (s *hostShell) Subscribe() (<-chan []byte, func()) {
+func (s *hostShell) Subscribe() (<-chan []byte, <-chan struct{}, func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nextSub++
 	id := s.nextSub
-	ch := make(chan []byte, 32)
-	s.subscribers[id] = ch
-	return ch, func() {
+	sub := &hostShellSubscriber{ch: make(chan []byte, 32), done: make(chan struct{})}
+	s.subscribers[id] = sub
+	return sub.ch, sub.done, func() {
 		s.mu.Lock()
-		defer s.mu.Unlock()
-		if sub := s.subscribers[id]; sub != nil {
+		if current := s.subscribers[id]; current == sub {
 			delete(s.subscribers, id)
-			close(sub)
 		}
+		s.mu.Unlock()
+		sub.doneOnce.Do(func() { close(sub.done) })
 	}
 }
 
@@ -1108,11 +1114,15 @@ func (s *hostShell) readLoop() {
 func (s *hostShell) publish(data []byte) {
 	data = append([]byte(nil), data...)
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	subs := make([]*hostShellSubscriber, 0, len(s.subscribers))
 	for _, sub := range s.subscribers {
+		subs = append(subs, sub)
+	}
+	s.mu.Unlock()
+	for _, sub := range subs {
 		select {
-		case sub <- data:
-		default:
+		case sub.ch <- data:
+		case <-sub.done:
 		}
 	}
 }
@@ -1136,7 +1146,7 @@ func (s *hostShell) closeDone() {
 		defer s.mu.Unlock()
 		for id, sub := range s.subscribers {
 			delete(s.subscribers, id)
-			close(sub)
+			sub.doneOnce.Do(func() { close(sub.done) })
 		}
 	})
 }
@@ -1200,7 +1210,11 @@ func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 		_ = websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "error"})
 		return
 	}
-	stream, closeStream := s.streams.Open("terminal", session.ID, attachment.ID)
+	stream, closeStream, err := s.streams.Open("terminal", session.ID, attachment.ID)
+	if err != nil {
+		_ = websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "error"})
+		return
+	}
 	defer func() {
 		closeStream()
 		s.events.Publish(Event{Kind: "terminal_stream_closed", Session: &session, Attachment: &attachment})
@@ -1239,13 +1253,18 @@ func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 			State:   "closed",
 		})
 	}(session.ID, firstNonEmpty(strings.TrimSpace(session.HostCWD), currentWorkingDirectory()))
-	output, unsubscribe := shell.Subscribe()
+	output, outputDone, unsubscribe := shell.Subscribe()
 	defer unsubscribe()
 	sendErr := make(chan error, 1)
 	go func() {
-		for data := range output {
-			if err := send(TerminalStreamMessage{Kind: "data", Data: data}); err != nil {
-				sendErr <- err
+		for {
+			select {
+			case data := <-output:
+				if err := send(TerminalStreamMessage{Kind: "data", Data: data}); err != nil {
+					sendErr <- err
+					return
+				}
+			case <-outputDone:
 				return
 			}
 		}
@@ -1546,16 +1565,24 @@ func newStreamRegistry() *streamRegistry {
 	return &streamRegistry{streams: map[string]StreamSummary{}}
 }
 
-func (r *streamRegistry) Open(kind, sessionID, attachmentID string) (StreamSummary, func()) {
+func (r *streamRegistry) Open(kind, sessionID, attachmentID string) (StreamSummary, func(), error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	kind = strings.TrimSpace(kind)
+	sessionID = strings.TrimSpace(sessionID)
+	attachmentID = strings.TrimSpace(attachmentID)
+	for _, active := range r.streams {
+		if active.Kind == kind && active.SessionID == sessionID && active.AttachmentID == attachmentID {
+			return StreamSummary{}, nil, fmt.Errorf("%s stream already active for attachment %s", kind, attachmentID)
+		}
+	}
 	r.next++
 	stream := StreamSummary{
 		ID:           fmt.Sprintf("%s_stream_%08x", strings.TrimSpace(kind), r.next),
-		Kind:         strings.TrimSpace(kind),
+		Kind:         kind,
 		State:        "open",
-		SessionID:    strings.TrimSpace(sessionID),
-		AttachmentID: strings.TrimSpace(attachmentID),
+		SessionID:    sessionID,
+		AttachmentID: attachmentID,
 		ConnectedAt:  time.Now(),
 	}
 	r.streams[stream.ID] = stream
@@ -1563,7 +1590,7 @@ func (r *streamRegistry) Open(kind, sessionID, attachmentID string) (StreamSumma
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		delete(r.streams, stream.ID)
-	}
+	}, nil
 }
 
 func (r *streamRegistry) List() []StreamSummary {
