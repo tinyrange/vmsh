@@ -31,6 +31,7 @@ import (
 const Kind = "vmshd"
 
 const maxJobLogBytes = 64 * 1024
+const maxCompletedJobsPerSession = 64
 
 type Status struct {
 	Kind      string                 `json:"kind"`
@@ -40,6 +41,13 @@ type Status struct {
 	Streams   []StreamSummary        `json:"active_streams"`
 	VMs       []client.InstanceState `json:"vms"`
 	StartedAt time.Time              `json:"started_at"`
+	Retention RetentionPolicy        `json:"retention"`
+}
+
+type RetentionPolicy struct {
+	CompletedJobsPerSession int    `json:"completed_jobs_per_session"`
+	JobLogBytes             int    `json:"job_log_bytes"`
+	Sessions                string `json:"sessions"`
 }
 
 type Event struct {
@@ -259,15 +267,16 @@ type sessionCleanup struct {
 }
 
 type sessionRegistry struct {
-	mu           sync.Mutex
-	next         int
-	nextFrontend int
-	nextAttach   int
-	nextJob      int
-	frontends    map[string]frontendRecord
-	sessions     map[string]Session
-	jobs         map[string]map[int]JobSummary
-	hostShells   map[string]ShellHandle
+	mu               sync.Mutex
+	next             int
+	nextFrontend     int
+	nextAttach       int
+	nextJob          int
+	frontends        map[string]frontendRecord
+	sessions         map[string]Session
+	jobs             map[string]map[int]JobSummary
+	hostShells       map[string]ShellHandle
+	maxCompletedJobs int
 }
 
 type eventHub struct {
@@ -474,6 +483,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			Streams:   append(s.events.Streams(), s.streams.List()...),
 			VMs:       runtimeInstanceStatuses(runtime),
 			StartedAt: s.startedAt,
+			Retention: RetentionPolicy{CompletedJobsPerSession: s.registry.maxCompletedJobs, JobLogBytes: maxJobLogBytes, Sessions: "explicit-delete"},
 		})
 	})
 	mux.HandleFunc("GET /vmsh/frontends", func(w http.ResponseWriter, r *http.Request) {
@@ -1439,10 +1449,11 @@ func newToken() (string, error) {
 
 func newSessionRegistry() *sessionRegistry {
 	return &sessionRegistry{
-		frontends:  map[string]frontendRecord{},
-		sessions:   map[string]Session{},
-		jobs:       map[string]map[int]JobSummary{},
-		hostShells: map[string]ShellHandle{},
+		frontends:        map[string]frontendRecord{},
+		sessions:         map[string]Session{},
+		jobs:             map[string]map[int]JobSummary{},
+		hostShells:       map[string]ShellHandle{},
+		maxCompletedJobs: maxCompletedJobsPerSession,
 	}
 }
 
@@ -1804,7 +1815,7 @@ func (r *sessionRegistry) Update(id string, req UpdateSessionRequest) (Session, 
 	session.HostShells = cloneShellHandles(req.HostShells)
 	session.GuestShells = cloneShellHandles(req.GuestShells)
 	session.SSHShells = cloneShellHandles(req.SSHShells)
-	session.Jobs = cloneJobSummaries(req.Jobs)
+	session.Jobs = retainTerminalJobHistory(cloneJobSummaries(req.Jobs), r.maxCompletedJobs)
 	session.Copies = cloneCopySummaries(req.Copies)
 	session.HostShells = r.mergedHostShellsLocked(id, session.HostShells)
 	session.UpdatedAt = time.Now()
@@ -2099,11 +2110,66 @@ func (r *sessionRegistry) FinishJob(sessionID string, jobID int, result JobSumma
 		job.FinishedAt = time.Now()
 	}
 	jobs[jobID] = job
+	r.pruneDaemonJobsLocked(sessionID)
 	if session, ok := r.sessions[sessionID]; ok {
 		session.UpdatedAt = job.FinishedAt
 		r.sessions[sessionID] = session
 	}
 	return job, true
+}
+
+func (r *sessionRegistry) pruneDaemonJobsLocked(sessionID string) {
+	jobs := r.jobs[sessionID]
+	if len(jobs) == 0 || r.maxCompletedJobs < 0 {
+		return
+	}
+	terminal := make([]JobSummary, 0, len(jobs))
+	for _, job := range jobs {
+		if !job.FinishedAt.IsZero() {
+			terminal = append(terminal, job)
+		}
+	}
+	sort.Slice(terminal, func(i, j int) bool {
+		if terminal[i].FinishedAt.Equal(terminal[j].FinishedAt) {
+			return terminal[i].ID < terminal[j].ID
+		}
+		return terminal[i].FinishedAt.Before(terminal[j].FinishedAt)
+	})
+	for len(terminal) > r.maxCompletedJobs {
+		delete(jobs, terminal[0].ID)
+		terminal = terminal[1:]
+	}
+}
+
+func retainTerminalJobHistory(jobs []JobSummary, limit int) []JobSummary {
+	if limit < 0 {
+		return jobs
+	}
+	terminal := make([]int, 0, len(jobs))
+	for i := range jobs {
+		if !jobs[i].FinishedAt.IsZero() || jobs[i].Status == "done" || jobs[i].Status == "error" || jobs[i].Status == "lost" {
+			terminal = append(terminal, i)
+		}
+	}
+	sort.Slice(terminal, func(i, j int) bool {
+		a, b := jobs[terminal[i]], jobs[terminal[j]]
+		if a.FinishedAt.Equal(b.FinishedAt) {
+			return a.ID < b.ID
+		}
+		return a.FinishedAt.Before(b.FinishedAt)
+	})
+	remove := map[int]bool{}
+	for len(terminal) > limit {
+		remove[terminal[0]] = true
+		terminal = terminal[1:]
+	}
+	out := make([]JobSummary, 0, len(jobs)-len(remove))
+	for i, job := range jobs {
+		if !remove[i] {
+			out = append(out, job)
+		}
+	}
+	return out
 }
 
 func (r *sessionRegistry) RequestCancelJob(sessionID string, jobID int) (JobSummary, error) {

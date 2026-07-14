@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -882,6 +883,40 @@ func TestDaemonOwnedVMJobRunsThroughRuntime(t *testing.T) {
 		jobs := getJobsFromServer(t, httpSrv.URL, "secret")
 		return len(jobs) == 1 && jobs[0].ID == started.ID && jobs[0].Status == "exited" && jobs[0].Logs == "vm-job:ok\n"
 	})
+}
+
+func TestCompletedJobRetentionNeverPrunesActiveJobs(t *testing.T) {
+	registry := newSessionRegistry()
+	registry.maxCompletedJobs = 2
+	session := mustCreateRegistrySession(t, registry, "main")
+	active, err := registry.StartJob(session.ID, StartHostJobRequest{Command: []string{"active"}})
+	if err != nil {
+		t.Fatalf("start active job: %v", err)
+	}
+	var completed []JobSummary
+	for i := 0; i < 3; i++ {
+		job, err := registry.StartJob(session.ID, StartHostJobRequest{Command: []string{fmt.Sprintf("job-%d", i)}})
+		if err != nil {
+			t.Fatalf("start completed job: %v", err)
+		}
+		finished, ok := registry.FinishJob(session.ID, job.ID, JobSummary{Status: "done", Logs: strings.Repeat("x", maxJobLogBytes), FinishedAt: time.Unix(int64(i+1), 0)})
+		if !ok {
+			t.Fatalf("finish job %d", job.ID)
+		}
+		completed = append(completed, finished)
+	}
+	jobs := registry.Jobs()
+	wantIDs := []int{active.ID, completed[1].ID, completed[2].ID}
+	gotIDs := make([]int, 0, len(jobs))
+	for _, job := range jobs {
+		gotIDs = append(gotIDs, job.ID)
+	}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Fatalf("retained job IDs = %v, want %v", gotIDs, wantIDs)
+	}
+	if jobs[0].Status != "running" {
+		t.Fatalf("active job = %+v", jobs[0])
+	}
 }
 
 func TestDaemonHostJobHelper(t *testing.T) {
