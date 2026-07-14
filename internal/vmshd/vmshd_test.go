@@ -1212,15 +1212,15 @@ func TestTerminalAttachmentStreamTracksActiveStreamAndResize(t *testing.T) {
 
 func TestTerminalStreamRegistryAllowsOneWriterPerAttachment(t *testing.T) {
 	registry := newStreamRegistry()
-	first, closeFirst, err := registry.Open("terminal", "session", "attachment")
+	first, closeFirst, err := registry.Open("terminal", "session", "attachment", "", nil)
 	if err != nil || first.ID == "" {
 		t.Fatalf("open first stream: stream=%+v err=%v", first, err)
 	}
-	if _, _, err := registry.Open("terminal", "session", "attachment"); err == nil {
+	if _, _, err := registry.Open("terminal", "session", "attachment", "", nil); err == nil {
 		t.Fatal("second writer stream was accepted")
 	}
 	closeFirst()
-	if _, closeSecond, err := registry.Open("terminal", "session", "attachment"); err != nil {
+	if _, closeSecond, err := registry.Open("terminal", "session", "attachment", "", nil); err != nil {
 		t.Fatalf("reopen after close: %v", err)
 	} else {
 		closeSecond()
@@ -1256,6 +1256,112 @@ func TestHostShellSubscriberReceivesEveryOutputChunkUnderBackpressure(t *testing
 	case <-published:
 	case <-time.After(time.Second):
 		t.Fatal("publisher remained blocked after subscriber caught up")
+	}
+}
+
+func TestTerminalStreamsAreRevokedByAttachmentLifecycle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host PTY shell test requires a Unix shell")
+	}
+	for _, lifecycle := range []string{"detach", "delete-session", "close-frontend"} {
+		t.Run(lifecycle, func(t *testing.T) {
+			srv := NewServer("secret")
+			mux := http.NewServeMux()
+			srv.RegisterHandlers(mux, nil)
+			frontend := srv.registry.RegisterFrontend(RegisterFrontendRequest{Name: "test"})
+			session, err := srv.registry.Create(CreateSessionRequest{Name: "main", FrontendID: frontend.ID, Scope: "frontend"})
+			if err != nil {
+				t.Fatalf("create session: %v", err)
+			}
+			_, attachment, err := srv.registry.Attach(session.ID, AttachSessionRequest{FrontendID: frontend.ID, Mode: "interactive"})
+			if err != nil {
+				t.Fatalf("attach session: %v", err)
+			}
+			httpSrv := httptest.NewServer(srv.Authenticate(mux))
+			defer httpSrv.Close()
+			t.Cleanup(func() { srv.shells.Close(session.ID) })
+
+			target := strings.Replace(httpSrv.URL, "http://", "ws://", 1) + "/vmsh/sessions/" + session.ID + "/attachments/" + attachment.ID + "/stream"
+			cfg, err := websocket.NewConfig(target, httpSrv.URL)
+			if err != nil {
+				t.Fatalf("websocket config: %v", err)
+			}
+			cfg.Header.Set("Authorization", "Bearer secret")
+			ws, err := websocket.DialConfig(cfg)
+			if err != nil {
+				t.Fatalf("dial stream: %v", err)
+			}
+			defer ws.Close()
+			var attached TerminalStreamMessage
+			if err := websocket.JSON.Receive(ws, &attached); err != nil {
+				t.Fatalf("receive attached message: %v", err)
+			}
+
+			method := http.MethodPost
+			path := "/vmsh/sessions/" + session.ID + "/detach"
+			body := bytes.NewBufferString(fmt.Sprintf(`{"attachment_id":%q}`, attachment.ID))
+			switch lifecycle {
+			case "delete-session":
+				method = http.MethodDelete
+				path = "/vmsh/sessions/" + session.ID
+				body = bytes.NewBuffer(nil)
+			case "close-frontend":
+				method = http.MethodDelete
+				path = "/vmsh/frontends/" + frontend.ID
+				body = bytes.NewBuffer(nil)
+			}
+			req, err := http.NewRequest(method, httpSrv.URL+path, body)
+			if err != nil {
+				t.Fatalf("new lifecycle request: %v", err)
+			}
+			req.Header.Set("Authorization", "Bearer secret")
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("lifecycle request: %v", err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("lifecycle status = %d, want %d", resp.StatusCode, http.StatusOK)
+			}
+			if err := ws.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatalf("set stream deadline: %v", err)
+			}
+			var msg TerminalStreamMessage
+			if err := websocket.JSON.Receive(ws, &msg); err == nil {
+				t.Fatalf("revoked stream remained readable: %+v", msg)
+			}
+			requireEventually(t, func() bool { return len(srv.streams.List()) == 0 })
+		})
+	}
+}
+
+func TestStreamRegistryRevocationIsIdempotentAndOutsideLock(t *testing.T) {
+	registry := newStreamRegistry()
+	revoked := make(chan struct{}, 1)
+	_, closeStream, err := registry.Open("terminal", "sess_1", "attach_1", "fe_1", func() {
+		registry.List()
+		revoked <- struct{}{}
+	})
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	registry.RevokeAttachment("sess_1", "attach_1")
+	registry.RevokeAttachment("sess_1", "attach_1")
+	closeStream()
+	closeStream()
+	select {
+	case <-revoked:
+	default:
+		t.Fatal("stream was not revoked")
+	}
+	select {
+	case <-revoked:
+		t.Fatal("stream revoke callback ran more than once")
+	default:
+	}
+	if streams := registry.List(); len(streams) != 0 {
+		t.Fatalf("streams after revocation = %+v", streams)
 	}
 }
 
