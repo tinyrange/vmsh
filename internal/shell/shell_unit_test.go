@@ -7454,6 +7454,38 @@ func TestExtractTarToHostRejectsTraversal(t *testing.T) {
 	}
 }
 
+func TestWritePathTarReturnsFinalizationError(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "empty.txt")
+	if err := os.WriteFile(src, nil, 0o644); err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	wantErr := errors.New("footer write failed")
+	w := &failAfterWriter{remaining: 512, err: wantErr}
+
+	err := writePathTar(w, src, "empty.txt")
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("write archive error = %v, want finalization error", err)
+	}
+}
+
+type failAfterWriter struct {
+	remaining int
+	err       error
+}
+
+func (w *failAfterWriter) Write(p []byte) (int, error) {
+	if w.remaining <= 0 {
+		return 0, w.err
+	}
+	if len(p) > w.remaining {
+		n := w.remaining
+		w.remaining = 0
+		return n, w.err
+	}
+	w.remaining -= len(p)
+	return len(p), nil
+}
+
 func TestExtractTarToHostDirectoryDestinationSemantics(t *testing.T) {
 	var archive bytes.Buffer
 	if err := writePathTar(&archive, makeTestCopyTree(t), "tree"); err != nil {
