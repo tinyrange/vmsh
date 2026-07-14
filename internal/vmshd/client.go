@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/tinyrange/vmsh/internal/backend"
 	"github.com/tinyrange/vmsh/internal/vmshdprotocol"
@@ -29,6 +30,8 @@ type TerminalStream struct {
 	closeOnce sync.Once
 }
 
+const vmshdControlRequestTimeout = 2 * time.Minute
+
 func NewHTTPClient(state backend.DaemonState) (*HTTPClient, error) {
 	token, err := backend.ReadDaemonToken(state.TokenPath)
 	if err != nil {
@@ -37,81 +40,139 @@ func NewHTTPClient(state backend.DaemonState) (*HTTPClient, error) {
 	return &HTTPClient{
 		baseURL: "http://" + state.Addr,
 		token:   token,
-		client:  http.DefaultClient,
+		client:  newControlHTTPClient(),
 	}, nil
 }
 
+func newControlHTTPClient() *http.Client {
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Client{Timeout: vmshdControlRequestTimeout}
+	}
+	clone := transport.Clone()
+	clone.ResponseHeaderTimeout = 30 * time.Second
+	return &http.Client{Transport: clone, Timeout: vmshdControlRequestTimeout}
+}
+
 func (c *HTTPClient) CreateSession(req CreateSessionRequest) (Session, error) {
+	return c.CreateSessionContext(context.Background(), req)
+}
+
+func (c *HTTPClient) CreateSessionContext(ctx context.Context, req CreateSessionRequest) (Session, error) {
 	var session Session
-	err := c.doJSON(http.MethodPost, "/vmsh/sessions", req, &session)
+	err := c.doJSONContext(ctx, http.MethodPost, "/vmsh/sessions", req, &session)
 	return session, err
 }
 
 func (c *HTTPClient) RegisterFrontend(req RegisterFrontendRequest) (FrontendSummary, error) {
+	return c.RegisterFrontendContext(context.Background(), req)
+}
+
+func (c *HTTPClient) RegisterFrontendContext(ctx context.Context, req RegisterFrontendRequest) (FrontendSummary, error) {
 	var frontend FrontendSummary
-	err := c.doJSON(http.MethodPost, "/vmsh/frontends", req, &frontend)
+	err := c.doJSONContext(ctx, http.MethodPost, "/vmsh/frontends", req, &frontend)
 	return frontend, err
 }
 
 func (c *HTTPClient) CloseFrontend(id string) (FrontendSummary, error) {
+	return c.CloseFrontendContext(context.Background(), id)
+}
+
+func (c *HTTPClient) CloseFrontendContext(ctx context.Context, id string) (FrontendSummary, error) {
 	var frontend FrontendSummary
-	err := c.doJSON(http.MethodDelete, "/vmsh/frontends/"+url.PathEscape(id), nil, &frontend)
+	err := c.doJSONContext(ctx, http.MethodDelete, "/vmsh/frontends/"+url.PathEscape(id), nil, &frontend)
 	return frontend, err
 }
 
 func (c *HTTPClient) Status() (Status, error) {
+	return c.StatusContext(context.Background())
+}
+
+func (c *HTTPClient) StatusContext(ctx context.Context) (Status, error) {
 	var status Status
-	err := c.doJSON(http.MethodGet, "/vmsh/status", nil, &status)
+	err := c.doJSONContext(ctx, http.MethodGet, "/vmsh/status", nil, &status)
 	return status, err
 }
 
 func (c *HTTPClient) Sessions() ([]SessionSummary, error) {
+	return c.SessionsContext(context.Background())
+}
+
+func (c *HTTPClient) SessionsContext(ctx context.Context) ([]SessionSummary, error) {
 	var sessions []SessionSummary
-	err := c.doJSON(http.MethodGet, "/vmsh/sessions", nil, &sessions)
+	err := c.doJSONContext(ctx, http.MethodGet, "/vmsh/sessions", nil, &sessions)
 	return sessions, err
 }
 
 func (c *HTTPClient) Session(id string) (Session, error) {
+	return c.SessionContext(context.Background(), id)
+}
+
+func (c *HTTPClient) SessionContext(ctx context.Context, id string) (Session, error) {
 	var session Session
-	err := c.doJSON(http.MethodGet, "/vmsh/sessions/"+url.PathEscape(id), nil, &session)
+	err := c.doJSONContext(ctx, http.MethodGet, "/vmsh/sessions/"+url.PathEscape(id), nil, &session)
 	return session, err
 }
 
 func (c *HTTPClient) UpdateSession(id string, req UpdateSessionRequest) (Session, error) {
+	return c.UpdateSessionContext(context.Background(), id, req)
+}
+
+func (c *HTTPClient) UpdateSessionContext(ctx context.Context, id string, req UpdateSessionRequest) (Session, error) {
 	var session Session
-	err := c.doJSON(http.MethodPatch, "/vmsh/sessions/"+url.PathEscape(id), req, &session)
+	err := c.doJSONContext(ctx, http.MethodPatch, "/vmsh/sessions/"+url.PathEscape(id), req, &session)
 	return session, err
 }
 
 func (c *HTTPClient) Jobs() ([]JobSummary, error) {
+	return c.JobsContext(context.Background())
+}
+
+func (c *HTTPClient) JobsContext(ctx context.Context) ([]JobSummary, error) {
 	var jobs []JobSummary
-	err := c.doJSON(http.MethodGet, "/vmsh/jobs", nil, &jobs)
+	err := c.doJSONContext(ctx, http.MethodGet, "/vmsh/jobs", nil, &jobs)
 	return jobs, err
 }
 
 func (c *HTTPClient) StartHostJob(sessionID string, req StartHostJobRequest) (JobSummary, error) {
+	return c.StartHostJobContext(context.Background(), sessionID, req)
+}
+
+func (c *HTTPClient) StartHostJobContext(ctx context.Context, sessionID string, req StartHostJobRequest) (JobSummary, error) {
 	var job JobSummary
-	err := c.doJSON(http.MethodPost, "/vmsh/sessions/"+url.PathEscape(sessionID)+"/jobs", req, &job)
+	err := c.doJSONContext(ctx, http.MethodPost, "/vmsh/sessions/"+url.PathEscape(sessionID)+"/jobs", req, &job)
 	return job, err
 }
 
 func (c *HTTPClient) CancelHostJob(sessionID string, jobID int) (JobSummary, error) {
+	return c.CancelHostJobContext(context.Background(), sessionID, jobID)
+}
+
+func (c *HTTPClient) CancelHostJobContext(ctx context.Context, sessionID string, jobID int) (JobSummary, error) {
 	var job JobSummary
 	path := fmt.Sprintf("/vmsh/sessions/%s/jobs/%d", url.PathEscape(sessionID), jobID)
-	err := c.doJSON(http.MethodDelete, path, nil, &job)
+	err := c.doJSONContext(ctx, http.MethodDelete, path, nil, &job)
 	return job, err
 }
 
 func (c *HTTPClient) AttachSession(id string, req AttachSessionRequest) (AttachSessionResponse, error) {
+	return c.AttachSessionContext(context.Background(), id, req)
+}
+
+func (c *HTTPClient) AttachSessionContext(ctx context.Context, id string, req AttachSessionRequest) (AttachSessionResponse, error) {
 	var resp AttachSessionResponse
-	err := c.doJSON(http.MethodPost, "/vmsh/sessions/"+url.PathEscape(id)+"/attach", req, &resp)
+	err := c.doJSONContext(ctx, http.MethodPost, "/vmsh/sessions/"+url.PathEscape(id)+"/attach", req, &resp)
 	return resp, err
 }
 
 func (c *HTTPClient) UpdateTerminal(sessionID, attachmentID string, req Terminal) (AttachSessionResponse, error) {
+	return c.UpdateTerminalContext(context.Background(), sessionID, attachmentID, req)
+}
+
+func (c *HTTPClient) UpdateTerminalContext(ctx context.Context, sessionID, attachmentID string, req Terminal) (AttachSessionResponse, error) {
 	var resp AttachSessionResponse
 	path := "/vmsh/sessions/" + url.PathEscape(sessionID) + "/attachments/" + url.PathEscape(attachmentID) + "/terminal"
-	err := c.doJSON(http.MethodPost, path, req, &resp)
+	err := c.doJSONContext(ctx, http.MethodPost, path, req, &resp)
 	return resp, err
 }
 
@@ -130,7 +191,10 @@ func (c *HTTPClient) DialTerminalStream(ctx context.Context, sessionID, attachme
 	}
 	cfg.Header.Set("Authorization", "Bearer "+c.token)
 	setFrontendProtocolHeaders(cfg.Header)
-	ws, err := websocket.DialConfig(cfg)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ws, err := cfg.DialContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -187,18 +251,26 @@ func (s *TerminalStream) Close() error {
 }
 
 func (c *HTTPClient) DetachSession(id string, req DetachSessionRequest) (Session, error) {
+	return c.DetachSessionContext(context.Background(), id, req)
+}
+
+func (c *HTTPClient) DetachSessionContext(ctx context.Context, id string, req DetachSessionRequest) (Session, error) {
 	var session Session
-	err := c.doJSON(http.MethodPost, "/vmsh/sessions/"+url.PathEscape(id)+"/detach", req, &session)
+	err := c.doJSONContext(ctx, http.MethodPost, "/vmsh/sessions/"+url.PathEscape(id)+"/detach", req, &session)
 	return session, err
 }
 
 func (c *HTTPClient) PersistSession(id string, req PersistSessionRequest) (Session, error) {
+	return c.PersistSessionContext(context.Background(), id, req)
+}
+
+func (c *HTTPClient) PersistSessionContext(ctx context.Context, id string, req PersistSessionRequest) (Session, error) {
 	var session Session
-	err := c.doJSON(http.MethodPost, "/vmsh/sessions/"+url.PathEscape(id)+"/persist", req, &session)
+	err := c.doJSONContext(ctx, http.MethodPost, "/vmsh/sessions/"+url.PathEscape(id)+"/persist", req, &session)
 	return session, err
 }
 
-func (c *HTTPClient) doJSON(method, path string, reqBody any, respBody any) error {
+func (c *HTTPClient) doJSONContext(ctx context.Context, method, path string, reqBody any, respBody any) error {
 	var body io.Reader
 	if reqBody != nil {
 		buf := &bytes.Buffer{}
@@ -207,7 +279,10 @@ func (c *HTTPClient) doJSON(method, path string, reqBody any, respBody any) erro
 		}
 		body = buf
 	}
-	req, err := http.NewRequest(method, c.baseURL+path, body)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
 	if err != nil {
 		return err
 	}
