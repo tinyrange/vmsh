@@ -16,15 +16,19 @@ import (
 )
 
 type paths struct {
-	root      string
-	ccDir     string
-	build     string
-	ccBin     string
-	ccvm      string
-	vmsh      string
-	initAMD64 string
-	initARM64 string
+	root  string
+	ccDir string
+	build string
+	ccBin string
+	ccvm  string
+	vmsh  string
 }
+
+var (
+	demoRunner        func(paths, []string) error
+	demoWantsHelpFunc func([]string) bool
+	demoUsageFunc     func(io.Writer)
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -76,14 +80,19 @@ func run() error {
 		if len(args) > 0 && args[0] == "--" {
 			args = args[1:]
 		}
-		if demoWantsHelp(args) {
-			printDemoUsage(os.Stderr)
+		if demoRunner == nil {
+			return fmt.Errorf("demo command requires the full tools package; run `go run ./tools demo`")
+		}
+		if demoWantsHelpFunc != nil && demoWantsHelpFunc(args) {
+			if demoUsageFunc != nil {
+				demoUsageFunc(os.Stderr)
+			}
 			return nil
 		}
 		if err := build(p); err != nil {
 			return err
 		}
-		return runDemo(p, args)
+		return demoRunner(p, args)
 	default:
 		return fmt.Errorf("unknown command %q", cmd)
 	}
@@ -100,8 +109,8 @@ func printUsage() {
 
 The default command is build. Outputs are written under build/vmsh unless
 --build-dir or VMSH_BUILD_DIR is set.
-The run command records an asciinema session to build/vmsh/session.cast unless
-vmsh args already include -record/--record.
+The run command records a raw session to build/vmsh/session.raw.jsonl unless
+vmsh args already include -record/--record or -record-raw/--record-raw.
 The demo command drives a real vmsh session through a PTY and writes a redacted
 marketing/demo cast to build/vmsh/demo.cast.
 `)
@@ -117,7 +126,6 @@ func makePaths(buildDirArg string) (paths, error) {
 	if err != nil {
 		return paths{}, err
 	}
-
 	suffix := ""
 	if targetGOOS == "windows" {
 		suffix = ".exe"
@@ -126,14 +134,12 @@ func makePaths(buildDirArg string) (paths, error) {
 	buildDir := resolveBuildDir(root, buildDirArg)
 	ccDir := filepath.Join(root, "cc")
 	return paths{
-		root:      root,
-		ccDir:     ccDir,
-		build:     buildDir,
-		ccBin:     filepath.Join(buildDir, "cc"+suffix),
-		ccvm:      filepath.Join(buildDir, "ccvm"+suffix),
-		vmsh:      filepath.Join(buildDir, "vmsh"+suffix),
-		initAMD64: filepath.Join(buildDir, "init-linux-amd64"),
-		initARM64: filepath.Join(buildDir, "init-linux-arm64"),
+		root:  root,
+		ccDir: ccDir,
+		build: buildDir,
+		ccBin: filepath.Join(buildDir, "cc"+suffix),
+		ccvm:  filepath.Join(buildDir, "ccvm"+suffix),
+		vmsh:  filepath.Join(buildDir, "vmsh"+suffix),
 	}, nil
 }
 
@@ -229,30 +235,8 @@ func build(p paths) error {
 		return err
 	}
 
-	if err := step("build linux/arm64 guest init", func() error {
-		return goBuild(p.ccDir, []string{"CGO_ENABLED=0", "GOOS=linux", "GOARCH=arm64"}, p.initARM64, "./internal/cmd/init")
-	}); err != nil {
-		return err
-	}
-	if err := step("install linux/arm64 guest init", func() error {
-		return copyFile(p.initARM64, filepath.Join(p.ccDir, "internal", "guestinit", "guest-init-linux-arm64"), 0o644)
-	}); err != nil {
-		return err
-	}
-
-	if err := step("build linux/amd64 guest init", func() error {
-		return goBuild(p.ccDir, []string{"CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64"}, p.initAMD64, "./internal/cmd/init")
-	}); err != nil {
-		return err
-	}
-	if err := step("install linux/amd64 guest init", func() error {
-		return copyFile(p.initAMD64, filepath.Join(p.ccDir, "internal", "guestinit", "guest-init-linux-amd64"), 0o644)
-	}); err != nil {
-		return err
-	}
-
-	if err := step("build ccvm with embedded guest init", func() error {
-		return goBuild(p.ccDir, []string{"CGO_ENABLED=0"}, p.ccvm, "-tags", "embed_guestinit", "./cmd/ccvm")
+	if err := step("build ccvm", func() error {
+		return goBuild(p.ccDir, []string{"CGO_ENABLED=0"}, p.ccvm, "./cmd/ccvm")
 	}); err != nil {
 		return err
 	}
@@ -262,7 +246,11 @@ func build(p paths) error {
 		return err
 	}
 	if err := step("build vmsh", func() error {
-		return goBuild(p.root, nil, p.vmsh, "./cmd/vmsh")
+		args := []string{"./cmd/vmsh"}
+		if ldflags := vmshVersionLDFlags(p.root); ldflags != "" {
+			args = append([]string{"-ldflags", ldflags}, args...)
+		}
+		return goBuild(p.root, nil, p.vmsh, args...)
 	}); err != nil {
 		return err
 	}
@@ -311,6 +299,41 @@ func formatDuration(d time.Duration) string {
 func goBuild(workDir string, env []string, output string, args ...string) error {
 	goArgs := append([]string{"build", "-o", output}, args...)
 	return command(workDir, env, "go", goArgs...)
+}
+
+func vmshVersionLDFlags(root string) string {
+	values := map[string]string{
+		"Release":   gitOutput(root, "describe", "--tags", "--dirty", "--always"),
+		"Commit":    gitOutput(root, "rev-parse", "HEAD"),
+		"Dirty":     fmt.Sprintf("%t", gitDirty(root)),
+		"BuildDate": time.Now().UTC().Format(time.RFC3339),
+	}
+	var parts []string
+	for _, key := range []string{"Release", "Commit", "Dirty", "BuildDate"} {
+		value := strings.TrimSpace(values[key])
+		if value == "" {
+			continue
+		}
+		parts = append(parts, "-X", "github.com/tinyrange/vmsh/internal/version."+key+"="+value)
+	}
+	return strings.Join(parts, " ")
+}
+
+func gitOutput(root string, args ...string) string {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func gitDirty(root string) bool {
+	cmd := exec.Command("git", "status", "--porcelain")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	return err == nil && strings.TrimSpace(string(out)) != ""
 }
 
 func command(workDir string, env []string, name string, args ...string) error {
@@ -362,10 +385,7 @@ func copyFile(src, dst string, mode os.FileMode) error {
 }
 
 func runVMSH(p paths, args []string) error {
-	vmshArgs := append([]string{"-ccvm", p.ccvm}, args...)
-	if !hasRecordArg(args) {
-		vmshArgs = append([]string{"-ccvm", p.ccvm, "-record", filepath.Join(p.build, "session.cast")}, args...)
-	}
+	vmshArgs := vmshRunArgs(p.build, args)
 	logf("run: %s %s", p.vmsh, strings.Join(vmshArgs, " "))
 	cmd := exec.Command(p.vmsh, vmshArgs...)
 	cmd.Dir = p.root
@@ -385,15 +405,23 @@ func runVMSH(p paths, args []string) error {
 	return nil
 }
 
+func vmshRunArgs(buildDir string, args []string) []string {
+	vmshArgs := append([]string{}, args...)
+	if !hasRecordArg(args) {
+		vmshArgs = append([]string{"-record-raw", filepath.Join(buildDir, "session.raw.jsonl")}, args...)
+	}
+	return vmshArgs
+}
+
 func hasRecordArg(args []string) bool {
 	for i, arg := range args {
 		if arg == "--" {
 			return false
 		}
-		if arg == "-record" || arg == "--record" || arg == "-recording" || arg == "--recording" {
+		if arg == "-record" || arg == "--record" || arg == "-record-raw" || arg == "--record-raw" || arg == "-recording" || arg == "--recording" {
 			return true
 		}
-		if strings.HasPrefix(arg, "-record=") || strings.HasPrefix(arg, "--record=") {
+		if strings.HasPrefix(arg, "-record=") || strings.HasPrefix(arg, "--record=") || strings.HasPrefix(arg, "-record-raw=") || strings.HasPrefix(arg, "--record-raw=") {
 			return true
 		}
 		if strings.HasPrefix(arg, "-recording=") || strings.HasPrefix(arg, "--recording=") {

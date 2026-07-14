@@ -37,6 +37,12 @@ type demoOptions struct {
 	vmMemory string
 }
 
+func init() {
+	demoRunner = runDemo
+	demoWantsHelpFunc = demoWantsHelp
+	demoUsageFunc = printDemoUsage
+}
+
 func runDemo(p paths, args []string) error {
 	opts, err := parseDemoArgs(p, args)
 	if err != nil {
@@ -252,7 +258,7 @@ func driveDemoSession(p paths, opts demoOptions, workRoot, hostWork string) erro
 	ctx, cancel := context.WithTimeout(context.Background(), opts.timeout)
 	defer cancel()
 
-	args := []string{"-ccvm", p.ccvm, "-cache-dir", defaultDemoCacheDir(), "-record", opts.raw}
+	args := []string{"-cache-dir", defaultDemoCacheDir(), "-record", opts.raw}
 	cmd := exec.CommandContext(ctx, p.vmsh, args...)
 	cmd.Dir = p.root
 	cmd.Env = append(os.Environ(),

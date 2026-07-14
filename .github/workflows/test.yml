@@ -49,17 +49,7 @@ jobs:
             cc/go.sum
 
       - name: Run tests
-        if: runner.os != 'Windows'
         run: go test -short ./... -count=1 -timeout 20m
-
-      - name: Run Windows tests
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          packages="$(go list ./... | grep -v 'github.com/tinyrange/vmsh/internal/shell$')"
-          go test -short ${packages} -count=1 -timeout 20m
-          go test -run '^$' ./internal/shell -count=1
 
   build:
     name: Build vmsh payload
@@ -123,6 +113,7 @@ jobs:
         env:
           VMSH_TEST_CCVM: ${{ github.workspace }}/build/vmsh/ccvm
           VMSH_TEST_VMSH: ${{ github.workspace }}/build/vmsh/vmsh
+          VMSH_TEST_VM_INTEGRATION: "1"
           VMSH_TEST_FREEBSD: "1"
           VMSH_VM_INTEGRATION_TIMEOUT_SECONDS: "180"
         run: go test ./internal/shell -run 'TestVMIntegration(ScriptCommandsStartVMAndUseShellFeatures|FreeBSDBuiltinRunsCommandsAndCopiesFiles)$' -count=1 -timeout 4m

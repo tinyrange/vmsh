@@ -41,6 +41,9 @@ jobs:
           - goos: windows
             goarch: amd64
             ext: .exe
+          - goos: windows
+            goarch: arm64
+            ext: .exe
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -71,8 +74,16 @@ jobs:
           install -m 644 ../build/release/init-linux-arm64 internal/guestinit/guest-init-linux-arm64
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o ../build/release/init-linux-amd64 ./internal/cmd/init
           install -m 644 ../build/release/init-linux-amd64 internal/guestinit/guest-init-linux-amd64
+          for bsd in openbsd freebsd netbsd; do
+            for arch in arm64 amd64; do
+              CGO_ENABLED=0 GOOS="$bsd" GOARCH="$arch" go build -trimpath -o "../build/release/init-${bsd}-${arch}" "./internal/cmd/${bsd}-init"
+              install -m 644 "../build/release/init-${bsd}-${arch}" "internal/${bsd}/guestinit/guest-init-${bsd}-${arch}"
+            done
+          done
           cd ..
-          GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -tags "embed_ccvm embed_guestinit" -o "dist/${name}" ./cmd/vmsh
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-X github.com/tinyrange/vmsh/internal/version.Release=${version} -X github.com/tinyrange/vmsh/internal/version.Commit=${GITHUB_SHA} -X github.com/tinyrange/vmsh/internal/version.Dirty=false -X github.com/tinyrange/vmsh/internal/version.BuildDate=${build_date}"
+          GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -tags "embed_ccvm embed_guestinit" -ldflags "$ldflags" -o "dist/${name}" ./cmd/vmsh
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -150,8 +161,16 @@ jobs:
           install -m 644 ../build/release/init-linux-arm64 internal/guestinit/guest-init-linux-arm64
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o ../build/release/init-linux-amd64 ./internal/cmd/init
           install -m 644 ../build/release/init-linux-amd64 internal/guestinit/guest-init-linux-amd64
+          for bsd in openbsd freebsd netbsd; do
+            for arch in arm64 amd64; do
+              CGO_ENABLED=0 GOOS="$bsd" GOARCH="$arch" go build -trimpath -o "../build/release/init-${bsd}-${arch}" "./internal/cmd/${bsd}-init"
+              install -m 644 "../build/release/init-${bsd}-${arch}" "internal/${bsd}/guestinit/guest-init-${bsd}-${arch}"
+            done
+          done
           cd ..
-          GOOS=darwin GOARCH=arm64 go build -trimpath -tags "embed_ccvm embed_guestinit" -o "dist/${name}" ./cmd/vmsh
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-X github.com/tinyrange/vmsh/internal/version.Release=${version} -X github.com/tinyrange/vmsh/internal/version.Commit=${GITHUB_SHA} -X github.com/tinyrange/vmsh/internal/version.Dirty=false -X github.com/tinyrange/vmsh/internal/version.BuildDate=${build_date}"
+          GOOS=darwin GOARCH=arm64 go build -trimpath -tags "embed_ccvm embed_guestinit" -ldflags "$ldflags" -o "dist/${name}" ./cmd/vmsh
 
       - name: Sign macOS binaries
         run: |
@@ -205,6 +224,9 @@ jobs:
     needs: [build-unix-windows, build-macos]
     runs-on: ubuntu-24.04
     steps:
+      - name: Checkout release notes
+        uses: actions/checkout@v6
+
       - name: Download binaries
         uses: actions/download-artifact@v4
         with:
@@ -231,7 +253,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_VERSION }}
-          generate_release_notes: true
+          body_path: RELEASENOTES.md
           files: |
             artifacts/**/vmsh_*
             checksums.txt

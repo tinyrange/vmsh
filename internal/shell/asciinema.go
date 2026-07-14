@@ -1,6 +1,7 @@
 package shell
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"os"
@@ -14,43 +15,70 @@ import (
 type asciinemaRecorder struct {
 	mu    sync.Mutex
 	file  *os.File
+	raw   *rawSessionRecorder
 	start time.Time
 }
 
-func newAsciinemaRecorder(path string, cols, rows int) (*asciinemaRecorder, error) {
-	if path == "" {
+type rawSessionRecorder struct {
+	file *os.File
+}
+
+func newAsciinemaRecorder(path, rawPath string, cols, rows int) (*asciinemaRecorder, error) {
+	if path == "" && rawPath == "" {
 		return nil, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
+	rec := &asciinemaRecorder{start: time.Now()}
+	if path != "" {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return nil, err
+		}
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+		if err != nil {
+			return nil, err
+		}
+		rec.file = file
+		header := map[string]any{
+			"version":   2,
+			"width":     cols,
+			"height":    rows,
+			"timestamp": rec.start.Unix(),
+			"env": map[string]string{
+				"TERM":  os.Getenv("TERM"),
+				"SHELL": os.Getenv("SHELL"),
+			},
+		}
+		if err := rec.writeJSONLine(header); err != nil {
+			_ = rec.Close()
+			return nil, err
+		}
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	rec := &asciinemaRecorder{file: file, start: time.Now()}
-	header := map[string]any{
-		"version":   2,
-		"width":     cols,
-		"height":    rows,
-		"timestamp": rec.start.Unix(),
-		"env": map[string]string{
-			"TERM":  os.Getenv("TERM"),
-			"SHELL": os.Getenv("SHELL"),
-		},
-	}
-	if err := rec.writeJSONLine(header); err != nil {
-		_ = file.Close()
-		return nil, err
+	if rawPath != "" {
+		raw, err := newRawSessionRecorder(rawPath, rec.start, cols, rows)
+		if err != nil {
+			_ = rec.Close()
+			return nil, err
+		}
+		rec.raw = raw
 	}
 	return rec, nil
 }
 
 func (r *asciinemaRecorder) Close() error {
-	if r == nil || r.file == nil {
+	if r == nil {
 		return nil
 	}
-	return r.file.Close()
+	var err error
+	if r.file != nil {
+		err = r.file.Close()
+		r.file = nil
+	}
+	if r.raw != nil {
+		if rawErr := r.raw.Close(); err == nil {
+			err = rawErr
+		}
+		r.raw = nil
+	}
+	return err
 }
 
 func (r *asciinemaRecorder) recordOutput(data []byte) {
@@ -61,16 +89,98 @@ func (r *asciinemaRecorder) recordInput(data []byte) {
 	r.recordEvent("i", data)
 }
 
+func (r *asciinemaRecorder) recordResize(cols, rows int) {
+	if r == nil || cols <= 0 || rows <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.raw != nil {
+		_ = r.raw.recordResize(time.Since(r.start).Seconds(), cols, rows)
+	}
+}
+
 func (r *asciinemaRecorder) recordEvent(kind string, data []byte) {
 	if r == nil || len(data) == 0 {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	_ = r.writeJSONLine([]any{time.Since(r.start).Seconds(), kind, string(data)})
+	elapsed := time.Since(r.start).Seconds()
+	if r.file != nil {
+		_ = r.writeJSONLine([]any{elapsed, kind, string(data)})
+	}
+	if r.raw != nil {
+		rawKind := "output"
+		if kind == "i" {
+			rawKind = "input"
+		}
+		_ = r.raw.recordBytes(elapsed, rawKind, data)
+	}
 }
 
 func (r *asciinemaRecorder) writeJSONLine(value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if _, err := r.file.Write(data); err != nil {
+		return err
+	}
+	_, err = r.file.Write([]byte("\n"))
+	return err
+}
+
+func newRawSessionRecorder(path string, started time.Time, cols, rows int) (*rawSessionRecorder, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	rec := &rawSessionRecorder{file: file}
+	header := map[string]any{
+		"kind":      "vmsh.raw_session",
+		"version":   1,
+		"cols":      cols,
+		"rows":      rows,
+		"timestamp": started.Unix(),
+	}
+	if err := rec.writeJSONLine(header); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return rec, nil
+}
+
+func (r *rawSessionRecorder) Close() error {
+	if r == nil || r.file == nil {
+		return nil
+	}
+	err := r.file.Close()
+	r.file = nil
+	return err
+}
+
+func (r *rawSessionRecorder) recordBytes(elapsed float64, kind string, data []byte) error {
+	return r.writeJSONLine(map[string]any{
+		"t":    elapsed,
+		"kind": kind,
+		"data": base64.StdEncoding.EncodeToString(data),
+	})
+}
+
+func (r *rawSessionRecorder) recordResize(elapsed float64, cols, rows int) error {
+	return r.writeJSONLine(map[string]any{
+		"t":    elapsed,
+		"kind": "resize",
+		"cols": cols,
+		"rows": rows,
+	})
+}
+
+func (r *rawSessionRecorder) writeJSONLine(value any) error {
 	data, err := json.Marshal(value)
 	if err != nil {
 		return err
