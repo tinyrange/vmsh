@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"testing"
 	"time"
@@ -26,14 +27,6 @@ func TestEvaluateRejectsProfileMutationAndPathEscape(t *testing.T) {
 	if _, err := Evaluate(profile, &grant, request, time.Now()); !IsDenial(err, DeniedProfile) {
 		t.Fatalf("expected mutated-profile denial, got %v", err)
 	}
-}
-
-func TestTrustedHelperProcess(t *testing.T) {
-	if os.Getenv("VMSH_TRUSTED_HELPER") != "1" {
-		return
-	}
-	_, _ = fmt.Fprintln(os.Stdout, os.Args[len(os.Args)-1])
-	os.Exit(0)
 }
 
 func TestGatewayExecutesStructuredActionAndRejectsReplay(t *testing.T) {
@@ -94,15 +87,24 @@ func TestGatewayExecutesStructuredActionAndRejectsReplay(t *testing.T) {
 func testProfile(t *testing.T) (Profile, Grant) {
 	t.Helper()
 	root := t.TempDir()
-	executablePath, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
+	executablePath := "/bin/sh"
+	if runtime.GOOS == "windows" {
+		var err error
+		executablePath, err = os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	executable, err := os.ReadFile(executablePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	executableDigest := sha256.Sum256(executable)
+	arguments := trustedTestArguments()
+	rules := make([]ArgumentRule, len(arguments))
+	for position, argument := range arguments {
+		rules[position] = ArgumentRule{Position: position, Pattern: regexp.QuoteMeta(argument)}
+	}
 	profile := Profile{
 		Version:          1,
 		ID:               "development",
@@ -115,8 +117,7 @@ func testProfile(t *testing.T) (Profile, Grant) {
 			Executable:       executablePath,
 			ExecutableDigest: hex.EncodeToString(executableDigest[:]),
 			RootIDs:          []string{"workspace"},
-			ArgumentRules:    []ArgumentRule{{Position: 0, Pattern: "-test.run=TestTrustedHelperProcess"}, {Position: 1, Pattern: "--"}, {Position: 2, Pattern: "hello"}},
-			Environment:      map[string]string{"VMSH_TRUSTED_HELPER": "1"},
+			ArgumentRules:    rules,
 			MaxRequestBytes:  4096,
 			MaxDuration:      "5s",
 		}},
@@ -129,7 +130,16 @@ func testProfile(t *testing.T) (Profile, Grant) {
 }
 
 func testRequest(profile Profile, grant Grant) Request {
-	return Request{Version: ProtocolVersion, CallID: "call-one", Sequence: 1, SourceVMID: grant.SourceVMID, SourceGeneration: grant.SourceGeneration, TargetID: profile.TargetID, ProfileDigest: profile.Digest, ActionID: "echo", Arguments: []string{"-test.run=TestTrustedHelperProcess", "--", "hello"}, RootID: "workspace", RelativeCWD: ".", Deadline: time.Now().Add(4 * time.Second)}
+	return Request{Version: ProtocolVersion, CallID: "call-one", Sequence: 1, SourceVMID: grant.SourceVMID, SourceGeneration: grant.SourceGeneration, TargetID: profile.TargetID, ProfileDigest: profile.Digest, ActionID: "echo", Arguments: trustedTestArguments(), RootID: "workspace", RelativeCWD: ".", Deadline: time.Now().Add(4 * time.Second)}
+}
+
+func trustedTestArguments() []string {
+	if runtime.GOOS == "windows" {
+		// The Windows gateway fails closed before execution because owner-only
+		// audit-file enforcement is unavailable there.
+		return []string{"-test.run=^$"}
+	}
+	return []string{"-c", "printf 'hello\\n'"}
 }
 
 func callGateway(t *testing.T, port int, envelope Envelope) []Event {

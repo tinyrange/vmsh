@@ -85,6 +85,16 @@ jobs:
           ldflags="-X github.com/tinyrange/vmsh/internal/version.Release=${version} -X github.com/tinyrange/vmsh/internal/version.Commit=${GITHUB_SHA} -X github.com/tinyrange/vmsh/internal/version.Dirty=false -X github.com/tinyrange/vmsh/internal/version.BuildDate=${build_date}"
           GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -tags "embed_ccvm embed_guestinit" -ldflags "$ldflags" -o "dist/${name}" ./cmd/vmsh
 
+      - name: Smoke-test native Linux payload
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          set -euo pipefail
+          name="vmsh_${RELEASE_VERSION}_linux_amd64"
+          output="$("dist/${name}" --version)"
+          grep -F "vmsh version ${RELEASE_VERSION}" <<<"$output"
+          grep -F "platform linux/amd64" <<<"$output"
+          grep -F "ccvm bundled" <<<"$output"
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
@@ -211,6 +221,15 @@ jobs:
 
           rm -f "$notary_zip"
           codesign --verify --strict --verbose=2 "dist/${name}"
+
+      - name: Smoke-test signed macOS payload
+        run: |
+          set -euo pipefail
+          name="vmsh_${RELEASE_VERSION}_darwin_arm64"
+          output="$("dist/${name}" --version)"
+          grep -F "vmsh version ${RELEASE_VERSION}" <<<"$output"
+          grep -F "platform darwin/arm64" <<<"$output"
+          grep -F "ccvm bundled" <<<"$output"
 
       - name: Upload binary
         uses: actions/upload-artifact@v4

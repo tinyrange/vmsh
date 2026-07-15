@@ -216,8 +216,11 @@ func (g *Gateway) execute(connection net.Conn, request Request, digest string, d
 	streams.Add(2)
 	go streamEvents(&streams, encoder, "stdout", stdout)
 	go streamEvents(&streams, encoder, "stderr", stderr)
-	err = command.Wait()
+	// StdoutPipe and StderrPipe require their readers to finish before Wait.
+	// Wait closes the parent pipe descriptors after observing process exit and
+	// can otherwise discard the final bytes from a short-lived action.
 	streams.Wait()
+	err = command.Wait()
 	exitCode := 0
 	if err != nil {
 		var exitError *exec.ExitError
