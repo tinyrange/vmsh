@@ -4894,17 +4894,22 @@ func TestGuestCopyInterruptReturnsStatus130(t *testing.T) {
 	}
 }
 
-func TestTTYGuestRunInterruptCancelsContext(t *testing.T) {
+func TestTTYGuestRunRepeatedInterruptsDoNotHardCancelContext(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	api.instances["default"] = client.InstanceState{ID: "default", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
 	started := make(chan struct{})
+	release := make(chan struct{})
 	api.runInteractiveContext = func(ctx context.Context, id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 		if !req.TTY {
 			t.Fatalf("TTY guest run used non-TTY request: %+v", req)
 		}
 		close(started)
-		<-ctx.Done()
-		return ctx.Err()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-release:
+			return nil
+		}
 	}
 	sh := newUnitShell(t, api)
 	interrupts := make(chan os.Signal, 1)
@@ -4934,14 +4939,17 @@ func TestTTYGuestRunInterruptCancelsContext(t *testing.T) {
 
 	select {
 	case err := <-errCh:
+		t.Fatalf("TTY guest run returned after repeated ctrl-c: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-errCh:
 		if err != nil {
-			t.Fatalf("interrupted TTY guest run returned error: %v", err)
-		}
-		if sh.lastCode != 130 {
-			t.Fatalf("lastCode = %d, want 130", sh.lastCode)
+			t.Fatalf("released TTY guest run returned error: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatalf("interrupted TTY guest run did not return")
+		t.Fatal("released TTY guest run did not return")
 	}
 }
 
@@ -5064,10 +5072,13 @@ func TestStreamHostPTYStdinControlCCallsInterruptHook(t *testing.T) {
 	called := make(chan struct{})
 	var once sync.Once
 
-	go streamHostPTYStdin(inR, outW, done, nil, interrupted, nil, func() {
-		once.Do(func() {
-			close(called)
-		})
+	go streamHostPTYStdin(inR, outW, done, nil, interrupted, nil, func(name string) bool {
+		if name == "INT" {
+			once.Do(func() {
+				close(called)
+			})
+		}
+		return false
 	})
 	if _, err := inW.Write([]byte{0x03}); err != nil {
 		t.Fatalf("write ctrl-c: %v", err)
@@ -5141,10 +5152,13 @@ func TestStreamSSHPTYStdinControlCCallsInterruptHook(t *testing.T) {
 	called := make(chan struct{})
 	var once sync.Once
 
-	go streamSSHPTYStdin(inR, outW, done, nil, nil, func() {
-		once.Do(func() {
-			close(called)
-		})
+	go streamSSHPTYStdin(inR, outW, done, nil, nil, func(name string) bool {
+		if name == "INT" {
+			once.Do(func() {
+				close(called)
+			})
+		}
+		return false
 	})
 	if _, err := inW.Write([]byte{0x03}); err != nil {
 		t.Fatalf("write ctrl-c: %v", err)
@@ -5160,6 +5174,51 @@ func TestStreamSSHPTYStdinControlCCallsInterruptHook(t *testing.T) {
 	case <-called:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("interrupt hook was not called")
+	}
+}
+
+func TestStreamSSHPTYStdinConsumesHandledForceShortcut(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PTY stdin test uses os.Pipe readiness semantics")
+	}
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("input pipe: %v", err)
+	}
+	defer inR.Close()
+	defer inW.Close()
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("output pipe: %v", err)
+	}
+	defer outR.Close()
+	defer outW.Close()
+	done := make(chan struct{})
+	defer close(done)
+	forced := make(chan struct{})
+	var once sync.Once
+
+	go streamSSHPTYStdin(inR, outW, done, nil, nil, func(name string) bool {
+		if name != "QUIT" {
+			return false
+		}
+		once.Do(func() { close(forced) })
+		return true
+	})
+	if _, err := inW.Write([]byte{0x1c, 'x'}); err != nil {
+		t.Fatalf("write force shortcut and input tail: %v", err)
+	}
+	var forwarded [1]byte
+	if _, err := io.ReadFull(outR, forwarded[:]); err != nil {
+		t.Fatalf("read forwarded input tail: %v", err)
+	}
+	if forwarded[0] != 'x' {
+		t.Fatalf("forwarded byte = %#x, want input tail without force shortcut", forwarded[0])
+	}
+	select {
+	case <-forced:
+	case <-time.After(5 * time.Second):
+		t.Fatal("force shortcut hook was not called")
 	}
 }
 
@@ -5185,9 +5244,44 @@ func TestCommandInterruptEscalatorForwardedInterruptSkipsSoftSignal(t *testing.T
 	if got := soft.Load(); got != 0 {
 		t.Fatalf("soft interrupts after second forwarded ctrl-c = %d, want 0", got)
 	}
+	if !interrupts.Force() {
+		t.Fatal("force shortcut was not armed after repeated ctrl-c")
+	}
+	if got := hard.Load(); got != 1 {
+		t.Fatalf("hard interrupts after force shortcut = %d, want 1", got)
+	}
 	interrupts.ForwardedInterrupt()
 	if got := hard.Load(); got != 1 {
-		t.Fatalf("hard interrupts after third forwarded ctrl-c = %d, want 1", got)
+		t.Fatalf("hard interrupts after third forwarded ctrl-c = %d, want unchanged 1", got)
+	}
+	if !interrupts.Force() || hard.Load() != 1 {
+		t.Fatal("repeated force shortcut did not remain consumed and idempotent")
+	}
+}
+
+func TestCommandInterruptEscalatorForwardsQuitUntilForceIsArmed(t *testing.T) {
+	var hard atomic.Int32
+	interrupts := newCommandInterruptEscalator("remote-command", io.Discard, nil, func() {
+		hard.Add(1)
+	})
+	handleSignal := func(name string) bool {
+		switch name {
+		case "INT":
+			interrupts.ForwardedInterrupt()
+		case "QUIT":
+			return interrupts.Force()
+		}
+		return false
+	}
+
+	before := filterCommandControlInput([]byte{0x1c, 'a'}, handleSignal)
+	if !bytes.Equal(before, []byte{0x1c, 'a'}) || hard.Load() != 0 {
+		t.Fatalf("unarmed quit = %v hard=%d, want forwarded unchanged", before, hard.Load())
+	}
+	filterCommandControlInput([]byte{0x03, 0x03}, handleSignal)
+	after := filterCommandControlInput([]byte{0x1c, 'b'}, handleSignal)
+	if !bytes.Equal(after, []byte{'b'}) || hard.Load() != 1 {
+		t.Fatalf("armed quit = %v hard=%d, want consumed with one hard interrupt", after, hard.Load())
 	}
 }
 

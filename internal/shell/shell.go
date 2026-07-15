@@ -3600,7 +3600,15 @@ func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 					}
 					go session.close()
 				})
-				stop, state, err := s.startHostPTYForwarding(tty, session, stdout, stderr, interrupts.Interrupt)
+				stop, state, err := s.startHostPTYForwarding(tty, session, stdout, stderr, func(name string) bool {
+					switch name {
+					case "INT":
+						interrupts.Interrupt()
+					case "QUIT":
+						return interrupts.Force()
+					}
+					return false
+				})
 				interrupted = state
 				return stop, err
 			})
@@ -5901,11 +5909,14 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 			go session.close()
 		})
 		err = session.run(line, stdout, stderr, func() (func(), error) {
-			return s.startGuestInputForwarding(req.TTY, true, session.inputs, stdout, stderr, func(name string) {
+			return s.startGuestInputForwarding(req.TTY, true, session.inputs, stdout, stderr, func(name string) bool {
 				if name == "INT" {
 					interrupted.Store(true)
 					interrupts.Interrupt()
+				} else if name == "QUIT" {
+					return interrupts.Force()
 				}
+				return false
 			})
 		})
 		if persistentGuestShellEnded(err) && s.guestShell == session {
@@ -6409,11 +6420,14 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 		stopInterrupts()
 		cancel()
 	}()
-	stopForwarding, err := s.startGuestInputForwarding(req.TTY, true, inputs, stdout, stderr, func(name string) {
+	stopForwarding, err := s.startGuestInputForwarding(req.TTY, true, inputs, stdout, stderr, func(name string) bool {
 		if name == "INT" {
 			interrupted.Store(true)
 			interrupts.Interrupt()
+		} else if name == "QUIT" {
+			return interrupts.Force()
 		}
+		return false
 	})
 	if err != nil {
 		return err
@@ -6608,7 +6622,9 @@ func sendGuestInputBlocking(out chan<- client.ExecInput, done <-chan struct{}, i
 	}
 }
 
-func (s *shellState) startGuestInputForwarding(tty, forwardStdin bool, inputs chan<- client.ExecInput, stdout, stderr io.Writer, onSignal ...func(string)) (func(), error) {
+type commandSignalHandler func(string) bool
+
+func (s *shellState) startGuestInputForwarding(tty, forwardStdin bool, inputs chan<- client.ExecInput, stdout, stderr io.Writer, onSignal ...commandSignalHandler) (func(), error) {
 	restore := func() {}
 	done := make(chan struct{})
 	cancelRead := func() {}
@@ -6676,7 +6692,7 @@ func stopPTYForwarding(restore func(), cancelProducers func(), waitProducers fun
 	}
 }
 
-func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan struct{}, inputCancel *ptyInputCanceller, recorder *asciinemaRecorder, onSignal ...func(string)) {
+func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan struct{}, inputCancel *ptyInputCanceller, recorder *asciinemaRecorder, onSignal ...commandSignalHandler) {
 	var buf [4096]byte
 	for {
 		select {
@@ -6694,14 +6710,12 @@ func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan st
 			if recorder != nil {
 				recorder.recordInput(buf[:n])
 			}
-			if bytes.Contains(buf[:n], []byte{0x03}) {
-				for _, fn := range onSignal {
-					if fn != nil {
-						fn("INT")
-					}
-				}
+			input := filterCommandControlInput(buf[:n], func(name string) bool {
+				return dispatchCommandSignal(onSignal, name)
+			})
+			if len(input) > 0 {
+				sendGuestInput(out, done, client.ExecInput{Kind: "stdin", Data: append([]byte(nil), input...)})
 			}
-			sendGuestInput(out, done, client.ExecInput{Kind: "stdin", Data: append([]byte(nil), buf[:n]...)})
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -6712,7 +6726,7 @@ func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan st
 	}
 }
 
-func forwardGuestSignals(out chan<- client.ExecInput, done <-chan struct{}, tty bool, stdout, stderr io.Writer, onSignal ...func(string)) {
+func forwardGuestSignals(out chan<- client.ExecInput, done <-chan struct{}, tty bool, stdout, stderr io.Writer, onSignal ...commandSignalHandler) {
 	signals := terminal.HostSignals(tty)
 	sigCh := make(chan os.Signal, 8)
 	signal.Notify(sigCh, signals...)
@@ -6744,10 +6758,8 @@ func forwardGuestSignals(out chan<- client.ExecInput, done <-chan struct{}, tty 
 			if !ok {
 				continue
 			}
-			for _, fn := range onSignal {
-				if fn != nil {
-					fn(name)
-				}
+			if dispatchCommandSignal(onSignal, name) {
+				continue
 			}
 			if name == "INT" {
 				fmt.Fprintln(stderr)
@@ -6777,7 +6789,7 @@ func sendGuestInputNonBlocking(out chan<- client.ExecInput, input client.ExecInp
 	}
 }
 
-func (s *shellState) startHostPTYForwarding(tty bool, session *persistentHostShell, stdout, stderr io.Writer, onInterrupt ...func()) (func(), *atomic.Bool, error) {
+func (s *shellState) startHostPTYForwarding(tty bool, session *persistentHostShell, stdout, stderr io.Writer, onSignal ...commandSignalHandler) (func(), *atomic.Bool, error) {
 	interrupted := &atomic.Bool{}
 	if session == nil || session.tty == nil {
 		return func() {}, interrupted, nil
@@ -6812,7 +6824,7 @@ func (s *shellState) startHostPTYForwarding(tty bool, session *persistentHostShe
 			go func() {
 				defer producers.Done()
 				defer inputCancel.close()
-				streamHostPTYStdin(os.Stdin, session.tty, done, inputCancel, interrupted, terminalWriterRecorder(stdout), onInterrupt...)
+				streamHostPTYStdin(os.Stdin, session.tty, done, inputCancel, interrupted, terminalWriterRecorder(stdout), onSignal...)
 			}()
 		}
 	}
@@ -6820,7 +6832,7 @@ func (s *shellState) startHostPTYForwarding(tty bool, session *persistentHostShe
 	producers.Add(1)
 	go func() {
 		defer producers.Done()
-		forwardHostPTYSignals(session.tty, done, tty, stdout, stderr, interrupted, onInterrupt...)
+		forwardHostPTYSignals(session.tty, done, tty, stdout, stderr, interrupted, onSignal...)
 	}()
 
 	stop := stopPTYForwarding(restore, func() {
@@ -6830,7 +6842,7 @@ func (s *shellState) startHostPTYForwarding(tty bool, session *persistentHostShe
 	return stop, interrupted, nil
 }
 
-func streamHostPTYStdin(in *os.File, out *os.File, done <-chan struct{}, inputCancel *ptyInputCanceller, interrupted *atomic.Bool, recorder *asciinemaRecorder, onInterrupt ...func()) {
+func streamHostPTYStdin(in *os.File, out *os.File, done <-chan struct{}, inputCancel *ptyInputCanceller, interrupted *atomic.Bool, recorder *asciinemaRecorder, onSignal ...commandSignalHandler) {
 	var buf [4096]byte
 	for {
 		select {
@@ -6848,15 +6860,13 @@ func streamHostPTYStdin(in *os.File, out *os.File, done <-chan struct{}, inputCa
 			if recorder != nil {
 				recorder.recordInput(buf[:n])
 			}
-			if bytes.Contains(buf[:n], []byte{0x03}) {
-				interrupted.Store(true)
-				for _, fn := range onInterrupt {
-					if fn != nil {
-						fn()
-					}
+			input := filterCommandControlInput(buf[:n], func(name string) bool {
+				if name == "INT" {
+					interrupted.Store(true)
 				}
-			}
-			if !writeHostPTYInput(out, done, buf[:n]) {
+				return dispatchCommandSignal(onSignal, name)
+			})
+			if len(input) > 0 && !writeHostPTYInput(out, done, input) {
 				return
 			}
 		}
@@ -6885,7 +6895,7 @@ func writeHostPTYInput(out *os.File, done <-chan struct{}, data []byte) bool {
 	return true
 }
 
-func forwardHostPTYSignals(out *os.File, done <-chan struct{}, tty bool, stdout, stderr io.Writer, interrupted *atomic.Bool, onInterrupt ...func()) {
+func forwardHostPTYSignals(out *os.File, done <-chan struct{}, tty bool, stdout, stderr io.Writer, interrupted *atomic.Bool, onSignal ...commandSignalHandler) {
 	signals := terminal.HostSignals(tty)
 	sigCh := make(chan os.Signal, 8)
 	signal.Notify(sigCh, signals...)
@@ -6909,11 +6919,9 @@ func forwardHostPTYSignals(out *os.File, done <-chan struct{}, tty bool, stdout,
 			if name == "INT" {
 				interrupted.Store(true)
 				fmt.Fprintln(stderr)
-				for _, fn := range onInterrupt {
-					if fn != nil {
-						fn()
-					}
-				}
+			}
+			if dispatchCommandSignal(onSignal, name) {
+				continue
 			}
 			writeHostPTYSignal(out, name)
 		}
@@ -6962,6 +6970,7 @@ type commandInterruptEscalator struct {
 	soft    func()
 	hard    func()
 	count   atomic.Int32
+	forced  atomic.Bool
 }
 
 func newCommandInterruptEscalator(command string, stderr io.Writer, soft, hard func()) *commandInterruptEscalator {
@@ -6996,15 +7005,55 @@ func (e *commandInterruptEscalator) handleCount(count int32, runSoft bool) {
 			e.soft()
 		}
 	case 2:
-		fmt.Fprintf(e.stderr, "\nvmsh: command %q is not responding to SIGINT; press Ctrl+C again to hard terminate it\n", compactCommandForMessage(e.command))
+		if e.hard != nil {
+			fmt.Fprintf(e.stderr, "\nvmsh: command %q is not responding to SIGINT; press Ctrl+\\ to hard terminate it\n", compactCommandForMessage(e.command))
+		}
 		if runSoft && e.soft != nil {
 			e.soft()
 		}
 	default:
-		if e.hard != nil {
-			e.hard()
+		if runSoft && e.soft != nil {
+			e.soft()
 		}
 	}
+}
+
+func (e *commandInterruptEscalator) Force() bool {
+	if e == nil || e.hard == nil || e.count.Load() < 2 {
+		return false
+	}
+	if e.forced.CompareAndSwap(false, true) {
+		e.hard()
+	}
+	return true
+}
+
+func dispatchCommandSignal(handlers []commandSignalHandler, name string) bool {
+	handled := false
+	for _, handler := range handlers {
+		if handler != nil && handler(name) {
+			handled = true
+		}
+	}
+	return handled
+}
+
+func filterCommandControlInput(data []byte, onSignal commandSignalHandler) []byte {
+	filtered := data[:0]
+	for _, value := range data {
+		name := ""
+		switch value {
+		case 0x03:
+			name = "INT"
+		case 0x1c:
+			name = "QUIT"
+		}
+		if name != "" && onSignal != nil && onSignal(name) {
+			continue
+		}
+		filtered = append(filtered, value)
+	}
+	return filtered
 }
 
 func compactCommandForMessage(command string) string {

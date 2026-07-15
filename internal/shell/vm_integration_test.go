@@ -543,6 +543,19 @@ func TestVMIntegrationInteractiveUIDrivesKeyboardAndRoutesCommands(t *testing.T)
 		t.Fatalf("interrupted host command created completion marker: %v; %s", err, uiSnapshotSummary(session.Snapshot()))
 	}
 
+	typeUI(t, driver, "@host sh -c 'trap \"\" INT QUIT; printf \"VMSH_UI_FORCE_READY=1\\n\"; while :; do sleep 1; done'", session)
+	enterUI(t, driver, session)
+	waitUILine(t, ctx, driver, "VMSH_UI_FORCE_READY=1", session)
+	position = session.Snapshot().BytesRead
+	inputUI(t, driver, ptyterm.Ctrl('c'), session)
+	inputUI(t, driver, ptyterm.Ctrl('c'), session)
+	inputUI(t, driver, ptyterm.Ctrl('\\'), session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+	typeUI(t, driver, "@host printf 'VMSH_UI_FORCE_RECOVERED=1\\n'", session)
+	position = enterUI(t, driver, session)
+	waitUILine(t, ctx, driver, "VMSH_UI_FORCE_RECOVERED=1", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
 	inputUI(t, driver, ptyterm.Ctrl('d'), session)
 	if result := session.Wait(ctx); result.Err != nil || result.ExitCode != 0 {
 		t.Fatalf("vmsh UI exit = %+v; %s", result, uiSnapshotSummary(session.Snapshot()))
