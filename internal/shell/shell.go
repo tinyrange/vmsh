@@ -1212,8 +1212,8 @@ func Run(args []string) (retErr error) {
 		return err
 	}
 	promptInput := os.Stdin
-	closePromptInput := func() {}
 	if *script == "" {
+		var closePromptInput func()
 		promptInput, closePromptInput = openPromptInput(os.Stdin)
 		defer closePromptInput()
 	}
@@ -4777,7 +4777,7 @@ func extractTarToHostLegacy(r io.Reader, dst copyTargetPath) error {
 			if err := os.Symlink(header.Linkname, target); err != nil {
 				return err
 			}
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg, 0:
 			if err := ensureHostTarTargetCompatible(target, false); err != nil {
 				return err
 			}

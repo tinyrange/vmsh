@@ -1309,7 +1309,7 @@ func extractTarSafeWithLimits(r io.Reader, dst string, limits tarExtractionLimit
 			if err := os.MkdirAll(target, os.FileMode(header.Mode).Perm()); err != nil {
 				return err
 			}
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg, 0:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}

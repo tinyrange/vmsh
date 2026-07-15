@@ -120,12 +120,9 @@ func startCodexAgentProxy(hostCodexHome string) (*codexAgentProxy, error) {
 	}
 	proxy.server = server
 	go func() {
-		if err := server.Serve(ln); err != nil &&
-			!errors.Is(err, http.ErrServerClosed) &&
-			!errors.Is(err, net.ErrClosed) {
-			// There is no logger on shellState; stderr may already belong to the guest TTY.
-			// Keep unexpected proxy shutdown silent here and let the guest request fail.
-		}
+		// There is no logger on shellState; stderr may already belong to the guest TTY.
+		// Keep proxy shutdown silent here and let any affected guest request fail.
+		_ = server.Serve(ln)
 	}()
 	return proxy, nil
 }
