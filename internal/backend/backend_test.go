@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -145,8 +146,10 @@ func TestDaemonStateFailedPublicationPreservesPreviousState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read daemon state directory: %v", err)
 	}
-	if len(entries) != 1 || entries[0].Name() != "vmshd.json" {
-		t.Fatalf("daemon state directory entries = %v", entries)
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".tmp-") {
+			t.Fatalf("failed publication left temporary file %q", entry.Name())
+		}
 	}
 }
 
@@ -201,6 +204,32 @@ func TestDaemonStateConcurrentPublicationNeverExposesPartialJSON(t *testing.T) {
 	}
 	if _, err := ReadDaemonState(path); err != nil {
 		t.Fatalf("read final daemon state: %v", err)
+	}
+}
+
+func TestRemoveDaemonStateIfUnchangedPreservesReplacement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vmshd.json")
+	oldState := normalizeDaemonState(DaemonState{Addr: "localhost:1001", Generation: "old"})
+	newState := normalizeDaemonState(DaemonState{Addr: "localhost:1002", Generation: "new"})
+	if err := WriteDaemonState(path, oldState); err != nil {
+		t.Fatalf("write old state: %v", err)
+	}
+	if err := WriteDaemonState(path, newState); err != nil {
+		t.Fatalf("write replacement state: %v", err)
+	}
+	removed, err := RemoveDaemonStateIfUnchanged(path, oldState)
+	if err != nil {
+		t.Fatalf("conditionally remove old state: %v", err)
+	}
+	if removed {
+		t.Fatal("newer daemon state was removed by stale owner")
+	}
+	got, err := ReadDaemonState(path)
+	if err != nil {
+		t.Fatalf("read replacement state: %v", err)
+	}
+	if got != newState {
+		t.Fatalf("daemon state = %+v, want replacement %+v", got, newState)
 	}
 }
 
@@ -637,6 +666,135 @@ func TestConnectCCVMWithOptionsPreservesIncompatibleVMSHDState(t *testing.T) {
 	}
 	if preserved != state {
 		t.Fatalf("preserved state = %+v, want %+v", preserved, state)
+	}
+}
+
+func TestConnectCCVMWithOptionsReplacesDeadVMSHDState(t *testing.T) {
+	deadListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for stale address: %v", err)
+	}
+	deadAddr := deadListener.Addr().String()
+	if err := deadListener.Close(); err != nil {
+		t.Fatalf("close stale listener: %v", err)
+	}
+
+	const newToken = "new-secret"
+	newAddr := startCompatibleVMSHDTestServer(t, newToken)
+	cacheDir := t.TempDir()
+	oldTokenPath := filepath.Join(cacheDir, "vmshd-old.token")
+	if err := os.WriteFile(oldTokenPath, []byte("old-secret\n"), 0o600); err != nil {
+		t.Fatalf("write stale token: %v", err)
+	}
+	newTokenPath := filepath.Join(cacheDir, "vmshd-new.token")
+	if err := os.WriteFile(newTokenPath, []byte(newToken+"\n"), 0o600); err != nil {
+		t.Fatalf("write replacement token: %v", err)
+	}
+	statePath := filepath.Join(cacheDir, "vmshd.json")
+	launch := CCVMLaunch{Path: "/stable/vmshd"}
+	staleState := normalizeDaemonState(DaemonState{
+		Addr: deadAddr, Kind: "vmshd", TokenPath: oldTokenPath, Generation: "old", LaunchKey: DaemonLaunchKey(launch),
+	})
+	if err := WriteDaemonState(statePath, staleState); err != nil {
+		t.Fatalf("write stale state: %v", err)
+	}
+
+	oldStartDaemonProcess := startDaemonProcess
+	var startedCacheDir string
+	startDaemonProcess = func(_ CCVMLaunch, dir string) (*startedDaemonProcess, error) {
+		startedCacheDir = dir
+		return &startedDaemonProcess{
+			stdout:  io.NopCloser(strings.NewReader(serverHelloBanner(t, client.ServerHello{Addr: newAddr, Kind: "vmshd", TokenPath: newTokenPath}))),
+			release: func() {},
+			stop:    func() {},
+		}, nil
+	}
+	t.Cleanup(func() { startDaemonProcess = oldStartDaemonProcess })
+
+	var incompatible bool
+	api, err := ConnectCCVMWithOptions(launch, cacheDir, statePath, ConnectOptions{
+		OnIncompatible: func(DaemonState, error) { incompatible = true },
+	})
+	if err != nil {
+		t.Fatalf("replace stale daemon: %v", err)
+	}
+	if incompatible {
+		t.Fatal("dead daemon was reported as protocol-incompatible")
+	}
+	if startedCacheDir != cacheDir {
+		t.Fatalf("replacement cache = %q, want shared cache %q", startedCacheDir, cacheDir)
+	}
+	if err := api.HealthCheck(); err != nil {
+		t.Fatalf("replacement health check: %v", err)
+	}
+	written, err := ReadDaemonState(statePath)
+	if err != nil {
+		t.Fatalf("read replacement state: %v", err)
+	}
+	if written.Addr != newAddr || written.PrivateCacheDir != "" || written.Generation != "new" {
+		t.Fatalf("replacement state = %+v", written)
+	}
+}
+
+func TestConcurrentConnectsPublishOneSharedDaemon(t *testing.T) {
+	deadListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for stale address: %v", err)
+	}
+	deadAddr := deadListener.Addr().String()
+	_ = deadListener.Close()
+
+	const token = "replacement-secret"
+	newAddr := startCompatibleVMSHDTestServer(t, token)
+	cacheDir := t.TempDir()
+	oldTokenPath := filepath.Join(cacheDir, "vmshd-old.token")
+	if err := os.WriteFile(oldTokenPath, []byte("old-secret\n"), 0o600); err != nil {
+		t.Fatalf("write stale token: %v", err)
+	}
+	newTokenPath := filepath.Join(cacheDir, "vmshd-generation-one.token")
+	if err := os.WriteFile(newTokenPath, []byte(token+"\n"), 0o600); err != nil {
+		t.Fatalf("write replacement token: %v", err)
+	}
+	statePath := filepath.Join(cacheDir, "vmshd.json")
+	launch := CCVMLaunch{Path: "/stable/vmshd"}
+	if err := WriteDaemonState(statePath, DaemonState{
+		Addr: deadAddr, Kind: "vmshd", TokenPath: oldTokenPath, Generation: "old", LaunchKey: DaemonLaunchKey(launch),
+	}); err != nil {
+		t.Fatalf("write stale state: %v", err)
+	}
+
+	oldStartDaemonProcess := startDaemonProcess
+	var starts atomic.Int32
+	startDaemonProcess = func(_ CCVMLaunch, _ string) (*startedDaemonProcess, error) {
+		starts.Add(1)
+		return &startedDaemonProcess{
+			stdout:  io.NopCloser(strings.NewReader(serverHelloBanner(t, client.ServerHello{Addr: newAddr, Kind: "vmshd", TokenPath: newTokenPath}))),
+			release: func() {},
+			stop:    func() {},
+		}, nil
+	}
+	t.Cleanup(func() { startDaemonProcess = oldStartDaemonProcess })
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			api, err := ConnectCCVM(launch, cacheDir, statePath)
+			if err == nil {
+				err = api.HealthCheck()
+			}
+			errs <- err
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent connect: %v", err)
+		}
+	}
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("daemon starts = %d, want 1", got)
 	}
 }
 
@@ -1089,6 +1247,35 @@ func requireBearer(token string, next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+func startCompatibleVMSHDTestServer(t *testing.T, token string) string {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", requireBearer(token, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	mux.HandleFunc("/capabilities", requireBearer(token, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"host":"test","vm_supported":true}`))
+	}))
+	mux.HandleFunc("/watchdog/lease", requireBearer(token, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	mux.HandleFunc("/vm/start", requireBearer(token, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	mux.HandleFunc("/vmsh/status", requireBearer(token, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"kind":"vmshd","status":"ok"}`))
+	}))
+	mux.HandleFunc("/vmsh/protocol", requireBearer(token, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"kind":"vmshd","protocol":{"name":"vmshd.frontend","current":1,"minimum":1},"daemon":{"version":"test","platform":"test/test","executable":{"mode":"stable-daemon-copy"}},"compatibility":{"compatible":true,"action":"reuse","reason":"compatible"}}`))
+	}))
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	return strings.TrimPrefix(server.URL, "http://")
 }
 
 func TestConnectCCVMWithOptionsRejectsLegacyDaemon(t *testing.T) {

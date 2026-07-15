@@ -17,19 +17,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tinyrange/vmsh/internal/backend"
 	"github.com/tinyrange/vmsh/internal/vmshdprotocol"
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
 )
 
 func TestTokenFileIsPrivate(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "vmshd.token")
-	token, err := writeTokenFile(path)
+	dir := t.TempDir()
+	path, token, generation, err := createTokenFile(dir)
 	if err != nil {
 		t.Fatalf("write token: %v", err)
 	}
 	if token == "" {
 		t.Fatal("empty token")
+	}
+	if generation == "" || backend.DaemonTokenGeneration(path) != generation {
+		t.Fatalf("token path %q does not identify generation %q", path, generation)
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -46,6 +50,28 @@ func TestTokenFileIsPrivate(t *testing.T) {
 		if got := parent.Mode().Perm(); got != 0o700 {
 			t.Fatalf("token directory mode = %o, want 700", got)
 		}
+	}
+}
+
+func TestTokenFilesHaveIndependentGenerations(t *testing.T) {
+	dir := t.TempDir()
+	firstPath, firstToken, firstGeneration, err := createTokenFile(dir)
+	if err != nil {
+		t.Fatalf("create first token: %v", err)
+	}
+	secondPath, secondToken, secondGeneration, err := createTokenFile(dir)
+	if err != nil {
+		t.Fatalf("create second token: %v", err)
+	}
+	if firstPath == secondPath || firstToken == secondToken || firstGeneration == secondGeneration {
+		t.Fatalf("token identities are not independent: first=%q second=%q", firstPath, secondPath)
+	}
+	got, err := backend.ReadDaemonToken(firstPath)
+	if err != nil {
+		t.Fatalf("read first token after second creation: %v", err)
+	}
+	if got != firstToken {
+		t.Fatalf("first token changed after second creation")
 	}
 }
 

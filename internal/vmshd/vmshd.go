@@ -448,11 +448,11 @@ func Run(args []string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	tokenPath := filepath.Join(cacheDir, "vmshd.token")
-	token, err := writeTokenFile(tokenPath)
+	tokenPath, token, generation, err := createTokenFile(cacheDir)
 	if err != nil {
 		return false, err
 	}
+	defer os.Remove(tokenPath)
 
 	srv := NewServer(token)
 	defer func() {
@@ -502,9 +502,10 @@ func Run(args []string) (bool, error) {
 				return err
 			}
 			return backend.WriteDaemonState(statePath, backend.DaemonState{
-				Addr:      hello.Addr,
-				Kind:      Kind,
-				TokenPath: tokenPath,
+				Addr:       hello.Addr,
+				Kind:       Kind,
+				TokenPath:  tokenPath,
+				Generation: generation,
 				LaunchKey: backend.DaemonLaunchKey(backend.CCVMLaunch{
 					Path: exePath,
 				}),
@@ -1727,21 +1728,44 @@ func resolveCacheDir(arg string) (string, error) {
 	return dir, nil
 }
 
-func writeTokenFile(path string) (string, error) {
+func createTokenFile(cacheDir string) (string, string, string, error) {
 	token, err := newToken()
 	if err != nil {
-		return "", err
+		return "", "", "", err
 	}
-	if err := ensurePrivateDir(filepath.Dir(path)); err != nil {
-		return "", err
+	generation, err := newTokenGeneration()
+	if err != nil {
+		return "", "", "", err
 	}
-	if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
-		return "", err
+	if err := ensurePrivateDir(cacheDir); err != nil {
+		return "", "", "", err
+	}
+	path := filepath.Join(cacheDir, "vmshd-"+generation+".token")
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", "", "", err
+	}
+	remove := true
+	defer func() {
+		_ = file.Close()
+		if remove {
+			_ = os.Remove(path)
+		}
+	}()
+	if _, err := file.WriteString(token + "\n"); err != nil {
+		return "", "", "", err
+	}
+	if err := file.Sync(); err != nil {
+		return "", "", "", err
+	}
+	if err := file.Close(); err != nil {
+		return "", "", "", err
 	}
 	if runtime.GOOS != "windows" {
 		_ = os.Chmod(path, 0o600)
 	}
-	return token, nil
+	remove = false
+	return path, token, generation, nil
 }
 
 func ensurePrivateDir(path string) error {
@@ -1756,6 +1780,14 @@ func ensurePrivateDir(path string) error {
 
 func newToken() (string, error) {
 	var buf [32]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf[:]), nil
+}
+
+func newTokenGeneration() (string, error) {
+	var buf [16]byte
 	if _, err := rand.Read(buf[:]); err != nil {
 		return "", err
 	}

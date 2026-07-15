@@ -68,6 +68,7 @@ type DaemonState struct {
 	Version         int    `json:"version,omitempty"`
 	APIVersion      string `json:"api_version,omitempty"`
 	TokenPath       string `json:"token_path,omitempty"`
+	Generation      string `json:"generation,omitempty"`
 	LaunchKey       string `json:"launch_key,omitempty"`
 	PrivateCacheDir string `json:"private_cache_dir,omitempty"`
 }
@@ -221,13 +222,28 @@ func ConnectCCVM(launch CCVMLaunch, cacheDir, statePath string) (*client.Client,
 }
 
 func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts ConnectOptions) (*client.Client, error) {
+	lock, err := acquireDaemonFileLock(statePath+".launch.lock", daemonStartupHandshakeTimeout+5*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("lock daemon discovery %s: %w", statePath, err)
+	}
+	defer lock.Release()
+	return connectCCVMWithOptionsLocked(launch, cacheDir, statePath, opts)
+}
+
+func connectCCVMWithOptionsLocked(launch CCVMLaunch, cacheDir, statePath string, opts ConnectOptions) (*client.Client, error) {
 	if err := reclaimStalePrivateDaemonCaches(cacheDir); err != nil {
 		return nil, fmt.Errorf("reclaim private daemon caches: %w", err)
 	}
 	launchKey := DaemonLaunchKey(launch)
 	var preservedState *DaemonState
 	var incompatibility error
-	if state, err := ReadDaemonState(statePath); err == nil {
+	discoverySettled := false
+	for attempt := 0; attempt < 3; attempt++ {
+		state, err := ReadDaemonState(statePath)
+		if err != nil {
+			discoverySettled = true
+			break
+		}
 		preserveVMSHDState := func(reason error) {
 			if strings.TrimSpace(state.Kind) != "vmshd" || strings.TrimSpace(state.TokenPath) == "" || preservedState != nil {
 				return
@@ -241,14 +257,30 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		}
 		api := NewClient(state.Addr)
 		if err := ApplyDaemonStateAuth(api, state); err != nil {
-			preserveVMSHDState(err)
+			if daemonEndpointReachable(state.Addr) {
+				preserveVMSHDState(err)
+			}
 			if preservedState == nil {
-				_ = os.Remove(statePath)
+				removed, removeErr := RemoveDaemonStateIfUnchanged(statePath, state)
+				if removeErr != nil {
+					return nil, fmt.Errorf("reclaim stale daemon state: %w", removeErr)
+				}
+				if !removed {
+					continue
+				}
 			}
 		} else if err := api.HealthCheck(); err != nil {
-			preserveVMSHDState(err)
+			if daemonEndpointReachable(state.Addr) {
+				preserveVMSHDState(err)
+			}
 			if preservedState == nil {
-				_ = os.Remove(statePath)
+				removed, removeErr := RemoveDaemonStateIfUnchanged(statePath, state)
+				if removeErr != nil {
+					return nil, fmt.Errorf("reclaim stale daemon state: %w", removeErr)
+				}
+				if !removed {
+					continue
+				}
 			}
 		} else {
 			reusable, compatibilityErr := daemonReusable(api, state, launchKey)
@@ -260,9 +292,20 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 			}
 			preserveVMSHDState(compatibilityErr)
 			if preservedState == nil {
-				_ = os.Remove(statePath)
+				removed, removeErr := RemoveDaemonStateIfUnchanged(statePath, state)
+				if removeErr != nil {
+					return nil, fmt.Errorf("reclaim incompatible daemon state: %w", removeErr)
+				}
+				if !removed {
+					continue
+				}
 			}
 		}
+		discoverySettled = true
+		break
+	}
+	if !discoverySettled {
+		return nil, fmt.Errorf("daemon state changed repeatedly during stale-state reclamation")
 	}
 
 	startCacheDir := cacheDir
@@ -299,7 +342,13 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		removeFailedPrivateCache()
 		return nil, err
 	}
-	state := normalizeDaemonState(DaemonState{Addr: hello.Addr, Kind: hello.Kind, TokenPath: hello.TokenPath, LaunchKey: launchKey})
+	state := normalizeDaemonState(DaemonState{
+		Addr:       hello.Addr,
+		Kind:       hello.Kind,
+		TokenPath:  hello.TokenPath,
+		Generation: DaemonTokenGeneration(hello.TokenPath),
+		LaunchKey:  launchKey,
+	})
 	if preservedState != nil {
 		state.PrivateCacheDir = startCacheDir
 	}
@@ -347,6 +396,15 @@ func ConnectCCVMWithOptions(launch CCVMLaunch, cacheDir, statePath string, opts 
 		opts.OnStart(state)
 	}
 	return api, nil
+}
+
+func daemonEndpointReachable(addr string) bool {
+	conn, err := net.DialTimeout("tcp", strings.TrimSpace(addr), 250*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 func reclaimStalePrivateDaemonCaches(cacheDir string) error {
@@ -809,7 +867,31 @@ func WriteDaemonState(path string, state DaemonState) error {
 	if err != nil {
 		return err
 	}
-	return writeDaemonStateAtomically(path, append(data, '\n'), replaceDaemonStateFile)
+	return withDaemonStateWriteLock(path, func() error {
+		return writeDaemonStateAtomically(path, append(data, '\n'), replaceDaemonStateFile)
+	})
+}
+
+func RemoveDaemonStateIfUnchanged(path string, expected DaemonState) (bool, error) {
+	removed := false
+	err := withDaemonStateWriteLock(path, func() error {
+		current, err := ReadDaemonState(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if current != expected {
+			return nil
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		removed = true
+		return nil
+	})
+	return removed, err
 }
 
 func writeDaemonStateAtomically(path string, data []byte, replace func(string, string) error) error {
@@ -859,6 +941,16 @@ func normalizeDaemonState(state DaemonState) DaemonState {
 		state.APIVersion = DaemonAPIVersion
 	}
 	return state
+}
+
+func DaemonTokenGeneration(path string) string {
+	base := filepath.Base(strings.TrimSpace(path))
+	const prefix = "vmshd-"
+	const suffix = ".token"
+	if !strings.HasPrefix(base, prefix) || !strings.HasSuffix(base, suffix) {
+		return ""
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(base, prefix), suffix)
 }
 
 func firstNonEmpty(values ...string) string {
