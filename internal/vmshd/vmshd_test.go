@@ -1711,7 +1711,11 @@ func TestStatusReportsActiveEventStreams(t *testing.T) {
 	scanner := bufio.NewScanner(resp.Body)
 	connected := readEvent(t, scanner)
 
-	status := getStatusFromServer(t, httpSrv.URL, "secret")
+	var status Status
+	requireEventually(t, func() bool {
+		status = getStatusFromServer(t, httpSrv.URL, "secret")
+		return len(status.Streams) == 1 && status.Streams[0].LastEventID == connected.ID
+	})
 	if len(status.Streams) != 1 {
 		t.Fatalf("streams = %+v", status.Streams)
 	}
