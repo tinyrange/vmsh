@@ -71,11 +71,13 @@ sh -lc 'uname -m && whoami'
 - `cmd/vmsh`: the `vmsh` shell.
 - `cc`: git submodule containing `ccvm`, VM backends, image import, and the
   lower-level `cc` CLI.
+- `docs`: focused development notes and test recipes.
 - `tools/build.go`: local build and run helper for `cc`, `ccvm`, and `vmsh`.
   It builds `ccvm` from the submodule as a sidecar artifact, builds `vmsh`,
   signs `ccvm` on macOS, and can launch the built `vmsh`.
 - `.github/workflows/release.yml`: tag-triggered single-binary releases for
   Linux, Windows, and signed macOS ARM64.
+- `docs/design`: accepted plans for cross-cutting vmsh features.
 
 ## Getting Started
 
@@ -277,6 +279,17 @@ Use `--` when the guest command itself begins with an option:
 ```sh
 @alpine -- --help
 ```
+
+After selecting a context, ordinary command lines run there:
+
+```sh
+@obsd-build --from openbsd --memory 4g --cpus 1 --network
+pwd
+cd /host/path/to/workspace
+```
+
+Use `@host ...` for one command on the host, or another `@<image> ...` line to
+run a one-off command in a different context.
 
 Guest commands run as UID `1000` by default. Use `@ --sudo <cmd>` or
 `@sudo <cmd>` to run a command as root in the current VM.

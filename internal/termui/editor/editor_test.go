@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math/rand"
 	"os"
 	"strings"
 	"syscall"
@@ -100,6 +101,255 @@ func TestReadLinePreparedWaitsForBracketedPasteEnd(t *testing.T) {
 	if got != "stealth" {
 		t.Fatalf("line = %q, want stealth", got)
 	}
+}
+
+func TestReadLinePreparedPreservesTextAfterNavigationKeys(t *testing.T) {
+	out, err := os.CreateTemp("", "termui-editor-navigation-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(out.Name())
+	defer out.Close()
+	caps := terminal.Capabilities{Mode: terminal.ModeDynamicInteractive, Width: 80, Height: 24}
+	ed := New(Options{
+		In:           os.Stdin,
+		Out:          out,
+		Reader:       bytes.NewBufferString("tail\x1b[Hhead \x1b[F\n"),
+		Capabilities: &caps,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := ed.ReadLinePrepared(ctx, "> ")
+	if err != nil {
+		t.Fatalf("ReadLinePrepared: %v", err)
+	}
+	if got != "head tail" {
+		t.Fatalf("line = %q, want %q", got, "head tail")
+	}
+}
+
+func TestReadLinePreparedPreservesTextAfterEscapeSequences(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		sequence string
+	}{
+		{name: "left CSI", sequence: "\x1b[D"},
+		{name: "left SS3", sequence: "\x1bOD"},
+		{name: "right CSI", sequence: "\x1b[C"},
+		{name: "up CSI", sequence: "\x1b[A"},
+		{name: "down CSI", sequence: "\x1b[B"},
+		{name: "home CSI", sequence: "\x1b[H"},
+		{name: "home tilde", sequence: "\x1b[1~"},
+		{name: "end CSI", sequence: "\x1b[F"},
+		{name: "end tilde", sequence: "\x1b[4~"},
+		{name: "delete", sequence: "\x1b[3~"},
+		{name: "page up", sequence: "\x1b[5~"},
+		{name: "page down", sequence: "\x1b[6~"},
+		{name: "standalone escape", sequence: "\x1b"},
+		{name: "unknown CSI", sequence: "\x1b[99~"},
+		{name: "unknown SS3", sequence: "\x1bOP"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := os.CreateTemp("", "termui-editor-escape-*")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.Remove(out.Name())
+			defer out.Close()
+			caps := terminal.Capabilities{Mode: terminal.ModeDynamicInteractive, Width: 80, Height: 24}
+			ed := New(Options{
+				In:           os.Stdin,
+				Out:          out,
+				Reader:       bytes.NewBufferString(tc.sequence + "tail\n"),
+				Capabilities: &caps,
+			})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			got, err := ed.ReadLinePrepared(ctx, "> ")
+			if err != nil {
+				t.Fatalf("ReadLinePrepared: %v", err)
+			}
+			if got != "tail" {
+				t.Fatalf("line = %q, want %q", got, "tail")
+			}
+		})
+	}
+}
+
+func TestReadLinePreparedPreservesTextAfterBracketedPaste(t *testing.T) {
+	out, err := os.CreateTemp("", "termui-editor-paste-tail-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(out.Name())
+	defer out.Close()
+	caps := terminal.Capabilities{Mode: terminal.ModeDynamicInteractive, Width: 80, Height: 24}
+	ed := New(Options{
+		In:           os.Stdin,
+		Out:          out,
+		Reader:       bytes.NewBufferString("\x1b[200~paste\x1b[201~tail\n"),
+		Capabilities: &caps,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := ed.ReadLinePrepared(ctx, "> ")
+	if err != nil {
+		t.Fatalf("ReadLinePrepared: %v", err)
+	}
+	if got != "pastetail" {
+		t.Fatalf("line = %q, want %q", got, "pastetail")
+	}
+}
+
+func TestReadLinePreparedRecognizesFragmentedEscapeSequences(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		chunks []string
+	}{
+		{name: "CSI", chunks: []string{"\x1b[", "Dtail\n"}},
+		{name: "SS3", chunks: []string{"\x1bO", "Dtail\n"}},
+		{name: "parameters", chunks: []string{"\x1b[3", "~tail\n"}},
+		{name: "bracketed paste start", chunks: []string{"\x1b[20", "0~paste\x1b[201~tail\n"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := os.CreateTemp("", "termui-editor-fragmented-*")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.Remove(out.Name())
+			defer out.Close()
+			caps := terminal.Capabilities{Mode: terminal.ModeDynamicInteractive, Width: 80, Height: 24}
+			ed := New(Options{
+				In:           os.Stdin,
+				Out:          out,
+				Reader:       newGapReader(tc.chunks, 10*time.Millisecond),
+				Capabilities: &caps,
+			})
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			got, err := ed.ReadLinePrepared(ctx, "> ")
+			if err != nil {
+				t.Fatalf("ReadLinePrepared: %v", err)
+			}
+			want := "tail"
+			if tc.name == "bracketed paste start" {
+				want = "pastetail"
+			}
+			if got != want {
+				t.Fatalf("line = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestReadLinePreparedRandomizedEditingMatchesLineModel(t *testing.T) {
+	out, err := os.CreateTemp("", "termui-editor-random-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(out.Name())
+	defer out.Close()
+	caps := terminal.Capabilities{Mode: terminal.ModeDynamicInteractive, Width: 80, Height: 24}
+	rng := rand.New(rand.NewSource(192))
+	runes := []rune("abc XYZ09é界")
+
+	for trial := 0; trial < 500; trial++ {
+		var input bytes.Buffer
+		var model []rune
+		cursor := 0
+		for step := 0; step < 100; step++ {
+			switch rng.Intn(11) {
+			case 0, 1, 2, 3, 4:
+				r := runes[rng.Intn(len(runes))]
+				input.WriteRune(r)
+				model = append(model, 0)
+				copy(model[cursor+1:], model[cursor:])
+				model[cursor] = r
+				cursor++
+			case 5:
+				input.WriteByte(0x7f)
+				if cursor > 0 {
+					model = append(model[:cursor-1], model[cursor:]...)
+					cursor--
+				}
+			case 6:
+				input.WriteString("\x1b[3~")
+				if cursor < len(model) {
+					model = append(model[:cursor], model[cursor+1:]...)
+				}
+			case 7:
+				input.WriteString("\x1b[D")
+				if cursor > 0 {
+					cursor--
+				}
+			case 8:
+				input.WriteString("\x1b[C")
+				if cursor < len(model) {
+					cursor++
+				}
+			case 9:
+				input.WriteString("\x1b[H")
+				cursor = 0
+			case 10:
+				input.WriteString("\x1b[F")
+				cursor = len(model)
+			}
+		}
+		input.WriteByte('\n')
+		ed := New(Options{
+			In:           os.Stdin,
+			Out:          out,
+			Reader:       &input,
+			Writer:       io.Discard,
+			Capabilities: &caps,
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		got, err := ed.ReadLinePrepared(ctx, "> ")
+		cancel()
+		if err != nil {
+			t.Fatalf("trial %d: ReadLinePrepared: %v", trial, err)
+		}
+		if want := string(model); got != want {
+			t.Fatalf("trial %d: line = %q, want %q", trial, got, want)
+		}
+	}
+}
+
+type gapReader struct {
+	chunks  [][]byte
+	delay   time.Duration
+	readyAt time.Time
+	waiting bool
+}
+
+func newGapReader(chunks []string, delay time.Duration) *gapReader {
+	r := &gapReader{delay: delay}
+	for _, chunk := range chunks {
+		r.chunks = append(r.chunks, []byte(chunk))
+	}
+	return r
+}
+
+func (r *gapReader) Read(p []byte) (int, error) {
+	for len(r.chunks) > 0 && len(r.chunks[0]) == 0 {
+		r.chunks = r.chunks[1:]
+		r.waiting = len(r.chunks) > 0
+		r.readyAt = time.Now().Add(r.delay)
+	}
+	if len(r.chunks) == 0 {
+		return 0, syscall.EAGAIN
+	}
+	if r.waiting && time.Now().Before(r.readyAt) {
+		return 0, syscall.EAGAIN
+	}
+	r.waiting = false
+	p[0] = r.chunks[0][0]
+	r.chunks[0] = r.chunks[0][1:]
+	return 1, nil
 }
 
 type delayedReader struct {

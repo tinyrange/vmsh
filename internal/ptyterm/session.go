@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/tinyrange/vmsh/internal/terminal"
 )
 
 type Options struct {
@@ -27,6 +29,8 @@ type Result struct {
 }
 
 var ErrUnsupported = errors.New("ptyterm: PTY ownership is unsupported on this platform")
+
+const MaxTerminalDimension = terminal.MaxTerminalDimension
 
 type ptyIO interface {
 	Read([]byte) (int, error)
@@ -64,7 +68,10 @@ func Start(ctx context.Context, opts Options) (*Session, error) {
 	if len(opts.Command) == 0 || strings.TrimSpace(opts.Command[0]) == "" {
 		return nil, fmt.Errorf("command is required")
 	}
-	size := normalizeSize(opts.Size)
+	size, err := validatedSize(opts.Size)
+	if err != nil {
+		return nil, err
+	}
 	cmd := exec.CommandContext(ctx, opts.Command[0], opts.Command[1:]...)
 	cmd.Dir = opts.Dir
 	if len(opts.Env) != 0 {
@@ -117,7 +124,11 @@ func (s *Session) Resize(size Size) error {
 	if s == nil || s.pty == nil {
 		return os.ErrClosed
 	}
-	size = normalizeSize(size)
+	var err error
+	size, err = validatedSize(size)
+	if err != nil {
+		return err
+	}
 	if s.resizePTY == nil {
 		return os.ErrInvalid
 	}
@@ -134,6 +145,14 @@ func (s *Session) Resize(size Size) error {
 	}
 	s.emu.Resize(size)
 	return nil
+}
+
+func validatedSize(size Size) (Size, error) {
+	cols, rows, err := terminal.NormalizeDimensions(size.Cols, size.Rows)
+	if err != nil {
+		return Size{}, err
+	}
+	return Size{Cols: cols, Rows: rows}, nil
 }
 
 func (s *Session) AttachRecorder(recorder Recorder) {

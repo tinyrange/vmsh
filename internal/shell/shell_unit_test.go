@@ -36,6 +36,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/tinyrange/vmsh/internal/backend"
+	"github.com/tinyrange/vmsh/internal/terminal"
 	"github.com/tinyrange/vmsh/internal/vmshd"
 	cryptossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -904,6 +905,84 @@ func TestVMSHDSessionReporterSerializesImmutableSnapshots(t *testing.T) {
 	}
 	if len(seen) != publications {
 		t.Fatalf("published generations = %d, want %d", len(seen), publications)
+	}
+}
+
+func TestVMSHDSessionPublicationRetriesNewestSnapshot(t *testing.T) {
+	var requests []vmshd.UpdateSessionRequest
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vmsh/sessions/sess_1", func(w http.ResponseWriter, r *http.Request) {
+		var req vmshd.UpdateSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode update request: %v", err)
+		}
+		requests = append(requests, req)
+		if len(requests) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(client.ErrorResponse{Error: "temporarily unavailable"})
+			return
+		}
+		writeJSONForShellTest(w, vmshd.Session{ID: "sess_1", State: "attached"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{Addr: strings.TrimPrefix(srv.URL, "http://"), TokenPath: tokenPath})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	reporter := &vmshdSessionReporter{client: httpClient, sessionID: "sess_1"}
+	first := []vmshd.JobSummary{{ID: 1, Status: "running"}}
+	if err := reporter.publish(func() vmshd.UpdateSessionRequest { return vmshd.UpdateSessionRequest{Jobs: first} }); err == nil || reporter.publicationError() == nil {
+		t.Fatal("failed publication was not retained")
+	}
+	newest := []vmshd.JobSummary{{ID: 1, Status: "done"}, {ID: 2, Status: "running"}}
+	if err := reporter.publish(func() vmshd.UpdateSessionRequest { return vmshd.UpdateSessionRequest{Jobs: newest} }); err != nil {
+		t.Fatalf("retry newest snapshot: %v", err)
+	}
+	if reporter.publicationError() != nil {
+		t.Fatalf("publication remains degraded: %v", reporter.publicationError())
+	}
+	if len(requests) != 2 || !reflect.DeepEqual(requests[1].Jobs, newest) {
+		t.Fatalf("published requests = %+v, want newest jobs %+v", requests, newest)
+	}
+}
+
+func TestVMSHDSessionCloseRefusesUnacknowledgedSnapshot(t *testing.T) {
+	var frontendCloses int
+	mux := http.NewServeMux()
+	mux.HandleFunc("PATCH /vmsh/sessions/sess_1", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(client.ErrorResponse{Error: "temporarily unavailable"})
+	})
+	mux.HandleFunc("DELETE /vmsh/frontends/fe_1", func(w http.ResponseWriter, r *http.Request) {
+		frontendCloses++
+		writeJSONForShellTest(w, vmshd.FrontendSummary{ID: "fe_1", State: "closed"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	tokenPath := filepath.Join(t.TempDir(), "vmshd.token")
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	httpClient, err := vmshd.NewHTTPClient(backend.DaemonState{Addr: strings.TrimPrefix(srv.URL, "http://"), TokenPath: tokenPath})
+	if err != nil {
+		t.Fatalf("new vmshd client: %v", err)
+	}
+	reporter := &vmshdSessionReporter{client: httpClient, frontendID: "fe_1", sessionID: "sess_1"}
+	if err := reporter.publish(func() vmshd.UpdateSessionRequest {
+		return vmshd.UpdateSessionRequest{Jobs: []vmshd.JobSummary{{ID: 1, Status: "running"}}}
+	}); err == nil {
+		t.Fatal("publication unexpectedly succeeded")
+	}
+	if err := reporter.close(); err == nil {
+		t.Fatal("close unexpectedly accepted unacknowledged state")
+	}
+	if frontendCloses != 0 {
+		t.Fatalf("frontend closes = %d, want 0", frontendCloses)
 	}
 }
 
@@ -2023,6 +2102,116 @@ func TestUbuntuKernelCanUseDefault(t *testing.T) {
 	}
 }
 
+func TestVMKernelPathResolvesRelativeToHostCWD(t *testing.T) {
+	dir := t.TempDir()
+	kernelPath := filepath.Join(dir, "vmlinuz-test")
+	if err := os.WriteFile(kernelPath, []byte("kernel"), 0o600); err != nil {
+		t.Fatalf("write kernel: %v", err)
+	}
+	api := newRecordingShellAPI("ubuntu")
+	sh := newUnitShell(t, api)
+	sh.hostCWD = dir
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ubuntu --kernel vmlinuz-test --vm work", &stdout, &stderr); err != nil {
+		t.Fatalf("activate VM with custom kernel: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	want := vmshCustomKernelFilePrefix + kernelPath
+	if api.starts[0].req.Kernel != want {
+		t.Fatalf("start kernel = %q, want %q", api.starts[0].req.Kernel, want)
+	}
+}
+
+func TestVMKernelPathResolvesRelativeToGuestHostShareCWD(t *testing.T) {
+	dir := t.TempDir()
+	kernelPath := filepath.Join(dir, "kernels", "vmlinuz-test")
+	if err := os.MkdirAll(filepath.Dir(kernelPath), 0o755); err != nil {
+		t.Fatalf("mkdir kernel dir: %v", err)
+	}
+	if err := os.WriteFile(kernelPath, []byte("kernel"), 0o600); err != nil {
+		t.Fatalf("write kernel: %v", err)
+	}
+	api := newRecordingShellAPI("ubuntu")
+	sh := newUnitShell(t, api)
+	sh.hostCWD = dir
+	_, guestCWD, err := guestHostPaths(dir)
+	if err != nil {
+		t.Fatalf("guest host paths: %v", err)
+	}
+	sh.context = commandContext{
+		Mode:       modeVM,
+		SystemName: "ubuntu",
+		Image:      "ubuntu",
+		VMID:       "ubuntu",
+		CWD:        path.Join(guestCWD, "kernels"),
+		Kernel:     "ubuntu",
+		Network:    true,
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ --kernel vmlinuz-test --vm work", &stdout, &stderr); err != nil {
+		t.Fatalf("activate VM with guest-relative custom kernel: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	want := vmshCustomKernelFilePrefix + kernelPath
+	if api.starts[0].req.Kernel != want {
+		t.Fatalf("start kernel = %q, want %q", api.starts[0].req.Kernel, want)
+	}
+}
+
+func TestVMDebugEnablesBootDmesgAndSerialOutput(t *testing.T) {
+	api := newRecordingShellAPI("ubuntu")
+	api.startStream = func(ctx context.Context, id string, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
+		api.starts = append(api.starts, recordedStart{id: id, req: req})
+		state := client.InstanceState{ID: id, Status: "running", Image: req.Image, Kernel: req.Kernel}
+		api.instances[id] = state
+		if onEvent != nil {
+			if req.Dmesg {
+				if err := onEvent(client.BootEvent{Kind: "serial", Data: "debug-serial\n"}); err != nil {
+					return client.InstanceState{}, err
+				}
+			}
+			if err := onEvent(client.BootEvent{Kind: "ready", State: state}); err != nil {
+				return client.InstanceState{}, err
+			}
+		}
+		return state, nil
+	}
+	sh := newUnitShell(t, api)
+
+	var stdout, stderr bytes.Buffer
+	if err := sh.eval("@ubuntu --debug --vm work", &stdout, &stderr); err != nil {
+		t.Fatalf("activate debug VM context: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if len(api.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(api.starts))
+	}
+	if !api.starts[0].req.Dmesg {
+		t.Fatalf("start Dmesg = false, want true")
+	}
+	if !sh.context.Debug {
+		t.Fatalf("context Debug = false, want true")
+	}
+	if got := stderr.String(); !strings.Contains(got, "debug-serial\n") {
+		t.Fatalf("stderr = %q, want debug serial output", got)
+	}
+}
+
+func TestVMDebugRejectsValue(t *testing.T) {
+	_, err := parseAtLine("@ubuntu --debug=true")
+	if err == nil {
+		t.Fatalf("parse @ubuntu --debug=true succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "--debug does not take a value") {
+		t.Fatalf("error = %v, want --debug value error", err)
+	}
+}
+
 func TestUbuntuInitRefusesRunningUntrackedVM(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	api.instances["work"] = client.InstanceState{ID: "work", Status: "running", Image: "ubuntu", Kernel: "ubuntu"}
@@ -2924,6 +3113,45 @@ func TestCodexAgentProxyServeHTTPStreamsResponsesWithoutContentLength(t *testing
 	}
 }
 
+func TestCodexAgentProxyRejectsOversizedGuestRequest(t *testing.T) {
+	proxy := &codexAgentProxy{
+		token:           "guest-token",
+		maxRequestBytes: 8,
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://guest/v1/responses", strings.NewReader("123456789"))
+	req.Header.Set(codexAgentProxyTokenHeader, "guest-token")
+	rec := httptest.NewRecorder()
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
+func TestCodexAgentProxyStopsWaitingForUpstreamHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+
+	client := &http.Client{Transport: codexAgentProxyRoundTripperWithResponseHeaderTimeout(25 * time.Millisecond)}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstream.URL, nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	_, err = client.Do(req)
+	if err == nil {
+		t.Fatal("request succeeded without upstream response headers")
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("request error = %v, want transport timeout", err)
+	}
+}
+
 func TestCodexAgentProxyPrefersChatGPTTokensWhenAuthModeIsChatGPT(t *testing.T) {
 	idToken := testCodexJWT(t, map[string]any{
 		"https://api.openai.com/auth": map[string]any{
@@ -3226,6 +3454,59 @@ func TestEnsureHostCodexReleaseDownloadsLatestForMissingGuestTarget(t *testing.T
 	if release.CodexGuestBin != path.Join(codexGuestStandaloneMount, "releases", "1.2.3-"+target, "bin/codex") {
 		t.Fatalf("guest binary = %q", release.CodexGuestBin)
 	}
+}
+
+func TestExtractTarSafeEnforcesResourceBudgets(t *testing.T) {
+	archive := func(t *testing.T, files ...string) []byte {
+		t.Helper()
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		for index, contents := range files {
+			if err := tw.WriteHeader(&tar.Header{Name: fmt.Sprintf("file-%d", index), Mode: 0o600, Size: int64(len(contents))}); err != nil {
+				t.Fatalf("write tar header: %v", err)
+			}
+			if _, err := io.WriteString(tw, contents); err != nil {
+				t.Fatalf("write tar contents: %v", err)
+			}
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatalf("close tar: %v", err)
+		}
+		return buf.Bytes()
+	}
+
+	t.Run("entry count", func(t *testing.T) {
+		dst := t.TempDir()
+		err := extractTarSafeWithLimits(bytes.NewReader(archive(t, "a", "b")), dst, tarExtractionLimits{MaxEntries: 1, MaxFileBytes: 8, MaxExpandedBytes: 8})
+		if err == nil {
+			t.Fatal("extract succeeded past entry budget")
+		}
+		if _, statErr := os.Stat(filepath.Join(dst, "file-1")); !os.IsNotExist(statErr) {
+			t.Fatalf("over-budget entry was created: %v", statErr)
+		}
+	})
+
+	t.Run("individual file", func(t *testing.T) {
+		dst := t.TempDir()
+		err := extractTarSafeWithLimits(bytes.NewReader(archive(t, "12345")), dst, tarExtractionLimits{MaxEntries: 2, MaxFileBytes: 4, MaxExpandedBytes: 8})
+		if err == nil {
+			t.Fatal("extract succeeded past file budget")
+		}
+		if _, statErr := os.Stat(filepath.Join(dst, "file-0")); !os.IsNotExist(statErr) {
+			t.Fatalf("over-budget file was created: %v", statErr)
+		}
+	})
+
+	t.Run("expanded bytes", func(t *testing.T) {
+		dst := t.TempDir()
+		err := extractTarSafeWithLimits(bytes.NewReader(archive(t, "123", "456")), dst, tarExtractionLimits{MaxEntries: 2, MaxFileBytes: 4, MaxExpandedBytes: 5})
+		if err == nil {
+			t.Fatal("extract succeeded past expanded-byte budget")
+		}
+		if _, statErr := os.Stat(filepath.Join(dst, "file-1")); !os.IsNotExist(statErr) {
+			t.Fatalf("entry exceeding expanded-byte budget was created: %v", statErr)
+		}
+	})
 }
 
 func TestCodexGuestTargetMapsLinuxArchitectures(t *testing.T) {
@@ -4664,6 +4945,35 @@ func TestTTYGuestRunInterruptCancelsContext(t *testing.T) {
 	}
 }
 
+func TestHostPTYWinsizeValidatesBeforeConversion(t *testing.T) {
+	winsize, err := hostPTYWinsize(0, 0)
+	if err != nil {
+		t.Fatalf("default winsize: %v", err)
+	}
+	if winsize.Cols != 80 || winsize.Rows != 24 {
+		t.Fatalf("default winsize = %+v", winsize)
+	}
+
+	winsize, err = hostPTYWinsize(terminal.MaxTerminalDimension, terminal.MaxTerminalDimension)
+	if err != nil {
+		t.Fatalf("maximum winsize: %v", err)
+	}
+	if int(winsize.Cols) != terminal.MaxTerminalDimension || int(winsize.Rows) != terminal.MaxTerminalDimension {
+		t.Fatalf("maximum winsize wrapped: %+v", winsize)
+	}
+
+	for _, size := range [][2]int{
+		{-1, 24},
+		{80, -1},
+		{terminal.MaxTerminalDimension + 1, 24},
+		{80, terminal.MaxTerminalDimension + 1},
+	} {
+		if _, err := hostPTYWinsize(size[0], size[1]); err == nil {
+			t.Fatalf("hostPTYWinsize(%d, %d) returned no error", size[0], size[1])
+		}
+	}
+}
+
 func TestTTYExecEventOutputNormalizesBareLF(t *testing.T) {
 	var out bytes.Buffer
 	writeTTYExecEventOutput(&out, client.ExecEvent{Kind: "stdout", Output: "one\ntwo\r\nthree"})
@@ -4684,6 +4994,42 @@ func TestGuestInputSendIgnoresClosedChannel(t *testing.T) {
 	done := make(chan struct{})
 	sendGuestInput(inputs, done, client.ExecInput{Kind: "stdin", Data: []byte{0x03}})
 	sendGuestInputNonBlocking(inputs, client.ExecInput{Kind: "stdin_close"})
+}
+
+func TestStopPTYForwardingDoesNotWaitForeverForBlockedProducer(t *testing.T) {
+	cancelled := make(chan struct{})
+	restored := make(chan struct{})
+	stop := stopPTYForwarding(func() {
+		close(restored)
+	}, func() {
+		close(cancelled)
+	}, func() {
+		select {}
+	})
+
+	done := make(chan struct{})
+	go func() {
+		stop()
+		close(done)
+	}()
+
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop did not cancel producers")
+	}
+	select {
+	case <-restored:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop did not restore terminal")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop waited forever for blocked producer")
+	}
+
+	stop()
 }
 
 func TestPersistentGuestShellCloseIsIdempotent(t *testing.T) {
@@ -6749,6 +7095,65 @@ func TestSSHCopyStreamsTarOverConnection(t *testing.T) {
 	}
 }
 
+func TestSSHCopyInterruptStopsRemoteArchiveAndExtractor(t *testing.T) {
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	server := startTestSSHServer(t, func(command string, stdin io.Reader, stdout, stderr io.Writer) uint32 {
+		tw := tar.NewWriter(stdout)
+		if err := tw.WriteHeader(&tar.Header{Name: "remote.bin", Mode: 0o600, Size: 1 << 30}); err != nil {
+			close(stopped)
+			return 1
+		}
+		close(started)
+		chunk := make([]byte, 32*1024)
+		for {
+			if _, err := tw.Write(chunk); err != nil {
+				close(stopped)
+				return 1
+			}
+		}
+	})
+	server.installConfig(t, "test-ssh-a")
+
+	sh := newUnitShell(t, newRecordingShellAPI())
+	interrupts := make(chan os.Signal, 1)
+	sh.interruptSignals = interrupts
+	dst := filepath.Join(t.TempDir(), "remote.bin")
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sh.copySSHToLocal(
+			commandContext{Mode: modeSSH, SSHHost: "test-ssh-a"},
+			copyTargetPath{path: "/tmp/remote.bin"},
+			copyTargetPath{path: dst},
+			io.Discard,
+			nil,
+		)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("remote archive did not start")
+	}
+	interrupts <- os.Interrupt
+	select {
+	case err := <-errCh:
+		if got := sessionLastCode(err); got != 130 {
+			t.Fatalf("interrupted SSH copy code = %d, err = %v; want 130", got, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("interrupted SSH copy did not return")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("remote archive producer did not stop")
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("partial SSH destination exists or stat failed: %v", err)
+	}
+}
+
 func readSingleRegularTarPayload(r io.Reader) (string, error) {
 	tr := tar.NewReader(r)
 	var got string
@@ -7729,6 +8134,273 @@ func (w *failAfterWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func TestStreamTarToHostExtractsBeforeProducerCompletes(t *testing.T) {
+	dst := filepath.Join(t.TempDir(), "copied.txt")
+	payload := []byte("streamed-payload")
+	observedDuringProduction := false
+	err := streamTarToHost(copyTargetPath{path: dst}, nil, func(w io.Writer) error {
+		tw := tar.NewWriter(w)
+		if err := tw.WriteHeader(&tar.Header{Name: "source.txt", Mode: 0o640, Size: int64(len(payload))}); err != nil {
+			return err
+		}
+		if _, err := tw.Write(payload); err != nil {
+			return err
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			got, err := os.ReadFile(dst)
+			if err == nil && bytes.Equal(got, payload) {
+				observedDuringProduction = true
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		return tw.Close()
+	})
+	if err != nil {
+		t.Fatalf("stream tar: %v", err)
+	}
+	if !observedDuringProduction {
+		t.Fatal("destination was not extracted while the producer was still active")
+	}
+	if got := readTestFile(t, dst); got != string(payload) {
+		t.Fatalf("copied payload = %q, want %q", got, payload)
+	}
+}
+
+func TestStreamTarToHostPreservesProducerAndExtractionErrors(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "copied.txt")
+	if err := os.WriteFile(dst, []byte("previous"), 0o600); err != nil {
+		t.Fatalf("write previous destination: %v", err)
+	}
+	producerErr := errors.New("remote archive failed")
+	err := streamTarToHost(copyTargetPath{path: dst}, nil, func(w io.Writer) error {
+		tw := tar.NewWriter(w)
+		if err := tw.WriteHeader(&tar.Header{Name: "source.txt", Mode: 0o640, Size: 1024}); err != nil {
+			return err
+		}
+		if _, err := tw.Write([]byte("partial")); err != nil {
+			return err
+		}
+		return producerErr
+	})
+	if !errors.Is(err, producerErr) {
+		t.Fatalf("stream error = %v, want producer error", err)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("stream error = %v, want truncated archive error", err)
+	}
+	if got := readTestFile(t, dst); got != "previous" {
+		t.Fatalf("destination after failed stream = %q, want previous content", got)
+	}
+	entries, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		t.Fatalf("read destination directory: %v", readErr)
+	}
+	if len(entries) != 1 || entries[0].Name() != "copied.txt" {
+		t.Fatalf("destination entries after failed stream = %v", entries)
+	}
+}
+
+func TestStreamTarToHostStopsProducerWhenExtractionFails(t *testing.T) {
+	dst := t.TempDir()
+	producerStopped := false
+	err := streamTarToHost(copyTargetPath{path: dst, directory: true}, nil, func(w io.Writer) error {
+		tw := tar.NewWriter(w)
+		if err := tw.WriteHeader(&tar.Header{Name: "../outside", Mode: 0o600, Size: 1024}); err != nil {
+			return err
+		}
+		_, writeErr := tw.Write(make([]byte, 1024))
+		producerStopped = writeErr != nil
+		return writeErr
+	})
+	if err == nil {
+		t.Fatal("stream accepted a traversal archive")
+	}
+	if !producerStopped {
+		t.Fatal("producer continued after the extractor rejected the archive")
+	}
+}
+
+func TestExtractTarToHostRejectsSymlinkEscapes(t *testing.T) {
+	testCases := []struct {
+		name               string
+		destinationMissing bool
+		prepare            func(t *testing.T, dst, outside string)
+		entries            []tar.Header
+		body               string
+	}{
+		{
+			name: "archive-created parent symlink",
+			entries: []tar.Header{
+				{Name: "link", Typeflag: tar.TypeSymlink, Linkname: "../outside", Mode: 0o777},
+				{Name: "link/escaped.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len("escaped"))},
+			},
+			body: "escaped",
+		},
+		{
+			name:               "archive-created parent symlink in renamed directory",
+			destinationMissing: true,
+			entries: []tar.Header{
+				{Name: "tree", Typeflag: tar.TypeDir, Mode: 0o755},
+				{Name: "tree/link", Typeflag: tar.TypeSymlink, Linkname: "../outside", Mode: 0o777},
+				{Name: "tree/link/escaped.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len("escaped"))},
+			},
+			body: "escaped",
+		},
+		{
+			name: "pre-existing parent symlink",
+			prepare: func(t *testing.T, dst, outside string) {
+				t.Helper()
+				if err := os.Symlink(outside, filepath.Join(dst, "link")); err != nil {
+					t.Skipf("create symlink: %v", err)
+				}
+			},
+			entries: []tar.Header{
+				{Name: "link/escaped.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len("escaped"))},
+			},
+			body: "escaped",
+		},
+		{
+			name: "pre-existing internal parent symlink",
+			prepare: func(t *testing.T, dst, _ string) {
+				t.Helper()
+				if err := os.Mkdir(filepath.Join(dst, "real"), 0o755); err != nil {
+					t.Fatalf("create internal directory: %v", err)
+				}
+				if err := os.Symlink("real", filepath.Join(dst, "link")); err != nil {
+					t.Skipf("create symlink: %v", err)
+				}
+			},
+			entries: []tar.Header{
+				{Name: "link/escaped.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len("escaped"))},
+			},
+			body: "escaped",
+		},
+		{
+			name: "pre-existing target symlink",
+			prepare: func(t *testing.T, dst, outside string) {
+				t.Helper()
+				outsideFile := filepath.Join(outside, "escaped.txt")
+				if err := os.WriteFile(outsideFile, []byte("keep"), 0o644); err != nil {
+					t.Fatalf("write outside file: %v", err)
+				}
+				if err := os.Symlink(outsideFile, filepath.Join(dst, "escaped.txt")); err != nil {
+					t.Skipf("create symlink: %v", err)
+				}
+			},
+			entries: []tar.Header{
+				{Name: "escaped.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len("escaped"))},
+			},
+			body: "escaped",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := t.TempDir()
+			dst := filepath.Join(parent, "dst")
+			outside := filepath.Join(parent, "outside")
+			if !tc.destinationMissing {
+				if err := os.MkdirAll(dst, 0o755); err != nil {
+					t.Fatalf("create destination: %v", err)
+				}
+			}
+			if err := os.MkdirAll(outside, 0o755); err != nil {
+				t.Fatalf("create outside directory: %v", err)
+			}
+			probe := filepath.Join(parent, "symlink-probe")
+			if err := os.Symlink(outside, probe); err != nil {
+				t.Skipf("symlinks are unavailable: %v", err)
+			}
+			if err := os.Remove(probe); err != nil {
+				t.Fatalf("remove symlink probe: %v", err)
+			}
+			if tc.prepare != nil {
+				tc.prepare(t, dst, outside)
+			}
+
+			var archive bytes.Buffer
+			tw := tar.NewWriter(&archive)
+			for _, entry := range tc.entries {
+				entry := entry
+				if err := tw.WriteHeader(&entry); err != nil {
+					t.Fatalf("write tar header: %v", err)
+				}
+				if entry.Typeflag == tar.TypeReg || entry.Typeflag == 0 {
+					if _, err := tw.Write([]byte(tc.body)); err != nil {
+						t.Fatalf("write tar body: %v", err)
+					}
+				}
+			}
+			if err := tw.Close(); err != nil {
+				t.Fatalf("close tar: %v", err)
+			}
+
+			if err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: dst}); err == nil {
+				t.Fatal("extract symlink escape succeeded")
+			}
+			outsideFile := filepath.Join(outside, "escaped.txt")
+			contents, err := os.ReadFile(outsideFile)
+			switch tc.name {
+			case "pre-existing target symlink":
+				if err != nil {
+					t.Fatalf("read protected outside file: %v", err)
+				}
+				if string(contents) != "keep" {
+					t.Fatalf("outside file contents = %q, want keep", contents)
+				}
+			default:
+				if !os.IsNotExist(err) {
+					t.Fatalf("outside file exists or read failed unexpectedly: %v", err)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(dst, "real", "escaped.txt")); !os.IsNotExist(err) {
+				t.Fatalf("file was written through an internal symlink or stat failed unexpectedly: %v", err)
+			}
+		})
+	}
+}
+
+func TestExtractTarToHostRejectsHardlinks(t *testing.T) {
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	if err := tw.WriteHeader(&tar.Header{Name: "alias", Typeflag: tar.TypeLink, Linkname: "../outside", Mode: 0o644}); err != nil {
+		t.Fatalf("write tar header: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar: %v", err)
+	}
+
+	if err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: t.TempDir()}); err == nil {
+		t.Fatal("extract hardlink succeeded")
+	}
+}
+
+func TestExtractTarToHostRejectsSymlinkDestination(t *testing.T) {
+	parent := t.TempDir()
+	dst := filepath.Join(parent, "dst")
+	outside := filepath.Join(parent, "outside")
+	if err := os.Mkdir(outside, 0o755); err != nil {
+		t.Fatalf("create outside directory: %v", err)
+	}
+	if err := os.Symlink(outside, dst); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+
+	var archive bytes.Buffer
+	if err := writeSingleFileTar(&archive, "src.txt", "escaped"); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+	if err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: dst}); err == nil {
+		t.Fatal("extract through symlink destination succeeded")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "src.txt")); !os.IsNotExist(err) {
+		t.Fatalf("file was written through the destination symlink or stat failed unexpectedly: %v", err)
+	}
+}
+
 func TestExtractTarToHostDirectoryDestinationSemantics(t *testing.T) {
 	var archive bytes.Buffer
 	if err := writePathTar(&archive, makeTestCopyTree(t), "tree"); err != nil {
@@ -7833,45 +8505,6 @@ func TestExtractTarToHostConflictSemantics(t *testing.T) {
 		}
 	})
 
-	t.Run("non-directory over directory fails when forced exact", func(t *testing.T) {
-		var archive bytes.Buffer
-		if err := writeSingleFileTar(&archive, "src.txt", "payload"); err != nil {
-			t.Fatalf("write archive: %v", err)
-		}
-		dst := filepath.Join(t.TempDir(), "dst")
-		if err := os.Mkdir(dst, 0o755); err != nil {
-			t.Fatalf("make dst dir: %v", err)
-		}
-
-		err := extractTarToHostExact(bytes.NewReader(archive.Bytes()), dst)
-		if err == nil {
-			t.Fatalf("extract file over directory error = %v", err)
-		}
-		if info, err := os.Stat(dst); err != nil || !info.IsDir() {
-			t.Fatalf("dst dir stat = %v info=%v", err, info)
-		}
-	})
-}
-
-func extractTarToHostExact(r io.Reader, dst string) error {
-	tr := tar.NewReader(r)
-	for {
-		header, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		target, err := hostTarTarget(dst, copyDestExact, header.Name)
-		if err != nil {
-			return err
-		}
-		incomingDir := header.Typeflag == tar.TypeDir
-		if err := ensureHostTarTargetCompatible(target, incomingDir); err != nil {
-			return err
-		}
-	}
 }
 
 func makeTestCopyTree(t *testing.T) string {

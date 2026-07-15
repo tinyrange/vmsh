@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -22,6 +23,8 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/tinyrange/vmsh/internal/backend"
+	"github.com/tinyrange/vmsh/internal/group"
+	"github.com/tinyrange/vmsh/internal/terminal"
 	"github.com/tinyrange/vmsh/internal/vmshdprotocol"
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/ccvmd"
@@ -30,7 +33,17 @@ import (
 
 const Kind = "vmshd"
 
-const maxJobLogBytes = 64 * 1024
+const (
+	maxJobLogBytes                   = 64 * 1024
+	maxCompletedJobsPerSession       = 64
+	maxTerminalWebSocketMessageBytes = 8 << 20
+
+	// Event streams send at least one frame inside the common 60 second idle
+	// window used by HTTP intermediaries. Each write gets the same full interval;
+	// a peer that cannot accept one small NDJSON frame is no longer healthy.
+	eventStreamHeartbeatInterval = 30 * time.Second
+	eventStreamWriteTimeout      = 30 * time.Second
+)
 
 type Status struct {
 	Kind      string                 `json:"kind"`
@@ -40,6 +53,13 @@ type Status struct {
 	Streams   []StreamSummary        `json:"active_streams"`
 	VMs       []client.InstanceState `json:"vms"`
 	StartedAt time.Time              `json:"started_at"`
+	Retention RetentionPolicy        `json:"retention"`
+}
+
+type RetentionPolicy struct {
+	CompletedJobsPerSession int    `json:"completed_jobs_per_session"`
+	JobLogBytes             int    `json:"job_log_bytes"`
+	Sessions                string `json:"sessions"`
 }
 
 type Event struct {
@@ -49,6 +69,8 @@ type Event struct {
 	Session    *Session          `json:"session,omitempty"`
 	Attachment *ClientAttachment `json:"attachment,omitempty"`
 	Job        *JobSummary       `json:"job,omitempty"`
+	After      string            `json:"after,omitempty"`
+	Refresh    string            `json:"refresh,omitempty"`
 	At         time.Time         `json:"at"`
 }
 
@@ -78,6 +100,7 @@ type Session struct {
 	Jobs            []JobSummary       `json:"jobs,omitempty"`
 	Copies          []CopySummary      `json:"copies,omitempty"`
 	Attachments     []ClientAttachment `json:"attached_clients"`
+	Cleanup         *CleanupStatus     `json:"cleanup,omitempty"`
 	CreatedAt       time.Time          `json:"created_at"`
 	UpdatedAt       time.Time          `json:"updated_at"`
 }
@@ -98,8 +121,25 @@ type SessionSummary struct {
 	Jobs            []JobSummary       `json:"jobs,omitempty"`
 	Copies          []CopySummary      `json:"copies,omitempty"`
 	AttachedClients []ClientAttachment `json:"attached_clients"`
+	Cleanup         *CleanupStatus     `json:"cleanup,omitempty"`
 	CreatedAt       time.Time          `json:"created_at"`
 	UpdatedAt       time.Time          `json:"updated_at"`
+}
+
+type CleanupStatus struct {
+	Attempts  int                `json:"attempts"`
+	Failures  []VMCleanupFailure `json:"failures"`
+	UpdatedAt time.Time          `json:"updated_at"`
+}
+
+type VMCleanupFailure struct {
+	VMID  string `json:"vm_id"`
+	Error string `json:"error"`
+}
+
+type CleanupErrorResponse struct {
+	Error    string    `json:"error"`
+	Sessions []Session `json:"sessions"`
 }
 
 type SessionContext struct {
@@ -259,26 +299,29 @@ type sessionCleanup struct {
 }
 
 type sessionRegistry struct {
-	mu           sync.Mutex
-	next         int
-	nextFrontend int
-	nextAttach   int
-	nextJob      int
-	frontends    map[string]frontendRecord
-	sessions     map[string]Session
-	jobs         map[string]map[int]JobSummary
-	hostShells   map[string]ShellHandle
+	mu               sync.Mutex
+	next             int
+	nextFrontend     int
+	nextAttach       int
+	nextJob          int
+	frontends        map[string]frontendRecord
+	sessions         map[string]Session
+	jobs             map[string]map[int]JobSummary
+	hostShells       map[string]ShellHandle
+	maxCompletedJobs int
 }
 
 type eventHub struct {
 	mu          sync.Mutex
-	next        int
+	nextEvent   int
+	nextSub     int
 	subscribers map[int]*eventSubscriber
 }
 
 type eventSubscriber struct {
 	id          int
 	ch          chan Event
+	done        chan struct{}
 	connectedAt time.Time
 	lastEventID string
 }
@@ -286,7 +329,13 @@ type eventSubscriber struct {
 type streamRegistry struct {
 	mu      sync.Mutex
 	next    int
-	streams map[string]StreamSummary
+	streams map[string]streamRecord
+}
+
+type streamRecord struct {
+	summary    StreamSummary
+	frontendID string
+	revoke     func()
 }
 
 type Server struct {
@@ -297,8 +346,50 @@ type Server struct {
 	jobs     *hostJobRunner
 	shells   *hostShellManager
 	balloon  *balloonController
+	trusted  *trustedManager
+	routeMu  sync.RWMutex
+	routes   []apiRoute
 
 	startedAt time.Time
+}
+
+type apiRoute struct {
+	Method string
+	Path   string
+}
+
+type trackedServeMux struct {
+	*http.ServeMux
+	routes []apiRoute
+}
+
+func (m *trackedServeMux) HandleFunc(pattern string, handler http.HandlerFunc) {
+	m.record(pattern)
+	m.ServeMux.HandleFunc(pattern, handler)
+}
+
+func (m *trackedServeMux) Handle(pattern string, handler http.Handler) {
+	m.record(pattern)
+	m.ServeMux.Handle(pattern, handler)
+}
+
+func (m *trackedServeMux) record(pattern string) {
+	method, path, ok := strings.Cut(pattern, " ")
+	if ok {
+		m.routes = append(m.routes, apiRoute{Method: method, Path: path})
+	}
+}
+
+func (s *Server) setAPIRoutes(routes []apiRoute) {
+	s.routeMu.Lock()
+	s.routes = append([]apiRoute(nil), routes...)
+	s.routeMu.Unlock()
+}
+
+func (s *Server) apiRoutes() []apiRoute {
+	s.routeMu.RLock()
+	defer s.routeMu.RUnlock()
+	return append([]apiRoute(nil), s.routes...)
 }
 
 type hostJobRunner struct {
@@ -313,13 +404,22 @@ type hostShellManager struct {
 
 type hostShell struct {
 	sessionID   string
+	cwd         string
 	cmd         *exec.Cmd
 	tty         *os.File
 	done        chan struct{}
+	exited      chan struct{}
 	doneOnce    sync.Once
+	cleanupOnce sync.Once
 	mu          sync.Mutex
 	nextSub     int
-	subscribers map[int]chan []byte
+	subscribers map[int]*hostShellSubscriber
+}
+
+type hostShellSubscriber struct {
+	ch       chan []byte
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 func Main(args []string) {
@@ -340,6 +440,10 @@ func Main(args []string) {
 
 func Run(args []string) (bool, error) {
 	statePath, args := scanStatePathArg(args)
+	groupConfigPath, args, err := scanValueArg(args, "group-config")
+	if err != nil {
+		return false, err
+	}
 	cacheDir, err := resolveCacheDir(scanCacheDir(args))
 	if err != nil {
 		return false, err
@@ -351,6 +455,36 @@ func Run(args []string) (bool, error) {
 	}
 
 	srv := NewServer(token)
+	defer func() {
+		if srv.trusted != nil {
+			srv.trusted.close()
+		}
+	}()
+	var runtimeMu sync.RWMutex
+	var groupRuntime ccvmd.RuntimeView
+	var groupServer *group.Server
+	if groupConfigPath != "" {
+		config, err := group.LoadServerConfig(groupConfigPath, func() []client.InstanceState {
+			runtimeMu.RLock()
+			defer runtimeMu.RUnlock()
+			if groupRuntime == nil {
+				return nil
+			}
+			return runtimeInstanceStatuses(groupRuntime)
+		})
+		if err != nil {
+			return false, err
+		}
+		groupServer, err = group.Listen(config)
+		if err != nil {
+			return false, err
+		}
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = groupServer.Close(ctx)
+		}()
+	}
 	args, err = ensureLoopbackAddrArg(args)
 	if err != nil {
 		return false, err
@@ -377,6 +511,9 @@ func Run(args []string) (bool, error) {
 			})
 		},
 		RegisterHandlers: func(mux *http.ServeMux, runtime ccvmd.RuntimeView) {
+			runtimeMu.Lock()
+			groupRuntime = runtime
+			runtimeMu.Unlock()
 			srv.RegisterHandlers(mux, runtime)
 		},
 		NormalizeCreateRequest: func(req *client.CreateInstanceRequest, runtime ccvmd.RuntimeView) error {
@@ -393,6 +530,38 @@ func Run(args []string) (bool, error) {
 		},
 		WrapHandler: srv.Authenticate,
 	})
+}
+
+func scanValueArg(args []string, name string) (string, []string, error) {
+	short, long := "-"+name, "--"+name
+	remaining := make([]string, 0, len(args))
+	var value string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == short || arg == long {
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return "", nil, fmt.Errorf("%s requires a value", arg)
+			}
+			if value != "" {
+				return "", nil, fmt.Errorf("%s may only be specified once", long)
+			}
+			value = args[i+1]
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, short+"=") || strings.HasPrefix(arg, long+"=") {
+			if value != "" {
+				return "", nil, fmt.Errorf("%s may only be specified once", long)
+			}
+			_, value, _ = strings.Cut(arg, "=")
+			if value == "" {
+				return "", nil, fmt.Errorf("%s requires a value", long)
+			}
+			continue
+		}
+		remaining = append(remaining, arg)
+	}
+	return value, remaining, nil
 }
 
 func ensureLoopbackAddrArg(args []string) ([]string, error) {
@@ -442,6 +611,7 @@ func isLoopbackListenAddr(addr string) bool {
 }
 
 func NewServer(token string) *Server {
+	trustedManager, _ := newTrustedManager()
 	return &Server{
 		token:     token,
 		registry:  newSessionRegistry(),
@@ -450,11 +620,16 @@ func NewServer(token string) *Server {
 		jobs:      newHostJobRunner(),
 		shells:    newHostShellManager(),
 		balloon:   newBalloonController(systemMemoryObserver{}),
+		trusted:   trustedManager,
 		startedAt: time.Now(),
 	}
 }
 
-func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView) {
+func (s *Server) RegisterHandlers(rawMux *http.ServeMux, runtime ccvmd.RuntimeView) {
+	mux := &trackedServeMux{ServeMux: rawMux}
+	if s.trusted != nil {
+		s.trusted.register(mux, runtime)
+	}
 	mux.HandleFunc("GET /vmsh/protocol", func(w http.ResponseWriter, r *http.Request) {
 		exePath, _ := os.Executable()
 		writeJSON(w, http.StatusOK, vmshdprotocol.NewInfo(
@@ -474,6 +649,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			Streams:   append(s.events.Streams(), s.streams.List()...),
 			VMs:       runtimeInstanceStatuses(runtime),
 			StartedAt: s.startedAt,
+			Retention: RetentionPolicy{CompletedJobsPerSession: s.registry.maxCompletedJobs, JobLogBytes: maxJobLogBytes, Sessions: "explicit-delete"},
 		})
 	})
 	mux.HandleFunc("GET /vmsh/frontends", func(w http.ResponseWriter, r *http.Request) {
@@ -495,7 +671,12 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			writeSessionError(w, err)
 			return
 		}
-		s.finishSessionCleanups(cleanups, runtime)
+		s.streams.RevokeFrontend(frontend.ID)
+		failed := s.finishSessionCleanups(cleanups, runtime)
+		if len(failed) != 0 {
+			writeJSON(w, http.StatusConflict, CleanupErrorResponse{Error: "frontend closed with pending session cleanup", Sessions: failed})
+			return
+		}
 		s.events.Publish(Event{Kind: "frontend_closed", Frontend: &frontend})
 		writeJSON(w, http.StatusOK, frontend)
 	})
@@ -545,15 +726,17 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 		writeJSON(w, http.StatusOK, session)
 	})
 	mux.HandleFunc("DELETE /vmsh/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
-		session, jobIDs, ok := s.registry.Delete(r.PathValue("id"))
+		session, jobIDs, ok := s.registry.BeginDelete(r.PathValue("id"))
 		if !ok {
 			writeJSON(w, http.StatusNotFound, client.ErrorResponse{Error: "session not found"})
 			return
 		}
-		s.jobs.Cancel(jobIDs)
-		s.shells.Close(session.ID)
-		s.events.Publish(Event{Kind: "session_deleted", Session: &session})
-		writeJSON(w, http.StatusOK, session)
+		result := s.finishSessionCleanup(sessionCleanup{Session: session, JobIDs: jobIDs, VMIDs: sessionVMIDs(session)}, runtime)
+		if result.State == "cleanup_failed" {
+			writeJSON(w, http.StatusConflict, CleanupErrorResponse{Error: "session cleanup failed", Sessions: []Session{result}})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("POST /vmsh/sessions/{id}/attach", func(w http.ResponseWriter, r *http.Request) {
 		var req AttachSessionRequest
@@ -580,6 +763,7 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 			writeSessionError(w, err)
 			return
 		}
+		s.streams.RevokeAttachment(session.ID, req.AttachmentID)
 		s.events.Publish(Event{Kind: "session_detached", Session: &session})
 		writeJSON(w, http.StatusOK, session)
 	})
@@ -644,23 +828,42 @@ func (s *Server) RegisterHandlers(mux *http.ServeMux, runtime ccvmd.RuntimeView)
 	mux.Handle("GET /vmsh/sessions/{id}/attachments/{attachment}/stream", websocket.Server{
 		Handshake: func(*websocket.Config, *http.Request) error { return nil },
 		Handler: func(ws *websocket.Conn) {
+			ws.MaxPayloadBytes = maxTerminalWebSocketMessageBytes
+			_ = ws.SetDeadline(time.Time{})
 			s.serveTerminalStream(ws)
 		},
 	})
+	s.setAPIRoutes(mux.routes)
 }
 
-func (s *Server) finishSessionCleanups(cleanups []sessionCleanup, runtime ccvmd.RuntimeView) {
+func (s *Server) finishSessionCleanups(cleanups []sessionCleanup, runtime ccvmd.RuntimeView) []Session {
+	var failed []Session
 	for _, cleanup := range cleanups {
-		s.jobs.Cancel(cleanup.JobIDs)
-		s.shells.Close(cleanup.Session.ID)
-		for _, vmID := range cleanup.VMIDs {
-			if err := runtimeShutdownInstance(runtime, vmID); err != nil {
-				continue
-			}
+		result := s.finishSessionCleanup(cleanup, runtime)
+		if result.State == "cleanup_failed" {
+			failed = append(failed, result)
 		}
-		session := cleanup.Session
-		s.events.Publish(Event{Kind: "session_deleted", Session: &session})
 	}
+	return failed
+}
+
+func (s *Server) finishSessionCleanup(cleanup sessionCleanup, runtime ccvmd.RuntimeView) Session {
+	s.jobs.Cancel(cleanup.JobIDs)
+	s.streams.RevokeSession(cleanup.Session.ID)
+	s.shells.Close(cleanup.Session.ID)
+	failures := make([]VMCleanupFailure, 0)
+	for _, vmID := range cleanup.VMIDs {
+		if err := runtimeShutdownInstance(runtime, vmID); err != nil {
+			failures = append(failures, VMCleanupFailure{VMID: vmID, Error: err.Error()})
+		}
+	}
+	session, complete := s.registry.FinishDelete(cleanup.Session.ID, failures)
+	if complete {
+		s.events.Publish(Event{Kind: "session_deleted", Session: &session})
+	} else {
+		s.events.Publish(Event{Kind: "session_cleanup_failed", Session: &session})
+	}
+	return session
 }
 
 func (s *Server) startJob(sessionID string, req StartHostJobRequest, runtime ccvmd.RuntimeView) (JobSummary, error) {
@@ -933,7 +1136,7 @@ func newHostShellManager() *hostShellManager {
 	return &hostShellManager{shells: map[string]*hostShell{}}
 }
 
-func (m *hostShellManager) Start(sessionID string, term *Terminal) (*hostShell, error) {
+func (m *hostShellManager) Start(sessionID, requestedCWD string, term *Terminal) (*hostShell, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return nil, fmt.Errorf("session id is required")
@@ -941,24 +1144,44 @@ func (m *hostShellManager) Start(sessionID string, term *Terminal) (*hostShell, 
 	m.mu.Lock()
 	if shell := m.shells[sessionID]; shell != nil && shell.Running() {
 		m.mu.Unlock()
-		_ = shell.SetSize(term)
+		if err := shell.SetSize(term); err != nil {
+			return nil, err
+		}
 		return shell, nil
 	}
 	delete(m.shells, sessionID)
 	m.mu.Unlock()
 
-	cmd := exec.Command(hostShellCommand())
+	cwd, err := verifiedHostShellCWD(requestedCWD)
+	if err != nil {
+		return nil, err
+	}
+	shellPath := hostShellCommand()
+	cmd := exec.Command(shellPath)
+	if runtime.GOOS != "windows" {
+		// A leading dash in argv[0] is the portable login-shell convention. A
+		// PTY makes the configured shell interactive without shell-specific flags.
+		cmd.Args[0] = "-" + filepath.Base(shellPath)
+	}
+	configureHostShellCommand(cmd)
+	cmd.Dir = cwd
 	cmd.Env = append(os.Environ(), "VMSH_ACTIVE=1")
-	tty, err := pty.StartWithSize(cmd, terminalWinsize(term))
+	winsize, err := terminalWinsize(term)
+	if err != nil {
+		return nil, err
+	}
+	tty, err := pty.StartWithSize(cmd, winsize)
 	if err != nil {
 		return nil, err
 	}
 	shell := &hostShell{
 		sessionID:   sessionID,
+		cwd:         cwd,
 		cmd:         cmd,
 		tty:         tty,
 		done:        make(chan struct{}),
-		subscribers: map[int]chan []byte{},
+		exited:      make(chan struct{}),
+		subscribers: map[int]*hostShellSubscriber{},
 	}
 	m.mu.Lock()
 	m.shells[sessionID] = shell
@@ -966,6 +1189,7 @@ func (m *hostShellManager) Start(sessionID string, term *Terminal) (*hostShell, 
 	go shell.readLoop()
 	go func() {
 		_ = cmd.Wait()
+		close(shell.exited)
 		shell.closeDone()
 		m.mu.Lock()
 		if m.shells[sessionID] == shell {
@@ -974,6 +1198,33 @@ func (m *hostShellManager) Start(sessionID string, term *Terminal) (*hostShell, 
 		m.mu.Unlock()
 	}()
 	return shell, nil
+}
+
+func verifiedHostShellCWD(requested string) (string, error) {
+	cwd := strings.TrimSpace(requested)
+	if cwd == "" {
+		var err error
+		cwd, err = os.Getwd()
+		if err != nil {
+			return "", err
+		}
+	}
+	cwd, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", err
+	}
+	cwd, err = filepath.EvalSymlinks(cwd)
+	if err != nil {
+		return "", fmt.Errorf("resolve host shell cwd: %w", err)
+	}
+	info, err := os.Stat(cwd)
+	if err != nil {
+		return "", fmt.Errorf("validate host shell cwd: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("host shell cwd is not a directory: %s", cwd)
+	}
+	return cwd, nil
 }
 
 func (m *hostShellManager) Close(sessionID string) {
@@ -1004,7 +1255,11 @@ func (s *hostShell) SetSize(term *Terminal) error {
 	if s == nil || s.tty == nil || term == nil {
 		return nil
 	}
-	return pty.Setsize(s.tty, terminalWinsize(term))
+	winsize, err := terminalWinsize(term)
+	if err != nil {
+		return err
+	}
+	return pty.Setsize(s.tty, winsize)
 }
 
 func (s *hostShell) Write(data []byte) error {
@@ -1015,20 +1270,20 @@ func (s *hostShell) Write(data []byte) error {
 	return err
 }
 
-func (s *hostShell) Subscribe() (<-chan []byte, func()) {
+func (s *hostShell) Subscribe() (<-chan []byte, <-chan struct{}, func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nextSub++
 	id := s.nextSub
-	ch := make(chan []byte, 32)
-	s.subscribers[id] = ch
-	return ch, func() {
+	sub := &hostShellSubscriber{ch: make(chan []byte, 32), done: make(chan struct{})}
+	s.subscribers[id] = sub
+	return sub.ch, sub.done, func() {
 		s.mu.Lock()
-		defer s.mu.Unlock()
-		if sub := s.subscribers[id]; sub != nil {
+		if current := s.subscribers[id]; current == sub {
 			delete(s.subscribers, id)
-			close(sub)
 		}
+		s.mu.Unlock()
+		sub.doneOnce.Do(func() { close(sub.done) })
 	}
 }
 
@@ -1049,11 +1304,15 @@ func (s *hostShell) readLoop() {
 func (s *hostShell) publish(data []byte) {
 	data = append([]byte(nil), data...)
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	subs := make([]*hostShellSubscriber, 0, len(s.subscribers))
 	for _, sub := range s.subscribers {
+		subs = append(subs, sub)
+	}
+	s.mu.Unlock()
+	for _, sub := range subs {
 		select {
-		case sub <- data:
-		default:
+		case sub.ch <- data:
+		case <-sub.done:
 		}
 	}
 }
@@ -1062,11 +1321,11 @@ func (s *hostShell) Close() {
 	if s == nil {
 		return
 	}
-	_ = s.tty.Close()
-	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-	}
-	s.closeDone()
+	s.cleanupOnce.Do(func() {
+		_ = s.tty.Close()
+		terminateHostShellProcess(s.cmd, s.exited, 2*time.Second)
+		s.closeDone()
+	})
 }
 
 func (s *hostShell) closeDone() {
@@ -1077,28 +1336,35 @@ func (s *hostShell) closeDone() {
 		defer s.mu.Unlock()
 		for id, sub := range s.subscribers {
 			delete(s.subscribers, id)
-			close(sub)
+			sub.doneOnce.Do(func() { close(sub.done) })
 		}
 	})
 }
 
-func terminalWinsize(term *Terminal) *pty.Winsize {
-	rows := uint16(24)
-	cols := uint16(80)
+const maxTerminalDimension = terminal.MaxTerminalDimension
+
+func terminalWinsize(term *Terminal) (*pty.Winsize, error) {
+	rows := 0
+	cols := 0
 	if term != nil {
-		if term.Rows > 0 {
-			rows = uint16(term.Rows)
-		}
-		if term.Cols > 0 {
-			cols = uint16(term.Cols)
-		}
+		rows = term.Rows
+		cols = term.Cols
 	}
-	return &pty.Winsize{Rows: rows, Cols: cols}
+	cols, rows, err := terminal.NormalizeDimensions(cols, rows)
+	if err != nil {
+		return nil, err
+	}
+	return &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)}, nil
 }
 
 func hostShellCommand() string {
 	if runtime.GOOS == "windows" {
 		return firstNonEmpty(os.Getenv("COMSPEC"), "cmd.exe")
+	}
+	if shell := strings.TrimSpace(os.Getenv("SHELL")); filepath.IsAbs(shell) {
+		if info, err := os.Stat(shell); err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+			return shell
+		}
 	}
 	for _, name := range []string{"zsh", "bash", "sh"} {
 		if path, err := exec.LookPath(name); err == nil {
@@ -1106,14 +1372,6 @@ func hostShellCommand() string {
 		}
 	}
 	return "/bin/sh"
-}
-
-func currentWorkingDirectory() string {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return ""
-	}
-	return cwd
 }
 
 func firstNonEmpty(values ...string) string {
@@ -1141,7 +1399,13 @@ func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 		_ = websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "error"})
 		return
 	}
-	stream, closeStream := s.streams.Open("terminal", session.ID, attachment.ID)
+	stream, closeStream, err := s.streams.Open("terminal", session.ID, attachment.ID, attachment.FrontendID, func() {
+		_ = ws.Close()
+	})
+	if err != nil {
+		_ = websocket.JSON.Send(ws, TerminalStreamMessage{Kind: "error"})
+		return
+	}
 	defer func() {
 		closeStream()
 		s.events.Publish(Event{Kind: "terminal_stream_closed", Session: &session, Attachment: &attachment})
@@ -1156,7 +1420,7 @@ func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 	if err := send(TerminalStreamMessage{Kind: "attached", Stream: &stream}); err != nil {
 		return
 	}
-	shell, err := s.shells.Start(session.ID, attachment.Terminal)
+	shell, err := s.shells.Start(session.ID, session.HostCWD, attachment.Terminal)
 	if err != nil {
 		_ = send(TerminalStreamMessage{Kind: "error"})
 		return
@@ -1166,7 +1430,7 @@ func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 		Kind:    "host",
 		Name:    "host",
 		Context: "host",
-		CWD:     firstNonEmpty(strings.TrimSpace(session.HostCWD), currentWorkingDirectory()),
+		CWD:     shell.cwd,
 		State:   "open",
 	})
 	go func(sessionID, cwd string) {
@@ -1179,14 +1443,19 @@ func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 			CWD:     cwd,
 			State:   "closed",
 		})
-	}(session.ID, firstNonEmpty(strings.TrimSpace(session.HostCWD), currentWorkingDirectory()))
-	output, unsubscribe := shell.Subscribe()
+	}(session.ID, shell.cwd)
+	output, outputDone, unsubscribe := shell.Subscribe()
 	defer unsubscribe()
 	sendErr := make(chan error, 1)
 	go func() {
-		for data := range output {
-			if err := send(TerminalStreamMessage{Kind: "data", Data: data}); err != nil {
-				sendErr <- err
+		for {
+			select {
+			case data := <-output:
+				if err := send(TerminalStreamMessage{Kind: "data", Data: data}); err != nil {
+					sendErr <- err
+					return
+				}
+			case <-outputDone:
 				return
 			}
 		}
@@ -1201,7 +1470,12 @@ func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 		if err := websocket.JSON.Receive(ws, &msg); err != nil {
 			return
 		}
-		switch strings.TrimSpace(msg.Kind) {
+		kind := strings.TrimSpace(msg.Kind)
+		if attachment.Mode == "observer" && kind != "close" {
+			_ = send(TerminalStreamMessage{Kind: "error"})
+			continue
+		}
+		switch kind {
 		case "resize":
 			if msg.Terminal == nil {
 				_ = send(TerminalStreamMessage{Kind: "error"})
@@ -1232,32 +1506,64 @@ func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 }
 
 func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
+	s.streamEventsWithTiming(w, r, eventStreamHeartbeatInterval, eventStreamWriteTimeout)
+}
+
+func (s *Server) streamEventsWithTiming(w http.ResponseWriter, r *http.Request, heartbeatInterval, writeTimeout time.Duration) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeJSON(w, http.StatusInternalServerError, client.ErrorResponse{Error: "event streaming is not supported"})
 		return
 	}
-	events, unsubscribe := s.events.Subscribe()
+	events, disconnected, cursor, gap, unsubscribe := s.events.Subscribe(r.URL.Query().Get("after"))
 	defer unsubscribe()
 
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.WriteHeader(http.StatusOK)
-	connected := s.events.Event(Event{Kind: "connected"})
-	s.events.MarkDelivered(events, connected.ID)
-	if err := json.NewEncoder(w).Encode(connected); err != nil {
+	controller := http.NewResponseController(w)
+	encoder := json.NewEncoder(w)
+	write := func(event Event) error {
+		if err := controller.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+			return err
+		}
+		if err := encoder.Encode(event); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+	connected := Event{ID: cursor, Kind: "connected", At: time.Now()}
+	if err := write(connected); err != nil {
 		return
 	}
-	flusher.Flush()
+	s.events.MarkDelivered(events, connected.ID)
+	if gap {
+		if err := write(Event{ID: cursor, Kind: "gap", After: strings.TrimSpace(r.URL.Query().Get("after")), Refresh: "/vmsh/status", At: time.Now()}); err != nil {
+			return
+		}
+		s.events.MarkDelivered(events, cursor)
+		// End the stream so a frontend cannot apply queued pre-snapshot events
+		// after refreshing. It reconnects with this gap event's ID.
+		return
+	}
 
+	heartbeats := time.NewTicker(heartbeatInterval)
+	defer heartbeats.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
-		case event := <-events:
-			if err := json.NewEncoder(w).Encode(event); err != nil {
+		case <-disconnected:
+			return
+		case <-heartbeats.C:
+			if err := write(Event{ID: s.events.Cursor(), Kind: "heartbeat", At: time.Now()}); err != nil {
 				return
 			}
-			flusher.Flush()
+		case event := <-events:
+			if err := write(event); err != nil {
+				return
+			}
+			s.events.MarkDelivered(events, event.ID)
 		}
 	}
 }
@@ -1290,6 +1596,8 @@ func (s *Server) Authenticate(next http.Handler) http.Handler {
 			return
 		}
 		if err := compatibleFrontendRequest(r); err != nil {
+			w.Header().Set(vmshdprotocol.HeaderProtocol, strconv.Itoa(vmshdprotocol.Current))
+			w.Header().Set(vmshdprotocol.HeaderMinProtocol, strconv.Itoa(vmshdprotocol.Minimum))
 			writeJSON(w, http.StatusUpgradeRequired, client.ErrorResponse{Error: err.Error()})
 			return
 		}
@@ -1316,12 +1624,29 @@ func compatibleFrontendRequest(r *http.Request) error {
 }
 
 func frontendProtocolReadOnly(r *http.Request) bool {
+	if websocketUpgradeRequest(r) {
+		return false
+	}
 	switch r.Method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
 		return true
 	default:
 		return false
 	}
+}
+
+func websocketUpgradeRequest(r *http.Request) bool {
+	if r == nil || !strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket") {
+		return false
+	}
+	for _, value := range r.Header.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "upgrade") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func protocolVersionFromRequest(r *http.Request, header string) int {
@@ -1439,10 +1764,11 @@ func newToken() (string, error) {
 
 func newSessionRegistry() *sessionRegistry {
 	return &sessionRegistry{
-		frontends:  map[string]frontendRecord{},
-		sessions:   map[string]Session{},
-		jobs:       map[string]map[int]JobSummary{},
-		hostShells: map[string]ShellHandle{},
+		frontends:        map[string]frontendRecord{},
+		sessions:         map[string]Session{},
+		jobs:             map[string]map[int]JobSummary{},
+		hostShells:       map[string]ShellHandle{},
+		maxCompletedJobs: maxCompletedJobsPerSession,
 	}
 }
 
@@ -1451,26 +1777,70 @@ func newEventHub() *eventHub {
 }
 
 func newStreamRegistry() *streamRegistry {
-	return &streamRegistry{streams: map[string]StreamSummary{}}
+	return &streamRegistry{streams: map[string]streamRecord{}}
 }
 
-func (r *streamRegistry) Open(kind, sessionID, attachmentID string) (StreamSummary, func()) {
+func (r *streamRegistry) Open(kind, sessionID, attachmentID, frontendID string, revoke func()) (StreamSummary, func(), error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	kind = strings.TrimSpace(kind)
+	sessionID = strings.TrimSpace(sessionID)
+	attachmentID = strings.TrimSpace(attachmentID)
+	for _, active := range r.streams {
+		if active.summary.Kind == kind && active.summary.SessionID == sessionID && active.summary.AttachmentID == attachmentID {
+			return StreamSummary{}, nil, fmt.Errorf("%s stream already active for attachment %s", kind, attachmentID)
+		}
+	}
 	r.next++
 	stream := StreamSummary{
 		ID:           fmt.Sprintf("%s_stream_%08x", strings.TrimSpace(kind), r.next),
-		Kind:         strings.TrimSpace(kind),
+		Kind:         kind,
 		State:        "open",
-		SessionID:    strings.TrimSpace(sessionID),
-		AttachmentID: strings.TrimSpace(attachmentID),
+		SessionID:    sessionID,
+		AttachmentID: attachmentID,
 		ConnectedAt:  time.Now(),
 	}
-	r.streams[stream.ID] = stream
+	r.streams[stream.ID] = streamRecord{summary: stream, frontendID: strings.TrimSpace(frontendID), revoke: revoke}
 	return stream, func() {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		delete(r.streams, stream.ID)
+	}, nil
+}
+
+func (r *streamRegistry) RevokeAttachment(sessionID, attachmentID string) {
+	r.revoke(func(record streamRecord) bool {
+		return record.summary.SessionID == strings.TrimSpace(sessionID) && record.summary.AttachmentID == strings.TrimSpace(attachmentID)
+	})
+}
+
+func (r *streamRegistry) RevokeSession(sessionID string) {
+	r.revoke(func(record streamRecord) bool {
+		return record.summary.SessionID == strings.TrimSpace(sessionID)
+	})
+}
+
+func (r *streamRegistry) RevokeFrontend(frontendID string) {
+	r.revoke(func(record streamRecord) bool {
+		return record.frontendID != "" && record.frontendID == strings.TrimSpace(frontendID)
+	})
+}
+
+func (r *streamRegistry) revoke(matches func(streamRecord) bool) {
+	r.mu.Lock()
+	var revocations []func()
+	for id, record := range r.streams {
+		if !matches(record) {
+			continue
+		}
+		delete(r.streams, id)
+		if record.revoke != nil {
+			revocations = append(revocations, record.revoke)
+		}
+	}
+	r.mu.Unlock()
+	for _, revoke := range revocations {
+		revoke()
 	}
 }
 
@@ -1484,42 +1854,41 @@ func (r *streamRegistry) List() []StreamSummary {
 	sort.Strings(ids)
 	out := make([]StreamSummary, 0, len(ids))
 	for _, id := range ids {
-		out = append(out, r.streams[id])
+		out = append(out, r.streams[id].summary)
 	}
 	return out
 }
 
-func (h *eventHub) Event(event Event) Event {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.nextEventLocked(event)
-}
-
 func (h *eventHub) Publish(event Event) {
-	event = h.Event(event)
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	event = h.nextEventLocked(event)
 	for _, sub := range h.subscribers {
 		select {
 		case sub.ch <- event:
-			sub.lastEventID = event.ID
 		default:
+			close(sub.done)
+			delete(h.subscribers, sub.id)
 		}
 	}
 }
 
-func (h *eventHub) Subscribe() (<-chan Event, func()) {
+func (h *eventHub) Subscribe(after string) (<-chan Event, <-chan struct{}, string, bool, func()) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.next++
-	id := h.next
+	h.nextSub++
+	id := h.nextSub
 	ch := make(chan Event, 16)
+	done := make(chan struct{})
+	cursor := h.cursorLocked()
+	after = strings.TrimSpace(after)
 	h.subscribers[id] = &eventSubscriber{
 		id:          id,
 		ch:          ch,
+		done:        done,
 		connectedAt: time.Now(),
 	}
-	return ch, func() {
+	return ch, done, cursor, after != "" && after != cursor, func() {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		sub := h.subscribers[id]
@@ -1527,8 +1896,18 @@ func (h *eventHub) Subscribe() (<-chan Event, func()) {
 		if sub == nil {
 			return
 		}
-		close(ch)
+		close(done)
 	}
+}
+
+func (h *eventHub) Cursor() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.cursorLocked()
+}
+
+func (h *eventHub) cursorLocked() string {
+	return fmt.Sprintf("evt_%08x", h.nextEvent)
 }
 
 func (h *eventHub) MarkDelivered(events <-chan Event, eventID string) {
@@ -1569,8 +1948,8 @@ func (h *eventHub) Streams() []StreamSummary {
 }
 
 func (h *eventHub) nextEventLocked(event Event) Event {
-	h.next++
-	event.ID = fmt.Sprintf("evt_%08x", h.next)
+	h.nextEvent++
+	event.ID = fmt.Sprintf("evt_%08x", h.nextEvent)
 	if event.At.IsZero() {
 		event.At = time.Now()
 	}
@@ -1657,16 +2036,13 @@ func (r *sessionRegistry) CloseFrontend(id string) (FrontendSummary, []sessionCl
 				JobIDs:  r.jobIDsLocked(sessionID),
 				VMIDs:   sessionVMIDs(session),
 			})
-			delete(r.sessions, sessionID)
-			delete(r.jobs, sessionID)
-			delete(r.hostShells, sessionID)
+			r.sessions[sessionID] = session
 			continue
 		}
 		if session.FrontendID == id {
 			session.FrontendID = ""
-			if session.Scope == "system" {
-				session.DetachOnClose = true
-			}
+			session.Scope = "system"
+			session.DetachOnClose = true
 			changed = true
 		}
 		if len(session.Attachments) != 0 {
@@ -1729,6 +2105,9 @@ func (r *sessionRegistry) Create(req CreateSessionRequest) (Session, error) {
 		}
 	}
 	scope := normalizeSessionScope(req.Scope, frontendID)
+	if scope == "frontend" && frontendID == "" {
+		return Session{}, sessionError{status: http.StatusBadRequest, err: "frontend-scoped session requires a live frontend owner"}
+	}
 	detachOnClose := scope == "system"
 	if req.DetachOnClose != nil {
 		detachOnClose = *req.DetachOnClose
@@ -1804,7 +2183,7 @@ func (r *sessionRegistry) Update(id string, req UpdateSessionRequest) (Session, 
 	session.HostShells = cloneShellHandles(req.HostShells)
 	session.GuestShells = cloneShellHandles(req.GuestShells)
 	session.SSHShells = cloneShellHandles(req.SSHShells)
-	session.Jobs = cloneJobSummaries(req.Jobs)
+	session.Jobs = retainTerminalJobHistory(cloneJobSummaries(req.Jobs), r.maxCompletedJobs)
 	session.Copies = cloneCopySummaries(req.Copies)
 	session.HostShells = r.mergedHostShellsLocked(id, session.HostShells)
 	session.UpdatedAt = time.Now()
@@ -1812,7 +2191,7 @@ func (r *sessionRegistry) Update(id string, req UpdateSessionRequest) (Session, 
 	return cloneSession(session), nil
 }
 
-func (r *sessionRegistry) Delete(id string) (Session, []int, bool) {
+func (r *sessionRegistry) BeginDelete(id string) (Session, []int, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	id = strings.TrimSpace(id)
@@ -1826,10 +2205,47 @@ func (r *sessionRegistry) Delete(id string) (Session, []int, bool) {
 	session.State = "closing"
 	session.UpdatedAt = time.Now()
 	jobIDs := r.jobIDsLocked(id)
-	delete(r.sessions, id)
-	delete(r.jobs, id)
-	delete(r.hostShells, id)
+	r.sessions[id] = session
 	return cloneSession(session), jobIDs, true
+}
+
+func (r *sessionRegistry) FinishDelete(id string, failures []VMCleanupFailure) (Session, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id = strings.TrimSpace(id)
+	session, ok := r.sessions[id]
+	if !ok {
+		return Session{}, true
+	}
+	if len(failures) == 0 {
+		session.State = "closing"
+		session.UpdatedAt = time.Now()
+		delete(r.sessions, id)
+		delete(r.jobs, id)
+		delete(r.hostShells, id)
+		return cloneSession(session), true
+	}
+	failed := make(map[string]bool, len(failures))
+	for _, failure := range failures {
+		failed[failure.VMID] = true
+	}
+	refs := make([]VMRef, 0, len(failures))
+	for _, ref := range session.VMRefs {
+		vmID := firstNonEmpty(strings.TrimSpace(ref.BackendID), strings.TrimSpace(ref.ID))
+		if failed[vmID] {
+			refs = append(refs, ref)
+		}
+	}
+	attempts := 1
+	if session.Cleanup != nil {
+		attempts = session.Cleanup.Attempts + 1
+	}
+	session.VMRefs = refs
+	session.State = "cleanup_failed"
+	session.Cleanup = &CleanupStatus{Attempts: attempts, Failures: append([]VMCleanupFailure(nil), failures...), UpdatedAt: time.Now()}
+	session.UpdatedAt = session.Cleanup.UpdatedAt
+	r.sessions[id] = session
+	return cloneSession(session), false
 }
 
 func markDaemonJobsCanceling(jobs []JobSummary) {
@@ -1873,6 +2289,11 @@ func (r *sessionRegistry) Attach(id string, req AttachSessionRequest) (Session, 
 	if mode != "interactive" && mode != "observer" {
 		return Session{}, ClientAttachment{}, sessionError{status: http.StatusBadRequest, err: "unsupported attachment mode"}
 	}
+	if req.Terminal != nil {
+		if err := validateTerminal(*req.Terminal); err != nil {
+			return Session{}, ClientAttachment{}, sessionError{status: http.StatusBadRequest, err: err.Error()}
+		}
+	}
 	frontendID := strings.TrimSpace(req.FrontendID)
 	if frontendID != "" {
 		frontend, ok := r.frontends[frontendID]
@@ -1893,7 +2314,7 @@ func (r *sessionRegistry) Attach(id string, req AttachSessionRequest) (Session, 
 		ID:         fmt.Sprintf("attach_%08x", r.nextAttach),
 		FrontendID: frontendID,
 		Mode:       mode,
-		Terminal:   normalizeTerminal(req.Terminal),
+		Terminal:   cloneTerminal(req.Terminal),
 		AttachedAt: now,
 		UpdatedAt:  now,
 	}
@@ -1918,6 +2339,13 @@ func (r *sessionRegistry) Persist(id string, req PersistSessionRequest) (Session
 	}
 	if scope != "system" && scope != "frontend" {
 		return Session{}, sessionError{status: http.StatusBadRequest, err: "unsupported session scope"}
+	}
+	if scope == "frontend" {
+		frontendID := strings.TrimSpace(session.FrontendID)
+		frontend, ok := r.frontends[frontendID]
+		if frontendID == "" || !ok || frontend.State != "open" {
+			return Session{}, sessionError{status: http.StatusBadRequest, err: "frontend-scoped session requires a live frontend owner"}
+		}
 	}
 	session.Scope = scope
 	session.DetachOnClose = scope == "system"
@@ -1974,12 +2402,15 @@ func (r *sessionRegistry) UpdateTerminal(id, attachmentID string, term Terminal)
 	if attachmentID == "" {
 		return Session{}, ClientAttachment{}, sessionError{status: http.StatusBadRequest, err: "attachment id is required"}
 	}
+	if err := validateTerminal(term); err != nil {
+		return Session{}, ClientAttachment{}, sessionError{status: http.StatusBadRequest, err: err.Error()}
+	}
 	for i, attachment := range session.Attachments {
 		if attachment.ID != attachmentID {
 			continue
 		}
 		now := time.Now()
-		attachment.Terminal = normalizeTerminal(&term)
+		attachment.Terminal = cloneTerminal(&term)
 		attachment.UpdatedAt = now
 		session.Attachments[i] = attachment
 		session.UpdatedAt = now
@@ -2018,6 +2449,7 @@ func (r *sessionRegistry) List() []SessionSummary {
 			Jobs:            cloneJobSummaries(session.Jobs),
 			Copies:          cloneCopySummaries(session.Copies),
 			AttachedClients: cloneAttachments(session.Attachments),
+			Cleanup:         cloneCleanupStatus(session.Cleanup),
 			CreatedAt:       session.CreatedAt,
 			UpdatedAt:       session.UpdatedAt,
 		})
@@ -2099,11 +2531,66 @@ func (r *sessionRegistry) FinishJob(sessionID string, jobID int, result JobSumma
 		job.FinishedAt = time.Now()
 	}
 	jobs[jobID] = job
+	r.pruneDaemonJobsLocked(sessionID)
 	if session, ok := r.sessions[sessionID]; ok {
 		session.UpdatedAt = job.FinishedAt
 		r.sessions[sessionID] = session
 	}
 	return job, true
+}
+
+func (r *sessionRegistry) pruneDaemonJobsLocked(sessionID string) {
+	jobs := r.jobs[sessionID]
+	if len(jobs) == 0 || r.maxCompletedJobs < 0 {
+		return
+	}
+	terminal := make([]JobSummary, 0, len(jobs))
+	for _, job := range jobs {
+		if !job.FinishedAt.IsZero() {
+			terminal = append(terminal, job)
+		}
+	}
+	sort.Slice(terminal, func(i, j int) bool {
+		if terminal[i].FinishedAt.Equal(terminal[j].FinishedAt) {
+			return terminal[i].ID < terminal[j].ID
+		}
+		return terminal[i].FinishedAt.Before(terminal[j].FinishedAt)
+	})
+	for len(terminal) > r.maxCompletedJobs {
+		delete(jobs, terminal[0].ID)
+		terminal = terminal[1:]
+	}
+}
+
+func retainTerminalJobHistory(jobs []JobSummary, limit int) []JobSummary {
+	if limit < 0 {
+		return jobs
+	}
+	terminal := make([]int, 0, len(jobs))
+	for i := range jobs {
+		if !jobs[i].FinishedAt.IsZero() || jobs[i].Status == "done" || jobs[i].Status == "error" || jobs[i].Status == "lost" {
+			terminal = append(terminal, i)
+		}
+	}
+	sort.Slice(terminal, func(i, j int) bool {
+		a, b := jobs[terminal[i]], jobs[terminal[j]]
+		if a.FinishedAt.Equal(b.FinishedAt) {
+			return a.ID < b.ID
+		}
+		return a.FinishedAt.Before(b.FinishedAt)
+	})
+	remove := map[int]bool{}
+	for len(terminal) > limit {
+		remove[terminal[0]] = true
+		terminal = terminal[1:]
+	}
+	out := make([]JobSummary, 0, len(jobs)-len(remove))
+	for i, job := range jobs {
+		if !remove[i] {
+			out = append(out, job)
+		}
+	}
+	return out
 }
 
 func (r *sessionRegistry) RequestCancelJob(sessionID string, jobID int) (JobSummary, error) {
@@ -2198,7 +2685,17 @@ func cloneSession(session Session) Session {
 	session.SSHShells = cloneShellHandles(session.SSHShells)
 	session.Jobs = cloneJobSummaries(session.Jobs)
 	session.Copies = cloneCopySummaries(session.Copies)
+	session.Cleanup = cloneCleanupStatus(session.Cleanup)
 	return session
+}
+
+func cloneCleanupStatus(status *CleanupStatus) *CleanupStatus {
+	if status == nil {
+		return nil
+	}
+	cloned := *status
+	cloned.Failures = append([]VMCleanupFailure(nil), status.Failures...)
+	return &cloned
 }
 
 func cloneAttachments(attachments []ClientAttachment) []ClientAttachment {
@@ -2302,36 +2799,48 @@ func writeSessionError(w http.ResponseWriter, err error) {
 	writeJSON(w, http.StatusInternalServerError, client.ErrorResponse{Error: err.Error()})
 }
 
-func normalizeTerminal(term *Terminal) *Terminal {
+func cloneTerminal(term *Terminal) *Terminal {
 	if term == nil {
 		return nil
 	}
 	out := *term
-	if out.Cols < 0 {
-		out.Cols = 0
-	}
-	if out.Rows < 0 {
-		out.Rows = 0
-	}
 	return &out
 }
 
+func validateTerminal(term Terminal) error {
+	_, _, err := terminal.NormalizeDimensions(term.Cols, term.Rows)
+	return err
+}
+
 func decodeOptionalJSON(r *http.Request, dst any) error {
-	if r.Body == nil || r.ContentLength == 0 {
-		return nil
-	}
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
-		return fmt.Errorf("decode request body: %w", err)
-	}
-	return nil
+	return decodeJSON(r, dst, false)
 }
 
 func decodeRequiredJSON(r *http.Request, dst any) error {
-	if r.Body == nil {
-		return fmt.Errorf("request body is required")
+	return decodeJSON(r, dst, true)
+}
+
+func decodeJSON(r *http.Request, dst any, required bool) error {
+	if r.Body == nil || r.ContentLength == 0 {
+		if required {
+			return fmt.Errorf("request body is required")
+		}
+		return nil
 	}
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		if !required && errors.Is(err, io.EOF) {
+			return nil
+		}
 		return fmt.Errorf("decode request body: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("decode request body: multiple JSON values")
+		}
+		return fmt.Errorf("decode request body: trailing data: %w", err)
 	}
 	return nil
 }

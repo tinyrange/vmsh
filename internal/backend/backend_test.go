@@ -1,14 +1,19 @@
 package backend
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -108,6 +113,94 @@ func TestDaemonStateRoundTripAndValidation(t *testing.T) {
 	}
 	if _, err := ReadDaemonState(badAPIPath); err == nil {
 		t.Fatal("unsupported daemon API version was accepted")
+	}
+}
+
+func TestDaemonStateFailedPublicationPreservesPreviousState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vmshd.json")
+	if err := WriteDaemonState(path, DaemonState{Addr: "localhost:1001"}); err != nil {
+		t.Fatalf("write previous daemon state: %v", err)
+	}
+	state := normalizeDaemonState(DaemonState{Addr: "localhost:1002"})
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal replacement state: %v", err)
+	}
+	replaceErr := errors.New("injected state publication failure")
+	err = writeDaemonStateAtomically(path, append(data, '\n'), func(string, string) error {
+		return replaceErr
+	})
+	if !errors.Is(err, replaceErr) {
+		t.Fatalf("publication error = %v, want injected failure", err)
+	}
+	preserved, err := ReadDaemonState(path)
+	if err != nil {
+		t.Fatalf("read preserved daemon state: %v", err)
+	}
+	if preserved.Addr != "localhost:1001" {
+		t.Fatalf("preserved daemon addr = %q, want previous state", preserved.Addr)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read daemon state directory: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "vmshd.json" {
+		t.Fatalf("daemon state directory entries = %v", entries)
+	}
+}
+
+func TestDaemonStateConcurrentPublicationNeverExposesPartialJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vmshd.json")
+	if err := WriteDaemonState(path, DaemonState{Addr: "localhost:1000"}); err != nil {
+		t.Fatalf("write initial daemon state: %v", err)
+	}
+
+	stop := make(chan struct{})
+	readErr := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				readErr <- nil
+				return
+			default:
+			}
+			state, err := ReadDaemonState(path)
+			if err != nil {
+				readErr <- err
+				return
+			}
+			if state.Addr == "" || state.Version != DaemonStateVersion || state.APIVersion != DaemonAPIVersion {
+				readErr <- fmt.Errorf("invalid observed daemon state: %+v", state)
+				return
+			}
+		}
+	}()
+
+	const writers = 24
+	var wg sync.WaitGroup
+	errCh := make(chan error, writers)
+	for i := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errCh <- WriteDaemonState(path, DaemonState{Addr: fmt.Sprintf("localhost:%d", 2000+i)})
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Errorf("concurrent state publication: %v", err)
+		}
+	}
+	close(stop)
+	if err := <-readErr; err != nil {
+		t.Fatalf("concurrent state read: %v", err)
+	}
+	if _, err := ReadDaemonState(path); err != nil {
+		t.Fatalf("read final daemon state: %v", err)
 	}
 }
 
@@ -224,6 +317,86 @@ type zeroReader struct{}
 func (zeroReader) Read(p []byte) (int, error) {
 	clear(p)
 	return len(p), nil
+}
+
+func TestReplaceFileFailurePreservesCurrentExecutable(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, HostExecutableName("vmshd"))
+	previous := []byte("known-good-executable")
+	if err := os.WriteFile(dst, previous, 0o755); err != nil {
+		t.Fatalf("write current executable: %v", err)
+	}
+	missingSource := filepath.Join(dir, "missing-replacement")
+	if err := replaceFile(missingSource, dst); err == nil {
+		t.Fatal("replacement with a missing source succeeded")
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read current executable after failed replacement: %v", err)
+	}
+	if !bytes.Equal(got, previous) {
+		t.Fatalf("current executable after failed replacement = %q, want previous bytes", got)
+	}
+}
+
+func TestReplaceFileAtomicallyPublishesCompleteExecutable(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, HostExecutableName("vmshd"))
+	oldContents := bytes.Repeat([]byte("o"), 64*1024)
+	newContents := bytes.Repeat([]byte("n"), 64*1024)
+	if err := os.WriteFile(dst, oldContents, 0o755); err != nil {
+		t.Fatalf("write current executable: %v", err)
+	}
+
+	stop := make(chan struct{})
+	readErr := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				readErr <- nil
+				return
+			default:
+			}
+			got, err := os.ReadFile(dst)
+			if err != nil {
+				if runtime.GOOS == "windows" {
+					// Replacing a file can briefly deny new opens on Windows;
+					// the durable contract is that any successful open sees
+					// one complete executable, never a partial write.
+					continue
+				}
+				readErr <- err
+				return
+			}
+			if !bytes.Equal(got, oldContents) && !bytes.Equal(got, newContents) {
+				readErr <- fmt.Errorf("observed partial executable with %d bytes", len(got))
+				return
+			}
+		}
+	}()
+	src := filepath.Join(dir, "replacement")
+	if err := os.WriteFile(src, newContents, 0o755); err != nil {
+		close(stop)
+		<-readErr
+		t.Fatalf("write replacement: %v", err)
+	}
+	if err := replaceFile(src, dst); err != nil {
+		close(stop)
+		<-readErr
+		t.Fatalf("replace executable: %v", err)
+	}
+	close(stop)
+	if err := <-readErr; err != nil {
+		t.Fatalf("launcher observation during replacement: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read replacement: %v", err)
+	}
+	if !bytes.Equal(got, newContents) {
+		t.Fatalf("replacement contents have %d bytes, want complete new executable", len(got))
+	}
 }
 
 func TestConnectCCVMWithOptionsReportsDaemonReuse(t *testing.T) {
@@ -579,6 +752,54 @@ func TestConnectCCVMWithOptionsStartsPrivateDaemonForIncompatibleVMSHD(t *testin
 	}
 }
 
+func TestReclaimPrivateDaemonCachesKeepsActiveAndRemovesStale(t *testing.T) {
+	const token = "secret"
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", requireBearer(token, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cache := t.TempDir()
+	parent := filepath.Join(cache, "private")
+	active := filepath.Join(parent, "vmshd-active")
+	stale := filepath.Join(parent, "vmshd-stale")
+	unknown := filepath.Join(parent, "vmshd-unknown")
+	for _, dir := range []string{active, stale, unknown} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("create private cache: %v", err)
+		}
+	}
+	activeToken := filepath.Join(active, "token")
+	if err := os.WriteFile(activeToken, []byte(token+"\n"), 0o600); err != nil {
+		t.Fatalf("write active token: %v", err)
+	}
+	if err := WriteDaemonState(filepath.Join(active, "owner.json"), DaemonState{Addr: strings.TrimPrefix(srv.URL, "http://"), TokenPath: activeToken}); err != nil {
+		t.Fatalf("write active owner: %v", err)
+	}
+	staleToken := filepath.Join(stale, "token")
+	if err := os.WriteFile(staleToken, []byte(token+"\n"), 0o600); err != nil {
+		t.Fatalf("write stale token: %v", err)
+	}
+	if err := WriteDaemonState(filepath.Join(stale, "owner.json"), DaemonState{Addr: "127.0.0.1:1", TokenPath: staleToken}); err != nil {
+		t.Fatalf("write stale owner: %v", err)
+	}
+
+	if err := reclaimStalePrivateDaemonCaches(cache); err != nil {
+		t.Fatalf("reclaim caches: %v", err)
+	}
+	if _, err := os.Stat(active); err != nil {
+		t.Fatalf("active cache removed: %v", err)
+	}
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale cache still exists: %v", err)
+	}
+	if _, err := os.Stat(unknown); err != nil {
+		t.Fatalf("unknown cache removed: %v", err)
+	}
+}
+
 func TestConnectCCVMWithOptionsStartsPrivateDaemonForUnauthenticatedVMSHDState(t *testing.T) {
 	const oldToken = "old-secret"
 	const newToken = "new-secret"
@@ -825,6 +1046,32 @@ func stubStartDaemonProcess(t *testing.T, banner string) func() {
 	}
 }
 
+func TestReadDaemonStartupBannerTimesOutAndStopsChild(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer writer.Close()
+	stopped := make(chan struct{})
+	var stopOnce sync.Once
+	started := &startedDaemonProcess{
+		stdout: reader,
+		stop: func() {
+			stopOnce.Do(func() {
+				close(stopped)
+				_ = writer.Close()
+			})
+		},
+	}
+
+	_, err := readDaemonStartupBanner(started, CCVMLaunch{Path: "/fake/ccvm"}, 20*time.Millisecond)
+	if !errors.Is(err, ErrDaemonStartupTimeout) {
+		t.Fatalf("startup error = %v, want timeout", err)
+	}
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("timed-out child was not stopped")
+	}
+}
+
 func serverHelloBanner(t *testing.T, hello client.ServerHello) string {
 	t.Helper()
 	data, err := json.Marshal(hello)
@@ -995,6 +1242,46 @@ func TestStartDaemonLeaseUsesShortTimeout(t *testing.T) {
 	if len(api.released) != 1 || api.released[0] != "lease" {
 		t.Fatalf("released leases = %q", api.released)
 	}
+}
+
+func TestStartDaemonLeaseReportsFeedAndReleaseFailures(t *testing.T) {
+	t.Setenv("VMSH_DAEMON_WATCHDOG_TIMEOUT", "30ms")
+	api := &failingWatchdogAPI{}
+	reported := make(chan error, 4)
+	stop, err := StartDaemonLease(api, func(err error) { reported <- err })
+	if err != nil {
+		t.Fatalf("start lease: %v", err)
+	}
+	var feedErr error
+	select {
+	case feedErr = <-reported:
+	case <-time.After(time.Second):
+		t.Fatal("feed failure was not reported")
+	}
+	var leaseErr *WatchdogLeaseError
+	if !errors.As(feedErr, &leaseErr) || leaseErr.Operation != "feed failed" {
+		t.Fatalf("feed error = %v", feedErr)
+	}
+	stop()
+	select {
+	case err := <-reported:
+		if !errors.As(err, &leaseErr) || leaseErr.Operation != "release failed" {
+			t.Fatalf("release error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("release failure was not reported")
+	}
+}
+
+type failingWatchdogAPI struct{}
+
+func (*failingWatchdogAPI) CreateWatchdogLease(req client.WatchdogLeaseRequest) (client.WatchdogLeaseResponse, error) {
+	return client.WatchdogLeaseResponse{LeaseID: "lease", TimeoutSeconds: req.TimeoutSeconds}, nil
+}
+
+func (*failingWatchdogAPI) FeedWatchdogLease(string) error { return fmt.Errorf("feed unavailable") }
+func (*failingWatchdogAPI) ReleaseWatchdogLease(string) error {
+	return fmt.Errorf("release unavailable")
 }
 
 type recordingWatchdogAPI struct {

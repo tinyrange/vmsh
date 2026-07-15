@@ -30,6 +30,16 @@ const (
 	codexGuestStandaloneMount = "/vmsh/codex-standalone"
 	codexGuestCertMount       = "/vmsh/host-certs"
 	codexStandaloneDir        = "packages/standalone"
+
+	// Current Codex packages are about 140 MiB compressed, contain 11 entries,
+	// and expand to about 310 MiB with a largest file around 260 MiB. These
+	// budgets leave substantial release-growth headroom while bounding disk,
+	// inode, and decompression work before publication.
+	codexPackageMaxArchiveBytes  int64 = 256 << 20
+	codexPackageMaxExpandedBytes int64 = 1 << 30
+	codexPackageMaxFileBytes     int64 = 512 << 20
+	codexPackageMaxEntries             = 1024
+	codexChecksumMaxBytes        int64 = 1 << 20
 )
 
 var (
@@ -71,6 +81,13 @@ type codexGitHubAsset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 	Digest             string `json:"digest"`
+	Size               int64  `json:"size"`
+}
+
+type tarExtractionLimits struct {
+	MaxEntries       int
+	MaxFileBytes     int64
+	MaxExpandedBytes int64
 }
 
 func (s *shellState) runAgent(at atLine, stdout, stderr io.Writer) error {
@@ -268,7 +285,9 @@ func ensureHostCodexRelease(hostCodexHome, target string, opts codexAgentOptions
 	releasesDir := filepath.Join(standaloneRoot, "releases")
 	if release == "latest" && !opts.Update {
 		if installed, ok := newestInstalledCodexRelease(releasesDir, target); ok {
-			_ = updateVMShCodexLink(standaloneRoot, target, installed.Name)
+			if err := updateVMShCodexLink(standaloneRoot, target, installed.Name); err != nil {
+				return codexHostRelease{}, fmt.Errorf("activate Codex release %s: %w", installed.Name, err)
+			}
 			installed.CodexGuestBin = codexGuestBinaryPath(installed)
 			return installed, nil
 		}
@@ -284,7 +303,9 @@ func ensureHostCodexRelease(hostCodexHome, target string, opts codexAgentOptions
 		}
 		if codexReleaseDirComplete(installed.ReleaseDir, release, target) {
 			installed.CodexRelPath = codexReleaseBinaryRelPath(installed.ReleaseDir)
-			_ = updateVMShCodexLink(standaloneRoot, target, installed.Name)
+			if err := updateVMShCodexLink(standaloneRoot, target, installed.Name); err != nil {
+				return codexHostRelease{}, fmt.Errorf("activate Codex release %s: %w", installed.Name, err)
+			}
 			installed.CodexGuestBin = codexGuestBinaryPath(installed)
 			return installed, nil
 		}
@@ -327,7 +348,9 @@ func ensureHostCodexRelease(hostCodexHome, target string, opts codexAgentOptions
 	if err != nil {
 		return codexHostRelease{}, err
 	}
-	_ = updateVMShCodexLink(standaloneRoot, target, installed.Name)
+	if err := updateVMShCodexLink(standaloneRoot, target, installed.Name); err != nil {
+		return codexHostRelease{}, fmt.Errorf("activate Codex release %s: %w", installed.Name, err)
+	}
 	installed.CodexGuestBin = codexGuestBinaryPath(installed)
 	return installed, nil
 }
@@ -394,6 +417,10 @@ func codexReleaseDirComplete(releaseDir, expectedVersion, expectedTarget string)
 	if filepath.Base(releaseDir) != expectedVersion+"-"+expectedTarget {
 		return false
 	}
+	return codexReleaseContentsComplete(releaseDir, expectedTarget)
+}
+
+func codexReleaseContentsComplete(releaseDir, expectedTarget string) bool {
 	if !isExecutable(filepath.Join(releaseDir, "bin", "codex")) {
 		return false
 	}
@@ -1041,7 +1068,7 @@ func installCodexPackageRelease(release codexGitHubRelease, releasesDir, version
 		return err
 	}
 	releaseDir := filepath.Join(releasesDir, version+"-"+target)
-	return extractCodexPackageArchive(releaseDir, archivePath)
+	return extractCodexPackageArchive(releaseDir, archivePath, version, target)
 }
 
 func findCodexReleaseAsset(release codexGitHubRelease, name string) (codexGitHubAsset, bool) {
@@ -1070,6 +1097,13 @@ func downloadCodexAsset(asset codexGitHubAsset, dst string) error {
 	if asset.BrowserDownloadURL == "" {
 		return fmt.Errorf("release asset %s is missing a download URL", asset.Name)
 	}
+	maxBytes := codexPackageMaxArchiveBytes
+	if asset.Name == "codex-package_SHA256SUMS" {
+		maxBytes = codexChecksumMaxBytes
+	}
+	if asset.Size < 0 || asset.Size > maxBytes {
+		return fmt.Errorf("release asset %s size %d exceeds limit %d", asset.Name, asset.Size, maxBytes)
+	}
 	req, err := http.NewRequest(http.MethodGet, asset.BrowserDownloadURL, nil)
 	if err != nil {
 		return err
@@ -1083,14 +1117,25 @@ func downloadCodexAsset(asset codexGitHubAsset, dst string) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("download %s: %s", asset.Name, resp.Status)
 	}
+	if resp.ContentLength > maxBytes {
+		return fmt.Errorf("download %s content length %d exceeds limit %d", asset.Name, resp.ContentLength, maxBytes)
+	}
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(out, resp.Body)
+	written, copyErr := io.Copy(out, io.LimitReader(resp.Body, maxBytes+1))
 	closeErr := out.Close()
 	if copyErr != nil {
 		return copyErr
+	}
+	if written > maxBytes {
+		_ = os.Remove(dst)
+		return fmt.Errorf("download %s exceeds limit %d", asset.Name, maxBytes)
+	}
+	if asset.Size > 0 && written != asset.Size {
+		_ = os.Remove(dst)
+		return fmt.Errorf("download %s size %d does not match release metadata %d", asset.Name, written, asset.Size)
 	}
 	return closeErr
 }
@@ -1134,7 +1179,7 @@ func codexPackageArchiveDigest(checksumPath, assetName string) (string, error) {
 	return "", fmt.Errorf("checksum manifest does not include %s", assetName)
 }
 
-func extractCodexPackageArchive(releaseDir, archivePath string) error {
+func extractCodexPackageArchive(releaseDir, archivePath, version, target string) error {
 	stage := filepath.Join(filepath.Dir(releaseDir), ".staging."+filepath.Base(releaseDir)+"."+strconv.FormatInt(time.Now().UnixNano(), 10))
 	if err := os.RemoveAll(stage); err != nil {
 		return err
@@ -1181,18 +1226,53 @@ func extractCodexPackageArchive(releaseDir, archivePath string) error {
 			return err
 		}
 	}
-	if err := os.RemoveAll(releaseDir); err != nil {
-		return err
+	if !codexReleaseContentsComplete(stage, target) {
+		return fmt.Errorf("staged Codex release %s-%s is incomplete", version, target)
 	}
-	if err := os.Rename(stage, releaseDir); err != nil {
+	if err := publishCodexRelease(stage, releaseDir, os.Rename, os.RemoveAll); err != nil {
 		return err
 	}
 	cleanupStage = false
 	return nil
 }
 
+func publishCodexRelease(stage, releaseDir string, rename func(string, string) error, removeAll func(string) error) error {
+	backup := filepath.Join(filepath.Dir(releaseDir), ".rollback."+filepath.Base(releaseDir)+"."+strconv.FormatInt(time.Now().UnixNano(), 10))
+	hadPrevious := false
+	if _, err := os.Lstat(releaseDir); err == nil {
+		if err := rename(releaseDir, backup); err != nil {
+			return fmt.Errorf("preserve previous Codex release: %w", err)
+		}
+		hadPrevious = true
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := rename(stage, releaseDir); err != nil {
+		if hadPrevious {
+			if restoreErr := rename(backup, releaseDir); restoreErr != nil {
+				return fmt.Errorf("publish Codex release: %v (restore previous release: %w)", err, restoreErr)
+			}
+		}
+		return fmt.Errorf("publish Codex release: %w", err)
+	}
+	if hadPrevious {
+		_ = removeAll(backup)
+	}
+	return nil
+}
+
 func extractTarSafe(r io.Reader, dst string) error {
+	return extractTarSafeWithLimits(r, dst, tarExtractionLimits{
+		MaxEntries:       codexPackageMaxEntries,
+		MaxFileBytes:     codexPackageMaxFileBytes,
+		MaxExpandedBytes: codexPackageMaxExpandedBytes,
+	})
+}
+
+func extractTarSafeWithLimits(r io.Reader, dst string, limits tarExtractionLimits) error {
 	tr := tar.NewReader(r)
+	entries := 0
+	var expanded int64
 	for {
 		header, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -1200,6 +1280,19 @@ func extractTarSafe(r io.Reader, dst string) error {
 		}
 		if err != nil {
 			return err
+		}
+		entries++
+		if limits.MaxEntries > 0 && entries > limits.MaxEntries {
+			return fmt.Errorf("archive contains more than %d entries", limits.MaxEntries)
+		}
+		if header.Size < 0 || limits.MaxFileBytes > 0 && header.Size > limits.MaxFileBytes {
+			return fmt.Errorf("archive entry %q size %d exceeds limit %d", header.Name, header.Size, limits.MaxFileBytes)
+		}
+		if header.Size > 0 && limits.MaxExpandedBytes > 0 {
+			if expanded > limits.MaxExpandedBytes-header.Size {
+				return fmt.Errorf("archive expanded size exceeds limit %d", limits.MaxExpandedBytes)
+			}
+			expanded += header.Size
 		}
 		name := path.Clean(strings.TrimPrefix(header.Name, "/"))
 		if name == "." || name == ".." || strings.HasPrefix(name, "../") {
@@ -1237,35 +1330,12 @@ func extractTarSafe(r io.Reader, dst string) error {
 }
 
 func withCodexInstallLock(standaloneRoot string, fn func() error) error {
-	lockDir := filepath.Join(standaloneRoot, "vmsh-install.lock.d")
-	deadline := time.Now().Add(2 * time.Minute)
-	for {
-		err := os.Mkdir(lockDir, 0o700)
-		if err == nil {
-			_ = os.WriteFile(filepath.Join(lockDir, "started_at"), []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0o600)
-			defer os.RemoveAll(lockDir)
-			return fn()
-		}
-		if !os.IsExist(err) {
-			return err
-		}
-		if codexLockStale(lockDir, 10*time.Minute) {
-			_ = os.RemoveAll(lockDir)
-			continue
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for Codex install lock")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func codexLockStale(lockDir string, staleAfter time.Duration) bool {
-	info, err := os.Stat(lockDir)
+	lock, err := acquireCodexFileLock(filepath.Join(standaloneRoot, "vmsh-install.lock"), 2*time.Minute)
 	if err != nil {
-		return true
+		return err
 	}
-	return time.Since(info.ModTime()) > staleAfter
+	defer lock.Release()
+	return fn()
 }
 
 func updateVMShCodexLink(standaloneRoot, target, releaseName string) error {
@@ -1279,7 +1349,7 @@ func updateVMShCodexLink(standaloneRoot, target, releaseName string) error {
 	if err := os.Symlink(filepath.Join("..", "..", "releases", releaseName), tmp); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, link); err != nil {
+	if err := replaceCodexActivationLink(tmp, link); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}

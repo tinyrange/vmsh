@@ -29,6 +29,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/tinyrange/vmsh/internal/backend"
+	"github.com/tinyrange/vmsh/internal/group"
 	"github.com/tinyrange/vmsh/internal/ptymux"
 	"github.com/tinyrange/vmsh/internal/terminal"
 	"github.com/tinyrange/vmsh/internal/termui/editor"
@@ -44,6 +45,7 @@ const isolatedVMSuffix = "-isolated"
 const defaultGuestUser = "1000:1000"
 const defaultVMSHBootTimeoutSeconds = 60
 const defaultBuiltInBSDBootTimeoutSeconds = 180
+const vmshCustomKernelFilePrefix = "file:"
 const defaultGuestShellReadyTimeout = 30 * time.Second
 const defaultCCVMGuestMemoryMB = 512
 const maxEmbeddedHostInitPreludeBytes = 64 * 1024
@@ -59,6 +61,7 @@ const (
 )
 
 var userCacheDir = os.UserCacheDir
+var userConfigDir = os.UserConfigDir
 var execProcess = syscall.Exec
 
 type shellMode string
@@ -116,6 +119,8 @@ type shellState struct {
 	tmuxExec           func([]string) error
 	interruptSignals   <-chan os.Signal
 	evaluatingPaste    bool
+	groupName          string
+	groupSnapshot      *group.Snapshot
 }
 
 type shellExecRequest struct {
@@ -172,7 +177,7 @@ type shellCopy struct {
 }
 
 type vmshdSessionReporter struct {
-	publishMu    sync.Mutex
+	mu           sync.Mutex
 	client       *vmshd.HTTPClient
 	frontendID   string
 	sessionID    string
@@ -180,6 +185,8 @@ type vmshdSessionReporter struct {
 	detached     bool
 	startedAt    time.Time
 	startedKnown bool
+	pending      *vmshd.UpdateSessionRequest
+	publishErr   error
 }
 
 type hostShellInit struct {
@@ -376,7 +383,7 @@ func (c *vmshCompleter) shellSSHSessionContext(name string) (commandContext, boo
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@agent", "@alias", "@copy", "@detach", "@exec", "@help", "@host", "@install", "@jobs", "@mux", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux", "@version"}
+	words := []string{"@agent", "@alias", "@connect", "@copy", "@detach", "@exec", "@help", "@host", "@install", "@jobs", "@mux", "@permissions", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux", "@trust", "@version"}
 	if c.shell != nil {
 		for _, name := range c.shell.sshSessionNames() {
 			words = append(words, "@"+name)
@@ -453,6 +460,7 @@ func (c *vmshCompleter) cachedImageNames() []string {
 
 func vmshOptionWords(prefix string) []string {
 	words := []string{
+		"--vm",
 		"--from",
 		"--cwd",
 		"--user",
@@ -1059,6 +1067,7 @@ type commandContext struct {
 	CPUs       int       `json:"cpus,omitempty"`
 	Network    bool      `json:"network,omitempty"`
 	NestedVirt bool      `json:"nested_virtualization,omitempty"`
+	Debug      bool      `json:"debug,omitempty"`
 	Isolated   bool      `json:"isolated,omitempty"`
 	ParentKey  string    `json:"parent_key,omitempty"`
 	ParentText string    `json:"parent_text,omitempty"`
@@ -1084,6 +1093,7 @@ type commandOptions struct {
 	CPUs         int
 	Network      *bool
 	NestedVirt   *bool
+	Debug        bool
 	Isolated     *bool
 	OptionFields []string
 }
@@ -1094,7 +1104,7 @@ type shellToken struct {
 	End   int
 }
 
-func Run(args []string) error {
+func Run(args []string) (retErr error) {
 	fs := flag.NewFlagSet("vmsh", flag.ExitOnError)
 	ccvmPath := fs.String("ccvm", "", "Path to ccvm binary")
 	cacheDir := fs.String("cache-dir", "", "Cache directory")
@@ -1183,14 +1193,29 @@ func Run(args []string) error {
 		}
 	}
 	caps, _ := api.Capabilities()
-	stopLease, err := backend.StartDaemonLease(api)
+	stopLeaseOnce, err := backend.StartDaemonLease(api, func(err error) {
+		fmt.Fprintf(stderr, "vmsh: warning: daemon lease degraded: %v\n", err)
+	})
 	if err != nil {
 		return err
 	}
-	defer stopLease()
+	var stopLeaseGuard sync.Once
+	stopLease := func() { stopLeaseGuard.Do(stopLeaseOnce) }
+	defer func() {
+		stopLease()
+		if err := backend.RemovePrivateDaemonCacheWhenStopped(api, daemonState.PrivateCacheDir); err != nil {
+			fmt.Fprintf(stderr, "vmsh: warning: remove private daemon cache: %v\n", err)
+		}
+	}()
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
+	}
+	promptInput := os.Stdin
+	closePromptInput := func() {}
+	if *script == "" {
+		promptInput, closePromptInput = openPromptInput(os.Stdin)
+		defer closePromptInput()
 	}
 	initialContext := defaultContext(strings.TrimSpace(*vmID), strings.TrimSpace(*image), caps.SupportsNestedVirt)
 	sh := &shellState{
@@ -1209,16 +1234,16 @@ func Run(args []string) error {
 		env:        map[string]string{},
 		aliases:    map[string]string{},
 		confirmPull: func(source string, stderr io.Writer) (bool, error) {
-			return promptPullConfirmation(os.Stdin, stderr, source)
+			return promptPullConfirmation(promptInput, stderr, source)
 		},
 		confirmVMRestart: func(id string, stderr io.Writer) (bool, error) {
-			return promptVMRestartConfirmation(os.Stdin, stderr, id)
+			return promptVMRestartConfirmation(promptInput, stderr, id)
 		},
 		confirmSSHHost: func(cfg resolvedSSHConfig, hostname string, remote net.Addr, key ssh.PublicKey) (bool, error) {
-			return promptSSHHostKeyConfirmation(os.Stdin, stderr, cfg, hostname, remote, key)
+			return promptSSHHostKeyConfirmation(promptInput, stderr, cfg, hostname, remote, key)
 		},
 		confirmExit: func(resources []exitResource, stderr io.Writer) (bool, error) {
-			return promptExitConfirmation(os.Stdin, stderr, resources)
+			return promptExitConfirmation(promptInput, stderr, resources)
 		},
 		confirmSystemd: func(stderr io.Writer) (bool, error) {
 			return promptSystemdUserUnitConfirmation(os.Stdin, stderr)
@@ -1226,10 +1251,10 @@ func Run(args []string) error {
 		hasSystemdUser:     defaultSystemdUserAvailable,
 		installSystemdUser: installSystemdUserUnit,
 		sshPassword: func(cfg resolvedSSHConfig) (string, error) {
-			return promptSSHPassword(os.Stdin, stderr, cfg)
+			return promptSSHPassword(promptInput, stderr, cfg)
 		},
 		sshKeyboardAuth: func(cfg resolvedSSHConfig, name, instruction string, questions []string, echos []bool) ([]string, error) {
-			return promptSSHKeyboardInteractive(os.Stdin, stderr, cfg, name, instruction, questions, echos)
+			return promptSSHKeyboardInteractive(promptInput, stderr, cfg, name, instruction, questions, echos)
 		},
 		sshBanner: func(cfg resolvedSSHConfig, message string) error {
 			_, err := fmt.Fprint(stderr, message)
@@ -1256,7 +1281,11 @@ func Run(args []string) error {
 			return err
 		}
 		sh.vmshd = reporter
-		defer stopVMSHDSession()
+		defer func() {
+			if err := stopVMSHDSession(); err != nil {
+				retErr = errors.Join(retErr, err)
+			}
+		}()
 	}
 	if *startVM {
 		if err := sh.startVM(sh.context.VMID, sh.context, stderr); err != nil {
@@ -1313,9 +1342,9 @@ func daemonDisplayName(state backend.DaemonState, launch backend.CCVMLaunch) str
 	return "ccvm"
 }
 
-func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmshd.UpdateSessionRequest, systemSession bool) (*vmshdSessionReporter, func(), error) {
+func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmshd.UpdateSessionRequest, systemSession bool) (*vmshdSessionReporter, func() error, error) {
 	if state.Kind != vmshd.Kind {
-		return nil, func() {}, nil
+		return nil, func() error { return nil }, nil
 	}
 	client, err := vmshd.NewHTTPClient(state)
 	if err != nil {
@@ -1325,8 +1354,9 @@ func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmsh
 	if err != nil {
 		return nil, nil, err
 	}
-	closeFrontend := func() {
-		_, _ = client.CloseFrontend(frontend.ID)
+	closeFrontend := func() error {
+		_, err := client.CloseFrontend(frontend.ID)
+		return err
 	}
 	scope := "frontend"
 	if systemSession {
@@ -1334,11 +1364,11 @@ func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmsh
 	}
 	session, err := client.CreateSession(vmshd.CreateSessionRequest{Name: "main", FrontendID: frontend.ID, Scope: scope})
 	if err != nil {
-		closeFrontend()
+		_ = closeFrontend()
 		return nil, nil, err
 	}
 	if _, err := client.UpdateSession(session.ID, metadata); err != nil {
-		closeFrontend()
+		_ = closeFrontend()
 		return nil, nil, err
 	}
 	attachReq := vmshd.AttachSessionRequest{FrontendID: frontend.ID, Mode: "interactive"}
@@ -1350,7 +1380,7 @@ func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmsh
 	}
 	attached, err := client.AttachSession(session.ID, attachReq)
 	if err != nil {
-		closeFrontend()
+		_ = closeFrontend()
 		return nil, nil, err
 	}
 	reporter := &vmshdSessionReporter{
@@ -1364,8 +1394,8 @@ func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmsh
 		reporter.startedAt = status.StartedAt
 		reporter.startedKnown = true
 	}
-	return reporter, func() {
-		closeFrontend()
+	return reporter, func() error {
+		return reporter.close()
 	}, nil
 }
 
@@ -1553,14 +1583,57 @@ func jobStatus(job shellJob) string {
 	return "done"
 }
 
-func (r *vmshdSessionReporter) publish(snapshot func() vmshd.UpdateSessionRequest) {
+func (r *vmshdSessionReporter) publish(snapshot func() vmshd.UpdateSessionRequest) error {
 	if r == nil || r.client == nil || strings.TrimSpace(r.sessionID) == "" {
-		return
+		return nil
 	}
-	r.publishMu.Lock()
-	defer r.publishMu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	req := snapshot()
-	_, _ = r.client.UpdateSession(r.sessionID, req)
+	r.pending = &req
+	_, err := r.client.UpdateSession(r.sessionID, req)
+	r.publishErr = err
+	if err == nil {
+		r.pending = nil
+	}
+	return err
+}
+
+func (r *vmshdSessionReporter) flush() error {
+	if r == nil || r.client == nil || strings.TrimSpace(r.sessionID) == "" {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pending == nil {
+		return nil
+	}
+	_, err := r.client.UpdateSession(r.sessionID, *r.pending)
+	r.publishErr = err
+	if err == nil {
+		r.pending = nil
+	}
+	return err
+}
+
+func (r *vmshdSessionReporter) publicationError() error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.publishErr
+}
+
+func (r *vmshdSessionReporter) close() error {
+	if r == nil || r.client == nil {
+		return nil
+	}
+	if err := r.flush(); err != nil {
+		return fmt.Errorf("publish final vmshd session state: %w", err)
+	}
+	_, err := r.client.CloseFrontend(r.frontendID)
+	return err
 }
 
 func (r *vmshdSessionReporter) bridgeTerminalStream(ctx context.Context, in *os.File, stdout, stderr io.Writer) error {
@@ -3251,6 +3324,21 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return nil
 		}
 		return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
+	case "trust":
+		if len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @trust VM --grant PROFILE | @trust VM --revoke PROFILE")
+		}
+		return s.changeTrust(at.Command, stdout)
+	case "permissions":
+		if len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @permissions [VM]")
+		}
+		return s.printPermissions(strings.TrimSpace(at.Command), stdout)
+	case "connect":
+		if len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @connect <group|local>")
+		}
+		return s.connectGroup(strings.TrimSpace(at.Command), stdout)
 	case "exec":
 		if len(at.Options.OptionFields) != 0 {
 			return fmt.Errorf("usage: @exec [cmd]")
@@ -4506,53 +4594,50 @@ func (s *shellState) copyGuestToLocal(ctx commandContext, src, dst copyTargetPat
 	if err := s.ensureGuestCopyReady(ctx, stderr); err != nil {
 		return err
 	}
-	var tarData bytes.Buffer
-	var exitSeen bool
-	var exitCode int
-	var eventErr error
-	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
-	defer stopInterrupts()
-	progress.Phase("downloading")
-	if err := s.execStreamInContext(runCtx, backendVMID(ctx), client.ExecRequest{
-		Kind:  "fs_archive",
-		Image: localImageName(ctx.Image, ctx.Arch),
-		Path:  src.path,
-		User:  guestRunUser(ctx),
-	}, nil, func(event client.ExecEvent) error {
-		switch event.Kind {
-		case "stdout", "output":
-			data := execEventBytes(event)
-			_, _ = tarData.Write(data)
-			progress.AddBytes(len(data))
-		case "stderr":
-			writeExecEventOutput(stderr, event)
-		case "error":
-			eventErr = fmt.Errorf("%s", firstNonEmpty(event.Error, execEventText(event)))
-		case "exit":
-			exitSeen = true
-			exitCode = event.ExitCode
-		}
-		return nil
-	}); err != nil {
+	progress.Phase("downloading and extracting")
+	return streamTarToHost(dst, progress, func(archive io.Writer) error {
+		var exitSeen bool
+		var exitCode int
+		var eventErr error
+		runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
+		defer stopInterrupts()
+		streamErr := s.execStreamInContext(runCtx, backendVMID(ctx), client.ExecRequest{
+			Kind:  "fs_archive",
+			Image: localImageName(ctx.Image, ctx.Arch),
+			Path:  src.path,
+			User:  guestRunUser(ctx),
+		}, nil, func(event client.ExecEvent) error {
+			switch event.Kind {
+			case "stdout", "output":
+				_, err := archive.Write(execEventBytes(event))
+				return err
+			case "stderr":
+				writeExecEventOutput(stderr, event)
+			case "error":
+				eventErr = fmt.Errorf("%s", firstNonEmpty(event.Error, execEventText(event)))
+			case "exit":
+				exitSeen = true
+				exitCode = event.ExitCode
+			}
+			return nil
+		})
 		if interrupted.Load() {
 			return persistentShellExit{code: 130}
 		}
-		return err
-	}
-	if interrupted.Load() {
-		return persistentShellExit{code: 130}
-	}
-	if eventErr != nil {
-		return eventErr
-	}
-	if exitSeen && exitCode != 0 {
-		return persistentShellExit{code: exitCode}
-	}
-	if !exitSeen {
-		return fmt.Errorf("guest copy did not report completion")
-	}
-	progress.Phase("extracting")
-	return extractTarToHost(bytes.NewReader(tarData.Bytes()), dst)
+		if streamErr != nil {
+			return streamErr
+		}
+		if eventErr != nil {
+			return eventErr
+		}
+		if exitSeen && exitCode != 0 {
+			return persistentShellExit{code: exitCode}
+		}
+		if !exitSeen {
+			return fmt.Errorf("guest copy did not report completion")
+		}
+		return nil
+	})
 }
 
 func (s *shellState) ensureGuestCopyReady(ctx commandContext, stderr io.Writer) error {
@@ -4648,6 +4733,12 @@ func writePathTar(w io.Writer, src, rootName string) error {
 }
 
 func extractTarToHost(r io.Reader, dst copyTargetPath) error {
+	return extractTarToHostRooted(r, dst)
+}
+
+// extractTarToHostLegacy is retained on the aggregate branch so the streaming
+// implementation from the other pull request can merge independently.
+func extractTarToHostLegacy(r io.Reader, dst copyTargetPath) error {
 	mode := hostCopyDestMode(dst.path, dst.directory)
 	tr := tar.NewReader(r)
 	var dirs []tarDirMtime
@@ -4693,29 +4784,63 @@ func extractTarToHost(r io.Reader, dst copyTargetPath) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
-			file, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(header.Mode).Perm())
+			file, err := os.CreateTemp(filepath.Dir(target), "."+filepath.Base(target)+".vmsh-copy-")
 			if err != nil {
 				return err
 			}
+			staged := file.Name()
 			_, copyErr := io.Copy(file, tr)
 			closeErr := file.Close()
 			if copyErr != nil {
+				_ = os.Remove(staged)
 				return copyErr
 			}
 			if closeErr != nil {
+				_ = os.Remove(staged)
 				return closeErr
 			}
 			perm := os.FileMode(header.Mode).Perm()
-			if err := os.Chmod(target, perm); err != nil {
+			if err := os.Chmod(staged, perm); err != nil {
+				_ = os.Remove(staged)
 				return err
 			}
-			if err := os.Chtimes(target, header.ModTime, header.ModTime); err != nil {
+			if err := os.Chtimes(staged, header.ModTime, header.ModTime); err != nil {
+				_ = os.Remove(staged)
+				return err
+			}
+			if err := os.Rename(staged, target); err != nil {
+				_ = os.Remove(staged)
 				return err
 			}
 		default:
 			continue
 		}
 	}
+}
+
+func hostTarTarget(dst string, mode copyDestMode, name string) (string, error) {
+	clean := filepath.Clean(filepath.FromSlash(name))
+	if clean == "." || filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("archive path escapes destination: %q", name)
+	}
+	if mode == copyDestExact {
+		return dst, nil
+	}
+	return filepath.Join(dst, clean), nil
+}
+
+func streamTarToHost(dst copyTargetPath, progress *copyProgress, produce func(io.Writer) error) error {
+	reader, writer := io.Pipe()
+	extractDone := make(chan error, 1)
+	go func() {
+		err := extractTarToHost(reader, dst)
+		_ = reader.CloseWithError(err)
+		extractDone <- err
+	}()
+	produceErr := produce(copyProgressWriter{w: writer, progress: progress})
+	closeErr := writer.Close()
+	extractErr := <-extractDone
+	return errors.Join(produceErr, closeErr, extractErr)
 }
 
 func ensureHostTarTargetCompatible(target string, incomingDir bool) error {
@@ -4770,21 +4895,6 @@ func hostCopyDestMode(dst string, directoryHint bool) copyDestMode {
 		return copyDestIntoDir
 	}
 	return copyDestExact
-}
-
-func hostTarTarget(dst string, mode copyDestMode, name string) (string, error) {
-	cleanName := path.Clean(strings.TrimPrefix(filepath.ToSlash(name), "/"))
-	if cleanName == "." || strings.HasPrefix(cleanName, "../") || cleanName == ".." {
-		return "", fmt.Errorf("unsafe tar path %q", name)
-	}
-	if mode == copyDestIntoDir {
-		return filepath.Join(dst, filepath.FromSlash(cleanName)), nil
-	}
-	parts := strings.SplitN(cleanName, "/", 2)
-	if len(parts) == 1 {
-		return dst, nil
-	}
-	return filepath.Join(dst, filepath.FromSlash(parts[1])), nil
 }
 
 func copyHostDir(src, dst string, mode os.FileMode) error {
@@ -5159,16 +5269,12 @@ func startPersistentHostShell(cwd string, env []string, cols, rows int, prelude 
 	}
 	defer controlWrite.Close()
 	cmd.ExtraFiles = []*os.File{controlWrite}
-	if cols <= 0 {
-		cols = 80
+	winsize, err := hostPTYWinsize(cols, rows)
+	if err != nil {
+		_ = controlRead.Close()
+		return nil, err
 	}
-	if rows <= 0 {
-		rows = 24
-	}
-	tty, err := pty.StartWithSize(cmd, &pty.Winsize{
-		Cols: uint16(cols),
-		Rows: uint16(rows),
-	})
+	tty, err := pty.StartWithSize(cmd, winsize)
 	if err != nil {
 		_ = controlRead.Close()
 		return nil, err
@@ -5867,6 +5973,11 @@ func (s *shellState) prepareGuestRunRequest(ctx commandContext, line string, tty
 	if strings.TrimSpace(ctx.Kernel) == "" {
 		ctx.Kernel = defaultKernelForImage(ctx.Image)
 	}
+	kernel, err := s.resolveStartKernel(ctx)
+	if err != nil {
+		return client.RunRequest{}, err
+	}
+	ctx.Kernel = kernel
 	if err := s.ensureImageAvailable(ctx, stderr); err != nil {
 		return client.RunRequest{}, err
 	}
@@ -6533,18 +6644,35 @@ func (s *shellState) startGuestInputForwarding(tty, forwardStdin bool, inputs ch
 	return stopGuestInputForwarding(restore, func() {
 		close(done)
 		cancelRead()
-		producers.Wait()
-	}), nil
+	}, producers.Wait), nil
 }
 
-func stopGuestInputForwarding(restore func(), stopProducers func()) func() {
+func stopGuestInputForwarding(restore func(), cancelProducers func(), waitProducers func()) func() {
+	return stopPTYForwarding(restore, cancelProducers, waitProducers)
+}
+
+func stopPTYForwarding(restore func(), cancelProducers func(), waitProducers func()) func() {
+	var stopOnce sync.Once
 	return func() {
-		if stopProducers != nil {
-			stopProducers()
-		}
-		if restore != nil {
-			restore()
-		}
+		stopOnce.Do(func() {
+			if cancelProducers != nil {
+				cancelProducers()
+			}
+			if waitProducers != nil {
+				done := make(chan struct{})
+				go func() {
+					waitProducers()
+					close(done)
+				}()
+				select {
+				case <-done:
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+			if restore != nil {
+				restore()
+			}
+		})
 	}
 }
 
@@ -6654,6 +6782,13 @@ func (s *shellState) startHostPTYForwarding(tty bool, session *persistentHostShe
 	if session == nil || session.tty == nil {
 		return func() {}, interrupted, nil
 	}
+	// The persistent shell can sit idle while the outer terminal is resized,
+	// before its per-command signal forwarder exists. Synchronize the current
+	// size whenever a command takes ownership of the PTY; subsequent SIGWINCH
+	// events are handled by forwardHostPTYSignals below.
+	if tty {
+		resizeHostPTY(session.tty, stdout)
+	}
 
 	done := make(chan struct{})
 	restore := func() {}
@@ -6688,15 +6823,10 @@ func (s *shellState) startHostPTYForwarding(tty bool, session *persistentHostShe
 		forwardHostPTYSignals(session.tty, done, tty, stdout, stderr, interrupted, onInterrupt...)
 	}()
 
-	var stopOnce sync.Once
-	stop := func() {
-		stopOnce.Do(func() {
-			close(done)
-			cancelRead()
-			producers.Wait()
-			restore()
-		})
-	}
+	stop := stopPTYForwarding(restore, func() {
+		close(done)
+		cancelRead()
+	}, producers.Wait)
 	return stop, interrupted, nil
 }
 
@@ -6796,13 +6926,25 @@ func resizeHostPTY(out *os.File, stdout io.Writer) {
 		return
 	}
 	cols, rows, err := terminal.Size(file)
-	if err != nil || cols <= 0 || rows <= 0 {
+	if err != nil {
+		return
+	}
+	winsize, err := hostPTYWinsize(cols, rows)
+	if err != nil {
 		return
 	}
 	if recorder := terminalWriterRecorder(stdout); recorder != nil {
 		recorder.recordResize(cols, rows)
 	}
-	_ = pty.Setsize(out, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+	_ = pty.Setsize(out, winsize)
+}
+
+func hostPTYWinsize(cols, rows int) (*pty.Winsize, error) {
+	cols, rows, err := terminal.NormalizeDimensions(cols, rows)
+	if err != nil {
+		return nil, err
+	}
+	return &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)}, nil
 }
 
 func writeHostPTYSignal(out *os.File, name string) {
@@ -7520,6 +7662,11 @@ func (s *shellState) ensureVMRunning(ctx commandContext, stderr io.Writer) error
 	if strings.TrimSpace(ctx.Kernel) == "" {
 		ctx.Kernel = defaultKernelForImage(ctx.Image)
 	}
+	kernel, kernelErr := s.resolveStartKernel(ctx)
+	if kernelErr != nil {
+		return kernelErr
+	}
+	ctx.Kernel = kernel
 	id := backendVMID(ctx)
 	if s.vmRunning != nil && s.vmRunning[id] && strings.TrimSpace(ctx.InitSystem) == "" && strings.TrimSpace(ctx.Kernel) == "" {
 		return nil
@@ -7610,6 +7757,11 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 	if strings.TrimSpace(ctx.Kernel) == "" {
 		ctx.Kernel = defaultKernelForImage(ctx.Image)
 	}
+	kernel, kernelErr := s.resolveStartKernel(ctx)
+	if kernelErr != nil {
+		return kernelErr
+	}
+	ctx.Kernel = kernel
 	req := client.StartInstanceRequest{
 		Image:          localImageName(ctx.Image, ctx.Arch),
 		InitSystem:     ctx.InitSystem,
@@ -7617,6 +7769,7 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 		MemoryMB:       ctx.MemoryMB,
 		CPUs:           ctx.CPUs,
 		NestedVirt:     ctx.NestedVirt,
+		Dmesg:          ctx.Debug,
 		TimeoutSeconds: vmshBootTimeoutSeconds(ctx.Image),
 	}
 	if startMountsHostShare(ctx) {
@@ -7637,7 +7790,7 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 		req.Network = networkConfigForContext(ctx)
 	}
 	s.applyStartupSnapshotDefaults(&req)
-	boot := newBootStatus(stderr)
+	boot := newBootStatus(stderr, ctx.Debug)
 	defer boot.Close()
 	runCtx, stopInterrupts, interrupted := s.interruptibleCommandContext()
 	defer stopInterrupts()
@@ -7864,15 +8017,22 @@ func vmshBootTimeoutSeconds(image string) float64 {
 
 type bootStatus struct {
 	*terminalHoldStatus
+	debug bool
 }
 
-func newBootStatus(w io.Writer) *bootStatus {
-	return &bootStatus{terminalHoldStatus: newTerminalHoldStatus(w, "Boot: starting VM")}
+func newBootStatus(w io.Writer, debug bool) *bootStatus {
+	return &bootStatus{
+		terminalHoldStatus: newTerminalHoldStatus(w, "Boot: starting VM"),
+		debug:              debug,
+	}
 }
 
 func (b *bootStatus) Update(event client.BootEvent) {
 	if event.Kind == "serial" {
-		if !b.tty && event.Data != "" {
+		if b.debug && b.tty {
+			b.Close()
+		}
+		if (b.debug || !b.tty) && event.Data != "" {
 			fmt.Fprint(b.w, event.Data)
 		}
 		return
@@ -8982,6 +9142,11 @@ func (s *shellState) drawPromptStatus(stdout io.Writer) {
 }
 
 func (s *shellState) printStatus(w io.Writer) error {
+	if s.groupSnapshot != nil {
+		if _, err := fmt.Fprintf(w, "group: %s id=%s generation=%d nodes=%d unavailable=%d\n", s.groupName, s.groupSnapshot.GroupID, s.groupSnapshot.Generation, len(s.groupSnapshot.Inventories), len(s.groupSnapshot.Unavailable)); err != nil {
+			return err
+		}
+	}
 	chain := s.activeContextChain()
 	if _, err := fmt.Fprintln(w, "context chain:"); err != nil {
 		return err
@@ -9307,7 +9472,125 @@ func (s *shellState) printVMs(w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	return s.printSessionTree(w, states, s.sshSessionStates(), s.sshConnectionStates())
+	if err := s.printSessionTree(w, states, s.sshSessionStates(), s.sshConnectionStates()); err != nil {
+		return err
+	}
+	if s.groupSnapshot == nil {
+		return nil
+	}
+	for _, node := range s.groupSnapshot.Inventories {
+		for _, state := range node.Inventory.VMs {
+			if _, err := fmt.Fprintf(w, "%s/%s vm %s\n", node.Node.Name, firstNonEmpty(strings.TrimSpace(state.ID), "default"), emptyText(state.Status, "unknown")); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *shellState) connectGroup(name string, w io.Writer) error {
+	if name == "" {
+		return fmt.Errorf("usage: @connect <group|local>")
+	}
+	if name == "local" || name == "-d" {
+		s.groupName = ""
+		s.groupSnapshot = nil
+		return nil
+	}
+	for _, char := range name {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '-' || char == '_' {
+			continue
+		}
+		return fmt.Errorf("group name must contain only URL-safe characters")
+	}
+	configRoot, err := userConfigDir()
+	if err != nil {
+		return fmt.Errorf("resolve user config directory: %w", err)
+	}
+	config, err := group.LoadClientConfig(filepath.Join(configRoot, "vmsh", "groups", name, "frontend.json"))
+	if err != nil {
+		return err
+	}
+	snapshot, err := group.Fetch(context.Background(), config)
+	if err != nil {
+		return err
+	}
+	s.groupName = name
+	s.groupSnapshot = &snapshot
+	_, err = fmt.Fprintf(w, "connected to %s (%d available, %d unavailable)\n", name, len(snapshot.Inventories), len(snapshot.Unavailable))
+	return err
+}
+
+func (s *shellState) changeTrust(command string, w io.Writer) error {
+	tokens, err := lexShellTokens(strings.TrimSpace(command))
+	if err != nil {
+		return err
+	}
+	if len(tokens) != 3 || (tokens[1].Value != "--grant" && tokens[1].Value != "--revoke") || strings.TrimSpace(tokens[0].Value) == "" || strings.TrimSpace(tokens[2].Value) == "" {
+		return fmt.Errorf("usage: @trust VM --grant PROFILE | @trust VM --revoke PROFILE")
+	}
+	if s.vmshd == nil || s.vmshd.client == nil {
+		return fmt.Errorf("trusted context calls require a vmshd session")
+	}
+	vmID := normalizedVMID(tokens[0].Value)
+	profile := tokens[2].Value
+	if tokens[1].Value == "--revoke" {
+		info, err := s.vmshd.client.RevokeTrust(vmID)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(w, "revoked %s from %s (generation %d)\n", info.Profile, info.VMID, info.SourceGeneration)
+		return err
+	}
+	info, err := s.vmshd.client.GrantTrust(vmshd.TrustGrantRequest{VMID: vmID, Profile: profile})
+	if err != nil {
+		return err
+	}
+	guestConfig, err := json.Marshal(struct {
+		Version          int               `json:"version"`
+		Address          string            `json:"address"`
+		Port             int               `json:"port"`
+		Token            string            `json:"token"`
+		SourceGeneration uint64            `json:"source_generation"`
+		TargetID         string            `json:"target_id"`
+		ProfileDigest    string            `json:"profile_digest"`
+		DefaultRootID    string            `json:"default_root_id"`
+		GuestRoot        string            `json:"guest_root"`
+		ActionDeadlines  map[string]string `json:"action_deadlines"`
+	}{Version: 1, Address: info.ServiceAddress, Port: info.ServicePort, Token: info.Token, SourceGeneration: info.SourceGeneration, TargetID: info.TargetID, ProfileDigest: info.ProfileDigest, DefaultRootID: info.DefaultRootID, GuestRoot: guestHostMount, ActionDeadlines: info.ActionDeadlines})
+	if err != nil {
+		return err
+	}
+	install := client.RunRequest{Command: []string{"/bin/sh", "-c", "umask 077; mkdir -p /run/vmsh && cat > /run/vmsh/context.json && chown 1000:1000 /run/vmsh/context.json && chmod 600 /run/vmsh/context.json"}, User: "root", Stdin: guestConfig}
+	if err := s.api.RunStreamInContext(context.Background(), vmID, install, func(event client.ExecEvent) error { return nil }); err != nil {
+		_, _ = s.vmshd.client.RevokeTrust(vmID)
+		return fmt.Errorf("install guest gateway configuration: %w", err)
+	}
+	_, err = fmt.Fprintf(w, "granted %s to %s (generation %d)\n", info.Profile, info.VMID, info.SourceGeneration)
+	return err
+}
+
+func (s *shellState) printPermissions(vmID string, w io.Writer) error {
+	if s.vmshd == nil || s.vmshd.client == nil {
+		return fmt.Errorf("trusted context calls require a vmshd session")
+	}
+	grants, err := s.vmshd.client.TrustGrants()
+	if err != nil {
+		return err
+	}
+	for _, grant := range grants {
+		if vmID != "" && grant.VMID != normalizedVMID(vmID) {
+			continue
+		}
+		state := "active"
+		if grant.Revoked {
+			state = "revoked"
+		}
+		if _, err := fmt.Fprintf(w, "%s %s profile=%s target=%s generation=%d\n", grant.VMID, state, grant.Profile, grant.TargetID, grant.SourceGeneration); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *shellState) liveVMSystemNames() []string {
@@ -9585,6 +9868,9 @@ func (s *shellState) printSessions(w io.Writer) error {
 		}
 		if row.Current {
 			parts = append(parts, "[current]")
+			if publishErr := s.vmshd.publicationError(); publishErr != nil {
+				parts = append(parts, "publication=degraded", "publication_error="+strconv.Quote(publishErr.Error()))
+			}
 		}
 		if _, err := fmt.Fprintln(w, strings.Join(parts, " ")); err != nil {
 			return err
@@ -9985,7 +10271,11 @@ func (s *shellState) help(w io.Writer) error {
 @<image> [opts] [cmd]    select/create the default system for an image, or run cmd in it
 @<name> --from SOURCE    create/select a named system from image, library/image, or ssh:host
 @host [cmd]              run cmd on the host, or make host current if cmd is omitted
+	@connect GROUP           activate read-only inventory from an enrolled group; use local to deactivate
 	@ssh [--from origin] HOST [cmd]  connect from host by default; origin may be @host, current, a VM, or an SSH session
+	@trust VM --grant PROFILE  attach a profile-bound host-call gateway to a stable VM
+	@trust VM --revoke PROFILE revoke the VM grant immediately
+	@permissions [VM]       show trusted-context grants
 @ [opts] [cmd]           update or use the current context
 @sudo [cmd]              open a root VM subshell, or run cmd as root in the current VM
 @exec [cmd]              replace vmsh with your normal shell, or exec cmd on the host
@@ -10011,7 +10301,7 @@ func (s *shellState) help(w io.Writer) error {
 @tmux [session]          open tmux with vmsh as the default pane command
 @mux [cmd]               open native vmsh pane frontend; Ctrl+G q exits, Ctrl+G c creates panes
 @forward H:G             forward host port H to guest port G
-opts: --from source --cwd path --user user --sudo --init --no-init --kernel default|ubuntu --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
+opts: --from source --vm id --cwd path --user user --sudo --init --no-init --kernel default|ubuntu --debug --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
 keys: Ctrl+R reverse history search; Esc/Ctrl+G cancel search
 cd <dir>                 change the current host, VM, or SSH working directory
 exit [--force]           leave the current subshell, or vmsh at top level
@@ -10148,6 +10438,12 @@ func parseCommandOptions(tokens []shellToken, start int, target string) (command
 		}
 		opts.OptionFields = append(opts.OptionFields, field)
 		switch name {
+		case "--vm":
+			v, err := readValue()
+			if err != nil {
+				return opts, i, err
+			}
+			opts.VMID = v
 		case "--from":
 			v, err := readValue()
 			if err != nil {
@@ -10203,6 +10499,11 @@ func parseCommandOptions(tokens []shellToken, start int, target string) (command
 				return opts, i, err
 			}
 			opts.Kernel = &kernel
+		case "--debug":
+			if hasInlineValue {
+				return opts, i, fmt.Errorf("--debug does not take a value")
+			}
+			opts.Debug = true
 		case "--proxy":
 			if target != "agent" {
 				return opts, i, fmt.Errorf("unknown vmsh option %q", name)
@@ -10320,6 +10621,9 @@ func (c commandContext) withOptions(opts commandOptions) commandContext {
 	}
 	if opts.NestedVirt != nil {
 		c.NestedVirt = *opts.NestedVirt
+	}
+	if opts.Debug {
+		c.Debug = true
 	}
 	if opts.Isolated != nil {
 		c.Isolated = *opts.Isolated
@@ -10566,15 +10870,73 @@ func defaultKernelForImage(image string) string {
 }
 
 func normalizeVMSHKernel(value string) (string, error) {
-	value = strings.ToLower(strings.TrimSpace(value))
-	switch value {
+	value = strings.TrimSpace(value)
+	switch strings.ToLower(value) {
 	case "", "default", "alpine":
 		return "default", nil
 	case "ubuntu":
 		return "ubuntu", nil
 	default:
-		return "", fmt.Errorf("invalid --kernel value %q; expected default or ubuntu", value)
+		return value, nil
 	}
+}
+
+func (s *shellState) resolveStartKernel(ctx commandContext) (string, error) {
+	kernel := strings.TrimSpace(ctx.Kernel)
+	if kernel == "" {
+		kernel = defaultKernelForImage(ctx.Image)
+	}
+	if isNamedVMSHKernel(kernel) || strings.HasPrefix(kernel, vmshCustomKernelFilePrefix) {
+		return kernel, nil
+	}
+	hostPath, err := s.resolveKernelHostPath(ctx, kernel)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(hostPath)
+	if err != nil {
+		return "", fmt.Errorf("stat kernel %s: %w", hostPath, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("kernel %s is a directory", hostPath)
+	}
+	return vmshCustomKernelFilePrefix + hostPath, nil
+}
+
+func isNamedVMSHKernel(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "default", "alpine", "ubuntu":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *shellState) resolveKernelHostPath(ctx commandContext, value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("kernel path is required")
+	}
+	if path.IsAbs(value) {
+		guestPath := path.Clean(value)
+		if hostPath, ok := guestHostPathToHost(s.hostCWD, guestPath); ok {
+			return hostPath, nil
+		}
+		if filepath.IsAbs(value) {
+			return filepath.Clean(value), nil
+		}
+		return "", fmt.Errorf("kernel path %s is not available on the host; place it under %s or use a host path", value, guestHostMount)
+	}
+	if ctx.CWD != "" {
+		guestPath := path.Clean(path.Join(ctx.CWD, filepath.ToSlash(value)))
+		if hostPath, ok := guestHostPathToHost(s.hostCWD, guestPath); ok {
+			return hostPath, nil
+		}
+	}
+	if s.hostCWD == "" {
+		return filepath.Abs(value)
+	}
+	return filepath.Abs(filepath.Join(s.hostCWD, value))
 }
 
 func kernelStateIsDefault(value string) bool {

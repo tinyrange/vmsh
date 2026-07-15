@@ -5,16 +5,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/tinyrange/vmsh/internal/vmshdprotocol"
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
 )
@@ -81,19 +84,94 @@ func TestWriteSessionErrorKeepsUnknownErrorsInternal(t *testing.T) {
 	}
 }
 
-func TestHostShellCommandPrefersSupportedShellOverEnv(t *testing.T) {
+func TestHostShellCommandUsesConfiguredExecutable(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("host shell lookup is Unix-specific")
 	}
 	dir := t.TempDir()
-	zsh := filepath.Join(dir, "zsh")
-	if err := os.WriteFile(zsh, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatalf("write zsh fixture: %v", err)
+	configured := filepath.Join(dir, "fish")
+	if err := os.WriteFile(configured, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write configured shell fixture: %v", err)
 	}
+	t.Setenv("SHELL", configured)
+	if got := hostShellCommand(); got != configured {
+		t.Fatalf("host shell command = %q, want %q", got, configured)
+	}
+}
+
+func TestHostShellCommandRejectsNonExecutableConfiguration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host shell lookup is Unix-specific")
+	}
+	dir := t.TempDir()
+	configured := filepath.Join(dir, "configured")
+	fallback := filepath.Join(dir, "sh")
+	if err := os.WriteFile(configured, []byte("not executable\n"), 0o600); err != nil {
+		t.Fatalf("write configured shell fixture: %v", err)
+	}
+	if err := os.WriteFile(fallback, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write fallback shell fixture: %v", err)
+	}
+	t.Setenv("SHELL", configured)
 	t.Setenv("PATH", dir)
-	t.Setenv("SHELL", "/usr/bin/fish")
-	if got := hostShellCommand(); got != zsh {
-		t.Fatalf("host shell command = %q, want %q", got, zsh)
+	if got := hostShellCommand(); got != fallback {
+		t.Fatalf("host shell command = %q, want fallback %q", got, fallback)
+	}
+}
+
+func TestHostShellStartsInVerifiedSessionCWD(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix shell fixture")
+	}
+	bin := t.TempDir()
+	shellPath := filepath.Join(bin, "zsh")
+	script := "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    pwd) pwd ;;\n    exit) exit 0 ;;\n  esac\ndone\n"
+	if err := os.WriteFile(shellPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write shell fixture: %v", err)
+	}
+	t.Setenv("SHELL", shellPath)
+	t.Setenv("PATH", bin)
+	requestedCWD := t.TempDir()
+	cwd, err := filepath.EvalSymlinks(requestedCWD)
+	if err != nil {
+		t.Fatalf("resolve cwd fixture: %v", err)
+	}
+	manager := newHostShellManager()
+	shell, err := manager.Start("sess_cwd", requestedCWD, nil)
+	if err != nil {
+		t.Fatalf("start host shell: %v", err)
+	}
+	t.Cleanup(func() { manager.Close("sess_cwd") })
+	if shell.cwd != cwd || shell.cmd.Dir != cwd {
+		t.Fatalf("shell cwd=%q cmd.Dir=%q, want %q", shell.cwd, shell.cmd.Dir, cwd)
+	}
+	output, _, unsubscribe := shell.Subscribe()
+	defer unsubscribe()
+	if err := shell.Write([]byte("pwd\n")); err != nil {
+		t.Fatalf("write pwd: %v", err)
+	}
+	var received bytes.Buffer
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case chunk := <-output:
+			received.Write(chunk)
+			for _, line := range strings.Split(strings.ReplaceAll(received.String(), "\r\n", "\n"), "\n") {
+				if strings.TrimSpace(line) == cwd {
+					return
+				}
+			}
+		case <-deadline:
+			t.Fatalf("pwd output lines = %q, want cwd %q", received.String(), cwd)
+		}
+	}
+}
+
+func TestHostShellRejectsMissingSessionCWD(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	_, err := newHostShellManager().Start("sess_missing_cwd", missing, nil)
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("start error = %v, want missing cwd", err)
 	}
 }
 
@@ -188,6 +266,53 @@ func TestAuthenticateRejectsUnsupportedFrontendMutation(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusUpgradeRequired {
 		t.Fatalf("status = %d, want %d", rr.Code, http.StatusUpgradeRequired)
+	}
+}
+
+func TestAuthenticateRejectsUnsupportedTerminalWebSocketUpgrade(t *testing.T) {
+	srv := NewServer("secret")
+	var called bool
+	handler := srv.Authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusSwitchingProtocols)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/vmsh/sessions/sess_1/attachments/attach_1/stream", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Connection", "keep-alive, Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set(vmshdprotocol.HeaderProtocol, "2")
+	req.Header.Set(vmshdprotocol.HeaderMinProtocol, "2")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+
+	if called {
+		t.Fatal("incompatible WebSocket upgrade reached the terminal handler")
+	}
+	if recorder.Code != http.StatusUpgradeRequired {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUpgradeRequired)
+	}
+	if got := recorder.Header().Get(vmshdprotocol.HeaderProtocol); got != fmt.Sprint(vmshdprotocol.Current) {
+		t.Fatalf("supported current protocol = %q, want %d", got, vmshdprotocol.Current)
+	}
+	if got := recorder.Header().Get(vmshdprotocol.HeaderMinProtocol); got != fmt.Sprint(vmshdprotocol.Minimum) {
+		t.Fatalf("supported minimum protocol = %q, want %d", got, vmshdprotocol.Minimum)
+	}
+}
+
+func TestAuthenticateKeepsReadOnlyGetAvailableToUnsupportedFrontend(t *testing.T) {
+	srv := NewServer("secret")
+	handler := srv.Authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/vmsh/status", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set(vmshdprotocol.HeaderProtocol, "2")
+	req.Header.Set(vmshdprotocol.HeaderMinProtocol, "2")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNoContent)
 	}
 }
 
@@ -567,6 +692,154 @@ func TestFrontendCloseCleansEphemeralSessionsAndKeepsPersistedSessions(t *testin
 	}
 }
 
+func TestSessionDeleteRetainsFailedVMOwnershipForRetry(t *testing.T) {
+	srv := NewServer("secret")
+	session := mustCreateRegistrySession(t, srv.registry, "main")
+	if _, err := srv.registry.Update(session.ID, UpdateSessionRequest{VMRefs: []VMRef{
+		{ID: "one", BackendID: "vm-one"},
+		{ID: "two", BackendID: "vm-two"},
+	}}); err != nil {
+		t.Fatalf("add VM refs: %v", err)
+	}
+
+	var shutdowns []string
+	failTwo := true
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, fakeRuntimeView{shutdown: func(_ context.Context, id string) error {
+		shutdowns = append(shutdowns, id)
+		if id == "vm-two" && failTwo {
+			return errors.New("backend unavailable")
+		}
+		return nil
+	}})
+
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/vmsh/sessions/"+session.ID, nil))
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("first delete status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var cleanupErr CleanupErrorResponse
+	if err := json.NewDecoder(rr.Body).Decode(&cleanupErr); err != nil {
+		t.Fatalf("decode cleanup failure: %v", err)
+	}
+	if len(cleanupErr.Sessions) != 1 || cleanupErr.Sessions[0].State != "cleanup_failed" || cleanupErr.Sessions[0].Cleanup == nil {
+		t.Fatalf("cleanup response = %+v", cleanupErr)
+	}
+	pending := cleanupErr.Sessions[0]
+	if pending.Cleanup.Attempts != 1 || len(pending.Cleanup.Failures) != 1 || pending.Cleanup.Failures[0].VMID != "vm-two" || len(pending.VMRefs) != 1 || pending.VMRefs[0].BackendID != "vm-two" {
+		t.Fatalf("pending cleanup = %+v", pending)
+	}
+	stored, ok := srv.registry.Get(session.ID)
+	if !ok || stored.State != "cleanup_failed" || len(stored.VMRefs) != 1 || stored.VMRefs[0].BackendID != "vm-two" {
+		t.Fatalf("stored cleanup tombstone = %+v, exists=%v", stored, ok)
+	}
+
+	failTwo = false
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/vmsh/sessions/"+session.ID, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("retry delete status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if _, ok := srv.registry.Get(session.ID); ok {
+		t.Fatal("session ownership remains after confirmed shutdown")
+	}
+	wantShutdowns := []string{"vm-one", "vm-two", "vm-two"}
+	if !reflect.DeepEqual(shutdowns, wantShutdowns) {
+		t.Fatalf("shutdowns = %v, want %v", shutdowns, wantShutdowns)
+	}
+}
+
+func TestFrontendCloseRetainsSessionWhenVMShutdownFails(t *testing.T) {
+	srv := NewServer("secret")
+	frontend := srv.registry.RegisterFrontend(RegisterFrontendRequest{Name: "vmsh"})
+	session, err := srv.registry.Create(CreateSessionRequest{Name: "ephemeral", FrontendID: frontend.ID, Scope: "frontend"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := srv.registry.Update(session.ID, UpdateSessionRequest{VMRefs: []VMRef{{ID: "dev", BackendID: "dev-isolated"}}}); err != nil {
+		t.Fatalf("add VM ref: %v", err)
+	}
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, fakeRuntimeView{shutdown: func(context.Context, string) error {
+		return errors.New("backend unavailable")
+	}})
+
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/vmsh/frontends/"+frontend.ID, nil))
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("frontend close status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	pending, ok := srv.registry.Get(session.ID)
+	if !ok || pending.State != "cleanup_failed" || pending.Cleanup == nil || len(pending.VMRefs) != 1 || pending.VMRefs[0].BackendID != "dev-isolated" {
+		t.Fatalf("pending frontend cleanup = %+v, exists=%v", pending, ok)
+	}
+}
+
+func TestFrontendScopedSessionsRequireLiveOwner(t *testing.T) {
+	registry := newSessionRegistry()
+	_, err := registry.Create(CreateSessionRequest{Name: "ownerless", Scope: "frontend"})
+	createErr, ok := err.(sessionError)
+	if !ok || createErr.status != http.StatusBadRequest {
+		t.Fatalf("ownerless create error = %#v, want bad request", err)
+	}
+
+	session, err := registry.Create(CreateSessionRequest{Name: "system", Scope: "system"})
+	if err != nil {
+		t.Fatalf("create system session: %v", err)
+	}
+	_, err = registry.Persist(session.ID, PersistSessionRequest{Scope: "frontend"})
+	persistErr, ok := err.(sessionError)
+	if !ok || persistErr.status != http.StatusBadRequest {
+		t.Fatalf("ownerless persist error = %#v, want bad request", err)
+	}
+	unchanged, ok := registry.Get(session.ID)
+	if !ok || unchanged.Scope != "system" || unchanged.FrontendID != "" {
+		t.Fatalf("session changed after rejected conversion = %+v", unchanged)
+	}
+
+	frontend := registry.RegisterFrontend(RegisterFrontendRequest{Name: "vmsh"})
+	owned, err := registry.Create(CreateSessionRequest{Name: "owned", FrontendID: frontend.ID, Scope: "system"})
+	if err != nil {
+		t.Fatalf("create owned system session: %v", err)
+	}
+	owned, err = registry.Persist(owned.ID, PersistSessionRequest{Scope: "frontend"})
+	if err != nil {
+		t.Fatalf("convert session with live owner: %v", err)
+	}
+	if owned.Scope != "frontend" || owned.FrontendID != frontend.ID || owned.DetachOnClose {
+		t.Fatalf("converted session ownership = %+v", owned)
+	}
+}
+
+func TestFrontendDetachOnCloseSurvivorBecomesSystemOwned(t *testing.T) {
+	registry := newSessionRegistry()
+	frontend := registry.RegisterFrontend(RegisterFrontendRequest{Name: "vmsh"})
+	detach := true
+	session, err := registry.Create(CreateSessionRequest{
+		Name:          "survivor",
+		FrontendID:    frontend.ID,
+		Scope:         "frontend",
+		DetachOnClose: &detach,
+	})
+	if err != nil {
+		t.Fatalf("create frontend session: %v", err)
+	}
+	_, cleanups, err := registry.CloseFrontend(frontend.ID)
+	if err != nil {
+		t.Fatalf("close frontend: %v", err)
+	}
+	if len(cleanups) != 0 {
+		t.Fatalf("detach-on-close session scheduled for cleanup: %+v", cleanups)
+	}
+	kept, ok := registry.Get(session.ID)
+	if !ok {
+		t.Fatal("detach-on-close session was removed")
+	}
+	if kept.Scope != "system" || kept.FrontendID != "" || !kept.DetachOnClose {
+		t.Fatalf("surviving session ownership = %+v", kept)
+	}
+}
+
 func TestSessionAttachDetachRoutes(t *testing.T) {
 	srv := NewServer("secret")
 	mux := http.NewServeMux()
@@ -639,6 +912,16 @@ func TestSessionAttachDetachRoutes(t *testing.T) {
 	}
 
 	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, resizeTarget, bytes.NewBufferString(`{"cols":65537,"rows":32}`)))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("oversized resize status = %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+	_, unchanged, ok := srv.registry.GetAttachment(session.ID, attached.Attachment.ID)
+	if !ok || unchanged.Terminal == nil || *unchanged.Terminal != (Terminal{Cols: 100, Rows: 32}) {
+		t.Fatalf("attachment changed after oversized resize: %+v", unchanged)
+	}
+
+	rr = httptest.NewRecorder()
 	body := `{"attachment_id":"` + attached.Attachment.ID + `"}`
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/vmsh/sessions/"+session.ID+"/detach", bytes.NewBufferString(body)))
 	if rr.Code != http.StatusOK {
@@ -666,6 +949,35 @@ func TestSessionAttachDetachRoutes(t *testing.T) {
 	}
 }
 
+func TestTerminalWinsizeValidatesBeforeConversion(t *testing.T) {
+	winsize, err := terminalWinsize(&Terminal{})
+	if err != nil {
+		t.Fatalf("default winsize: %v", err)
+	}
+	if winsize.Cols != 80 || winsize.Rows != 24 {
+		t.Fatalf("default winsize = %+v", winsize)
+	}
+
+	winsize, err = terminalWinsize(&Terminal{Cols: maxTerminalDimension, Rows: maxTerminalDimension})
+	if err != nil {
+		t.Fatalf("maximum winsize: %v", err)
+	}
+	if int(winsize.Cols) != maxTerminalDimension || int(winsize.Rows) != maxTerminalDimension {
+		t.Fatalf("maximum winsize wrapped: %+v", winsize)
+	}
+
+	for _, term := range []Terminal{
+		{Cols: -1, Rows: 24},
+		{Cols: 80, Rows: -1},
+		{Cols: maxTerminalDimension + 1, Rows: 24},
+		{Cols: 80, Rows: maxTerminalDimension + 1},
+	} {
+		if _, err := terminalWinsize(&term); err == nil {
+			t.Fatalf("terminalWinsize(%+v) returned no error", term)
+		}
+	}
+}
+
 func TestSessionAttachRejectsBadRequests(t *testing.T) {
 	srv := NewServer("secret")
 	mux := http.NewServeMux()
@@ -681,6 +993,8 @@ func TestSessionAttachRejectsBadRequests(t *testing.T) {
 		{name: "missing session", target: "/vmsh/sessions/sess_missing/attach", body: `{}`, status: http.StatusNotFound},
 		{name: "bad mode", target: "/vmsh/sessions/" + session.ID + "/attach", body: `{"mode":"writer"}`, status: http.StatusBadRequest},
 		{name: "bad attach json", target: "/vmsh/sessions/" + session.ID + "/attach", body: `{`, status: http.StatusBadRequest},
+		{name: "trailing attach json", target: "/vmsh/sessions/" + session.ID + "/attach", body: `{"mode":"interactive"}{}`, status: http.StatusBadRequest},
+		{name: "unknown attach field", target: "/vmsh/sessions/" + session.ID + "/attach", body: `{"mode":"interactive","unexpected":true}`, status: http.StatusBadRequest},
 		{name: "missing attachment id", target: "/vmsh/sessions/" + session.ID + "/detach", body: `{}`, status: http.StatusBadRequest},
 		{name: "missing attachment", target: "/vmsh/sessions/" + session.ID + "/detach", body: `{"attachment_id":"attach_missing"}`, status: http.StatusNotFound},
 	} {
@@ -919,6 +1233,40 @@ func TestDaemonOwnedVMJobRunsThroughRuntime(t *testing.T) {
 	})
 }
 
+func TestCompletedJobRetentionNeverPrunesActiveJobs(t *testing.T) {
+	registry := newSessionRegistry()
+	registry.maxCompletedJobs = 2
+	session := mustCreateRegistrySession(t, registry, "main")
+	active, err := registry.StartJob(session.ID, StartHostJobRequest{Command: []string{"active"}})
+	if err != nil {
+		t.Fatalf("start active job: %v", err)
+	}
+	var completed []JobSummary
+	for i := 0; i < 3; i++ {
+		job, err := registry.StartJob(session.ID, StartHostJobRequest{Command: []string{fmt.Sprintf("job-%d", i)}})
+		if err != nil {
+			t.Fatalf("start completed job: %v", err)
+		}
+		finished, ok := registry.FinishJob(session.ID, job.ID, JobSummary{Status: "done", Logs: strings.Repeat("x", maxJobLogBytes), FinishedAt: time.Unix(int64(i+1), 0)})
+		if !ok {
+			t.Fatalf("finish job %d", job.ID)
+		}
+		completed = append(completed, finished)
+	}
+	jobs := registry.Jobs()
+	wantIDs := []int{active.ID, completed[1].ID, completed[2].ID}
+	gotIDs := make([]int, 0, len(jobs))
+	for _, job := range jobs {
+		gotIDs = append(gotIDs, job.ID)
+	}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Fatalf("retained job IDs = %v, want %v", gotIDs, wantIDs)
+	}
+	if jobs[0].Status != "running" {
+		t.Fatalf("active job = %+v", jobs[0])
+	}
+}
+
 func TestDaemonHostJobHelper(t *testing.T) {
 	if os.Getenv("VMSHD_TEST_HOST_JOB") != "1" {
 		return
@@ -1003,6 +1351,246 @@ func TestTerminalAttachmentStreamTracksActiveStreamAndResize(t *testing.T) {
 	requireEventually(t, func() bool {
 		return len(getStatusFromServer(t, httpSrv.URL, "secret").Streams) == 0
 	})
+}
+
+func TestTerminalStreamRegistryAllowsOneWriterPerAttachment(t *testing.T) {
+	registry := newStreamRegistry()
+	first, closeFirst, err := registry.Open("terminal", "session", "attachment", "", nil)
+	if err != nil || first.ID == "" {
+		t.Fatalf("open first stream: stream=%+v err=%v", first, err)
+	}
+	if _, _, err := registry.Open("terminal", "session", "attachment", "", nil); err == nil {
+		t.Fatal("second writer stream was accepted")
+	}
+	closeFirst()
+	if _, closeSecond, err := registry.Open("terminal", "session", "attachment", "", nil); err != nil {
+		t.Fatalf("reopen after close: %v", err)
+	} else {
+		closeSecond()
+	}
+}
+
+func TestHostShellSubscriberReceivesEveryOutputChunkUnderBackpressure(t *testing.T) {
+	shell := &hostShell{subscribers: map[int]*hostShellSubscriber{}}
+	output, done, unsubscribe := shell.Subscribe()
+	defer unsubscribe()
+
+	const chunks = 128
+	published := make(chan struct{})
+	go func() {
+		defer close(published)
+		for i := 0; i < chunks; i++ {
+			shell.publish([]byte{byte(i)})
+		}
+	}()
+	for i := 0; i < chunks; i++ {
+		select {
+		case data := <-output:
+			if len(data) != 1 || data[0] != byte(i) {
+				t.Fatalf("chunk %d = %v", i, data)
+			}
+		case <-done:
+			t.Fatalf("subscriber closed after %d chunks", i)
+		case <-time.After(time.Second):
+			t.Fatalf("timed out after %d chunks", i)
+		}
+	}
+	select {
+	case <-published:
+	case <-time.After(time.Second):
+		t.Fatal("publisher remained blocked after subscriber caught up")
+	}
+}
+
+func TestTerminalStreamsAreRevokedByAttachmentLifecycle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host PTY shell test requires a Unix shell")
+	}
+	for _, lifecycle := range []string{"detach", "delete-session", "close-frontend"} {
+		t.Run(lifecycle, func(t *testing.T) {
+			srv := NewServer("secret")
+			mux := http.NewServeMux()
+			srv.RegisterHandlers(mux, nil)
+			frontend := srv.registry.RegisterFrontend(RegisterFrontendRequest{Name: "test"})
+			session, err := srv.registry.Create(CreateSessionRequest{Name: "main", FrontendID: frontend.ID, Scope: "frontend"})
+			if err != nil {
+				t.Fatalf("create session: %v", err)
+			}
+			_, attachment, err := srv.registry.Attach(session.ID, AttachSessionRequest{FrontendID: frontend.ID, Mode: "interactive"})
+			if err != nil {
+				t.Fatalf("attach session: %v", err)
+			}
+			httpSrv := httptest.NewServer(srv.Authenticate(mux))
+			defer httpSrv.Close()
+			t.Cleanup(func() { srv.shells.Close(session.ID) })
+
+			target := strings.Replace(httpSrv.URL, "http://", "ws://", 1) + "/vmsh/sessions/" + session.ID + "/attachments/" + attachment.ID + "/stream"
+			cfg, err := websocket.NewConfig(target, httpSrv.URL)
+			if err != nil {
+				t.Fatalf("websocket config: %v", err)
+			}
+			cfg.Header.Set("Authorization", "Bearer secret")
+			ws, err := websocket.DialConfig(cfg)
+			if err != nil {
+				t.Fatalf("dial stream: %v", err)
+			}
+			defer ws.Close()
+			var attached TerminalStreamMessage
+			if err := websocket.JSON.Receive(ws, &attached); err != nil {
+				t.Fatalf("receive attached message: %v", err)
+			}
+
+			method := http.MethodPost
+			path := "/vmsh/sessions/" + session.ID + "/detach"
+			body := bytes.NewBufferString(fmt.Sprintf(`{"attachment_id":%q}`, attachment.ID))
+			switch lifecycle {
+			case "delete-session":
+				method = http.MethodDelete
+				path = "/vmsh/sessions/" + session.ID
+				body = bytes.NewBuffer(nil)
+			case "close-frontend":
+				method = http.MethodDelete
+				path = "/vmsh/frontends/" + frontend.ID
+				body = bytes.NewBuffer(nil)
+			}
+			req, err := http.NewRequest(method, httpSrv.URL+path, body)
+			if err != nil {
+				t.Fatalf("new lifecycle request: %v", err)
+			}
+			req.Header.Set("Authorization", "Bearer secret")
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("lifecycle request: %v", err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("lifecycle status = %d, want %d", resp.StatusCode, http.StatusOK)
+			}
+			if err := ws.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatalf("set stream deadline: %v", err)
+			}
+			var msg TerminalStreamMessage
+			if err := websocket.JSON.Receive(ws, &msg); err == nil {
+				t.Fatalf("revoked stream remained readable: %+v", msg)
+			}
+			requireEventually(t, func() bool { return len(srv.streams.List()) == 0 })
+		})
+	}
+}
+
+func TestStreamRegistryRevocationIsIdempotentAndOutsideLock(t *testing.T) {
+	registry := newStreamRegistry()
+	revoked := make(chan struct{}, 1)
+	_, closeStream, err := registry.Open("terminal", "sess_1", "attach_1", "fe_1", func() {
+		registry.List()
+		revoked <- struct{}{}
+	})
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	registry.RevokeAttachment("sess_1", "attach_1")
+	registry.RevokeAttachment("sess_1", "attach_1")
+	closeStream()
+	closeStream()
+	select {
+	case <-revoked:
+	default:
+		t.Fatal("stream was not revoked")
+	}
+	select {
+	case <-revoked:
+		t.Fatal("stream revoke callback ran more than once")
+	default:
+	}
+	if streams := registry.List(); len(streams) != 0 {
+		t.Fatalf("streams after revocation = %+v", streams)
+	}
+}
+
+func TestObserverTerminalStreamIsReadOnlyAndReceivesOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host PTY shell test requires a Unix shell")
+	}
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, nil)
+	session := mustCreateRegistrySession(t, srv.registry, "main")
+	_, observer, err := srv.registry.Attach(session.ID, AttachSessionRequest{Mode: "observer", Terminal: &Terminal{Cols: 80, Rows: 24}})
+	if err != nil {
+		t.Fatalf("attach observer: %v", err)
+	}
+	httpSrv := httptest.NewServer(srv.Authenticate(mux))
+	defer httpSrv.Close()
+
+	dial := func(attachmentID string) *websocket.Conn {
+		t.Helper()
+		target := strings.Replace(httpSrv.URL, "http://", "ws://", 1) + "/vmsh/sessions/" + session.ID + "/attachments/" + attachmentID + "/stream"
+		cfg, err := websocket.NewConfig(target, httpSrv.URL)
+		if err != nil {
+			t.Fatalf("websocket config: %v", err)
+		}
+		cfg.Header.Set("Authorization", "Bearer secret")
+		ws, err := websocket.DialConfig(cfg)
+		if err != nil {
+			t.Fatalf("dial stream: %v", err)
+		}
+		var attached TerminalStreamMessage
+		if err := websocket.JSON.Receive(ws, &attached); err != nil {
+			t.Fatalf("receive attached message: %v", err)
+		}
+		if attached.Kind != "attached" || attached.Stream == nil || attached.Stream.AttachmentID != attachmentID {
+			t.Fatalf("attached message = %+v", attached)
+		}
+		return ws
+	}
+	observerWS := dial(observer.ID)
+	defer observerWS.Close()
+
+	if err := websocket.JSON.Send(observerWS, TerminalStreamMessage{Kind: "resize", Terminal: &Terminal{Cols: 1, Rows: 1}}); err != nil {
+		t.Fatalf("send observer resize: %v", err)
+	}
+	receiveTerminalMessageKind(t, observerWS, "error")
+	if err := websocket.JSON.Send(observerWS, TerminalStreamMessage{Kind: "stdin", Data: []byte("printf '__observer_injected__\\n'\n")}); err != nil {
+		t.Fatalf("send observer stdin: %v", err)
+	}
+	receiveTerminalMessageKind(t, observerWS, "error")
+
+	_, storedObserver, ok := srv.registry.GetAttachment(session.ID, observer.ID)
+	if !ok || storedObserver.Terminal == nil || storedObserver.Terminal.Cols != 80 || storedObserver.Terminal.Rows != 24 {
+		t.Fatalf("observer terminal changed = %+v", storedObserver.Terminal)
+	}
+	var shell *hostShell
+	requireEventually(t, func() bool {
+		srv.shells.mu.Lock()
+		shell = srv.shells.shells[session.ID]
+		srv.shells.mu.Unlock()
+		if shell == nil {
+			return false
+		}
+		shell.mu.Lock()
+		defer shell.mu.Unlock()
+		return len(shell.subscribers) > 0
+	})
+	shell.publish([]byte("__observer_can_read__\n"))
+	receiveTerminalDataUntil(t, observerWS, "__observer_can_read__")
+}
+
+func receiveTerminalMessageKind(t *testing.T, ws *websocket.Conn, want string) TerminalStreamMessage {
+	t.Helper()
+	if err := ws.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set terminal read deadline: %v", err)
+	}
+	defer ws.SetReadDeadline(time.Time{})
+	for {
+		var msg TerminalStreamMessage
+		if err := websocket.JSON.Receive(ws, &msg); err != nil {
+			t.Fatalf("receive terminal message: %v", err)
+		}
+		if msg.Kind == want {
+			return msg
+		}
+	}
 }
 
 func receiveTerminalDataUntil(t *testing.T, ws *websocket.Conn, marker string) string {
@@ -1123,7 +1711,11 @@ func TestStatusReportsActiveEventStreams(t *testing.T) {
 	scanner := bufio.NewScanner(resp.Body)
 	connected := readEvent(t, scanner)
 
-	status := getStatusFromServer(t, httpSrv.URL, "secret")
+	var status Status
+	requireEventually(t, func() bool {
+		status = getStatusFromServer(t, httpSrv.URL, "secret")
+		return len(status.Streams) == 1 && status.Streams[0].LastEventID == connected.ID
+	})
 	if len(status.Streams) != 1 {
 		t.Fatalf("streams = %+v", status.Streams)
 	}
@@ -1137,6 +1729,85 @@ func TestStatusReportsActiveEventStreams(t *testing.T) {
 	requireEventually(t, func() bool {
 		return len(getStatusFromServer(t, httpSrv.URL, "secret").Streams) == 0
 	})
+}
+
+func TestEventStreamReportsGapForStaleCursor(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	srv.RegisterHandlers(mux, nil)
+	httpSrv := httptest.NewServer(srv.Authenticate(mux))
+	defer httpSrv.Close()
+
+	open := func(after string) (*http.Response, *bufio.Scanner) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, httpSrv.URL+"/vmsh/events?after="+after, nil)
+		if err != nil {
+			t.Fatalf("new event request: %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer secret")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("open event stream: %v", err)
+		}
+		return resp, bufio.NewScanner(resp.Body)
+	}
+
+	resp, scanner := open("")
+	initial := readEvent(t, scanner)
+	resp.Body.Close()
+	srv.events.Publish(Event{Kind: "session_updated"})
+
+	resp, scanner = open(initial.ID)
+	defer resp.Body.Close()
+	connected := readEvent(t, scanner)
+	gap := readEvent(t, scanner)
+	if gap.Kind != "gap" || gap.After != initial.ID || gap.ID != connected.ID || gap.Refresh != "/vmsh/status" {
+		t.Fatalf("gap event = %+v, connected=%+v", gap, connected)
+	}
+}
+
+func TestEventStreamHeartbeatKeepsIdleStreamActive(t *testing.T) {
+	srv := NewServer("secret")
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /vmsh/events", func(w http.ResponseWriter, r *http.Request) {
+		srv.streamEventsWithTiming(w, r, 10*time.Millisecond, time.Second)
+	})
+	httpSrv := httptest.NewServer(srv.Authenticate(mux))
+	defer httpSrv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, httpSrv.URL+"/vmsh/events", nil)
+	if err != nil {
+		t.Fatalf("new event request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("open event stream: %v", err)
+	}
+	defer resp.Body.Close()
+	scanner := bufio.NewScanner(resp.Body)
+	connected := readEvent(t, scanner)
+	heartbeat := readEvent(t, scanner)
+	if heartbeat.Kind != "heartbeat" || heartbeat.ID != connected.ID || heartbeat.At.IsZero() {
+		t.Fatalf("heartbeat event = %+v, connected=%+v", heartbeat, connected)
+	}
+}
+
+func TestEventHubDisconnectsSubscriberInsteadOfDropping(t *testing.T) {
+	hub := newEventHub()
+	_, disconnected, _, _, unsubscribe := hub.Subscribe("")
+	defer unsubscribe()
+	for i := 0; i < 17; i++ {
+		hub.Publish(Event{Kind: "session_updated"})
+	}
+	select {
+	case <-disconnected:
+	case <-time.After(time.Second):
+		t.Fatal("full event subscriber was not disconnected")
+	}
+	if streams := hub.Streams(); len(streams) != 0 {
+		t.Fatalf("active streams = %+v", streams)
+	}
 }
 
 func TestEventStreamRequiresAuth(t *testing.T) {
@@ -1254,6 +1925,7 @@ type fakeRuntimeView struct {
 	statuses  []client.InstanceState
 	runStream func(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	shutdown  func(context.Context, string) error
+	allowPort func(context.Context, string, int) error
 }
 
 func (f fakeRuntimeView) InstanceStatuses() []client.InstanceState {
@@ -1270,6 +1942,13 @@ func (f fakeRuntimeView) RunStreamIn(ctx context.Context, id string, req client.
 func (f fakeRuntimeView) ShutdownInstance(ctx context.Context, id string) error {
 	if f.shutdown != nil {
 		return f.shutdown(ctx, id)
+	}
+	return nil
+}
+
+func (f fakeRuntimeView) AllowServiceProxyPort(ctx context.Context, id string, port int) error {
+	if f.allowPort != nil {
+		return f.allowPort(ctx, id, port)
 	}
 	return nil
 }

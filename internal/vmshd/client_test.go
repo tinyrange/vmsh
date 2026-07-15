@@ -3,6 +3,7 @@ package vmshd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -380,6 +381,25 @@ func TestHTTPClientDialTerminalStream(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for stdin")
+	}
+}
+
+func TestHTTPClientControlRequestHonorsContext(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	api := &HTTPClient{
+		baseURL: srv.URL,
+		token:   "secret",
+		client:  newControlHTTPClient(),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	_, err := api.StatusContext(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("status error = %v, want deadline exceeded", err)
 	}
 }
 
