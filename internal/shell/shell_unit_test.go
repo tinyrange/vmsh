@@ -7169,7 +7169,7 @@ func readSingleRegularTarPayload(r io.Reader) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("read %s: %w", header.Name, err)
 		}
-		if header.Typeflag == tar.TypeReg || header.Typeflag == tar.TypeRegA {
+		if header.Typeflag == tar.TypeReg || header.Typeflag == 0 {
 			got = header.Name + ":" + string(data)
 		}
 	}
