@@ -107,7 +107,16 @@ func (s *shellState) runSSH(ctx commandContext, line string, stdout, stderr io.W
 				}()
 			})
 			stopInterrupts, _ := s.startInterruptWatcher(interrupts.Interrupt)
-			err = session.run(line, stdout, stderr, interrupts.ForwardedInterrupt)
+			err = session.run(line, stdout, stderr, func(name string) bool {
+				switch name {
+				case "INT":
+					interrupted.Store(true)
+					interrupts.ForwardedInterrupt()
+				case "QUIT":
+					return interrupts.Force()
+				}
+				return false
+			})
 			stopInterrupts()
 			if interrupted.Load() && sshPersistentShellEnded(err) {
 				s.closeSSHSessionKey(session.key)
@@ -759,20 +768,20 @@ func (p *persistentSSHShell) waitReadySideband() error {
 	}
 }
 
-func (p *persistentSSHShell) run(line string, stdout, stderr io.Writer, onInterrupt ...func()) error {
+func (p *persistentSSHShell) run(line string, stdout, stderr io.Writer, onSignal ...commandSignalHandler) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.runSideband(line, stdout, stderr, onInterrupt...)
+	return p.runSideband(line, stdout, stderr, onSignal...)
 }
 
-func (p *persistentSSHShell) runSideband(line string, stdout, stderr io.Writer, onInterrupt ...func()) error {
+func (p *persistentSSHShell) runSideband(line string, stdout, stderr io.Writer, onSignal ...commandSignalHandler) error {
 	p.setOutput(stdout)
 	stopForwarding := func() {}
 	defer func() {
 		p.clearOutputSoon()
 		stopForwarding()
 	}()
-	stop, err := startSSHPTYForwarding(p, true, stdout, stderr, onInterrupt...)
+	stop, err := startSSHPTYForwarding(p, true, stdout, stderr, onSignal...)
 	if err != nil {
 		return err
 	}
@@ -828,7 +837,7 @@ func (p *persistentSSHShell) clearOutputSoon() {
 	p.setOutput(nil)
 }
 
-func startSSHPTYForwarding(p *persistentSSHShell, tty bool, stdout, stderr io.Writer, onInterrupt ...func()) (func(), error) {
+func startSSHPTYForwarding(p *persistentSSHShell, tty bool, stdout, stderr io.Writer, onSignal ...commandSignalHandler) (func(), error) {
 	done := make(chan struct{})
 	restore := func() {}
 	cancelRead := func() {}
@@ -854,7 +863,7 @@ func startSSHPTYForwarding(p *persistentSSHShell, tty bool, stdout, stderr io.Wr
 			go func() {
 				defer producers.Done()
 				defer inputCancel.close()
-				streamSSHPTYStdin(os.Stdin, p.stdin, done, inputCancel, terminalWriterRecorder(stdout), onInterrupt...)
+				streamSSHPTYStdin(os.Stdin, p.stdin, done, inputCancel, terminalWriterRecorder(stdout), onSignal...)
 			}()
 		}
 	}
@@ -862,7 +871,7 @@ func startSSHPTYForwarding(p *persistentSSHShell, tty bool, stdout, stderr io.Wr
 	producers.Add(1)
 	go func() {
 		defer producers.Done()
-		forwardSSHPTYSignals(p, done, tty, stdout, stderr)
+		forwardSSHPTYSignals(p, done, tty, stdout, stderr, onSignal...)
 	}()
 
 	var stopOnce sync.Once
@@ -877,7 +886,7 @@ func startSSHPTYForwarding(p *persistentSSHShell, tty bool, stdout, stderr io.Wr
 	return stop, nil
 }
 
-func streamSSHPTYStdin(in *os.File, out io.Writer, done <-chan struct{}, inputCancel *ptyInputCanceller, recorder *asciinemaRecorder, onInterrupt ...func()) {
+func streamSSHPTYStdin(in *os.File, out io.Writer, done <-chan struct{}, inputCancel *ptyInputCanceller, recorder *asciinemaRecorder, onSignal ...commandSignalHandler) {
 	var buf [4096]byte
 	for {
 		select {
@@ -895,14 +904,10 @@ func streamSSHPTYStdin(in *os.File, out io.Writer, done <-chan struct{}, inputCa
 			if recorder != nil {
 				recorder.recordInput(buf[:n])
 			}
-			if bytes.Contains(buf[:n], []byte{0x03}) {
-				for _, fn := range onInterrupt {
-					if fn != nil {
-						fn()
-					}
-				}
-			}
-			if !writeSSHPTYInput(out, done, buf[:n]) {
+			input := filterCommandControlInput(buf[:n], func(name string) bool {
+				return dispatchCommandSignal(onSignal, name)
+			})
+			if len(input) > 0 && !writeSSHPTYInput(out, done, input) {
 				return
 			}
 		}
@@ -931,7 +936,7 @@ func writeSSHPTYInput(out io.Writer, done <-chan struct{}, data []byte) bool {
 	return true
 }
 
-func forwardSSHPTYSignals(p *persistentSSHShell, done <-chan struct{}, tty bool, stdout, stderr io.Writer) {
+func forwardSSHPTYSignals(p *persistentSSHShell, done <-chan struct{}, tty bool, stdout, stderr io.Writer, onSignal ...commandSignalHandler) {
 	signals := terminal.HostSignals(tty)
 	sigCh := make(chan os.Signal, 8)
 	signal.Notify(sigCh, signals...)
@@ -954,6 +959,9 @@ func forwardSSHPTYSignals(p *persistentSSHShell, done <-chan struct{}, tty bool,
 			}
 			if name == "INT" {
 				fmt.Fprintln(stderr)
+			}
+			if dispatchCommandSignal(onSignal, name) {
+				continue
 			}
 			writeSSHPTYSignal(p, name)
 		}
