@@ -16,8 +16,8 @@ The ordinary workflow is:
 - Run ordinary command lines in the selected context.
 - Use `@host` to return to the host context.
 
-For example, `@alpine` by itself is a context transition. The VM starts lazily
-when the user runs the first guest command after selecting that context.
+For example, `@alpine` by itself is a context transition that starts the VM and
+waits for it to become ready before returning the prompt.
 `@alpine uname -a` is a supported one-shot command line inside a vmsh session,
 but it is not the mental model for the product. Prefer examples and tests that
 exercise context selection followed by ordinary commands when the behavior under

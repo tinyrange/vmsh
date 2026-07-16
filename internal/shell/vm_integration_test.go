@@ -24,7 +24,7 @@ import (
 	"j5.nz/cc/client"
 )
 
-const vmIntegrationTestImage = "vmsh-integration-alpine"
+const vmIntegrationTestImage = "alpine-vmsh-integration"
 
 // VMSH_TEST_VM_INTEGRATION enables the small VM smoke suite. Tests that boot
 // extra VMs, move large data, exercise interactive PTYs, or duplicate copy
@@ -132,6 +132,50 @@ func TestVMIntegrationNetworkEnabledGuestBootsWithAssignedIdentity(t *testing.T)
 	}
 	requireOutputLine(t, stdout, "guest-ip:10.42.0.2/24")
 	requireOutputLine(t, stdout, "gateway-dns-reachable")
+}
+
+func TestVMIntegrationContextSelectionRestoresWarmVMWithoutColdBootDelay(t *testing.T) {
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+	selectContext := "@warm --from " + env.image + " --memory 512 --cpus 1 --no-network"
+
+	coldStarted := time.Now()
+	stdout, stderr, err := sh.runTestScriptWithTimeout(selectContext, 90*time.Second)
+	if err != nil {
+		t.Fatalf("cold context activation: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	coldElapsed := time.Since(coldStarted)
+	state, err := env.api.InstanceStatusOf("warm")
+	if err != nil {
+		t.Fatalf("cold VM status: %v", err)
+	}
+	if state.Status != "running" {
+		t.Fatalf("cold context activation left VM status %q, want running", state.Status)
+	}
+	if err := sh.stopVM("warm"); err != nil {
+		t.Fatalf("stop cold VM: %v", err)
+	}
+
+	warmStarted := time.Now()
+	stdout, stderr, err = sh.runTestScriptWithTimeout("@warm", 2*time.Second)
+	if err != nil {
+		t.Fatalf("warm context activation: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	warmElapsed := time.Since(warmStarted)
+	state, err = env.api.InstanceStatusOf("warm")
+	if err != nil {
+		t.Fatalf("warm VM status: %v", err)
+	}
+	if state.Status != "running" {
+		t.Fatalf("warm context activation left VM status %q, want running", state.Status)
+	}
+	if warmElapsed >= time.Second {
+		t.Fatalf("warm context activation took %s after %s cold boot; snapshot restore regressed to cold-boot latency", warmElapsed, coldElapsed)
+	}
+	t.Logf("context activation latency cold=%s warm=%s", coldElapsed, warmElapsed)
+	if err := sh.stopVM("warm"); err != nil {
+		t.Fatalf("stop warm VM: %v", err)
+	}
 }
 
 func TestVMIntegrationFreeBSDBuiltinRunsCommandsAndCopiesFiles(t *testing.T) {
