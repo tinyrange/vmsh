@@ -70,20 +70,22 @@ jobs:
           mkdir -p dist build/release
 
           cd cc
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o ../build/release/init-linux-arm64 ./internal/cmd/init
-          install -m 644 ../build/release/init-linux-arm64 internal/guestinit/guest-init-linux-arm64
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o ../build/release/init-linux-amd64 ./internal/cmd/init
-          install -m 644 ../build/release/init-linux-amd64 internal/guestinit/guest-init-linux-amd64
-          for bsd in openbsd freebsd netbsd; do
-            for arch in arm64 amd64; do
-              CGO_ENABLED=0 GOOS="$bsd" GOARCH="$arch" go build -trimpath -o "../build/release/init-${bsd}-${arch}" "./internal/cmd/${bsd}-init"
-              install -m 644 "../build/release/init-${bsd}-${arch}" "internal/${bsd}/guestinit/guest-init-${bsd}-${arch}"
-            done
-          done
+          env -u GOOS -u GOARCH go run ./internal/cmd/build-guestinit -arch "$GOARCH"
           cd ..
           build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           ldflags="-X github.com/tinyrange/vmsh/internal/version.Release=${version} -X github.com/tinyrange/vmsh/internal/version.Commit=${GITHUB_SHA} -X github.com/tinyrange/vmsh/internal/version.Dirty=false -X github.com/tinyrange/vmsh/internal/version.BuildDate=${build_date}"
-          GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -tags "embed_ccvm embed_guestinit" -ldflags "$ldflags" -o "dist/${name}" ./cmd/vmsh
+          GOOS="$GOOS" GOARCH="$GOARCH" go build -buildvcs=false -trimpath -ldflags "$ldflags" -o "dist/${name}" ./cmd/vmsh
+
+      - name: Verify embedded guest init payloads
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          set -euo pipefail
+          cd cc
+          go test \
+            ./internal/guestinit \
+            ./internal/freebsd/guestinit \
+            ./internal/netbsd/guestinit \
+            ./internal/openbsd/guestinit
 
       - name: Smoke-test native Linux payload
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
@@ -167,20 +169,21 @@ jobs:
           mkdir -p dist build/release
 
           cd cc
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o ../build/release/init-linux-arm64 ./internal/cmd/init
-          install -m 644 ../build/release/init-linux-arm64 internal/guestinit/guest-init-linux-arm64
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o ../build/release/init-linux-amd64 ./internal/cmd/init
-          install -m 644 ../build/release/init-linux-amd64 internal/guestinit/guest-init-linux-amd64
-          for bsd in openbsd freebsd netbsd; do
-            for arch in arm64 amd64; do
-              CGO_ENABLED=0 GOOS="$bsd" GOARCH="$arch" go build -trimpath -o "../build/release/init-${bsd}-${arch}" "./internal/cmd/${bsd}-init"
-              install -m 644 "../build/release/init-${bsd}-${arch}" "internal/${bsd}/guestinit/guest-init-${bsd}-${arch}"
-            done
-          done
+          go run ./internal/cmd/build-guestinit -arch arm64
           cd ..
           build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           ldflags="-X github.com/tinyrange/vmsh/internal/version.Release=${version} -X github.com/tinyrange/vmsh/internal/version.Commit=${GITHUB_SHA} -X github.com/tinyrange/vmsh/internal/version.Dirty=false -X github.com/tinyrange/vmsh/internal/version.BuildDate=${build_date}"
-          GOOS=darwin GOARCH=arm64 go build -trimpath -tags "embed_ccvm embed_guestinit" -ldflags "$ldflags" -o "dist/${name}" ./cmd/vmsh
+          GOOS=darwin GOARCH=arm64 go build -buildvcs=false -trimpath -ldflags "$ldflags" -o "dist/${name}" ./cmd/vmsh
+
+      - name: Verify embedded guest init payloads
+        run: |
+          set -euo pipefail
+          cd cc
+          go test \
+            ./internal/guestinit \
+            ./internal/freebsd/guestinit \
+            ./internal/netbsd/guestinit \
+            ./internal/openbsd/guestinit
 
       - name: Sign macOS binaries
         run: |
@@ -202,6 +205,8 @@ jobs:
           set -euo pipefail
           name="vmsh_${RELEASE_VERSION}_darwin_arm64"
           notary_zip="dist/${name}_notary.zip"
+          notary_result="$(mktemp)"
+          trap 'rm -f "$notary_zip" "$notary_result"' EXIT
           ditto -c -k --keepParent "dist/${name}" "$notary_zip"
 
           if [[ "$APPLE_ID_PASSWORD" == @keychain:* ]]; then
@@ -209,17 +214,19 @@ jobs:
             xcrun notarytool submit "$notary_zip" \
               --keychain-profile "$notary_profile" \
               --wait \
-              --timeout 30m
+              --timeout 30m \
+              --output-format plist > "$notary_result"
           else
             xcrun notarytool submit "$notary_zip" \
               --apple-id "$APPLE_ID" \
               --password "$APPLE_ID_PASSWORD" \
               --team-id "$TEAM_ID" \
               --wait \
-              --timeout 30m
+              --timeout 30m \
+              --output-format plist > "$notary_result"
           fi
 
-          rm -f "$notary_zip"
+          test "$(plutil -extract status raw -o - "$notary_result")" = Accepted
           codesign --verify --strict --verbose=2 "dist/${name}"
 
       - name: Smoke-test signed macOS payload
