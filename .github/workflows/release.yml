@@ -205,6 +205,8 @@ jobs:
           set -euo pipefail
           name="vmsh_${RELEASE_VERSION}_darwin_arm64"
           notary_zip="dist/${name}_notary.zip"
+          notary_result="$(mktemp)"
+          trap 'rm -f "$notary_zip" "$notary_result"' EXIT
           ditto -c -k --keepParent "dist/${name}" "$notary_zip"
 
           if [[ "$APPLE_ID_PASSWORD" == @keychain:* ]]; then
@@ -212,26 +214,20 @@ jobs:
             xcrun notarytool submit "$notary_zip" \
               --keychain-profile "$notary_profile" \
               --wait \
-              --timeout 30m
+              --timeout 30m \
+              --output-format plist > "$notary_result"
           else
             xcrun notarytool submit "$notary_zip" \
               --apple-id "$APPLE_ID" \
               --password "$APPLE_ID_PASSWORD" \
               --team-id "$TEAM_ID" \
               --wait \
-              --timeout 30m
+              --timeout 30m \
+              --output-format plist > "$notary_result"
           fi
 
-          rm -f "$notary_zip"
+          test "$(plutil -extract status raw -o - "$notary_result")" = Accepted
           codesign --verify --strict --verbose=2 "dist/${name}"
-          # Gatekeeper publishes standalone-binary tickets online, but spctl's
-          # execute policy only assesses app-like bundles. Test the notarized
-          # code requirement directly for this command-line executable.
-          codesign \
-            --verify \
-            --verbose=2 \
-            --test-requirement '=notarized' \
-            "dist/${name}"
 
       - name: Smoke-test signed macOS payload
         run: |
