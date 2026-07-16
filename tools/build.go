@@ -234,6 +234,16 @@ func build(p paths) error {
 	if err := os.MkdirAll(p.build, 0o755); err != nil {
 		return err
 	}
+	targetGOARCH, err := goEnv("GOARCH")
+	if err != nil {
+		return err
+	}
+
+	if err := step("build guest init payloads", func() error {
+		return hostCommand(p.ccDir, "go", "run", "./internal/cmd/build-guestinit", "-arch", targetGOARCH)
+	}); err != nil {
+		return err
+	}
 
 	if err := step("build ccvm", func() error {
 		return goBuild(p.ccDir, []string{"CGO_ENABLED=0"}, p.ccvm, "./cmd/ccvm")
@@ -340,6 +350,25 @@ func command(workDir string, env []string, name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	cmd.Dir = workDir
 	cmd.Env = append(os.Environ(), env...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+	}
+	return nil
+}
+
+func hostCommand(workDir, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = workDir
+	for _, item := range os.Environ() {
+		key, _, _ := strings.Cut(item, "=")
+		if key == "GOOS" || key == "GOARCH" || key == "CGO_ENABLED" {
+			continue
+		}
+		cmd.Env = append(cmd.Env, item)
+	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin

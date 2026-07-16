@@ -144,6 +144,7 @@ go run .\tools\build.go run
 Run an existing `ccvm` binary instead:
 
 ```sh
+(cd cc && go run ./internal/cmd/build-guestinit)
 go build -o build/vmsh/vmsh ./cmd/vmsh
 ./build/vmsh/vmsh -ccvm /path/to/ccvm
 ```

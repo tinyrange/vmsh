@@ -33,6 +33,10 @@ jobs:
             go.sum
             cc/go.sum
 
+      - name: Build guest init payloads
+        working-directory: cc
+        run: go run ./internal/cmd/build-guestinit
+
       - name: Check Go formatting
         shell: bash
         run: |
@@ -69,6 +73,10 @@ jobs:
             go.sum
             cc/go.sum
 
+      - name: Build guest init payloads
+        working-directory: cc
+        run: go run ./internal/cmd/build-guestinit
+
       - name: Validate OpenAPI and route inventory
         run: go test ./internal/vmshd -run '^TestOpenAPIContract$' -count=1
 
@@ -104,6 +112,10 @@ jobs:
           cache-dependency-path: |
             go.sum
             cc/go.sum
+
+      - name: Build guest init payloads
+        working-directory: cc
+        run: go run ./internal/cmd/build-guestinit
 
       - name: Run tests
         run: go test -short ./... -count=1 -timeout 20m
