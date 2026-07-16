@@ -115,6 +115,25 @@ func TestVMIntegrationScriptCommandsStartVMAndUseShellFeatures(t *testing.T) {
 	}
 }
 
+func TestVMIntegrationNetworkEnabledGuestBootsWithAssignedIdentity(t *testing.T) {
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+
+	script := strings.Join([]string{
+		"@network --from " + env.image + " --memory 768 --cpus 1",
+		"ip -4 addr show dev eth0 | awk '$1 == \"inet\" { print \"guest-ip:\" $2 }'",
+		"nslookup -type=A host.internal 10.42.0.1 >/dev/null && printf 'gateway-dns-reachable\\n'",
+		"@stop network",
+	}, "\n")
+
+	stdout, stderr, err := sh.runTestScriptWithTimeout(script, 90*time.Second)
+	if err != nil {
+		t.Fatalf("run network-enabled vmsh script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	requireOutputLine(t, stdout, "guest-ip:10.42.0.2/24")
+	requireOutputLine(t, stdout, "gateway-dns-reachable")
+}
+
 func TestVMIntegrationFreeBSDBuiltinRunsCommandsAndCopiesFiles(t *testing.T) {
 	if os.Getenv("VMSH_TEST_FREEBSD") == "" {
 		t.Skip("set VMSH_TEST_FREEBSD=1 to run FreeBSD vmsh integration test")
