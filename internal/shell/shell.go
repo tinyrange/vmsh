@@ -183,8 +183,6 @@ type vmshdSessionReporter struct {
 	sessionID    string
 	attachmentID string
 	detached     bool
-	startedAt    time.Time
-	startedKnown bool
 	pending      *vmshd.UpdateSessionRequest
 	publishErr   error
 }
@@ -1389,10 +1387,6 @@ func startVMSHDSession(state backend.DaemonState, output *os.File, metadata vmsh
 		sessionID:    session.ID,
 		attachmentID: attached.Attachment.ID,
 		detached:     systemSession,
-	}
-	if status, err := client.Status(); err == nil && !status.StartedAt.IsZero() {
-		reporter.startedAt = status.StartedAt
-		reporter.startedKnown = true
 	}
 	return reporter, func() error {
 		return reporter.close()
@@ -3299,7 +3293,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			if at.Options.Sudo {
 				return fmt.Errorf("usage: @ --sudo <cmd>")
 			}
-			if err := s.prepareVMContextSelection(&ctx, stderr); err != nil {
+			if err := s.prepareActivatedVMContext(&ctx, stderr); err != nil {
 				return err
 			}
 			s.activateContext(ctx)
@@ -3491,7 +3485,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 				if at.Options.Sudo {
 					return fmt.Errorf("usage: @%s --sudo <cmd>", at.Target)
 				}
-				if err := s.prepareVMContextSelection(&ctx, stderr); err != nil {
+				if err := s.prepareActivatedVMContext(&ctx, stderr); err != nil {
 					return err
 				}
 				s.activateContext(ctx)
@@ -3508,7 +3502,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 				if at.Options.Sudo {
 					return fmt.Errorf("usage: @%s --sudo <cmd>", at.Target)
 				}
-				if err := s.prepareVMContextSelection(&ctx, stderr); err != nil {
+				if err := s.prepareActivatedVMContext(&ctx, stderr); err != nil {
 					return err
 				}
 				s.activateContext(ctx)
@@ -3534,7 +3528,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 				if at.Options.Sudo {
 					return fmt.Errorf("usage: @%s --sudo <cmd>", at.Target)
 				}
-				if err := s.prepareVMContextSelection(&ctx, stderr); err != nil {
+				if err := s.prepareActivatedVMContext(&ctx, stderr); err != nil {
 					return err
 				}
 				s.activateContext(ctx)
@@ -3550,7 +3544,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			if at.Options.Sudo {
 				return fmt.Errorf("usage: @%s --sudo <cmd>", at.Target)
 			}
-			if err := s.prepareVMContextSelection(&ctx, stderr); err != nil {
+			if err := s.prepareActivatedVMContext(&ctx, stderr); err != nil {
 				return err
 			}
 			s.activateContext(ctx)
@@ -3569,14 +3563,17 @@ func (s *shellState) vmTargetCommandContext(id string, opts commandOptions) (com
 	return ctx, nil
 }
 
-func (s *shellState) prepareVMContextSelection(ctx *commandContext, stderr io.Writer) error {
+func (s *shellState) prepareActivatedVMContext(ctx *commandContext, stderr io.Writer) error {
 	if ctx == nil || ctx.Mode != modeVM {
 		return nil
 	}
 	if ctx.Image == "" {
 		return nil
 	}
-	return s.ensureImageAvailable(*ctx, stderr)
+	if err := s.ensureImageAvailable(*ctx, stderr); err != nil {
+		return err
+	}
+	return s.ensureVMRunning(*ctx, stderr)
 }
 
 func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
@@ -7853,7 +7850,6 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 	if err != nil {
 		return err
 	}
-	s.noteStartupSnapshotStart(req)
 	startedID := firstNonEmpty(state.ID, id)
 	if s.vmRunning == nil {
 		s.vmRunning = map[string]bool{}
@@ -7883,8 +7879,6 @@ const (
 	startupSnapshotCPUs     = 1
 )
 
-const startupSnapshotDaemonMarker = ".vmshd-started-at"
-
 func (s *shellState) applyStartupSnapshotDefaults(req *client.StartInstanceRequest) {
 	if s.rootCache == "" || !startupSnapshotCompatible(*req) {
 		return
@@ -7894,12 +7888,6 @@ func (s *shellState) applyStartupSnapshotDefaults(req *client.StartInstanceReque
 		return
 	}
 	req.SnapshotDir = root
-	if generation, _, ok := s.startupSnapshotGeneration(); ok && !startupSnapshotMarkerMatches(root, generation) {
-		if err := os.MkdirAll(root, 0o755); err != nil {
-			req.SnapshotDir = ""
-		}
-		return
-	}
 	if snapshot := latestStartupSnapshot(root); snapshot != "" {
 		req.RestoreSnapshot = snapshot
 		return
@@ -7908,57 +7896,6 @@ func (s *shellState) applyStartupSnapshotDefaults(req *client.StartInstanceReque
 		req.SnapshotDir = ""
 	}
 }
-
-func (s *shellState) startupSnapshotGeneration() (string, time.Time, bool) {
-	if s == nil || s.vmshd == nil {
-		return "", time.Time{}, false
-	}
-	startedAt, ok := s.vmshd.daemonStartedAt()
-	if !ok || startedAt.IsZero() {
-		return "", time.Time{}, false
-	}
-	startedAt = startedAt.UTC()
-	return startedAt.Format(time.RFC3339Nano), startedAt, true
-}
-
-func (r *vmshdSessionReporter) daemonStartedAt() (time.Time, bool) {
-	if r == nil {
-		return time.Time{}, false
-	}
-	if r.startedKnown {
-		return r.startedAt, !r.startedAt.IsZero()
-	}
-	if r.client == nil {
-		return time.Time{}, false
-	}
-	status, err := r.client.Status()
-	if err != nil || status.StartedAt.IsZero() {
-		return time.Time{}, false
-	}
-	r.startedAt = status.StartedAt
-	r.startedKnown = true
-	return r.startedAt, true
-}
-
-func (s *shellState) noteStartupSnapshotStart(req client.StartInstanceRequest) {
-	if strings.TrimSpace(req.SnapshotDir) == "" || strings.TrimSpace(req.RestoreSnapshot) != "" {
-		return
-	}
-	generation, startedAt, ok := s.startupSnapshotGeneration()
-	if !ok {
-		return
-	}
-	snapshot := latestStartupSnapshot(req.SnapshotDir)
-	if snapshot == "" {
-		return
-	}
-	modTime, ok := startupSnapshotModTime(snapshot)
-	if !ok || modTime.Before(startedAt) {
-		return
-	}
-	_ = os.WriteFile(filepath.Join(req.SnapshotDir, startupSnapshotDaemonMarker), []byte(generation+"\n"), 0o644)
-}
-
 func startupSnapshotCompatible(req client.StartInstanceRequest) bool {
 	if !kernelStateIsDefault(req.Kernel) || strings.TrimSpace(req.InitSystem) != "" {
 		return false
@@ -8021,25 +7958,6 @@ func latestStartupSnapshot(root string) string {
 		}
 	}
 	return latest
-}
-
-func startupSnapshotMarkerMatches(root, generation string) bool {
-	data, err := os.ReadFile(filepath.Join(root, startupSnapshotDaemonMarker))
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(data)) == strings.TrimSpace(generation)
-}
-
-func startupSnapshotModTime(snapshot string) (time.Time, bool) {
-	info, err := os.Stat(filepath.Join(snapshot, "manifest.json"))
-	if err != nil {
-		info, err = os.Stat(snapshot)
-	}
-	if err != nil {
-		return time.Time{}, false
-	}
-	return info.ModTime(), true
 }
 
 func vmshBootTimeoutSeconds(image string) float64 {

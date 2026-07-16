@@ -202,7 +202,7 @@ not the main execution model:
 Common forms:
 
 ```sh
-@alpine                         # select an image context; VM starts lazily
+@alpine                         # select the context and start its VM
 uname -a                        # run in the selected context
 @alpine uname -a                # one-shot command in alpine
 @host                           # switch back to the host context

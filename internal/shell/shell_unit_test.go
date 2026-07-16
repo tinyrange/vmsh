@@ -1614,7 +1614,6 @@ func TestIsolatedContextRejectsSharedNameCollision(t *testing.T) {
 	sh := newUnitShell(t, api)
 	script := strings.Join([]string{
 		"@work --from ubuntu",
-		"true",
 		"@host",
 		"@work --from ubuntu --isolated",
 	}, "\n")
@@ -1633,7 +1632,6 @@ func TestSharedContextRejectsIsolatedNameCollision(t *testing.T) {
 	sh := newUnitShell(t, api)
 	script := strings.Join([]string{
 		"@work --from ubuntu --isolated",
-		"true",
 		"@host",
 		"@work --from ubuntu --shared",
 	}, "\n")
@@ -1647,7 +1645,7 @@ func TestSharedContextRejectsIsolatedNameCollision(t *testing.T) {
 	}
 }
 
-func TestBareVMTargetStartsVMOnFirstCommand(t *testing.T) {
+func TestBareVMTargetStartsVMWhenActivated(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	sh := newUnitShell(t, api)
 
@@ -1657,12 +1655,6 @@ func TestBareVMTargetStartsVMOnFirstCommand(t *testing.T) {
 	}
 	if sh.context.Mode != modeVM || sh.context.Image != "ubuntu" || sh.context.VMID != "work" {
 		t.Fatalf("context = %+v, want ubuntu work VM context", sh.context)
-	}
-	if len(api.starts) != 0 {
-		t.Fatalf("starts after context selection = %d, want 0", len(api.starts))
-	}
-	if err := sh.eval("true", &stdout, &stderr); err != nil {
-		t.Fatalf("run first VM command: %v\nstderr:\n%s", err, stderr.String())
 	}
 	if len(api.starts) != 1 {
 		t.Fatalf("starts = %d, want 1", len(api.starts))
@@ -1683,8 +1675,8 @@ func TestBareVMTargetStartsVMOnFirstCommand(t *testing.T) {
 	if start.req.Network != nil {
 		t.Fatalf("start network = %+v, want nil for --no-network", start.req.Network)
 	}
-	if len(api.runs) != 1 {
-		t.Fatalf("runs = %d, want first command run", len(api.runs))
+	if len(api.runs) != 0 {
+		t.Fatalf("runs = %d, want no command run during activation", len(api.runs))
 	}
 }
 
@@ -1776,10 +1768,9 @@ func TestStartVMRestoresNewestStartupSnapshotForCompatibleAlpine(t *testing.T) {
 	}
 }
 
-func TestStartVMSkipsPersistedStartupSnapshotUntilDaemonRefresh(t *testing.T) {
+func TestStartVMRestoresPersistedStartupSnapshotAfterDaemonRestart(t *testing.T) {
 	api := newRecordingShellAPI("alpine")
 	sh := newUnitShell(t, api)
-	sh.vmshd = &vmshdSessionReporter{startedAt: time.Unix(20, 0), startedKnown: true}
 	baseReq := startupSnapshotTestRequest(t, sh)
 	root, err := startupSnapshotRoot(sh.rootCache, baseReq)
 	if err != nil {
@@ -1795,48 +1786,8 @@ func TestStartVMSkipsPersistedStartupSnapshotUntilDaemonRefresh(t *testing.T) {
 	if req.SnapshotDir != root {
 		t.Fatalf("snapshot dir = %q, want %q", req.SnapshotDir, root)
 	}
-	if req.RestoreSnapshot != "" {
-		t.Fatalf("restore snapshot = %q, want cold boot before daemon refresh", req.RestoreSnapshot)
-	}
-	if startupSnapshotMarkerMatches(root, sh.vmshd.startedAt.UTC().Format(time.RFC3339Nano)) {
-		t.Fatalf("daemon marker was written without a fresh snapshot")
-	}
-}
-
-func TestStartVMRestoresStartupSnapshotAfterDaemonRefresh(t *testing.T) {
-	api := newRecordingShellAPI("alpine")
-	sh := newUnitShell(t, api)
-	sh.vmshd = &vmshdSessionReporter{startedAt: time.Unix(20, 0), startedKnown: true}
-	baseReq := startupSnapshotTestRequest(t, sh)
-	root, err := startupSnapshotRoot(sh.rootCache, baseReq)
-	if err != nil {
-		t.Fatalf("snapshot root: %v", err)
-	}
-	oldSnapshot := filepath.Join(root, "snapshot-20260101T000000.000000000Z")
-	writeStartupSnapshotManifest(t, oldSnapshot, time.Unix(10, 0))
-	freshSnapshot := filepath.Join(root, "snapshot-20260102T000000.000000000Z")
-	api.startStream = func(ctx context.Context, id string, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
-		api.starts = append(api.starts, recordedStart{id: id, req: req})
-		if req.RestoreSnapshot == "" {
-			writeStartupSnapshotManifest(t, freshSnapshot, time.Unix(30, 0))
-		}
-		return client.InstanceState{ID: id, Status: "running"}, nil
-	}
-
-	if err := sh.startVM("work", commandContext{Image: "alpine", MemoryMB: 512, CPUs: 1}, io.Discard); err != nil {
-		t.Fatalf("first start VM: %v", err)
-	}
-	if api.starts[0].req.RestoreSnapshot != "" {
-		t.Fatalf("first restore snapshot = %q, want cold boot", api.starts[0].req.RestoreSnapshot)
-	}
-	if !startupSnapshotMarkerMatches(root, sh.vmshd.startedAt.UTC().Format(time.RFC3339Nano)) {
-		t.Fatalf("daemon marker was not written after fresh snapshot")
-	}
-	if err := sh.startVM("work", commandContext{Image: "alpine", MemoryMB: 512, CPUs: 1}, io.Discard); err != nil {
-		t.Fatalf("second start VM: %v", err)
-	}
-	if api.starts[1].req.RestoreSnapshot != freshSnapshot {
-		t.Fatalf("second restore snapshot = %q, want %q", api.starts[1].req.RestoreSnapshot, freshSnapshot)
+	if req.RestoreSnapshot != oldSnapshot {
+		t.Fatalf("restore snapshot = %q, want persisted snapshot %q", req.RestoreSnapshot, oldSnapshot)
 	}
 }
 
@@ -1955,12 +1906,6 @@ func TestBareImageTargetUsesImageNameAsSystemName(t *testing.T) {
 	if sh.context.Mode != modeVM || sh.context.Image != "ubuntu" || sh.context.VMID != "ubuntu" || sh.context.SystemName != "ubuntu" {
 		t.Fatalf("context = %+v, want ubuntu system", sh.context)
 	}
-	if len(api.starts) != 0 {
-		t.Fatalf("starts after context selection = %+v, want none", api.starts)
-	}
-	if err := sh.eval("true", &stdout, &stderr); err != nil {
-		t.Fatalf("run first ubuntu command: %v", err)
-	}
 	if len(api.starts) != 1 || api.starts[0].id != "ubuntu" {
 		t.Fatalf("starts = %+v, want ubuntu VM start", api.starts)
 	}
@@ -1976,12 +1921,6 @@ func TestNamedSystemFromImageSource(t *testing.T) {
 	}
 	if sh.context.Mode != modeVM || sh.context.Image != "ubuntu" || sh.context.VMID != "hello" || sh.context.SystemName != "hello" {
 		t.Fatalf("context = %+v, want hello from ubuntu", sh.context)
-	}
-	if len(api.starts) != 0 {
-		t.Fatalf("starts after context selection = %+v, want none", api.starts)
-	}
-	if err := sh.eval("true", &stdout, &stderr); err != nil {
-		t.Fatalf("run first named-system command: %v", err)
 	}
 	if len(api.starts) != 1 || api.starts[0].id != "hello" {
 		t.Fatalf("starts = %+v, want hello VM start", api.starts)
@@ -2096,9 +2035,6 @@ func TestUbuntuInitCanBeDisabled(t *testing.T) {
 	if err := sh.eval("@work --from ubuntu --no-init", &stdout, &stderr); err != nil {
 		t.Fatalf("activate VM context: %v\nstderr:\n%s", err, stderr.String())
 	}
-	if err := sh.eval("true", &stdout, &stderr); err != nil {
-		t.Fatalf("run first VM command: %v", err)
-	}
 	if len(api.starts) != 1 {
 		t.Fatalf("starts = %d, want 1", len(api.starts))
 	}
@@ -2117,9 +2053,6 @@ func TestUbuntuKernelCanUseDefault(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if err := sh.eval("@work --from ubuntu --kernel default", &stdout, &stderr); err != nil {
 		t.Fatalf("activate VM context: %v\nstderr:\n%s", err, stderr.String())
-	}
-	if err := sh.eval("true", &stdout, &stderr); err != nil {
-		t.Fatalf("run first VM command: %v", err)
 	}
 	if len(api.starts) != 1 {
 		t.Fatalf("starts = %d, want 1", len(api.starts))
@@ -2142,9 +2075,6 @@ func TestVMKernelPathResolvesRelativeToHostCWD(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if err := sh.eval("@ubuntu --kernel vmlinuz-test --vm work", &stdout, &stderr); err != nil {
 		t.Fatalf("activate VM with custom kernel: %v\nstderr:\n%s", err, stderr.String())
-	}
-	if err := sh.eval("true", &stdout, &stderr); err != nil {
-		t.Fatalf("run first VM command: %v", err)
 	}
 	if len(api.starts) != 1 {
 		t.Fatalf("starts = %d, want 1", len(api.starts))
@@ -2185,9 +2115,6 @@ func TestVMKernelPathResolvesRelativeToGuestHostShareCWD(t *testing.T) {
 	if err := sh.eval("@ --kernel vmlinuz-test --vm work", &stdout, &stderr); err != nil {
 		t.Fatalf("activate VM with guest-relative custom kernel: %v\nstderr:\n%s", err, stderr.String())
 	}
-	if err := sh.eval("true", &stdout, &stderr); err != nil {
-		t.Fatalf("run first VM command: %v", err)
-	}
 	if len(api.starts) != 1 {
 		t.Fatalf("starts = %d, want 1", len(api.starts))
 	}
@@ -2220,9 +2147,6 @@ func TestVMDebugEnablesBootDmesgAndSerialOutput(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if err := sh.eval("@ubuntu --debug --vm work", &stdout, &stderr); err != nil {
 		t.Fatalf("activate debug VM context: %v\nstderr:\n%s", err, stderr.String())
-	}
-	if err := sh.eval("true", &stdout, &stderr); err != nil {
-		t.Fatalf("run first debug VM command: %v", err)
 	}
 	if len(api.starts) != 1 {
 		t.Fatalf("starts = %d, want 1", len(api.starts))
@@ -2423,20 +2347,11 @@ func TestBuiltInBSDTargetsSwitchFromActiveGuestContext(t *testing.T) {
 			if err := sh.eval(tc.base+" --memory 768 --cpus 1 --no-network", &stdout, &stderr); err != nil {
 				t.Fatalf("enter %s context: %v\nstdout:\n%s\nstderr:\n%s", tc.base, err, stdout.String(), stderr.String())
 			}
-			if err := sh.eval("true", &stdout, &stderr); err != nil {
-				t.Fatalf("run first %s command: %v", tc.base, err)
-			}
 			if err := sh.eval(tc.line, &stdout, &stderr); err != nil {
 				t.Fatalf("switch to %s context: %v\nstdout:\n%s\nstderr:\n%s", tc.image, err, stdout.String(), stderr.String())
 			}
 			if sh.context.Mode != modeVM || sh.context.Image != tc.image || sh.context.VMID != tc.vmid {
 				t.Fatalf("context = %+v, want %s VM %s", sh.context, tc.image, tc.vmid)
-			}
-			if len(api.starts) != 1 {
-				t.Fatalf("starts after second context selection = %+v, want only %s", api.starts, tc.base)
-			}
-			if err := sh.eval("true", &stdout, &stderr); err != nil {
-				t.Fatalf("run first %s command: %v", tc.image, err)
 			}
 			if len(api.starts) != 2 {
 				t.Fatalf("starts = %+v, want %s and %s", api.starts, tc.base, tc.image)
@@ -2448,7 +2363,7 @@ func TestBuiltInBSDTargetsSwitchFromActiveGuestContext(t *testing.T) {
 	}
 }
 
-func TestBareVMOptionsApplyWhenFirstCommandStartsVM(t *testing.T) {
+func TestBareVMOptionsStartVMWhenActivated(t *testing.T) {
 	api := newRecordingShellAPI("ubuntu")
 	sh := newUnitShell(t, api)
 	sh.context = commandContext{Mode: modeVM, VMID: "default", Image: "ubuntu", Network: true}
@@ -2459,12 +2374,6 @@ func TestBareVMOptionsApplyWhenFirstCommandStartsVM(t *testing.T) {
 	}
 	if sh.context.Mode != modeVM || sh.context.Image != "ubuntu" || sh.context.VMID != "other" {
 		t.Fatalf("context = %+v, want ubuntu other VM context", sh.context)
-	}
-	if len(api.starts) != 0 {
-		t.Fatalf("starts after context selection = %d, want 0", len(api.starts))
-	}
-	if err := sh.eval("true", &stdout, &stderr); err != nil {
-		t.Fatalf("run first VM command: %v", err)
 	}
 	if len(api.starts) != 1 {
 		t.Fatalf("starts = %d, want 1", len(api.starts))
