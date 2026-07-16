@@ -3299,7 +3299,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			if at.Options.Sudo {
 				return fmt.Errorf("usage: @ --sudo <cmd>")
 			}
-			if err := s.prepareActivatedVMContext(&ctx, stdout, stderr); err != nil {
+			if err := s.prepareVMContextSelection(&ctx, stderr); err != nil {
 				return err
 			}
 			s.activateContext(ctx)
@@ -3491,7 +3491,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 				if at.Options.Sudo {
 					return fmt.Errorf("usage: @%s --sudo <cmd>", at.Target)
 				}
-				if err := s.prepareActivatedVMContext(&ctx, stdout, stderr); err != nil {
+				if err := s.prepareVMContextSelection(&ctx, stderr); err != nil {
 					return err
 				}
 				s.activateContext(ctx)
@@ -3508,7 +3508,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 				if at.Options.Sudo {
 					return fmt.Errorf("usage: @%s --sudo <cmd>", at.Target)
 				}
-				if err := s.prepareActivatedVMContext(&ctx, stdout, stderr); err != nil {
+				if err := s.prepareVMContextSelection(&ctx, stderr); err != nil {
 					return err
 				}
 				s.activateContext(ctx)
@@ -3534,7 +3534,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 				if at.Options.Sudo {
 					return fmt.Errorf("usage: @%s --sudo <cmd>", at.Target)
 				}
-				if err := s.prepareActivatedVMContext(&ctx, stdout, stderr); err != nil {
+				if err := s.prepareVMContextSelection(&ctx, stderr); err != nil {
 					return err
 				}
 				s.activateContext(ctx)
@@ -3550,7 +3550,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			if at.Options.Sudo {
 				return fmt.Errorf("usage: @%s --sudo <cmd>", at.Target)
 			}
-			if err := s.prepareActivatedVMContext(&ctx, stdout, stderr); err != nil {
+			if err := s.prepareVMContextSelection(&ctx, stderr); err != nil {
 				return err
 			}
 			s.activateContext(ctx)
@@ -3569,17 +3569,14 @@ func (s *shellState) vmTargetCommandContext(id string, opts commandOptions) (com
 	return ctx, nil
 }
 
-func (s *shellState) prepareActivatedVMContext(ctx *commandContext, stdout, stderr io.Writer) error {
+func (s *shellState) prepareVMContextSelection(ctx *commandContext, stderr io.Writer) error {
 	if ctx == nil || ctx.Mode != modeVM {
 		return nil
 	}
 	if ctx.Image == "" {
 		return nil
 	}
-	if err := s.ensureImageAvailable(*ctx, stderr); err != nil {
-		return err
-	}
-	return s.ensureVMRunning(*ctx, stderr)
+	return s.ensureImageAvailable(*ctx, stderr)
 }
 
 func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {

@@ -416,10 +416,18 @@ func TestVMIntegrationInteractiveUIDrivesKeyboardAndRoutesCommands(t *testing.T)
 	}
 
 	vmsh := buildVMIntegrationVMSH(t)
-	hostCWD := t.TempDir()
+	hostCWD, err := os.MkdirTemp("", "vmsh-ui-")
+	if err != nil {
+		t.Fatalf("create UI cwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(hostCWD) })
 	nestedCWD := filepath.Join(hostCWD, "nested")
 	if err := os.Mkdir(nestedCWD, 0o755); err != nil {
 		t.Fatalf("create nested UI cwd: %v", err)
+	}
+	canonicalNestedCWD, err := filepath.EvalSymlinks(nestedCWD)
+	if err != nil {
+		t.Fatalf("resolve nested UI cwd: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), vmIntegrationLongTimeout())
 	defer cancel()
@@ -456,7 +464,7 @@ func TestVMIntegrationInteractiveUIDrivesKeyboardAndRoutesCommands(t *testing.T)
 
 	typeUI(t, driver, "printf 'VMSH_UI_CWD=%s\\n' \"$PWD\"", session)
 	position = enterUI(t, driver, session)
-	waitUILine(t, ctx, driver, "VMSH_UI_CWD="+nestedCWD, session)
+	waitUILine(t, ctx, driver, "VMSH_UI_CWD="+canonicalNestedCWD, session)
 	waitUIPromptAfter(t, ctx, driver, position, session)
 
 	typeUI(t, driver, "export VMSH_UI_VALUE=from-ui", session)
@@ -480,11 +488,11 @@ func TestVMIntegrationInteractiveUIDrivesKeyboardAndRoutesCommands(t *testing.T)
 
 	typeUI(t, driver, "pwd", session)
 	position = enterUI(t, driver, session)
-	waitUILineCount(t, ctx, driver, nestedCWD, 1, session)
+	waitUILineCount(t, ctx, driver, canonicalNestedCWD, 1, session)
 	waitUIPromptAfter(t, ctx, driver, position, session)
 	keyUI(t, driver, ptyterm.KeyUp, session)
 	position = enterUI(t, driver, session)
-	waitUILineCount(t, ctx, driver, nestedCWD, 2, session)
+	waitUILineCount(t, ctx, driver, canonicalNestedCWD, 2, session)
 	waitUIPromptAfter(t, ctx, driver, position, session)
 
 	cancelledPath := filepath.Join(nestedCWD, ".vmsh-ui-cancelled")
@@ -523,19 +531,19 @@ func TestVMIntegrationInteractiveUIDrivesKeyboardAndRoutesCommands(t *testing.T)
 	}
 	typeUI(t, driver, "@host stty size", session)
 	position = enterUI(t, driver, session)
-	waitUILine(t, ctx, driver, "17 73", session)
+	waitUIOutputAfter(t, ctx, driver, position, "17 73", session)
 	waitUIPromptAfter(t, ctx, driver, position, session)
 
 	inputUI(t, driver, ptyterm.Ctrl('l'), session)
 	typeUI(t, driver, "@host printf 'VMSH_UI_UTF8=%s\\n' 'é界'", session)
 	position = enterUI(t, driver, session)
-	waitUILine(t, ctx, driver, "VMSH_UI_UTF8=é界", session)
+	waitUIOutputAfter(t, ctx, driver, position, "VMSH_UI_UTF8=é界", session)
 	waitUIPromptAfter(t, ctx, driver, position, session)
 
 	runningMarker := filepath.Join(nestedCWD, ".vmsh-ui-running-completed")
-	typeUI(t, driver, "@host sh -c 'printf \"VMSH_UI_RUNNING=1\\n\"; sleep 30; touch "+runningMarker+"'", session)
-	enterUI(t, driver, session)
-	waitUILine(t, ctx, driver, "VMSH_UI_RUNNING=1", session)
+	typeUI(t, driver, "@host sh -c 'printf \"VMSH_UI_RUNNING=1\\n\"; sleep 30; touch .vmsh-ui-running-completed'", session)
+	position = enterUI(t, driver, session)
+	waitUIOutputAfter(t, ctx, driver, position, "VMSH_UI_RUNNING=1", session)
 	position = session.Snapshot().BytesRead
 	inputUI(t, driver, ptyterm.Ctrl('c'), session)
 	waitUIPromptAfter(t, ctx, driver, position, session)
@@ -544,8 +552,8 @@ func TestVMIntegrationInteractiveUIDrivesKeyboardAndRoutesCommands(t *testing.T)
 	}
 
 	typeUI(t, driver, "@host sh -c 'trap \"\" INT QUIT; printf \"VMSH_UI_FORCE_READY=1\\n\"; while :; do sleep 1; done'", session)
-	enterUI(t, driver, session)
-	waitUILine(t, ctx, driver, "VMSH_UI_FORCE_READY=1", session)
+	position = enterUI(t, driver, session)
+	waitUIOutputAfter(t, ctx, driver, position, "VMSH_UI_FORCE_READY=1", session)
 	position = session.Snapshot().BytesRead
 	inputUI(t, driver, ptyterm.Ctrl('c'), session)
 	inputUI(t, driver, ptyterm.Ctrl('c'), session)
@@ -553,7 +561,7 @@ func TestVMIntegrationInteractiveUIDrivesKeyboardAndRoutesCommands(t *testing.T)
 	waitUIPromptAfter(t, ctx, driver, position, session)
 	typeUI(t, driver, "@host printf 'VMSH_UI_FORCE_RECOVERED=1\\n'", session)
 	position = enterUI(t, driver, session)
-	waitUILine(t, ctx, driver, "VMSH_UI_FORCE_RECOVERED=1", session)
+	waitUIOutputAfter(t, ctx, driver, position, "VMSH_UI_FORCE_RECOVERED=1", session)
 	waitUIPromptAfter(t, ctx, driver, position, session)
 
 	inputUI(t, driver, ptyterm.Ctrl('d'), session)
@@ -632,12 +640,12 @@ func TestVMIntegrationInteractiveUIRoutesCommandsAcrossVMs(t *testing.T) {
 	keyUI(t, driver, ptyterm.KeyDelete, session)
 	keyUI(t, driver, ptyterm.KeyEnd, session)
 	position = enterUI(t, driver, session)
-	waitUILine(t, ctx, driver, "VMSH_UI_LINUX_UTF8=é界", session)
+	waitUIOutputAfter(t, ctx, driver, position, "VMSH_UI_LINUX_UTF8=é界", session)
 	waitUIPromptAfter(t, ctx, driver, position, session)
 
 	typeUI(t, driver, "sh -c 'printf \"VMSH_UI_LINUX_RUNNING=1\\n\"; sleep 30; touch /tmp/vmsh-ui-linux-completed'", session)
-	enterUI(t, driver, session)
-	waitUILine(t, ctx, driver, "VMSH_UI_LINUX_RUNNING=1", session)
+	position = enterUI(t, driver, session)
+	waitUIOutputAfter(t, ctx, driver, position, "VMSH_UI_LINUX_RUNNING=1", session)
 	position = session.Snapshot().BytesRead
 	inputUI(t, driver, ptyterm.Ctrl('c'), session)
 	waitUIPromptAfter(t, ctx, driver, position, session)
@@ -671,8 +679,8 @@ func TestVMIntegrationInteractiveUIRoutesCommandsAcrossVMs(t *testing.T) {
 		waitUIPromptAfter(t, ctx, driver, position, session)
 
 		typeUI(t, driver, "sh -c 'printf \"VMSH_UI_FREEBSD_RUNNING=1\\n\"; sleep 30; touch /tmp/vmsh-ui-freebsd-completed'", session)
-		enterUI(t, driver, session)
-		waitUILine(t, ctx, driver, "VMSH_UI_FREEBSD_RUNNING=1", session)
+		position = enterUI(t, driver, session)
+		waitUIOutputAfter(t, ctx, driver, position, "VMSH_UI_FREEBSD_RUNNING=1", session)
 		position = session.Snapshot().BytesRead
 		inputUI(t, driver, ptyterm.Ctrl('c'), session)
 		waitUIPromptAfter(t, ctx, driver, position, session)
@@ -738,6 +746,14 @@ func waitUIRaw(t *testing.T, ctx context.Context, driver *ptyterm.Driver, sequen
 	t.Helper()
 	if _, err := driver.WaitRaw(ctx, sequence); err != nil {
 		t.Fatalf("wait for vmsh UI terminal sequence %q: %v; %s", sequence, err, uiSnapshotSummary(session.Snapshot()))
+	}
+}
+
+func waitUIOutputAfter(t *testing.T, ctx context.Context, driver *ptyterm.Driver, position int64, line string, session *ptyterm.Session) {
+	t.Helper()
+	sequence := []byte("\x1b[?2004l" + line + "\r\n")
+	if _, err := driver.WaitRawAfter(ctx, position, sequence); err != nil {
+		t.Fatalf("wait for vmsh UI output %q after byte %d: %v; %s", line, position, err, uiSnapshotSummary(session.Snapshot()))
 	}
 }
 

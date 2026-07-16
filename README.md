@@ -122,6 +122,19 @@ By default, a `vmsh` frontend owns its daemon session and cleans it up when the
 frontend exits. Start with `-system-session` or run `@detach` to keep the
 session available after the current frontend closes.
 
+### Local security model
+
+vmshd authenticates local connections, and its state and credential files are
+restricted to the operating-system account that started it. All vmsh frontend
+processes running as that account currently share one daemon security principal:
+they are not an isolation boundary from each other and may discover or control
+the account's other daemon sessions. Do not run an untrusted vmsh frontend under
+the same account. Guests, SSH targets, and other clients remain untrusted and
+must interact with the host only through explicitly granted interfaces.
+
+Frontend-scoped credentials and cross-frontend authorization are tracked in
+[issue #112](https://github.com/tinyrange/vmsh/issues/112).
+
 On Windows, the same helper can be run with:
 
 ```powershell
@@ -131,6 +144,7 @@ go run .\tools\build.go run
 Run an existing `ccvm` binary instead:
 
 ```sh
+(cd cc && go run ./internal/cmd/build-guestinit)
 go build -o build/vmsh/vmsh ./cmd/vmsh
 ./build/vmsh/vmsh -ccvm /path/to/ccvm
 ```
