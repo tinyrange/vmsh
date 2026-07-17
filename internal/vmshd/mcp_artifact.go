@@ -339,7 +339,7 @@ func validateMCPArchive(data []byte) error {
 			return fmt.Errorf("unsafe archive entry path %q", header.Name)
 		}
 		switch header.Typeflag {
-		case tar.TypeReg, tar.TypeRegA, tar.TypeDir:
+		case tar.TypeReg, tar.TypeDir:
 		case tar.TypeSymlink:
 			if header.Linkname == "" {
 				return fmt.Errorf("archive symlink %q has an empty target", header.Name)
