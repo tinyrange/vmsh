@@ -86,14 +86,14 @@ func (e *mcpEndpoint) runVM(ctx context.Context, _ *mcp.CallToolRequest, in mcpR
 	}
 	select {
 	case <-command.done:
-		return nil, command.snapshot(0, 0, mcpMaxOutputChunk), nil
+		return nil, command.snapshot(0, 0, mcpMaxOutputChunk, true), nil
 	case <-ctx.Done():
 		command.requestCancel()
 		select {
 		case <-command.done:
 		case <-time.After(3 * time.Second):
 		}
-		return nil, command.snapshot(0, 0, mcpMaxOutputChunk), ctx.Err()
+		return nil, command.snapshot(0, 0, mcpMaxOutputChunk, true), ctx.Err()
 	}
 }
 
@@ -102,7 +102,7 @@ func (e *mcpEndpoint) startVMCommand(_ context.Context, _ *mcp.CallToolRequest, 
 	if err != nil {
 		return nil, mcpCommandOutput{}, err
 	}
-	return nil, command.snapshot(0, 0, mcpDefaultOutputChunk), nil
+	return nil, command.snapshot(0, 0, mcpDefaultOutputChunk, false), nil
 }
 
 type mcpCommandStatusInput struct {
@@ -124,7 +124,7 @@ func (e *mcpEndpoint) statusVMCommand(_ context.Context, _ *mcp.CallToolRequest,
 	if in.StdoutOffset < 0 || in.StderrOffset < 0 {
 		return nil, mcpCommandOutput{}, fmt.Errorf("output offsets must be non-negative")
 	}
-	return nil, command.snapshot(in.StdoutOffset, in.StderrOffset, maxBytes), nil
+	return nil, command.snapshot(in.StdoutOffset, in.StderrOffset, maxBytes, false), nil
 }
 
 type mcpCommandWaitInput struct {
@@ -139,6 +139,13 @@ func (e *mcpEndpoint) waitVMCommand(ctx context.Context, _ *mcp.CallToolRequest,
 	command, err := e.command(in.CommandID)
 	if err != nil {
 		return nil, mcpCommandOutput{}, err
+	}
+	maxBytes, err := mcpOutputChunkSize(in.MaxBytes)
+	if err != nil {
+		return nil, mcpCommandOutput{}, err
+	}
+	if in.StdoutOffset < 0 || in.StderrOffset < 0 {
+		return nil, mcpCommandOutput{}, fmt.Errorf("output offsets must be non-negative")
 	}
 	wait := in.WaitSeconds
 	if wait == 0 {
@@ -155,21 +162,27 @@ func (e *mcpEndpoint) waitVMCommand(ctx context.Context, _ *mcp.CallToolRequest,
 	case <-ctx.Done():
 		return nil, mcpCommandOutput{}, ctx.Err()
 	}
-	maxBytes, err := mcpOutputChunkSize(in.MaxBytes)
-	if err != nil {
-		return nil, mcpCommandOutput{}, err
-	}
-	return nil, command.snapshot(in.StdoutOffset, in.StderrOffset, maxBytes), nil
+	return nil, command.snapshot(in.StdoutOffset, in.StderrOffset, maxBytes, false), nil
 }
 
 type mcpCommandCancelInput struct {
-	CommandID string `json:"command_id" jsonschema:"ID returned by vm_exec_start or vm_run"`
+	CommandID    string `json:"command_id" jsonschema:"ID returned by vm_exec_start or vm_run"`
+	StdoutOffset int64  `json:"stdout_offset,omitempty" jsonschema:"next stdout byte offset previously returned"`
+	StderrOffset int64  `json:"stderr_offset,omitempty" jsonschema:"next stderr byte offset previously returned"`
+	MaxBytes     int    `json:"max_bytes,omitempty" jsonschema:"maximum bytes returned per stream"`
 }
 
 func (e *mcpEndpoint) cancelVMCommand(ctx context.Context, _ *mcp.CallToolRequest, in mcpCommandCancelInput) (*mcp.CallToolResult, mcpCommandOutput, error) {
 	command, err := e.command(in.CommandID)
 	if err != nil {
 		return nil, mcpCommandOutput{}, err
+	}
+	maxBytes, err := mcpOutputChunkSize(in.MaxBytes)
+	if err != nil {
+		return nil, mcpCommandOutput{}, err
+	}
+	if in.StdoutOffset < 0 || in.StderrOffset < 0 {
+		return nil, mcpCommandOutput{}, fmt.Errorf("output offsets must be non-negative")
 	}
 	command.requestCancel()
 	timer := time.NewTimer(3 * time.Second)
@@ -180,7 +193,7 @@ func (e *mcpEndpoint) cancelVMCommand(ctx context.Context, _ *mcp.CallToolReques
 	case <-ctx.Done():
 		return nil, mcpCommandOutput{}, ctx.Err()
 	}
-	return nil, command.snapshot(0, 0, mcpDefaultOutputChunk), nil
+	return nil, command.snapshot(in.StdoutOffset, in.StderrOffset, maxBytes, false), nil
 }
 
 func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
@@ -324,7 +337,7 @@ func (c *mcpCommand) requestCancel() {
 	c.mu.Unlock()
 }
 
-func (c *mcpCommand) snapshot(stdoutOffset, stderrOffset int64, maxBytes int) mcpCommandOutput {
+func (c *mcpCommand) snapshot(stdoutOffset, stderrOffset int64, maxBytes int, includeCombined bool) mcpCommandOutput {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	stdout := commandOutputChunk(c.stdout, c.stdoutTotal, c.stdoutTruncated, stdoutOffset, maxBytes)
@@ -333,13 +346,15 @@ func (c *mcpCommand) snapshot(stdoutOffset, stderrOffset int64, maxBytes int) mc
 		CommandID: c.id, VMID: c.vmID, Status: c.status, ExitCode: cloneInt(c.exitCode), Stdout: stdout, Stderr: stderr,
 		Error: c.err, StartedAt: c.startedAt, FinishedAt: cloneTime(c.finishedAt),
 	}
-	combined := make([]byte, 0, len(c.stdout)+len(c.stderr))
-	combined = append(combined, c.stdout...)
-	combined = append(combined, c.stderr...)
-	if utf8.Valid(combined) {
-		out.Output = string(combined)
-	} else if len(combined) > 0 {
-		out.OutputBase64 = base64.StdEncoding.EncodeToString(combined)
+	if includeCombined {
+		combined := make([]byte, 0, len(c.stdout)+len(c.stderr))
+		combined = append(combined, c.stdout...)
+		combined = append(combined, c.stderr...)
+		if utf8.Valid(combined) {
+			out.Output = string(combined)
+		} else if len(combined) > 0 {
+			out.OutputBase64 = base64.StdEncoding.EncodeToString(combined)
+		}
 	}
 	return out
 }
@@ -358,6 +373,9 @@ func appendCommandOutput(dst []byte, total int64, truncated bool, data []byte) (
 }
 
 func commandOutputChunk(data []byte, total int64, truncated bool, offset int64, maxBytes int) mcpOutputChunk {
+	if offset < 0 {
+		offset = 0
+	}
 	if offset > int64(len(data)) {
 		offset = int64(len(data))
 	}

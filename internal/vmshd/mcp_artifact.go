@@ -1,10 +1,14 @@
 package vmshd
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -17,7 +21,11 @@ const (
 	mcpMaxArtifacts          = 64
 	mcpMaxArtifactBytes      = 64 << 20
 	mcpMaxArtifactTotalBytes = 256 << 20
-	mcpArtifactInputChunk    = 256 << 10
+	// Keep each base64-encoded control message below the guest vsock receive
+	// window. WriteFull can span the window, but a message larger than it can
+	// deadlock with the guest waiting for the remainder before decoding JSON.
+	mcpArtifactInputChunk = 32 << 10
+	mcpArtifactTimeout    = 2 * time.Minute
 )
 
 type mcpArtifact struct {
@@ -181,13 +189,20 @@ func (e *mcpEndpoint) deleteArtifact(_ context.Context, _ *mcp.CallToolRequest, 
 }
 
 func (e *mcpEndpoint) archiveGuestPath(ctx context.Context, vmID, path, user string) ([]byte, error) {
+	opCtx, cancel := context.WithTimeout(ctx, mcpArtifactTimeout)
+	defer cancel()
 	data := make([]byte, 0, 1<<20)
 	exitSeen := false
 	exitCode := 0
 	var eventErr string
-	err := e.control.ExecStreamInContext(ctx, vmID, client.ExecRequest{Kind: "fs_archive", Path: path, User: user}, nil, func(event client.ExecEvent) error {
+	var stderr []byte
+	err := e.control.ExecStreamInContext(opCtx, vmID, client.ExecRequest{Kind: "fs_archive", Path: path, User: user}, nil, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stdout", "output":
+			if event.Stream == "stderr" {
+				stderr = appendArtifactDiagnostic(stderr, event.Data, event.Output)
+				return nil
+			}
 			chunk := event.Data
 			if len(chunk) == 0 && event.Output != "" {
 				chunk = []byte(event.Output)
@@ -196,6 +211,8 @@ func (e *mcpEndpoint) archiveGuestPath(ctx context.Context, vmID, path, user str
 				return fmt.Errorf("artifact exceeds the %d MiB MCP limit", mcpMaxArtifactBytes>>20)
 			}
 			data = append(data, chunk...)
+		case "stderr":
+			stderr = appendArtifactDiagnostic(stderr, event.Data, event.Output)
 		case "error":
 			eventErr = firstNonEmpty(event.Error, event.Output, "guest archive failed")
 		case "exit":
@@ -204,19 +221,27 @@ func (e *mcpEndpoint) archiveGuestPath(ctx context.Context, vmID, path, user str
 		}
 		return nil
 	})
-	if err != nil {
+	if err != nil && !exitSeen {
 		return nil, fmt.Errorf("archive guest path: %s", conciseCommandError(err))
 	}
 	if eventErr != "" {
 		return nil, fmt.Errorf("archive guest path: %s", eventErr)
 	}
 	if !exitSeen || exitCode != 0 {
-		return nil, fmt.Errorf("archive guest path exited with status %d", exitCode)
+		return nil, artifactExitError("archive guest path", exitCode, stderr)
+	}
+	if err := validateMCPArchive(data); err != nil {
+		return nil, fmt.Errorf("archive guest path: %w", err)
 	}
 	return data, nil
 }
 
 func (e *mcpEndpoint) extractGuestArchive(ctx context.Context, vmID, path string, directory bool, user string, data []byte) error {
+	if err := validateMCPArchive(data); err != nil {
+		return fmt.Errorf("extract guest archive: %w", err)
+	}
+	opCtx, cancel := context.WithTimeout(ctx, mcpArtifactTimeout)
+	defer cancel()
 	inputs := make(chan client.ExecInput, 4)
 	go func() {
 		defer close(inputs)
@@ -227,7 +252,7 @@ func (e *mcpEndpoint) extractGuestArchive(ctx context.Context, vmID, path string
 			}
 			select {
 			case inputs <- client.ExecInput{Kind: "stdin", Data: data[offset:end]}:
-			case <-ctx.Done():
+			case <-opCtx.Done():
 				return
 			}
 		}
@@ -235,11 +260,18 @@ func (e *mcpEndpoint) extractGuestArchive(ctx context.Context, vmID, path string
 	exitSeen := false
 	exitCode := 0
 	var eventErr string
-	err := e.control.ExecStreamInContext(ctx, vmID, client.ExecRequest{
+	var stderr []byte
+	err := e.control.ExecStreamInContext(opCtx, vmID, client.ExecRequest{
 		Kind: "fs_extract", Path: path, Directory: directory, User: user,
-		ArchiveLimits: &client.ArchiveLimits{MaxEntries: 100000, MaxFileBytes: mcpMaxArtifactBytes, MaxExpandedBytes: mcpMaxArtifactBytes * 4},
+		ArchiveLimits: &client.ArchiveLimits{MaxEntries: 100000, MaxFileBytes: mcpMaxArtifactBytes, MaxExpandedBytes: mcpMaxArtifactBytes * 4, TimeoutSeconds: mcpArtifactTimeout.Seconds()},
 	}, inputs, func(event client.ExecEvent) error {
 		switch event.Kind {
+		case "stderr":
+			stderr = appendArtifactDiagnostic(stderr, event.Data, event.Output)
+		case "output":
+			if event.Stream == "stderr" {
+				stderr = appendArtifactDiagnostic(stderr, event.Data, event.Output)
+			}
 		case "error":
 			eventErr = firstNonEmpty(event.Error, event.Output, "guest extract failed")
 		case "exit":
@@ -248,16 +280,96 @@ func (e *mcpEndpoint) extractGuestArchive(ctx context.Context, vmID, path string
 		}
 		return nil
 	})
-	if err != nil {
+	if err != nil && !exitSeen {
 		return fmt.Errorf("extract guest archive: %s", conciseCommandError(err))
 	}
 	if eventErr != "" {
 		return fmt.Errorf("extract guest archive: %s", eventErr)
 	}
 	if !exitSeen || exitCode != 0 {
-		return fmt.Errorf("extract guest archive exited with status %d", exitCode)
+		return artifactExitError("extract guest archive", exitCode, stderr)
 	}
 	return nil
+}
+
+const mcpMaxArtifactDiagnosticBytes = 16 << 10
+
+func appendArtifactDiagnostic(dst, data []byte, fallback string) []byte {
+	if len(data) == 0 && fallback != "" {
+		data = []byte(fallback)
+	}
+	remaining := mcpMaxArtifactDiagnosticBytes - len(dst)
+	if remaining <= 0 {
+		return dst
+	}
+	if len(data) > remaining {
+		data = data[:remaining]
+	}
+	return append(dst, data...)
+}
+
+func artifactExitError(operation string, exitCode int, stderr []byte) error {
+	diagnostic := strings.TrimSpace(string(stderr))
+	if diagnostic == "" {
+		return fmt.Errorf("%s exited with status %d", operation, exitCode)
+	}
+	return fmt.Errorf("%s exited with status %d: %s", operation, exitCode, diagnostic)
+}
+
+func validateMCPArchive(data []byte) error {
+	tr := tar.NewReader(bytes.NewReader(data))
+	entries := 0
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			if entries == 0 {
+				return fmt.Errorf("archive is empty")
+			}
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read archive: %w", err)
+		}
+		entries++
+		if path.IsAbs(header.Name) {
+			return fmt.Errorf("unsafe absolute archive entry path %q", header.Name)
+		}
+		name := path.Clean(strings.TrimPrefix(header.Name, "/"))
+		if name == "." || name == ".." || strings.HasPrefix(name, "../") {
+			return fmt.Errorf("unsafe archive entry path %q", header.Name)
+		}
+		switch header.Typeflag {
+		case tar.TypeReg, tar.TypeRegA, tar.TypeDir:
+		case tar.TypeSymlink:
+			if header.Linkname == "" {
+				return fmt.Errorf("archive symlink %q has an empty target", header.Name)
+			}
+			if path.IsAbs(header.Linkname) {
+				return fmt.Errorf("archive symlink %q has absolute target %q", header.Name, header.Linkname)
+			}
+			resolved := path.Clean(path.Join(path.Dir(name), header.Linkname))
+			if resolved == ".." || strings.HasPrefix(resolved, "../") {
+				return fmt.Errorf("archive symlink %q escapes through target %q", header.Name, header.Linkname)
+			}
+		default:
+			return fmt.Errorf("unsupported archive entry %q (%s)", header.Name, tarEntryTypeName(header.Typeflag))
+		}
+	}
+}
+
+func tarEntryTypeName(typeflag byte) string {
+	switch typeflag {
+	case tar.TypeLink:
+		return "hard link"
+	case tar.TypeChar:
+		return "character device"
+	case tar.TypeBlock:
+		return "block device"
+	case tar.TypeFifo:
+		return "FIFO"
+	default:
+		return fmt.Sprintf("type %d", typeflag)
+	}
 }
 
 func (e *mcpEndpoint) storeArtifact(name, sourceVM, source string, data []byte) (mcpArtifact, error) {

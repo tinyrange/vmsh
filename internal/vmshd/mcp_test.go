@@ -1,9 +1,11 @@
 package vmshd
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -293,9 +295,25 @@ func TestMCPAsyncCommandSeparatesOutputAndCancels(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-command.done
-	result := command.snapshot(0, 0, 1024)
+	result := command.snapshot(0, 0, 1024, false)
 	if result.Status != "exited" || result.ExitCode == nil || *result.ExitCode != 3 || result.Stdout.Text != "out\n" || result.Stderr.Text != "err\n" {
 		t.Fatalf("command result = %#v", result)
+	}
+	if result.Output != "" || result.OutputBase64 != "" {
+		t.Fatalf("paginated command result duplicated output: %#v", result)
+	}
+	paged := command.snapshot(1, 0, 2, false)
+	if paged.Stdout.Text != "ut" || paged.Stdout.NextOffset != 3 || paged.Stdout.TotalBytes != 4 || paged.Output != "" {
+		t.Fatalf("paged command result = %#v", paged)
+	}
+	_, canceledPage, err := endpoint.cancelVMCommand(t.Context(), nil, mcpCommandCancelInput{
+		CommandID: command.id, StdoutOffset: 1, MaxBytes: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canceledPage.Stdout.Text != "ut" || canceledPage.Output != "" || canceledPage.OutputBase64 != "" {
+		t.Fatalf("cancel page = %#v", canceledPage)
 	}
 
 	blocked, err := endpoint.startCommand(mcpRunVMInput{VMID: "owned", Command: []string{"block"}})
@@ -308,7 +326,7 @@ func TestMCPAsyncCommandSeparatesOutputAndCancels(t *testing.T) {
 		t.Fatal("blocking command did not stream its first output")
 	}
 	deadline := time.Now().Add(time.Second)
-	for blocked.snapshot(0, 0, 1024).Stdout.Text != "ready\n" && time.Now().Before(deadline) {
+	for blocked.snapshot(0, 0, 1024, false).Stdout.Text != "ready\n" && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	blocked.requestCancel()
@@ -317,15 +335,16 @@ func TestMCPAsyncCommandSeparatesOutputAndCancels(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("canceled command was not reaped")
 	}
-	canceled := blocked.snapshot(0, 0, 1024)
+	canceled := blocked.snapshot(0, 0, 1024, false)
 	if canceled.Status != "canceled" || canceled.ExitCode == nil || *canceled.ExitCode != 130 || canceled.Stdout.Text != "ready\n" {
 		t.Fatalf("canceled command result = %#v", canceled)
 	}
 }
 
 func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
-	archive := []byte{0x00, 0xff, 't', 'a', 'r'}
+	archive := testMCPArchive(t, "payload.bin", bytes.Repeat([]byte{0x00, 0xff, 't', 'a', 'r'}, 20<<10))
 	var extracted []byte
+	var largestInput int
 	var shellExported bool
 	mux := http.NewServeMux()
 	streamHandler := websocket.Handler(func(ws *websocket.Conn) {
@@ -336,7 +355,18 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 		}
 		switch req.Kind {
 		case "fs_archive":
-			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: archive})
+			var input client.ExecInput
+			if err := websocket.JSON.Receive(ws, &input); err != nil || input.Kind != "stdin_close" {
+				t.Errorf("archive stdin close = %#v, %v", input, err)
+				return
+			}
+			for offset := 0; offset < len(archive); offset += 16 << 10 {
+				end := offset + 16<<10
+				if end > len(archive) {
+					end = len(archive)
+				}
+				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: archive[offset:end]})
+			}
 			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 0})
 			return
 		case "fs_extract":
@@ -347,6 +377,9 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 				}
 				if input.Kind == "stdin_close" {
 					break
+				}
+				if len(input.Data) > largestInput {
+					largestInput = len(input.Data)
 				}
 				extracted = append(extracted, input.Data...)
 			}
@@ -407,7 +440,10 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 		t.Fatalf("import artifact: %v", err)
 	}
 	if !bytes.Equal(extracted, archive) {
-		t.Fatalf("extracted archive = %x, want %x", extracted, archive)
+		t.Fatalf("extracted archive size = %d, want %d", len(extracted), len(archive))
+	}
+	if largestInput > mcpArtifactInputChunk {
+		t.Fatalf("largest artifact input = %d, want at most %d", largestInput, mcpArtifactInputChunk)
 	}
 
 	_, opened, err := endpoint.openGuestContext(context.Background(), nil, mcpContextOpenInput{VMID: "one"})
@@ -421,7 +457,7 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read context state: %v", err)
 	}
-	if result.Stdout != "42" || result.Stderr != "problem" || result.ExitCode != 0 {
+	if result.Stdout != "42" || result.Stderr != "problem" || result.ExitCode != 0 || result.CommandStatus != "exited" || result.ContextStatus != "running" {
 		t.Fatalf("context result = %#v", result)
 	}
 	if _, _, err := endpoint.openGuestContext(context.Background(), nil, mcpContextOpenInput{VMID: "foreign"}); err == nil {
@@ -430,6 +466,126 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 	if _, _, err := endpoint.closeGuestContext(context.Background(), nil, mcpContextStatusInput{ContextID: opened.ContextID}); err != nil {
 		t.Fatalf("close context: %v", err)
 	}
+}
+
+func TestMCPArchiveRejectsUnsupportedEntriesBeforeImport(t *testing.T) {
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	if err := tw.WriteHeader(&tar.Header{Name: "project", Typeflag: tar.TypeDir, Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "project/pipe", Typeflag: tar.TypeFifo, Mode: 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	err := validateMCPArchive(archive.Bytes())
+	if err == nil || err.Error() != `unsupported archive entry "project/pipe" (FIFO)` {
+		t.Fatalf("archive validation error = %v", err)
+	}
+}
+
+func TestMCPFailedSpecialFileCopyLeavesLifecycleResponsive(t *testing.T) {
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	if err := tw.WriteHeader(&tar.Header{Name: "project", Typeflag: tar.TypeDir, Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "project/pipe", Typeflag: tar.TypeFifo, Mode: 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var extractCalls int
+	control := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		defer ws.Close()
+		var req client.ExecRequest
+		if err := websocket.JSON.Receive(ws, &req); err != nil {
+			return
+		}
+		switch req.Kind {
+		case "fs_archive":
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: archive.Bytes()})
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 0})
+		case "fs_extract":
+			extractCalls++
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte("unexpected extract")})
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 1})
+		}
+	}))
+	defer control.Close()
+	endpoint := &mcpEndpoint{
+		control: client.NewClient(control.URL, nil),
+		vms: map[string]mcpVM{
+			"source":      {ID: "source"},
+			"destination": {ID: "destination"},
+		},
+		commands: make(map[string]*mcpCommand), artifacts: make(map[string]*mcpArtifact), contexts: make(map[string]*mcpGuestContext),
+	}
+
+	if _, _, err := endpoint.copyGuestPath(t.Context(), nil, mcpCopyInput{
+		SourceVM: "source", SourcePath: "/project", DestinationVM: "destination", DestinationPath: "/project",
+	}); err == nil || err.Error() != `archive guest path: unsupported archive entry "project/pipe" (FIFO)` {
+		t.Fatalf("copy error = %v", err)
+	}
+	if extractCalls != 0 {
+		t.Fatalf("destination extraction started %d time(s)", extractCalls)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, listed, err := endpoint.listVMs(t.Context(), nil, mcpListVMsInput{})
+		if err == nil && len(listed.VMs) != 2 {
+			err = fmt.Errorf("listed VMs = %#v", listed.VMs)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("VM lifecycle remained blocked after failed copy")
+	}
+}
+
+func TestMCPExtractErrorIncludesGuestDiagnostic(t *testing.T) {
+	archive := testMCPArchive(t, "payload", []byte("data"))
+	control := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		defer ws.Close()
+		var req client.ExecRequest
+		if err := websocket.JSON.Receive(ws, &req); err != nil {
+			return
+		}
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte("copy conflict at /work/payload")})
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 1})
+	}))
+	defer control.Close()
+	endpoint := &mcpEndpoint{control: client.NewClient(control.URL, nil)}
+	err := endpoint.extractGuestArchive(t.Context(), "destination", "/work", true, "1000:1000", archive)
+	if err == nil || err.Error() != "extract guest archive exited with status 1: copy conflict at /work/payload" {
+		t.Fatalf("extract error = %v", err)
+	}
+}
+
+func testMCPArchive(t *testing.T, name string, data []byte) []byte {
+	t.Helper()
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(data))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return archive.Bytes()
 }
 
 func TestMCPRevokedCredentialStopsAuthenticating(t *testing.T) {

@@ -95,14 +95,15 @@ type mcpContextRunInput struct {
 }
 
 type mcpContextRunOutput struct {
-	ContextID    string `json:"context_id"`
-	VMID         string `json:"vm_id"`
-	Status       string `json:"status"`
-	ExitCode     int    `json:"exit_code"`
-	Stdout       string `json:"stdout,omitempty"`
-	StdoutBase64 string `json:"stdout_base64,omitempty"`
-	Stderr       string `json:"stderr,omitempty"`
-	StderrBase64 string `json:"stderr_base64,omitempty"`
+	ContextID     string `json:"context_id"`
+	VMID          string `json:"vm_id"`
+	ContextStatus string `json:"context_status"`
+	CommandStatus string `json:"command_status"`
+	ExitCode      int    `json:"exit_code"`
+	Stdout        string `json:"stdout,omitempty"`
+	StdoutBase64  string `json:"stdout_base64,omitempty"`
+	Stderr        string `json:"stderr,omitempty"`
+	StderrBase64  string `json:"stderr_base64,omitempty"`
 }
 
 func (e *mcpEndpoint) runGuestContext(ctx context.Context, _ *mcp.CallToolRequest, in mcpContextRunInput) (*mcp.CallToolResult, mcpContextRunOutput, error) {
@@ -139,11 +140,11 @@ func (e *mcpEndpoint) runGuestContext(ctx context.Context, _ *mcp.CallToolReques
 				status = "timed_out"
 				exitCode = 124
 			}
-			return nil, mcpContextRunOutput{ContextID: guest.id, VMID: guest.vmID, Status: status, ExitCode: exitCode}, nil
+			return nil, mcpContextRunOutput{ContextID: guest.id, VMID: guest.vmID, ContextStatus: "closed", CommandStatus: status, ExitCode: exitCode}, nil
 		}
 		return nil, mcpContextRunOutput{}, err
 	}
-	out := mcpContextRunOutput{ContextID: guest.id, VMID: guest.vmID, Status: "exited", ExitCode: result.exitCode}
+	out := mcpContextRunOutput{ContextID: guest.id, VMID: guest.vmID, ContextStatus: "running", CommandStatus: "exited", ExitCode: result.exitCode}
 	encodeContextOutput(result.stdout, &out.Stdout, &out.StdoutBase64)
 	encodeContextOutput(result.stderr, &out.Stderr, &out.StderrBase64)
 	return nil, out, nil
