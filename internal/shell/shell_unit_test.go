@@ -1465,6 +1465,56 @@ func TestPersistentShellPreludesPrefixEvalArgument(t *testing.T) {
 	}
 }
 
+func TestCodexMCPLaunchKeepsCredentialOutOfArguments(t *testing.T) {
+	const token = "child-secret-token"
+	args, env := codexMCPLaunch("http://127.0.0.1:4321/mcp", token, []string{"--model", "gpt-5"})
+	if strings.Contains(strings.Join(args, "\x00"), token) {
+		t.Fatal("MCP credential leaked into Codex arguments")
+	}
+	if !slices.Equal(args[len(args)-2:], []string{"--model", "gpt-5"}) {
+		t.Fatalf("Codex user arguments = %q", args)
+	}
+	if !slices.Equal(env, []string{mcpCodexTokenEnv + "=" + token}) {
+		t.Fatalf("Codex MCP environment = %q", env)
+	}
+	joined := strings.Join(args, "\n")
+	if !strings.Contains(joined, `mcp_servers.vmsh.url="http://127.0.0.1:4321/mcp"`) ||
+		!strings.Contains(joined, `mcp_servers.vmsh.bearer_token_env_var="VMSH_MCP_TOKEN"`) {
+		t.Fatalf("Codex MCP arguments = %q", args)
+	}
+	if !slices.Contains(args, `mcp_servers.vmsh.default_tools_approval_mode="approve"`) {
+		t.Fatalf("Codex MCP tools are not configured for approval: %q", args)
+	}
+	if !slices.Contains(args, "mcp_servers.vmsh.tool_timeout_sec=86400") {
+		t.Fatalf("Codex MCP tools do not allow long-running guest work: %q", args)
+	}
+}
+
+func TestHostProgramPreservesTerminalThroughRecorder(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host PTYs are unavailable on Windows")
+	}
+	master, slave, err := pty.Open()
+	if err != nil {
+		t.Fatalf("open outer PTY: %v", err)
+	}
+	defer master.Close()
+	defer slave.Close()
+	recorder, err := newAsciinemaRecorder("", filepath.Join(t.TempDir(), "session.raw.jsonl"), 80, 24)
+	if err != nil {
+		t.Fatalf("create recorder: %v", err)
+	}
+	defer recorder.Close()
+	output := newRecordingTerminalWriter(slave, recorder)
+	sh := newUnitShell(t, newRecordingShellAPI())
+	if err := sh.runHostProgram([]string{"sh", "-c", "test -t 0 && test -t 1 && test -t 2"}, nil, output, output); err != nil {
+		t.Fatalf("run terminal-aware host program: %v", err)
+	}
+	if sh.lastCode != 0 {
+		t.Fatalf("terminal-aware host program exit code = %d, want 0", sh.lastCode)
+	}
+}
+
 func TestPersistentShellCommandAllowedRejectsLeadingDashCommand(t *testing.T) {
 	if persistentShellCommandAllowed("-la") {
 		t.Fatal("leading-dash command should not use persistent shell")

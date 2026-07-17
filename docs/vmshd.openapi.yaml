@@ -70,6 +70,8 @@ tags:
     description: Terminal WebSocket stream.
   - name: Jobs
     description: Daemon-owned background jobs.
+  - name: MCP
+    description: Session-scoped MCP endpoints with isolated VM authority.
   - name: Events
     description: NDJSON event stream.
   - name: Trust
@@ -359,6 +361,102 @@ paths:
                 $ref: "#/components/schemas/Session"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /vmsh/sessions/{session_id}/mcp:
+    get:
+      tags: [MCP]
+      summary: Return the session MCP endpoint status.
+      x-vmsh-status: current
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      responses:
+        "200":
+          description: Running MCP endpoint.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MCPEndpointInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [MCP]
+      summary: Start or reuse the session MCP endpoint.
+      description: |
+        The endpoint listens on an operating-system-selected loopback port. It
+        exposes only regular vmsh isolated VM creation, command execution,
+        listing, and stop tools. These VMs use the same `-isolated` backend
+        identity and network policy as `@name --from IMAGE --isolated`. Guests
+        may reach the internet, but host access, host shares, and port forwards
+        are deliberately unavailable to MCP clients.
+      x-vmsh-status: current
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      responses:
+        "200":
+          description: Running MCP endpoint.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MCPEndpointInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [MCP]
+      summary: Stop the MCP endpoint and its isolated VMs.
+      x-vmsh-status: current
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      responses:
+        "200":
+          description: Endpoint stopped.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /vmsh/sessions/{session_id}/mcp/credentials:
+    post:
+      tags: [MCP]
+      summary: Mint a revocable child credential for the session MCP endpoint.
+      x-vmsh-status: current
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      responses:
+        "200":
+          description: Child credential. The token must not be logged or persisted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MCPCredential"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /vmsh/sessions/{session_id}/mcp/credentials/{credential_id}:
+    delete:
+      tags: [MCP]
+      summary: Revoke an MCP child credential.
+      x-vmsh-status: current
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+        - name: credential_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Credential revoked.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -995,6 +1093,29 @@ components:
       properties:
         scope:
           $ref: "#/components/schemas/SessionScope"
+    MCPEndpointInfo:
+      type: object
+      additionalProperties: false
+      required: [url, vms, created_at]
+      properties:
+        url:
+          type: string
+          format: uri
+        vms:
+          type: integer
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+    MCPCredential:
+      type: object
+      additionalProperties: false
+      required: [id, token]
+      properties:
+        id:
+          type: string
+        token:
+          type: string
     Session:
       allOf:
         - $ref: "#/components/schemas/SessionSummary"

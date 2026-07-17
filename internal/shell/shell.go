@@ -34,6 +34,7 @@ import (
 	"github.com/tinyrange/vmsh/internal/terminal"
 	"github.com/tinyrange/vmsh/internal/termui/editor"
 	"github.com/tinyrange/vmsh/internal/version"
+	"github.com/tinyrange/vmsh/internal/vmconfig"
 	"github.com/tinyrange/vmsh/internal/vmshd"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
@@ -41,7 +42,7 @@ import (
 )
 
 const guestHostMount = "/host"
-const isolatedVMSuffix = "-isolated"
+const isolatedVMSuffix = vmconfig.IsolatedVMSuffix
 const defaultGuestUser = "1000:1000"
 const defaultVMSHBootTimeoutSeconds = 60
 const defaultBuiltInBSDBootTimeoutSeconds = 180
@@ -381,7 +382,7 @@ func (c *vmshCompleter) shellSSHSessionContext(name string) (commandContext, boo
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@agent", "@alias", "@connect", "@copy", "@detach", "@exec", "@help", "@host", "@install", "@jobs", "@mux", "@permissions", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux", "@trust", "@version"}
+	words := []string{"@agent", "@alias", "@connect", "@copy", "@detach", "@exec", "@help", "@host", "@install", "@jobs", "@mcp", "@mux", "@permissions", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux", "@trust", "@version"}
 	if c.shell != nil {
 		for _, name := range c.shell.sshSessionNames() {
 			words = append(words, "@"+name)
@@ -3388,6 +3389,11 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("usage: @sessions")
 		}
 		return s.printSessions(stdout)
+	case "mcp":
+		if len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @mcp [status|stop|codex [-- args]]")
+		}
+		return s.runMCP(at.Command, stdout, stderr)
 	case "detach":
 		if at.Command != "" || len(at.Options.OptionFields) != 0 {
 			return fmt.Errorf("usage: @detach")
@@ -3637,6 +3643,196 @@ func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 		return nil
 	}
 	interrupts := newCommandInterruptEscalator(line, stderr, func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+	}, func() {
+		_ = cmd.Process.Kill()
+	})
+	stopInterrupts, interrupted := s.startInterruptWatcher(interrupts.Interrupt)
+	err := cmd.Wait()
+	stopInterrupts()
+	if interrupted.Load() {
+		s.lastCode = 130
+		return nil
+	}
+	s.lastCode = exitCode(err)
+	if err != nil && s.lastCode < 0 {
+		return err
+	}
+	return nil
+}
+
+const mcpCodexTokenEnv = "VMSH_MCP_TOKEN"
+
+func (s *shellState) runMCP(command string, stdout, stderr io.Writer) error {
+	if s.vmshd == nil || s.vmshd.client == nil || strings.TrimSpace(s.vmshd.sessionID) == "" {
+		return fmt.Errorf("@mcp requires a vmshd session")
+	}
+	fields, err := splitShellFields(command)
+	if err != nil {
+		return err
+	}
+	sessionID := s.vmshd.sessionID
+	if len(fields) == 0 {
+		info, err := s.vmshd.client.StartMCP(sessionID)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(stdout, "MCP endpoint ready at %s (%d VMs)\n", info.URL, info.VMs)
+		return err
+	}
+	switch fields[0] {
+	case "status":
+		if len(fields) != 1 {
+			return fmt.Errorf("usage: @mcp status")
+		}
+		info, err := s.vmshd.client.MCPStatus(sessionID)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(stdout, "MCP endpoint running at %s (%d VMs)\n", info.URL, info.VMs)
+		return err
+	case "stop":
+		if len(fields) != 1 {
+			return fmt.Errorf("usage: @mcp stop")
+		}
+		if err := s.vmshd.client.StopMCP(sessionID); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintln(stdout, "MCP endpoint stopped")
+		return err
+	case "codex":
+		args := fields[1:]
+		if len(args) > 0 && args[0] == "--" {
+			args = args[1:]
+		}
+		info, err := s.vmshd.client.StartMCP(sessionID)
+		if err != nil {
+			return err
+		}
+		credential, err := s.vmshd.client.MintMCPCredential(sessionID)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = s.vmshd.client.RevokeMCPCredential(sessionID, credential.ID) }()
+		argv, env := codexMCPLaunch(info.URL, credential.Token, args)
+		return s.runHostProgram(argv, env, stdout, stderr)
+	default:
+		return fmt.Errorf("usage: @mcp [status|stop|codex [-- args]]")
+	}
+}
+
+func codexMCPLaunch(endpointURL, token string, userArgs []string) ([]string, []string) {
+	argv := []string{
+		"codex",
+		"-c", "mcp_servers.vmsh.url=" + strconv.Quote(endpointURL),
+		"-c", "mcp_servers.vmsh.bearer_token_env_var=" + strconv.Quote(mcpCodexTokenEnv),
+		"-c", "mcp_servers.vmsh.required=true",
+		"-c", "mcp_servers.vmsh.default_tools_approval_mode=\"approve\"",
+		"-c", "mcp_servers.vmsh.tool_timeout_sec=86400",
+	}
+	argv = append(argv, userArgs...)
+	return argv, []string{mcpCodexTokenEnv + "=" + token}
+}
+
+func (s *shellState) runHostProgram(argv, extraEnv []string, stdout, stderr io.Writer) error {
+	if len(argv) == 0 || strings.TrimSpace(argv[0]) == "" {
+		return fmt.Errorf("host program is required")
+	}
+	tty, cols, rows := terminalRequestSize(stdout)
+	termEnv := []string(nil)
+	if tty {
+		termEnv = terminalEnv(cols, rows)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Dir = s.hostCWD
+	cmd.Stdin = os.Stdin
+	cmd.Env = mergedEnv(hostCommandEnv(s.env, termEnv), extraEnv)
+	if tty && runtime.GOOS != "windows" {
+		return s.runHostProgramPTY(cmd, cols, rows, stdout, stderr, argv)
+	}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	// os/exec replaces non-file writers with pipes. On platforms where vmsh's
+	// PTY support is unavailable, preserve terminal identity through wrappers
+	// such as the session recorder even though their output cannot be observed.
+	if tty {
+		if file, ok := terminalWriterFile(stdout); ok {
+			cmd.Stdout = file
+		}
+		if file, ok := terminalWriterFile(stderr); ok {
+			cmd.Stderr = file
+		}
+	}
+	return s.waitHostProgram(cmd, argv, stderr)
+}
+
+func (s *shellState) runHostProgramPTY(cmd *exec.Cmd, cols, rows int, stdout, stderr io.Writer, argv []string) error {
+	winsize, err := hostPTYWinsize(cols, rows)
+	if err != nil {
+		return err
+	}
+	// pty.StartWithSize only installs the slave for nil streams. In particular,
+	// stdin must be replaced so the child can make the slave its controlling TTY.
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	tty, err := pty.StartWithSize(cmd, winsize)
+	if err != nil {
+		return err
+	}
+	outputDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(stdout, tty)
+		close(outputDone)
+	}()
+	session := &persistentHostShell{tty: tty}
+	display := strings.Join(argv, " ")
+	interrupts := newCommandInterruptEscalator(display, stderr, nil, func() {
+		_ = cmd.Process.Kill()
+	})
+	stopForwarding, interrupted, err := s.startHostPTYForwarding(true, session, stdout, stderr, func(name string) bool {
+		switch name {
+		case "INT":
+			interrupts.Interrupt()
+		case "QUIT":
+			return interrupts.Force()
+		}
+		return false
+	})
+	if err != nil {
+		_ = tty.Close()
+		<-outputDone
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return err
+	}
+	err = cmd.Wait()
+	stopForwarding()
+	_ = tty.Close()
+	<-outputDone
+	if interrupted.Load() && err != nil && exitCode(err) < 0 {
+		s.lastCode = 130
+		return nil
+	}
+	s.lastCode = exitCode(err)
+	if err != nil && s.lastCode < 0 {
+		return err
+	}
+	return nil
+}
+
+func (s *shellState) waitHostProgram(cmd *exec.Cmd, argv []string, stderr io.Writer) error {
+	if cmd.Process == nil {
+		if err := cmd.Start(); err != nil {
+			s.lastCode = exitCode(err)
+			if s.lastCode < 0 {
+				return err
+			}
+			return nil
+		}
+	}
+	display := strings.Join(argv, " ")
+	interrupts := newCommandInterruptEscalator(display, stderr, func() {
 		_ = cmd.Process.Signal(os.Interrupt)
 	}, func() {
 		_ = cmd.Process.Kill()
@@ -5190,7 +5386,7 @@ func backendVMID(ctx commandContext) string {
 func backendVMIDFor(id string, isolated bool) string {
 	id = normalizedVMID(id)
 	if isolated {
-		return id + isolatedVMSuffix
+		return vmconfig.IsolatedVMID(id)
 	}
 	return id
 }
@@ -8126,11 +8322,10 @@ func defaultNetworkConfig() *client.NetworkConfig {
 }
 
 func networkConfigForContext(ctx commandContext) *client.NetworkConfig {
-	cfg := defaultNetworkConfig()
 	if ctx.Isolated {
-		cfg.BlockHostAccess = true
+		return vmconfig.IsolatedNetworkConfig()
 	}
-	return cfg
+	return defaultNetworkConfig()
 }
 
 func (s *shellState) stopVM(id string) error {
@@ -10251,6 +10446,9 @@ func (s *shellState) help(w io.Writer) error {
 @sessions                list vmshd shell sessions and resource counts
 @detach                  keep the current vmshd session after this frontend exits
 @install                 install or update the user-wide vmshd daemon copy
+@mcp                     start a session-scoped MCP endpoint for isolated VMs
+@mcp codex [-- args]     run host Codex with the MCP endpoint configured temporarily
+@mcp status|stop         inspect or stop the session MCP endpoint
 @status                  show vmsh and selected VM state
 @version                 show vmsh build metadata
 @start                   start the current VM

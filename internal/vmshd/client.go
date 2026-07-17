@@ -132,6 +132,33 @@ func (c *HTTPClient) SessionContext(ctx context.Context, id string) (Session, er
 	return session, err
 }
 
+func (c *HTTPClient) StartMCP(sessionID string) (MCPEndpointInfo, error) {
+	var info MCPEndpointInfo
+	err := c.doJSONContext(context.Background(), http.MethodPost, "/vmsh/sessions/"+url.PathEscape(sessionID)+"/mcp", nil, &info)
+	return info, err
+}
+
+func (c *HTTPClient) MCPStatus(sessionID string) (MCPEndpointInfo, error) {
+	var info MCPEndpointInfo
+	err := c.doJSONContext(context.Background(), http.MethodGet, "/vmsh/sessions/"+url.PathEscape(sessionID)+"/mcp", nil, &info)
+	return info, err
+}
+
+func (c *HTTPClient) StopMCP(sessionID string) error {
+	return c.doJSONContext(context.Background(), http.MethodDelete, "/vmsh/sessions/"+url.PathEscape(sessionID)+"/mcp", nil, nil)
+}
+
+func (c *HTTPClient) MintMCPCredential(sessionID string) (MCPCredential, error) {
+	var credential MCPCredential
+	err := c.doJSONContext(context.Background(), http.MethodPost, "/vmsh/sessions/"+url.PathEscape(sessionID)+"/mcp/credentials", nil, &credential)
+	return credential, err
+}
+
+func (c *HTTPClient) RevokeMCPCredential(sessionID, credentialID string) error {
+	path := "/vmsh/sessions/" + url.PathEscape(sessionID) + "/mcp/credentials/" + url.PathEscape(credentialID)
+	return c.doJSONContext(context.Background(), http.MethodDelete, path, nil, nil)
+}
+
 func (c *HTTPClient) UpdateSession(id string, req UpdateSessionRequest) (Session, error) {
 	return c.UpdateSessionContext(context.Background(), id, req)
 }

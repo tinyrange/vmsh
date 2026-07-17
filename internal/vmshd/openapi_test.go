@@ -36,6 +36,8 @@ func TestOpenAPIContract(t *testing.T) {
 		{name: "CreateSessionRequest", value: CreateSessionRequest{}},
 		{name: "UpdateSessionRequest", value: UpdateSessionRequest{}},
 		{name: "PersistSessionRequest", value: PersistSessionRequest{}},
+		{name: "MCPEndpointInfo", value: MCPEndpointInfo{}},
+		{name: "MCPCredential", value: MCPCredential{}},
 		{name: "Session", value: Session{}},
 		{name: "SessionSummary", value: SessionSummary{}},
 		{name: "AttachSessionRequest", value: AttachSessionRequest{}},
