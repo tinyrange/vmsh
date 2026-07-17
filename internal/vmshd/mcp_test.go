@@ -508,6 +508,11 @@ func TestMCPFailedSpecialFileCopyLeavesLifecycleResponsive(t *testing.T) {
 		}
 		switch req.Kind {
 		case "fs_archive":
+			var input client.ExecInput
+			if err := websocket.JSON.Receive(ws, &input); err != nil || input.Kind != "stdin_close" {
+				t.Errorf("archive stdin close = %#v, %v", input, err)
+				return
+			}
 			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: archive.Bytes()})
 			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 0})
 		case "fs_extract":
@@ -560,6 +565,15 @@ func TestMCPExtractErrorIncludesGuestDiagnostic(t *testing.T) {
 		var req client.ExecRequest
 		if err := websocket.JSON.Receive(ws, &req); err != nil {
 			return
+		}
+		for {
+			var input client.ExecInput
+			if err := websocket.JSON.Receive(ws, &input); err != nil {
+				return
+			}
+			if input.Kind == "stdin_close" {
+				break
+			}
 		}
 		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte("copy conflict at /work/payload")})
 		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 1})
