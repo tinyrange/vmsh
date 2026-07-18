@@ -19,15 +19,16 @@ import (
 const mcpShellEventBuffer = 256
 
 type mcpGuestContext struct {
-	id      string
-	vmID    string
-	user    string
-	workDir string
-	env     []string
-	inputs  chan client.ExecInput
-	events  chan client.ExecEvent
-	cancel  context.CancelFunc
-	done    chan struct{}
+	id          string
+	vmID        string
+	user        string
+	workDir     string
+	env         []string
+	controlPath string
+	inputs      chan client.ExecInput
+	events      chan client.ExecEvent
+	cancel      context.CancelFunc
+	done        chan struct{}
 
 	runMu    sync.Mutex
 	stopOnce sync.Once
@@ -80,7 +81,7 @@ func (e *mcpEndpoint) openGuestContext(ctx context.Context, _ *mcp.CallToolReque
 	}
 	streamCtx, cancel := context.WithCancel(context.Background())
 	guest := &mcpGuestContext{
-		id: id, vmID: vm.ID, user: user, workDir: workDir, env: append([]string(nil), in.Env...),
+		id: id, vmID: vm.ID, user: user, workDir: workDir, env: append([]string(nil), in.Env...), controlPath: "/tmp/.vmsh-" + id + ".control",
 		inputs: make(chan client.ExecInput, 16), events: make(chan client.ExecEvent, mcpShellEventBuffer), cancel: cancel, done: make(chan struct{}),
 	}
 	e.mu.Lock()
@@ -373,7 +374,7 @@ type mcpContextResult struct {
 
 func (g *mcpGuestContext) serve(ctx context.Context, control *client.Client) {
 	err := control.RunInteractiveStreamInContext(ctx, g.vmID, client.RunRequest{
-		Command: []string{"/bin/sh"}, Env: append([]string(nil), g.env...), WorkDir: g.workDir, User: g.user, ControlFD: true,
+		Command: []string{"/bin/sh", "-c", mcpContextShellScript(g.controlPath)}, Env: append([]string(nil), g.env...), WorkDir: g.workDir, User: g.user, ControlFD: true,
 	}, g.inputs, func(event client.ExecEvent) error {
 		select {
 		case g.events <- event:
@@ -398,7 +399,7 @@ func (g *mcpGuestContext) runLine(ctx context.Context, line string) (mcpContextR
 		return mcpContextResult{}, err
 	}
 	marker := []byte("\x1e" + token + ":")
-	script := mcpContextCommandScript(token, line)
+	script := mcpContextCommandScript(token, line, g.controlPath)
 	select {
 	case g.inputs <- client.ExecInput{Kind: "stdin", Data: []byte(script)}:
 	case <-g.done:
@@ -470,13 +471,36 @@ func (g *mcpGuestContext) runLine(ctx context.Context, line string) (mcpContextR
 	}
 }
 
-func mcpContextCommandScript(token, line string) string {
+func mcpContextShellScript(controlPath string) string {
+	return mcpContextShellScriptForShell(controlPath, "/bin/sh")
+}
+
+func mcpContextShellScriptForShell(controlPath, shellPath string) string {
+	path := shellJoin([]string{controlPath})
+	shell := shellJoin([]string{shellPath})
+	return "__vmsh_mcp_fifo=" + path + "\n" +
+		"umask 077\n" +
+		"rm -f \"$__vmsh_mcp_fifo\"\n" +
+		"mkfifo \"$__vmsh_mcp_fifo\" || exit 126\n" +
+		"(exec 8<>\"$__vmsh_mcp_fifo\"; while IFS= read -r __vmsh_mcp_frame <&8; do command printf '%s\\n' \"$__vmsh_mcp_frame\"; done) >&3 &\n" +
+		"__vmsh_mcp_relay=$!\n" +
+		// Keep fd 3 occupied so shells such as BusyBox ash do not reuse it as
+		// an internal script-reader descriptor. The user may freely close or
+		// replace this harmless placeholder without affecting the relay.
+		"exec 3</dev/null\n" +
+		"__vmsh_mcp_cleanup() { kill \"$__vmsh_mcp_relay\" 2>/dev/null; wait \"$__vmsh_mcp_relay\" 2>/dev/null; rm -f \"$__vmsh_mcp_fifo\"; }\n" +
+		"trap '__vmsh_mcp_cleanup; exit 143' HUP INT TERM\n" +
+		shell + "\n" +
+		"__vmsh_mcp_shell_status=$?\n" +
+		"trap - HUP INT TERM\n" +
+		"__vmsh_mcp_cleanup\n" +
+		"exit \"$__vmsh_mcp_shell_status\"\n"
+}
+
+func mcpContextCommandScript(token, line, controlPath string) string {
 	statusVar := "__vmsh_mcp_status_" + strings.TrimPrefix(token, "marker_")
-	// Preserve the protocol descriptor before evaluating user shell state.
-	// Commands may legitimately close or redirect fd 3; the saved descriptor
-	// carries the status frame and then restores fd 3 before the next prompt.
-	// Hide fd 9 while the user command runs so it cannot overwrite the backup.
-	return "exec 9>&3\nif {\n" + line + "\n} 9>&-; then\n" + statusVar + "=0\nelse\n" + statusVar + "=$?\nfi\n/usr/bin/printf '\\036" + token + ":%s\\037\\n' \"$" + statusVar + "\" >&9\nexec 3>&9 9>&-\n"
+	path := shellJoin([]string{controlPath})
+	return "if {\n" + line + "\n}; then\n" + statusVar + "=0\nelse\n" + statusVar + "=$?\nfi\n/usr/bin/printf '\\036" + token + ":%s\\037\\n' \"$" + statusVar + "\" >" + path + "\nunset " + statusVar + "\n"
 }
 
 func (g *mcpGuestContext) info() mcpContextInfo {

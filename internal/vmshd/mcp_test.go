@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -748,20 +749,40 @@ func TestMCPContextOpenReportsInvalidWorkdirWithoutWaitingForShellProbe(t *testi
 	}
 }
 
-func TestMCPContextFramingSurvivesClosingControlDescriptor(t *testing.T) {
+func TestMCPContextFramingPreservesUserDescriptors(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX shell and inherited file descriptors")
 	}
+	t.Run("system shell", func(t *testing.T) {
+		testMCPContextFramingPreservesUserDescriptors(t, "/bin/sh")
+	})
+	t.Run("BusyBox ash", func(t *testing.T) {
+		busybox, err := exec.LookPath("busybox")
+		if err != nil {
+			t.Skip("BusyBox is not installed")
+		}
+		shellPath := filepath.Join(t.TempDir(), "sh")
+		if err := os.Symlink(busybox, shellPath); err != nil {
+			t.Fatal(err)
+		}
+		testMCPContextFramingPreservesUserDescriptors(t, shellPath)
+	})
+}
+
+func testMCPContextFramingPreservesUserDescriptors(t *testing.T, shellPath string) {
+	t.Helper()
+	controlPath := filepath.Join(t.TempDir(), "context-control")
+	userFile := filepath.Join(t.TempDir(), "user-fd9")
 	controlR, controlW, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer controlR.Close()
 
-	cmd := exec.Command("/bin/sh")
+	cmd := exec.Command("/bin/sh", "-c", mcpContextShellScriptForShell(controlPath, shellPath))
 	cmd.Stdin = strings.NewReader(
-		mcpContextCommandScript("marker_first", "printf() { :; }; exec 3>&- 9>&-; echo protocol-fds-closed") +
-			mcpContextCommandScript("marker_second", "echo context-still-running"),
+		mcpContextCommandScript("marker_first", "exec 3>&-; exec 9>"+shellJoin([]string{userFile})+"; echo first >&9", controlPath) +
+			mcpContextCommandScript("marker_second", "echo second >&9; echo context-still-running", controlPath),
 	)
 	cmd.ExtraFiles = []*os.File{controlW}
 	var stdout, stderr bytes.Buffer
@@ -777,11 +798,18 @@ func TestMCPContextFramingSurvivesClosingControlDescriptor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := stdout.String(), "protocol-fds-closed\ncontext-still-running\n"; got != want {
+	if got, want := stdout.String(), "context-still-running\n"; got != want {
 		t.Fatalf("shell output = %q, want %q", got, want)
 	}
 	if got, want := string(control), "\x1emarker_first:0\x1f\n\x1emarker_second:0\x1f\n"; got != want {
 		t.Fatalf("control frames = %q, want %q", got, want)
+	}
+	userData, err := os.ReadFile(userFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(userData), "first\nsecond\n"; got != want {
+		t.Fatalf("persistent fd 9 output = %q, want %q", got, want)
 	}
 }
 
