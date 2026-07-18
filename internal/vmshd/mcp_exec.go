@@ -21,6 +21,9 @@ const (
 	mcpDefaultWaitSeconds    = 20
 	mcpMaxWaitSeconds        = 30
 	mcpMaxTimeoutSeconds     = 24 * 60 * 60
+	// Managed input is base64-encoded in JSON before crossing guest vsock. Keep
+	// the encoded frame below the guest receive window.
+	mcpStdinChunkBytes = 16 << 10
 )
 
 type mcpRunVMInput struct {
@@ -61,6 +64,8 @@ type mcpCommand struct {
 	id      string
 	vmID    string
 	request client.RunRequest
+	stdin   []byte
+	inputs  chan client.ExecInput
 	cancel  context.CancelFunc
 	done    chan struct{}
 
@@ -77,6 +82,7 @@ type mcpCommand struct {
 	startedAt       time.Time
 	finishedAt      *time.Time
 	cancelRequested bool
+	cancelOnce      sync.Once
 }
 
 func (e *mcpEndpoint) runVM(ctx context.Context, _ *mcp.CallToolRequest, in mcpRunVMInput) (*mcp.CallToolResult, mcpCommandOutput, error) {
@@ -226,7 +232,8 @@ func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	command := &mcpCommand{
 		id: commandID, vmID: id, cancel: cancel, done: make(chan struct{}), status: "running", startedAt: time.Now().UTC(),
-		request: client.RunRequest{Command: append([]string(nil), in.Command...), Env: append([]string(nil), in.Env...), WorkDir: workDir, User: user, Stdin: stdin, TimeoutSeconds: in.TimeoutSeconds},
+		request: client.RunRequest{Command: append([]string(nil), in.Command...), Env: append([]string(nil), in.Env...), WorkDir: workDir, User: user, TimeoutSeconds: in.TimeoutSeconds},
+		stdin:   stdin, inputs: make(chan client.ExecInput),
 	}
 	e.mu.Lock()
 	if e.closed {
@@ -267,10 +274,12 @@ func (e *mcpEndpoint) command(id string) (*mcpCommand, error) {
 }
 
 func (c *mcpCommand) run(ctx context.Context, control *client.Client) {
-	err := control.RunStreamInContext(ctx, c.vmID, c.request, func(event client.ExecEvent) error {
+	onEvent := func(event client.ExecEvent) error {
 		c.accept(event)
 		return nil
-	})
+	}
+	go streamMCPCommandStdin(ctx, c.inputs, c.stdin)
+	err := control.RunInteractiveStreamInContext(ctx, c.vmID, c.request, c.inputs, onEvent)
 	now := time.Now().UTC()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -300,6 +309,26 @@ func (c *mcpCommand) run(ctx context.Context, control *client.Client) {
 		return
 	}
 	c.status = "exited"
+}
+
+func streamMCPCommandStdin(ctx context.Context, inputs chan<- client.ExecInput, stdin []byte) {
+	for len(stdin) > 0 {
+		n := len(stdin)
+		if n > mcpStdinChunkBytes {
+			n = mcpStdinChunkBytes
+		}
+		chunk := append([]byte(nil), stdin[:n]...)
+		select {
+		case inputs <- client.ExecInput{Kind: "stdin", Data: chunk}:
+			stdin = stdin[n:]
+		case <-ctx.Done():
+			return
+		}
+	}
+	select {
+	case inputs <- client.ExecInput{Kind: "stdin_close"}:
+	case <-ctx.Done():
+	}
 }
 
 func (c *mcpCommand) accept(event client.ExecEvent) {
@@ -332,9 +361,45 @@ func (c *mcpCommand) requestCancel() {
 	c.mu.Lock()
 	if c.status == "running" {
 		c.cancelRequested = true
-		c.cancel()
+		c.cancelOnce.Do(func() { go c.terminate() })
 	}
 	c.mu.Unlock()
+}
+
+func (c *mcpCommand) terminate() {
+	if !c.sendInput(client.ExecInput{Kind: "signal", Signal: "TERM"}) {
+		return
+	}
+	if c.waitDone(500 * time.Millisecond) {
+		return
+	}
+	if !c.sendInput(client.ExecInput{Kind: "signal", Signal: "KILL"}) {
+		return
+	}
+	if c.waitDone(2500 * time.Millisecond) {
+		return
+	}
+	c.cancel()
+}
+
+func (c *mcpCommand) sendInput(input client.ExecInput) bool {
+	select {
+	case c.inputs <- input:
+		return true
+	case <-c.done:
+		return false
+	}
+}
+
+func (c *mcpCommand) waitDone(timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-c.done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 func (c *mcpCommand) snapshot(stdoutOffset, stderrOffset int64, maxBytes int, includeCombined bool) mcpCommandOutput {

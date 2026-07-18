@@ -28,10 +28,11 @@ type mcpGuestContext struct {
 	cancel  context.CancelFunc
 	done    chan struct{}
 
-	runMu sync.Mutex
-	mu    sync.Mutex
-	err   string
-	carry []byte
+	runMu    sync.Mutex
+	stopOnce sync.Once
+	mu       sync.Mutex
+	err      string
+	carry    []byte
 }
 
 type mcpContextOpenInput struct {
@@ -133,7 +134,7 @@ func (e *mcpEndpoint) runGuestContext(ctx context.Context, _ *mcp.CallToolReques
 	result, err := guest.runLine(runCtx, line)
 	if err != nil {
 		if runCtx.Err() != nil {
-			guest.stop()
+			guest.stopAndWait(3 * time.Second)
 			status := "canceled"
 			exitCode := 130
 			if runCtx.Err() == context.DeadlineExceeded {
@@ -301,16 +302,52 @@ func (g *mcpGuestContext) info() mcpContextInfo {
 }
 
 func (g *mcpGuestContext) stop() {
-	g.cancel()
+	g.stopOnce.Do(func() { go g.terminate() })
 }
 
 func (g *mcpGuestContext) stopAndWait(timeout time.Duration) {
-	g.cancel()
+	g.stop()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case <-g.done:
 	case <-timer.C:
+	}
+}
+
+func (g *mcpGuestContext) terminate() {
+	if !g.sendControl(client.ExecInput{Kind: "signal", Signal: "TERM"}) {
+		return
+	}
+	if g.waitDone(500 * time.Millisecond) {
+		return
+	}
+	if !g.sendControl(client.ExecInput{Kind: "signal", Signal: "KILL"}) {
+		return
+	}
+	if g.waitDone(2500 * time.Millisecond) {
+		return
+	}
+	g.cancel()
+}
+
+func (g *mcpGuestContext) sendControl(input client.ExecInput) bool {
+	select {
+	case g.inputs <- input:
+		return true
+	case <-g.done:
+		return false
+	}
+}
+
+func (g *mcpGuestContext) waitDone(timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-g.done:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 

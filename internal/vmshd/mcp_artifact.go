@@ -24,7 +24,7 @@ const (
 	// Keep each base64-encoded control message below the guest vsock receive
 	// window. WriteFull can span the window, but a message larger than it can
 	// deadlock with the guest waiting for the remainder before decoding JSON.
-	mcpArtifactInputChunk = 32 << 10
+	mcpArtifactInputChunk = 16 << 10
 	mcpArtifactTimeout    = 2 * time.Minute
 )
 
@@ -256,6 +256,10 @@ func (e *mcpEndpoint) extractGuestArchive(ctx context.Context, vmID, path string
 				return
 			}
 		}
+		select {
+		case inputs <- client.ExecInput{Kind: "stdin_close"}:
+		case <-opCtx.Done():
+		}
 	}()
 	exitSeen := false
 	exitCode := 0
@@ -319,6 +323,7 @@ func artifactExitError(operation string, exitCode int, stderr []byte) error {
 func validateMCPArchive(data []byte) error {
 	tr := tar.NewReader(bytes.NewReader(data))
 	entries := 0
+	regularEntries := make(map[string]struct{})
 	for {
 		header, err := tr.Next()
 		if err == io.EOF {
@@ -339,7 +344,17 @@ func validateMCPArchive(data []byte) error {
 			return fmt.Errorf("unsafe archive entry path %q", header.Name)
 		}
 		switch header.Typeflag {
-		case tar.TypeReg, tar.TypeDir:
+		case tar.TypeReg, tar.TypeRegA:
+			regularEntries[name] = struct{}{}
+		case tar.TypeDir:
+		case tar.TypeLink:
+			link := path.Clean(strings.TrimPrefix(header.Linkname, "/"))
+			if path.IsAbs(header.Linkname) || link == "." || link == ".." || strings.HasPrefix(link, "../") {
+				return fmt.Errorf("archive hard link %q has unsafe target %q", header.Name, header.Linkname)
+			}
+			if _, ok := regularEntries[link]; !ok {
+				return fmt.Errorf("archive hard link %q targets an unavailable regular file %q", header.Name, header.Linkname)
+			}
 		case tar.TypeSymlink:
 			if header.Linkname == "" {
 				return fmt.Errorf("archive symlink %q has an empty target", header.Name)

@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -37,6 +38,28 @@ func TestMCPEndpointIsScopedToOwnedIsolatedVMs(t *testing.T) {
 	var pulls []client.PullImageRequest
 	var runs []client.RunRequest
 	var shutdowns []string
+	streamHandler := websocket.Handler(func(ws *websocket.Conn) {
+		defer ws.Close()
+		var req client.RunRequest
+		if err := websocket.JSON.Receive(ws, &req); err != nil {
+			return
+		}
+		mu.Lock()
+		runs = append(runs, req)
+		mu.Unlock()
+		for {
+			var input client.ExecInput
+			if err := websocket.JSON.Receive(ws, &input); err != nil {
+				return
+			}
+			if input.Kind == "stdin_close" {
+				break
+			}
+		}
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: []byte("guest-output")})
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte("guest-error")})
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 7})
+	})
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+daemonToken {
 			writeJSON(w, http.StatusUnauthorized, client.ErrorResponse{Error: "unauthorized"})
@@ -47,6 +70,8 @@ func TestMCPEndpointIsScopedToOwnedIsolatedVMs(t *testing.T) {
 			return
 		}
 		switch r.URL.Path {
+		case "/vm/run/stream":
+			streamHandler.ServeHTTP(w, r)
 		case "/image/alpine":
 			if r.Method == http.MethodGet {
 				writeJSON(w, http.StatusNotFound, client.ErrorResponse{Error: "image not found"})
@@ -258,32 +283,36 @@ func TestMCPAutoPullRejectsHostFacingSources(t *testing.T) {
 
 func TestMCPAsyncCommandSeparatesOutputAndCancels(t *testing.T) {
 	started := make(chan struct{})
-	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/vm/run" || r.URL.Query().Get("stream") != "1" {
-			http.NotFound(w, r)
-			return
-		}
+	mux := http.NewServeMux()
+	mux.Handle("/vm/run/stream", websocket.Handler(func(ws *websocket.Conn) {
+		defer ws.Close()
 		var req client.RunRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Errorf("decode run request: %v", err)
-			w.WriteHeader(http.StatusBadRequest)
+		if err := websocket.JSON.Receive(ws, &req); err != nil {
 			return
 		}
-		w.Header().Set("Content-Type", "application/x-ndjson")
-		w.WriteHeader(http.StatusOK)
-		flusher, _ := w.(http.Flusher)
-		encoder := json.NewEncoder(w)
 		if len(req.Command) != 0 && req.Command[0] == "block" {
-			_ = encoder.Encode(client.ExecEvent{Kind: "stdout", Data: []byte("ready\n")})
-			flusher.Flush()
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: []byte("ready\n")})
 			close(started)
-			<-r.Context().Done()
+			for {
+				var input client.ExecInput
+				if err := websocket.JSON.Receive(ws, &input); err != nil {
+					return
+				}
+				if input.Kind == "signal" {
+					_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 143})
+					return
+				}
+			}
+		}
+		var input client.ExecInput
+		if err := websocket.JSON.Receive(ws, &input); err != nil || input.Kind != "stdin_close" {
 			return
 		}
-		_ = encoder.Encode(client.ExecEvent{Kind: "stdout", Data: []byte("out\n")})
-		_ = encoder.Encode(client.ExecEvent{Kind: "stderr", Data: []byte("err\n")})
-		_ = encoder.Encode(client.ExecEvent{Kind: "exit", ExitCode: 3})
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: []byte("out\n")})
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte("err\n")})
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 3})
 	}))
+	control := httptest.NewServer(mux)
 	defer control.Close()
 
 	endpoint := &mcpEndpoint{
@@ -338,6 +367,75 @@ func TestMCPAsyncCommandSeparatesOutputAndCancels(t *testing.T) {
 	canceled := blocked.snapshot(0, 0, 1024, false)
 	if canceled.Status != "canceled" || canceled.ExitCode == nil || *canceled.ExitCode != 130 || canceled.Stdout.Text != "ready\n" {
 		t.Fatalf("canceled command result = %#v", canceled)
+	}
+}
+
+func TestMCPCommandStreamsLargeStdinToEOF(t *testing.T) {
+	stdin := bytes.Repeat([]byte{0x00, 0xff, 0x7f, 0x80}, 256<<10)
+	received := make(chan []byte, 1)
+	var largestChunk int
+	mux := http.NewServeMux()
+	mux.Handle("/vm/run/stream", websocket.Handler(func(ws *websocket.Conn) {
+		defer ws.Close()
+		var req client.RunRequest
+		if err := websocket.JSON.Receive(ws, &req); err != nil {
+			t.Errorf("receive run request: %v", err)
+			return
+		}
+		if len(req.Stdin) != 0 {
+			t.Errorf("run request contained %d inline stdin bytes", len(req.Stdin))
+			return
+		}
+		var data []byte
+		for {
+			var input client.ExecInput
+			if err := websocket.JSON.Receive(ws, &input); err != nil {
+				t.Errorf("receive stdin: %v", err)
+				return
+			}
+			if input.Kind == "stdin_close" {
+				break
+			}
+			if input.Kind != "stdin" {
+				t.Errorf("input kind = %q", input.Kind)
+				return
+			}
+			if len(input.Data) > largestChunk {
+				largestChunk = len(input.Data)
+			}
+			data = append(data, input.Data...)
+		}
+		received <- data
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 0})
+	}))
+	control := httptest.NewServer(mux)
+	defer control.Close()
+	endpoint := &mcpEndpoint{
+		control: client.NewClient(control.URL, nil), vms: map[string]mcpVM{"owned": {ID: "owned"}},
+		commands: make(map[string]*mcpCommand), artifacts: make(map[string]*mcpArtifact), contexts: make(map[string]*mcpGuestContext),
+	}
+	command, err := endpoint.startCommand(mcpRunVMInput{VMID: "owned", Command: []string{"consume"}, StdinBase64: base64.StdEncoding.EncodeToString(stdin)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-command.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("large stdin command did not finish")
+	}
+	if result := command.snapshot(0, 0, 1024, false); result.Status != "exited" || result.ExitCode == nil || *result.ExitCode != 0 {
+		t.Fatalf("command result = %#v", result)
+	}
+	select {
+	case data := <-received:
+		if !bytes.Equal(data, stdin) {
+			t.Fatalf("received %d of %d stdin bytes", len(data), len(stdin))
+		}
+	default:
+		t.Fatal("server did not receive stdin")
+	}
+	if largestChunk > mcpStdinChunkBytes {
+		t.Fatalf("largest stdin chunk = %d", largestChunk)
 	}
 }
 

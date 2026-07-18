@@ -516,7 +516,7 @@ func (e *mcpEndpoint) close() error {
 	e.vms = make(map[string]mcpVM)
 	e.mu.Unlock()
 	for _, command := range commands {
-		command.cancel()
+		command.requestCancel()
 	}
 	stopGuestContexts(contexts)
 	var errs []error
