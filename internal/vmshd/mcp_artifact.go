@@ -344,7 +344,7 @@ func validateMCPArchive(data []byte) error {
 			return fmt.Errorf("unsafe archive entry path %q", header.Name)
 		}
 		switch header.Typeflag {
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg, byte(0):
 			regularEntries[name] = struct{}{}
 		case tar.TypeDir:
 		case tar.TypeLink:
