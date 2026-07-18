@@ -451,6 +451,14 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 		if err := websocket.JSON.Receive(ws, &req); err != nil {
 			return
 		}
+		if slices.Equal(req.Command, []string{"/bin/sh", "-c", ":"}) {
+			var input client.ExecInput
+			if err := websocket.JSON.Receive(ws, &input); err != nil || input.Kind != "stdin_close" {
+				return
+			}
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 0})
+			return
+		}
 		switch req.Kind {
 		case "fs_archive":
 			var input client.ExecInput
@@ -563,6 +571,111 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 	}
 	if _, _, err := endpoint.closeGuestContext(context.Background(), nil, mcpContextStatusInput{ContextID: opened.ContextID}); err != nil {
 		t.Fatalf("close context: %v", err)
+	}
+}
+
+func TestMCPContextOpenReportsInvalidWorkdirWithoutWaitingForShellProbe(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.Handle("/vm/run", websocket.Handler(func(ws *websocket.Conn) {
+		defer ws.Close()
+		var req client.ExecRequest
+		if err := websocket.JSON.Receive(ws, &req); err != nil {
+			return
+		}
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte("invalid workdir: permission denied")})
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 126})
+	}))
+	control := httptest.NewServer(mux)
+	defer control.Close()
+	endpoint := &mcpEndpoint{
+		control: client.NewClient(control.URL, nil), vms: map[string]mcpVM{"one": {ID: "one"}},
+		commands: make(map[string]*mcpCommand), artifacts: make(map[string]*mcpArtifact), contexts: make(map[string]*mcpGuestContext),
+	}
+	started := time.Now()
+	_, _, err := endpoint.openGuestContext(t.Context(), nil, mcpContextOpenInput{VMID: "one", WorkDir: "/root", User: "1000:1000"})
+	if err == nil {
+		t.Fatal("opened context with inaccessible workdir")
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("invalid workdir took %s to reject", time.Since(started))
+	}
+}
+
+func TestMCPContextCloseCancelsActiveShellStreamOutOfBand(t *testing.T) {
+	active := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.Handle("/vm/run", websocket.Handler(func(ws *websocket.Conn) {
+		defer ws.Close()
+		var req client.ExecRequest
+		if err := websocket.JSON.Receive(ws, &req); err != nil {
+			return
+		}
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 0})
+	}))
+	mux.Handle("/vm/run/stream", websocket.Handler(func(ws *websocket.Conn) {
+		defer ws.Close()
+		var req client.RunRequest
+		if err := websocket.JSON.Receive(ws, &req); err != nil {
+			return
+		}
+		for count := 0; ; count++ {
+			var input client.ExecInput
+			if err := websocket.JSON.Receive(ws, &input); err != nil {
+				return
+			}
+			if input.Kind != "stdin" {
+				continue
+			}
+			if count == 0 {
+				script := string(input.Data)
+				markerStart := strings.Index(script, `\036marker_`)
+				if markerStart < 0 {
+					t.Errorf("probe did not contain a status marker")
+					return
+				}
+				markerEnd := strings.Index(script[markerStart+4:], ":%s")
+				if markerEnd < 0 {
+					t.Errorf("probe did not contain a complete status marker")
+					return
+				}
+				marker := script[markerStart+4 : markerStart+4+markerEnd]
+				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: []byte("\x1e" + marker + ":0\x1f\n")})
+				continue
+			}
+			close(active)
+		}
+	}))
+	control := httptest.NewServer(mux)
+	defer control.Close()
+	endpoint := &mcpEndpoint{
+		control: client.NewClient(control.URL, nil), vms: map[string]mcpVM{"one": {ID: "one"}},
+		commands: make(map[string]*mcpCommand), artifacts: make(map[string]*mcpArtifact), contexts: make(map[string]*mcpGuestContext),
+	}
+	_, opened, err := endpoint.openGuestContext(t.Context(), nil, mcpContextOpenInput{VMID: "one"})
+	if err != nil {
+		t.Fatalf("open context: %v", err)
+	}
+	runDone := make(chan error, 1)
+	go func() {
+		_, _, err := endpoint.runGuestContext(context.Background(), nil, mcpContextRunInput{ContextID: opened.ContextID, CommandLine: "sleep 60"})
+		runDone <- err
+	}()
+	select {
+	case <-active:
+	case <-time.After(time.Second):
+		t.Fatal("context command did not reach the shell stream")
+	}
+	started := time.Now()
+	if _, result, err := endpoint.closeGuestContext(t.Context(), nil, mcpContextStatusInput{ContextID: opened.ContextID}); err != nil || !result.Closed {
+		t.Fatalf("close context = %#v, %v", result, err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("context close took %s", time.Since(started))
+	}
+	select {
+	case <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("active context call remained blocked after close")
 	}
 }
 

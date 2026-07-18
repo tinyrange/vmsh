@@ -60,6 +60,7 @@ type mcpEndpoint struct {
 	commands    map[string]*mcpCommand
 	artifacts   map[string]*mcpArtifact
 	contexts    map[string]*mcpGuestContext
+	stopping    map[string]struct{}
 	starting    int
 	closed      bool
 }
@@ -117,6 +118,7 @@ func (m *mcpManager) Start(sessionID string) (MCPEndpointInfo, error) {
 		commands:    make(map[string]*mcpCommand),
 		artifacts:   make(map[string]*mcpArtifact),
 		contexts:    make(map[string]*mcpGuestContext),
+		stopping:    make(map[string]struct{}),
 	}
 	handler := endpoint.handler()
 	endpoint.server = &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 2 * time.Minute}
@@ -466,16 +468,20 @@ type mcpStopVMOutput struct {
 }
 
 func (e *mcpEndpoint) stopVM(ctx context.Context, _ *mcp.CallToolRequest, in mcpStopVMInput) (*mcp.CallToolResult, mcpStopVMOutput, error) {
-	id, err := e.ownedVMID(in.VMID)
+	id, err := e.beginVMStop(in.VMID)
 	if err != nil {
 		return nil, mcpStopVMOutput{}, err
 	}
 	e.cancelVMWork(id)
 	if err := e.control.ShutdownInstanceWithIDContext(ctx, id); err != nil {
+		e.mu.Lock()
+		delete(e.stopping, id)
+		e.mu.Unlock()
 		return nil, mcpStopVMOutput{}, fmt.Errorf("stop VM: %w", err)
 	}
 	e.mu.Lock()
 	delete(e.vms, id)
+	delete(e.stopping, id)
 	e.mu.Unlock()
 	return nil, mcpStopVMOutput{Stopped: true}, nil
 }
@@ -487,6 +493,26 @@ func (e *mcpEndpoint) ownedVMID(id string) (string, error) {
 	if _, ok := e.vms[id]; !ok {
 		return "", fmt.Errorf("VM %q is not owned by this MCP session", id)
 	}
+	if _, ok := e.stopping[id]; ok {
+		return "", fmt.Errorf("VM %q is stopping", id)
+	}
+	return id, nil
+}
+
+func (e *mcpEndpoint) beginVMStop(id string) (string, error) {
+	id = strings.TrimSpace(id)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, ok := e.vms[id]; !ok {
+		return "", fmt.Errorf("VM %q is not owned by this MCP session", id)
+	}
+	if _, ok := e.stopping[id]; ok {
+		return "", fmt.Errorf("VM %q is already stopping", id)
+	}
+	if e.stopping == nil {
+		e.stopping = make(map[string]struct{})
+	}
+	e.stopping[id] = struct{}{}
 	return id, nil
 }
 

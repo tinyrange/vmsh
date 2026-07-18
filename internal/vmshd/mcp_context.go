@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -58,6 +59,9 @@ func (e *mcpEndpoint) openGuestContext(ctx context.Context, _ *mcp.CallToolReque
 	}
 	user := firstNonEmpty(strings.TrimSpace(in.User), "1000:1000")
 	workDir := firstNonEmpty(strings.TrimSpace(in.WorkDir), "/home/cc")
+	if err := validateGuestContextStart(ctx, e.control, vmID, user, workDir, in.Env); err != nil {
+		return nil, mcpContextInfo{}, fmt.Errorf("open guest context: %w", err)
+	}
 	id, err := randomMCPID("context")
 	if err != nil {
 		return nil, mcpContextInfo{}, err
@@ -86,6 +90,42 @@ func (e *mcpEndpoint) openGuestContext(ctx context.Context, _ *mcp.CallToolReque
 		return nil, mcpContextInfo{}, fmt.Errorf("open guest context: %w", err)
 	}
 	return nil, guest.info(), nil
+}
+
+func validateGuestContextStart(ctx context.Context, control *client.Client, vmID, user, workDir string, env []string) error {
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	events, err := control.RunEventsInContext(probeCtx, vmID, client.RunRequest{
+		Command: []string{"/bin/sh", "-c", ":"}, Env: append([]string(nil), env...), WorkDir: workDir, User: user,
+	})
+	if err != nil {
+		return errors.New(conciseCommandError(err))
+	}
+	exitCode := -1
+	var diagnostic strings.Builder
+	for _, event := range events {
+		switch event.Kind {
+		case "stderr", "error":
+			data := event.Data
+			if len(data) == 0 {
+				data = []byte(firstNonEmpty(event.Error, event.Output))
+			}
+			diagnostic.Write(data)
+		case "exit":
+			exitCode = event.ExitCode
+		}
+	}
+	if exitCode == 0 {
+		return nil
+	}
+	message := strings.TrimSpace(diagnostic.String())
+	if message != "" {
+		return fmt.Errorf("%s", message)
+	}
+	if exitCode >= 0 {
+		return fmt.Errorf("workdir validation exited with status %d", exitCode)
+	}
+	return fmt.Errorf("workdir validation ended without an exit status")
 }
 
 type mcpContextRunInput struct {
@@ -302,7 +342,7 @@ func (g *mcpGuestContext) info() mcpContextInfo {
 }
 
 func (g *mcpGuestContext) stop() {
-	g.stopOnce.Do(func() { go g.terminate() })
+	g.stopOnce.Do(g.cancel)
 }
 
 func (g *mcpGuestContext) stopAndWait(timeout time.Duration) {
@@ -312,42 +352,6 @@ func (g *mcpGuestContext) stopAndWait(timeout time.Duration) {
 	select {
 	case <-g.done:
 	case <-timer.C:
-	}
-}
-
-func (g *mcpGuestContext) terminate() {
-	if !g.sendControl(client.ExecInput{Kind: "signal", Signal: "TERM"}) {
-		return
-	}
-	if g.waitDone(500 * time.Millisecond) {
-		return
-	}
-	if !g.sendControl(client.ExecInput{Kind: "signal", Signal: "KILL"}) {
-		return
-	}
-	if g.waitDone(2500 * time.Millisecond) {
-		return
-	}
-	g.cancel()
-}
-
-func (g *mcpGuestContext) sendControl(input client.ExecInput) bool {
-	select {
-	case g.inputs <- input:
-		return true
-	case <-g.done:
-		return false
-	}
-}
-
-func (g *mcpGuestContext) waitDone(timeout time.Duration) bool {
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-g.done:
-		return true
-	case <-timer.C:
-		return false
 	}
 }
 
