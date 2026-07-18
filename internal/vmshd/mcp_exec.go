@@ -49,6 +49,7 @@ type mcpOutputChunk struct {
 type mcpCommandOutput struct {
 	CommandID    string         `json:"command_id"`
 	VMID         string         `json:"vm_id"`
+	ContextID    string         `json:"context_id,omitempty"`
 	Status       string         `json:"status"`
 	ExitCode     *int           `json:"exit_code,omitempty"`
 	Stdout       mcpOutputChunk `json:"stdout"`
@@ -61,28 +62,30 @@ type mcpCommandOutput struct {
 }
 
 type mcpCommand struct {
-	id      string
-	vmID    string
-	request client.RunRequest
-	stdin   []byte
-	inputs  chan client.ExecInput
-	cancel  context.CancelFunc
-	done    chan struct{}
+	id        string
+	vmID      string
+	contextID string
+	request   client.RunRequest
+	stdin     []byte
+	inputs    chan client.ExecInput
+	cancel    context.CancelFunc
+	done      chan struct{}
 
-	mu              sync.Mutex
-	status          string
-	exitCode        *int
-	stdout          []byte
-	stderr          []byte
-	stdoutTotal     int64
-	stderrTotal     int64
-	stdoutTruncated bool
-	stderrTruncated bool
-	err             string
-	startedAt       time.Time
-	finishedAt      *time.Time
-	cancelRequested bool
-	cancelOnce      sync.Once
+	mu                sync.Mutex
+	status            string
+	exitCode          *int
+	stdout            []byte
+	stderr            []byte
+	stdoutTotal       int64
+	stderrTotal       int64
+	stdoutTruncated   bool
+	stderrTruncated   bool
+	err               string
+	startedAt         time.Time
+	finishedAt        *time.Time
+	cancelRequested   bool
+	cancelOnce        sync.Once
+	terminateOverride func()
 }
 
 func (e *mcpEndpoint) runVM(ctx context.Context, _ *mcp.CallToolRequest, in mcpRunVMInput) (*mcp.CallToolResult, mcpCommandOutput, error) {
@@ -112,7 +115,7 @@ func (e *mcpEndpoint) startVMCommand(_ context.Context, _ *mcp.CallToolRequest, 
 }
 
 type mcpCommandStatusInput struct {
-	CommandID    string `json:"command_id" jsonschema:"ID returned by vm_exec_start or vm_run"`
+	CommandID    string `json:"command_id" jsonschema:"ID returned by vm_exec_start, vm_run, or vm_context_exec_start"`
 	StdoutOffset int64  `json:"stdout_offset,omitempty" jsonschema:"next stdout byte offset previously returned"`
 	StderrOffset int64  `json:"stderr_offset,omitempty" jsonschema:"next stderr byte offset previously returned"`
 	MaxBytes     int    `json:"max_bytes,omitempty" jsonschema:"maximum bytes returned per stream"`
@@ -134,7 +137,7 @@ func (e *mcpEndpoint) statusVMCommand(_ context.Context, _ *mcp.CallToolRequest,
 }
 
 type mcpCommandWaitInput struct {
-	CommandID    string  `json:"command_id" jsonschema:"ID returned by vm_exec_start or vm_run"`
+	CommandID    string  `json:"command_id" jsonschema:"ID returned by vm_exec_start, vm_run, or vm_context_exec_start"`
 	WaitSeconds  float64 `json:"wait_seconds,omitempty" jsonschema:"maximum seconds to wait in this call; defaults to 20 and is capped at 30"`
 	StdoutOffset int64   `json:"stdout_offset,omitempty"`
 	StderrOffset int64   `json:"stderr_offset,omitempty"`
@@ -172,7 +175,7 @@ func (e *mcpEndpoint) waitVMCommand(ctx context.Context, _ *mcp.CallToolRequest,
 }
 
 type mcpCommandCancelInput struct {
-	CommandID    string `json:"command_id" jsonschema:"ID returned by vm_exec_start or vm_run"`
+	CommandID    string `json:"command_id" jsonschema:"ID returned by vm_exec_start, vm_run, or vm_context_exec_start"`
 	StdoutOffset int64  `json:"stdout_offset,omitempty" jsonschema:"next stdout byte offset previously returned"`
 	StderrOffset int64  `json:"stderr_offset,omitempty" jsonschema:"next stderr byte offset previously returned"`
 	MaxBytes     int    `json:"max_bytes,omitempty" jsonschema:"maximum bytes returned per stream"`
@@ -235,11 +238,19 @@ func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
 		request: client.RunRequest{Command: append([]string(nil), in.Command...), Env: append([]string(nil), in.Env...), WorkDir: workDir, User: user, TimeoutSeconds: in.TimeoutSeconds},
 		stdin:   stdin, inputs: make(chan client.ExecInput),
 	}
-	e.mu.Lock()
-	if e.closed {
-		e.mu.Unlock()
+	if err := e.registerMCPCommand(command); err != nil {
 		cancel()
-		return nil, fmt.Errorf("MCP endpoint is stopped")
+		return nil, err
+	}
+	go command.run(ctx, e.control)
+	return command, nil
+}
+
+func (e *mcpEndpoint) registerMCPCommand(command *mcpCommand) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return fmt.Errorf("MCP endpoint is stopped")
 	}
 	for existingID, existing := range e.commands {
 		if len(e.commands) < mcpMaxCommands {
@@ -252,14 +263,10 @@ func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
 		}
 	}
 	if len(e.commands) >= mcpMaxCommands {
-		e.mu.Unlock()
-		cancel()
-		return nil, fmt.Errorf("MCP command limit reached (%d)", mcpMaxCommands)
+		return fmt.Errorf("MCP command limit reached (%d)", mcpMaxCommands)
 	}
-	e.commands[commandID] = command
-	e.mu.Unlock()
-	go command.run(ctx, e.control)
-	return command, nil
+	e.commands[command.id] = command
+	return nil
 }
 
 func (e *mcpEndpoint) command(id string) (*mcpCommand, error) {
@@ -367,6 +374,13 @@ func (c *mcpCommand) requestCancel() {
 }
 
 func (c *mcpCommand) terminate() {
+	if c.terminateOverride != nil {
+		c.terminateOverride()
+		if !c.waitDone(3 * time.Second) {
+			c.cancel()
+		}
+		return
+	}
 	if !c.sendInput(client.ExecInput{Kind: "signal", Signal: "TERM"}) {
 		return
 	}
@@ -408,7 +422,7 @@ func (c *mcpCommand) snapshot(stdoutOffset, stderrOffset int64, maxBytes int, in
 	stdout := commandOutputChunk(c.stdout, c.stdoutTotal, c.stdoutTruncated, stdoutOffset, maxBytes)
 	stderr := commandOutputChunk(c.stderr, c.stderrTotal, c.stderrTruncated, stderrOffset, maxBytes)
 	out := mcpCommandOutput{
-		CommandID: c.id, VMID: c.vmID, Status: c.status, ExitCode: cloneInt(c.exitCode), Stdout: stdout, Stderr: stderr,
+		CommandID: c.id, VMID: c.vmID, ContextID: c.contextID, Status: c.status, ExitCode: cloneInt(c.exitCode), Stdout: stdout, Stderr: stderr,
 		Error: c.err, StartedAt: c.startedAt, FinishedAt: cloneTime(c.finishedAt),
 	}
 	if includeCombined {

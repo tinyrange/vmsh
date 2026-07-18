@@ -185,7 +185,7 @@ func TestMCPEndpointIsScopedToOwnedIsolatedVMs(t *testing.T) {
 	slices.Sort(names)
 	wantNames := []string{
 		"vm_artifact_delete", "vm_artifact_export", "vm_artifact_import", "vm_artifact_list",
-		"vm_context_close", "vm_context_open", "vm_context_run", "vm_context_status", "vm_copy",
+		"vm_context_close", "vm_context_exec_start", "vm_context_open", "vm_context_run", "vm_context_status", "vm_copy",
 		"vm_create", "vm_exec_cancel", "vm_exec_start", "vm_exec_status", "vm_exec_wait", "vm_list", "vm_run", "vm_stop",
 	}
 	if !slices.Equal(names, wantNames) {
@@ -566,6 +566,25 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 	if result.Stdout != "42" || result.Stderr != "problem" || result.ExitCode != 0 || result.CommandStatus != "exited" || result.ContextStatus != "running" {
 		t.Fatalf("context result = %#v", result)
 	}
+	_, asyncResult, err := endpoint.startGuestContextCommand(context.Background(), nil, mcpContextRunInput{
+		ContextID: opened.ContextID, CommandLine: `printf '%s' "$ANSWER"; printf problem >&2`,
+	})
+	if err != nil {
+		t.Fatalf("start async context command: %v", err)
+	}
+	asyncCommand, err := endpoint.command(asyncResult.CommandID)
+	if err != nil {
+		t.Fatalf("find async context command: %v", err)
+	}
+	select {
+	case <-asyncCommand.done:
+	case <-time.After(time.Second):
+		t.Fatal("async context command did not finish")
+	}
+	asyncResult = asyncCommand.snapshot(0, 0, mcpDefaultOutputChunk, false)
+	if asyncResult.ContextID != opened.ContextID || asyncResult.Status != "exited" || asyncResult.ExitCode == nil || *asyncResult.ExitCode != 0 || asyncResult.Stdout.Text != "42" || asyncResult.Stderr.Text != "problem" {
+		t.Fatalf("async context result = %#v", asyncResult)
+	}
 	if _, _, err := endpoint.openGuestContext(context.Background(), nil, mcpContextOpenInput{VMID: "foreign"}); err == nil {
 		t.Fatal("opened a persistent context for a foreign VM")
 	}
@@ -601,8 +620,8 @@ func TestMCPContextOpenReportsInvalidWorkdirWithoutWaitingForShellProbe(t *testi
 	}
 }
 
-func TestMCPContextCloseCancelsActiveShellStreamOutOfBand(t *testing.T) {
-	active := make(chan struct{})
+func TestMCPAsyncContextCommandsAllowSequentialLifecycleInterruption(t *testing.T) {
+	active := make(chan struct{}, 2)
 	mux := http.NewServeMux()
 	mux.Handle("/vm/run", websocket.Handler(func(ws *websocket.Conn) {
 		defer ws.Close()
@@ -646,41 +665,119 @@ func TestMCPContextCloseCancelsActiveShellStreamOutOfBand(t *testing.T) {
 				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: []byte("\x1e" + marker + ":0\x1f\n")})
 				continue
 			}
-			close(active)
+			active <- struct{}{}
 		}
 	}))
+	mux.HandleFunc("/vm/shutdown", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]bool{"stopped": true})
+	})
 	control := httptest.NewServer(mux)
 	defer control.Close()
 	endpoint := &mcpEndpoint{
-		control: client.NewClient(control.URL, nil), vms: map[string]mcpVM{"one": {ID: "one"}},
+		control: client.NewClient(control.URL, nil), credentials: map[string]string{"test": "token"}, vms: map[string]mcpVM{"one": {ID: "one"}},
 		commands: make(map[string]*mcpCommand), artifacts: make(map[string]*mcpArtifact), contexts: make(map[string]*mcpGuestContext),
 	}
 	_, opened, err := endpoint.openGuestContext(t.Context(), nil, mcpContextOpenInput{VMID: "one"})
 	if err != nil {
 		t.Fatalf("open context: %v", err)
 	}
-	runDone := make(chan error, 1)
-	go func() {
-		_, _, err := endpoint.runGuestContext(context.Background(), nil, mcpContextRunInput{ContextID: opened.ContextID, CommandLine: "sleep 60"})
-		runDone <- err
-	}()
+	mcpServer := httptest.NewServer(endpoint.handler())
+	defer mcpServer.Close()
+	mcpClient := mcp.NewClient(&mcp.Implementation{Name: "vmsh-lifecycle-test", Version: "1"}, nil)
+	session, err := mcpClient.Connect(t.Context(), &mcp.StreamableClientTransport{
+		Endpoint:   mcpServer.URL + "/mcp",
+		HTTPClient: &http.Client{Transport: mcpBearerTransport{token: "token"}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("connect MCP client: %v", err)
+	}
+	defer session.Close()
+	startedCommand, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_context_exec_start", Arguments: map[string]any{
+		"context_id": opened.ContextID, "command_line": "sleep 60",
+	}})
+	if err != nil || startedCommand.IsError {
+		t.Fatalf("start context command = %#v, %v", startedCommand, err)
+	}
+	startedOutput := structuredToolOutput[mcpCommandOutput](t, startedCommand)
+	if startedOutput.ContextID != opened.ContextID || startedOutput.CommandID == "" || startedOutput.Status != "running" {
+		t.Fatalf("started context command = %#v", startedOutput)
+	}
 	select {
 	case <-active:
 	case <-time.After(time.Second):
 		t.Fatal("context command did not reach the shell stream")
 	}
 	started := time.Now()
-	if _, result, err := endpoint.closeGuestContext(t.Context(), nil, mcpContextStatusInput{ContextID: opened.ContextID}); err != nil || !result.Closed {
-		t.Fatalf("close context = %#v, %v", result, err)
+	closed, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_context_close", Arguments: map[string]any{
+		"context_id": opened.ContextID,
+	}})
+	if err != nil || closed.IsError {
+		t.Fatalf("close context = %#v, %v", closed, err)
 	}
 	if time.Since(started) > time.Second {
 		t.Fatalf("context close took %s", time.Since(started))
 	}
-	select {
-	case <-runDone:
-	case <-time.After(time.Second):
-		t.Fatal("active context call remained blocked after close")
+	status, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_exec_status", Arguments: map[string]any{
+		"command_id": startedOutput.CommandID,
+	}})
+	if err != nil || status.IsError {
+		t.Fatalf("read context command after close = %#v, %v", status, err)
 	}
+	statusOutput := structuredToolOutput[mcpCommandOutput](t, status)
+	if statusOutput.Status != "canceled" || statusOutput.ExitCode == nil || *statusOutput.ExitCode != 130 {
+		t.Fatalf("context command after close = %#v", statusOutput)
+	}
+
+	_, opened, err = endpoint.openGuestContext(t.Context(), nil, mcpContextOpenInput{VMID: "one"})
+	if err != nil {
+		t.Fatalf("open second context: %v", err)
+	}
+	startedCommand, err = session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_context_exec_start", Arguments: map[string]any{
+		"context_id": opened.ContextID, "command_line": "sleep 60",
+	}})
+	if err != nil || startedCommand.IsError {
+		t.Fatalf("start second context command = %#v, %v", startedCommand, err)
+	}
+	startedOutput = structuredToolOutput[mcpCommandOutput](t, startedCommand)
+	if startedOutput.ContextID != opened.ContextID || startedOutput.CommandID == "" || startedOutput.Status != "running" {
+		t.Fatalf("started second context command = %#v", startedOutput)
+	}
+	select {
+	case <-active:
+	case <-time.After(time.Second):
+		t.Fatal("second context command did not reach the shell stream")
+	}
+	started = time.Now()
+	stopped, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_stop", Arguments: map[string]any{"vm_id": "one"}})
+	if err != nil || stopped.IsError {
+		t.Fatalf("stop VM = %#v, %v", stopped, err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("VM stop took %s", time.Since(started))
+	}
+	status, err = session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_exec_status", Arguments: map[string]any{
+		"command_id": startedOutput.CommandID,
+	}})
+	if err != nil || status.IsError {
+		t.Fatalf("read context command after VM stop = %#v, %v", status, err)
+	}
+	statusOutput = structuredToolOutput[mcpCommandOutput](t, status)
+	if statusOutput.Status != "canceled" || statusOutput.ExitCode == nil || *statusOutput.ExitCode != 130 {
+		t.Fatalf("context command after VM stop = %#v", statusOutput)
+	}
+}
+
+func structuredToolOutput[T any](t *testing.T, result *mcp.CallToolResult) T {
+	t.Helper()
+	encoded, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("encode structured tool output: %v", err)
+	}
+	var output T
+	if err := json.Unmarshal(encoded, &output); err != nil {
+		t.Fatalf("decode structured tool output: %v", err)
+	}
+	return output
 }
 
 func TestMCPArchiveRejectsUnsupportedEntriesBeforeImport(t *testing.T) {

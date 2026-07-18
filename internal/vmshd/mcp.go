@@ -220,16 +220,17 @@ func (e *mcpEndpoint) handler() http.Handler {
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_list", Description: "List VMs created through this MCP session."}, e.listVMs)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_run", Description: "Run any command inside a VM created through this MCP session and wait for it to finish."}, e.runVM)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_exec_start", Description: "Start a command in an MCP-owned VM and return a reconnectable command ID immediately."}, e.startVMCommand)
-	mcp.AddTool(server, &mcp.Tool{Name: "vm_exec_status", Description: "Read command status and binary-safe stdout/stderr chunks from byte offsets."}, e.statusVMCommand)
-	mcp.AddTool(server, &mcp.Tool{Name: "vm_exec_wait", Description: "Wait briefly for a command to finish and return its current status and output."}, e.waitVMCommand)
-	mcp.AddTool(server, &mcp.Tool{Name: "vm_exec_cancel", Description: "Terminate and reap a running command in an MCP-owned VM."}, e.cancelVMCommand)
+	mcp.AddTool(server, &mcp.Tool{Name: "vm_exec_status", Description: "Read status and binary-safe output for a command ID returned by vm_exec_start or vm_context_exec_start."}, e.statusVMCommand)
+	mcp.AddTool(server, &mcp.Tool{Name: "vm_exec_wait", Description: "Wait briefly for a command ID returned by vm_exec_start or vm_context_exec_start."}, e.waitVMCommand)
+	mcp.AddTool(server, &mcp.Tool{Name: "vm_exec_cancel", Description: "Terminate and reap a command; canceling a persistent-context command also closes that context."}, e.cancelVMCommand)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_artifact_export", Description: "Archive a guest file or directory into binary-safe storage scoped to this MCP session."}, e.exportArtifact)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_artifact_import", Description: "Extract a session artifact into an MCP-owned VM without exposing the host filesystem."}, e.importArtifact)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_artifact_list", Description: "List metadata for artifacts owned by this MCP session."}, e.listArtifacts)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_artifact_delete", Description: "Delete an artifact owned by this MCP session."}, e.deleteArtifact)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_copy", Description: "Copy a file or directory directly between two MCP-owned isolated VMs."}, e.copyGuestPath)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_context_open", Description: "Open a persistent shell context in an MCP-owned VM; cwd, exports, functions, and aliases survive across calls."}, e.openGuestContext)
-	mcp.AddTool(server, &mcp.Tool{Name: "vm_context_run", Description: "Run a command line in a persistent guest context. Host contexts are never available."}, e.runGuestContext)
+	mcp.AddTool(server, &mcp.Tool{Name: "vm_context_run", Description: "Run a short command line synchronously in a persistent guest context. Use vm_context_exec_start for long-running or cancelable work."}, e.runGuestContext)
+	mcp.AddTool(server, &mcp.Tool{Name: "vm_context_exec_start", Description: "Start a persistent-context command and return immediately; use vm_exec_status/wait, while vm_context_close or vm_stop can interrupt it."}, e.startGuestContextCommand)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_context_status", Description: "Report whether a persistent guest context is still running."}, e.statusGuestContext)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_context_close", Description: "Close and reap a persistent guest shell context."}, e.closeGuestContext)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_stop", Description: "Stop a VM created through this MCP session."}, e.stopVM)
@@ -541,10 +542,7 @@ func (e *mcpEndpoint) close() error {
 	}
 	e.vms = make(map[string]mcpVM)
 	e.mu.Unlock()
-	for _, command := range commands {
-		command.requestCancel()
-	}
-	stopGuestContexts(contexts)
+	cancelAndWaitMCPWork(commands, contexts)
 	var errs []error
 	if e.server != nil {
 		// Stop accepting and terminate active MCP transports before cleaning up
@@ -576,13 +574,13 @@ func (e *mcpEndpoint) cancelVMWork(vmID string) {
 		}
 	}
 	e.mu.Unlock()
+	cancelAndWaitMCPWork(commands, contexts)
+}
+
+func cancelAndWaitMCPWork(commands []*mcpCommand, contexts []*mcpGuestContext) {
 	for _, command := range commands {
 		command.requestCancel()
 	}
-	stopGuestContexts(contexts)
-}
-
-func stopGuestContexts(contexts []*mcpGuestContext) {
 	for _, guest := range contexts {
 		guest.stop()
 	}
@@ -599,6 +597,12 @@ func stopGuestContexts(contexts []*mcpGuestContext) {
 				<-timer.C
 			}
 		case <-timer.C:
+			return
+		}
+	}
+	for _, command := range commands {
+		remaining := time.Until(deadline)
+		if remaining <= 0 || !command.waitDone(remaining) {
 			return
 		}
 	}

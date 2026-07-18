@@ -152,18 +152,9 @@ func (e *mcpEndpoint) runGuestContext(ctx context.Context, _ *mcp.CallToolReques
 	if err != nil {
 		return nil, mcpContextRunOutput{}, err
 	}
-	if in.CommandLine != "" && len(in.Command) != 0 {
-		return nil, mcpContextRunOutput{}, fmt.Errorf("command_line and command are mutually exclusive")
-	}
-	line := in.CommandLine
-	if len(in.Command) != 0 {
-		line = shellJoin(in.Command)
-	}
-	if strings.TrimSpace(line) == "" {
-		return nil, mcpContextRunOutput{}, fmt.Errorf("command_line or command is required")
-	}
-	if in.TimeoutSeconds < 0 || in.TimeoutSeconds > mcpMaxTimeoutSeconds {
-		return nil, mcpContextRunOutput{}, fmt.Errorf("timeout_seconds must be between 0 and %d", mcpMaxTimeoutSeconds)
+	line, err := validateGuestContextCommand(in)
+	if err != nil {
+		return nil, mcpContextRunOutput{}, err
 	}
 	runCtx := ctx
 	var cancel context.CancelFunc
@@ -191,6 +182,90 @@ func (e *mcpEndpoint) runGuestContext(ctx context.Context, _ *mcp.CallToolReques
 	return nil, out, nil
 }
 
+func validateGuestContextCommand(in mcpContextRunInput) (string, error) {
+	if in.CommandLine != "" && len(in.Command) != 0 {
+		return "", fmt.Errorf("command_line and command are mutually exclusive")
+	}
+	line := in.CommandLine
+	if len(in.Command) != 0 {
+		line = shellJoin(in.Command)
+	}
+	if strings.TrimSpace(line) == "" {
+		return "", fmt.Errorf("command_line or command is required")
+	}
+	if in.TimeoutSeconds < 0 || in.TimeoutSeconds > mcpMaxTimeoutSeconds {
+		return "", fmt.Errorf("timeout_seconds must be between 0 and %d", mcpMaxTimeoutSeconds)
+	}
+	return line, nil
+}
+
+func (e *mcpEndpoint) startGuestContextCommand(_ context.Context, _ *mcp.CallToolRequest, in mcpContextRunInput) (*mcp.CallToolResult, mcpCommandOutput, error) {
+	guest, err := e.guestContext(in.ContextID)
+	if err != nil {
+		return nil, mcpCommandOutput{}, err
+	}
+	line, err := validateGuestContextCommand(in)
+	if err != nil {
+		return nil, mcpCommandOutput{}, err
+	}
+	commandID, err := randomMCPID("cmd")
+	if err != nil {
+		return nil, mcpCommandOutput{}, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	command := &mcpCommand{
+		id: commandID, vmID: guest.vmID, contextID: guest.id, cancel: cancel, done: make(chan struct{}),
+		status: "running", startedAt: time.Now().UTC(), terminateOverride: guest.stop,
+	}
+	if err := e.registerMCPCommand(command); err != nil {
+		cancel()
+		return nil, mcpCommandOutput{}, err
+	}
+	go command.runGuestContext(ctx, guest, line, in.TimeoutSeconds)
+	return nil, command.snapshot(0, 0, mcpDefaultOutputChunk, false), nil
+}
+
+func (c *mcpCommand) runGuestContext(ctx context.Context, guest *mcpGuestContext, line string, timeoutSeconds float64) {
+	runCtx := ctx
+	var timeoutCancel context.CancelFunc
+	if timeoutSeconds > 0 {
+		runCtx, timeoutCancel = context.WithTimeout(ctx, time.Duration(timeoutSeconds*float64(time.Second)))
+		defer timeoutCancel()
+	}
+	result, err := guest.runLine(runCtx, line)
+	if runCtx.Err() != nil {
+		guest.stopAndWait(3 * time.Second)
+	}
+	guestClosed := guest.info().Status == "closed"
+	now := time.Now().UTC()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	defer close(c.done)
+	c.finishedAt = &now
+	if runCtx.Err() == context.DeadlineExceeded {
+		c.status = "timed_out"
+		code := 124
+		c.exitCode = &code
+		return
+	}
+	if c.cancelRequested || runCtx.Err() != nil || guestClosed {
+		c.status = "canceled"
+		code := 130
+		c.exitCode = &code
+		return
+	}
+	if err != nil {
+		c.status = "failed"
+		c.err = err.Error()
+		return
+	}
+	c.status = "exited"
+	code := result.exitCode
+	c.exitCode = &code
+	c.stdout, c.stdoutTotal, c.stdoutTruncated = appendCommandOutput(c.stdout, c.stdoutTotal, c.stdoutTruncated, result.stdout)
+	c.stderr, c.stderrTotal, c.stderrTruncated = appendCommandOutput(c.stderr, c.stderrTotal, c.stderrTruncated, result.stderr)
+}
+
 type mcpContextStatusInput struct {
 	ContextID string `json:"context_id" jsonschema:"ID returned by vm_context_open"`
 }
@@ -212,10 +287,16 @@ func (e *mcpEndpoint) closeGuestContext(_ context.Context, _ *mcp.CallToolReques
 	if err != nil {
 		return nil, mcpContextCloseOutput{}, err
 	}
-	guest.stopAndWait(3 * time.Second)
 	e.mu.Lock()
+	commands := make([]*mcpCommand, 0)
+	for _, command := range e.commands {
+		if command.contextID == guest.id {
+			commands = append(commands, command)
+		}
+	}
 	delete(e.contexts, guest.id)
 	e.mu.Unlock()
+	cancelAndWaitMCPWork(commands, []*mcpGuestContext{guest})
 	return nil, mcpContextCloseOutput{Closed: true}, nil
 }
 
