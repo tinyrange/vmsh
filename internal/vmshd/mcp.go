@@ -372,10 +372,10 @@ func (e *mcpEndpoint) createVM(ctx context.Context, _ *mcp.CallToolRequest, in m
 			}
 		}
 	}
-	_, err = e.control.StartInstanceWithIDContext(ctx, id, client.StartInstanceRequest{
+	_, err = e.control.StartInstanceStreamWithIDContext(ctx, id, client.StartInstanceRequest{
 		Image: image, MemoryMB: in.MemoryMB, CPUs: in.CPUs,
 		Network: vmconfig.IsolatedNetworkConfig(), TimeoutSeconds: in.BootTimeoutSeconds,
-	})
+	}, nil)
 	if err != nil {
 		return nil, mcpCreateVMOutput{}, fmt.Errorf("create VM: %w", err)
 	}

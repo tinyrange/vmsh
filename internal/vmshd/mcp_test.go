@@ -97,7 +97,7 @@ func TestMCPEndpointIsScopedToOwnedIsolatedVMs(t *testing.T) {
 			mu.Lock()
 			starts = append(starts, req)
 			mu.Unlock()
-			writeJSON(w, http.StatusOK, client.InstanceState{ID: req.ID, Status: "running", Image: req.Image})
+			writeMCPBootReady(t, w, r, client.InstanceState{ID: req.ID, Status: "running", Image: req.Image})
 		case "/vm/run":
 			var req client.RunRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -309,6 +309,51 @@ func TestMCPEndpointIsScopedToOwnedIsolatedVMs(t *testing.T) {
 	defer mu.Unlock()
 	if !slices.Contains(shutdowns, start.ID) {
 		t.Fatalf("shutdowns = %v, want %q", shutdowns, start.ID)
+	}
+}
+
+func TestMCPCreateVMCancelsBootStreamWithoutClaimingTheVM(t *testing.T) {
+	requestCanceled := make(chan struct{})
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/vm/start" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Accept") != "application/x-ndjson" {
+			t.Error("VM start did not request the boot event stream")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(client.BootEvent{Kind: "status", Message: "cold boot in progress"}); err != nil {
+			return
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+		close(requestCanceled)
+	}))
+	defer control.Close()
+	endpoint := &mcpEndpoint{
+		control: client.NewClient(control.URL, nil), vms: make(map[string]mcpVM),
+		commands: make(map[string]*mcpCommand), contexts: make(map[string]*mcpGuestContext), stopping: make(map[string]struct{}),
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if _, _, err := endpoint.createVM(ctx, nil, mcpCreateVMInput{Image: "@openbsd", Name: "cold-openbsd"}); err == nil {
+		t.Fatal("canceled cold boot unexpectedly succeeded")
+	}
+	select {
+	case <-requestCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("backend start request did not observe caller cancellation")
+	}
+	endpoint.mu.Lock()
+	defer endpoint.mu.Unlock()
+	if len(endpoint.vms) != 0 || endpoint.starting != 0 {
+		t.Fatalf("canceled boot retained MCP ownership: vms=%v starting=%d", endpoint.vms, endpoint.starting)
 	}
 }
 
@@ -1306,7 +1351,7 @@ func TestMCPOwnedVMStopsWhenShellSessionIsDeleted(t *testing.T) {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			writeJSON(w, http.StatusOK, client.InstanceState{ID: req.ID, Status: "running", Image: req.Image})
+			writeMCPBootReady(t, w, r, client.InstanceState{ID: req.ID, Status: "running", Image: req.Image})
 		case "/vm/shutdown":
 			shutdown <- r.URL.Query().Get("id")
 			writeJSON(w, http.StatusOK, map[string]bool{"stopped": true})
@@ -1355,5 +1400,19 @@ func TestMCPOwnedVMStopsWhenShellSessionIsDeleted(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("session cleanup did not stop the MCP-owned VM")
+	}
+}
+
+func writeMCPBootReady(t *testing.T, w http.ResponseWriter, r *http.Request, state client.InstanceState) {
+	t.Helper()
+	if r.Header.Get("Accept") != "application/x-ndjson" {
+		t.Error("VM start did not request the boot event stream")
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(client.BootEvent{Kind: "ready", State: state}); err != nil {
+		t.Errorf("encode boot event: %v", err)
 	}
 }
