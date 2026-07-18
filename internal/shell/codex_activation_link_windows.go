@@ -16,6 +16,18 @@ type codexFileRenameInformation struct {
 	fileName       [1]uint16
 }
 
+type codexFileRenameInformationLegacy struct {
+	replaceIfExists byte
+	rootDirectory   windows.Handle
+	fileNameLength  uint32
+	fileName        [1]uint16
+}
+
+const (
+	ntFileRenameInformation   = 10
+	ntFileRenameInformationEx = 65
+)
+
 func replaceCodexActivationLink(src, dst string) error {
 	srcName, err := windows.UTF16PtrFromString(src)
 	if err != nil {
@@ -41,7 +53,7 @@ func replaceCodexActivationLink(src, dst string) error {
 	}
 	dstDir, err := windows.CreateFile(
 		dstDirName,
-		windows.FILE_LIST_DIRECTORY,
+		windows.FILE_TRAVERSE|windows.FILE_READ_ATTRIBUTES,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
 		nil,
 		windows.OPEN_EXISTING,
@@ -65,5 +77,23 @@ func replaceCodexActivationLink(src, dst string) error {
 	info.rootDirectory = dstDir
 	info.fileNameLength = uint32(nameBytes)
 	copy((*[windows.MAX_LONG_PATH]uint16)(unsafe.Pointer(&info.fileName[0]))[:len(dstName)-1], dstName)
-	return windows.SetFileInformationByHandle(handle, windows.FileRenameInfoEx, &buffer[0], uint32(len(buffer)))
+	var iosb windows.IO_STATUS_BLOCK
+	if err := windows.NtSetInformationFile(handle, &iosb, &buffer[0], uint32(len(buffer)), ntFileRenameInformationEx); err == nil {
+		return nil
+	}
+
+	var legacyLayout codexFileRenameInformationLegacy
+	legacyBuffer := make([]byte, int(unsafe.Offsetof(legacyLayout.fileName))+nameBytes)
+	legacy := (*codexFileRenameInformationLegacy)(unsafe.Pointer(&legacyBuffer[0]))
+	legacy.replaceIfExists = 1
+	legacy.rootDirectory = dstDir
+	legacy.fileNameLength = uint32(nameBytes)
+	copy((*[windows.MAX_LONG_PATH]uint16)(unsafe.Pointer(&legacy.fileName[0]))[:len(dstName)-1], dstName)
+	if err := windows.NtSetInformationFile(handle, &iosb, &legacyBuffer[0], uint32(len(legacyBuffer)), ntFileRenameInformation); err != nil {
+		if status, ok := err.(windows.NTStatus); ok {
+			return status.Errno()
+		}
+		return err
+	}
+	return nil
 }
