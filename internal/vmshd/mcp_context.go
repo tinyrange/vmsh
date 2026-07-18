@@ -398,8 +398,7 @@ func (g *mcpGuestContext) runLine(ctx context.Context, line string) (mcpContextR
 		return mcpContextResult{}, err
 	}
 	marker := []byte("\x1e" + token + ":")
-	statusVar := "__vmsh_mcp_status_" + strings.TrimPrefix(token, "marker_")
-	script := "if {\n" + line + "\n}; then\n" + statusVar + "=0\nelse\n" + statusVar + "=$?\nfi\n/usr/bin/printf '\\036" + token + ":%s\\037\\n' \"$" + statusVar + "\" >&3\n"
+	script := mcpContextCommandScript(token, line)
 	select {
 	case g.inputs <- client.ExecInput{Kind: "stdin", Data: []byte(script)}:
 	case <-g.done:
@@ -469,6 +468,15 @@ func (g *mcpGuestContext) runLine(ctx context.Context, line string) (mcpContextR
 			return result, ctx.Err()
 		}
 	}
+}
+
+func mcpContextCommandScript(token, line string) string {
+	statusVar := "__vmsh_mcp_status_" + strings.TrimPrefix(token, "marker_")
+	// Preserve the protocol descriptor before evaluating user shell state.
+	// Commands may legitimately close or redirect fd 3; the saved descriptor
+	// carries the status frame and then restores fd 3 before the next prompt.
+	// Hide fd 9 while the user command runs so it cannot overwrite the backup.
+	return "exec 9>&3\nif {\n" + line + "\n} 9>&-; then\n" + statusVar + "=0\nelse\n" + statusVar + "=$?\nfi\n/usr/bin/printf '\\036" + token + ":%s\\037\\n' \"$" + statusVar + "\" >&9\nexec 3>&9 9>&-\n"
 }
 
 func (g *mcpGuestContext) info() mcpContextInfo {

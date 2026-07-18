@@ -55,8 +55,8 @@ func (e *mcpEndpoint) exportArtifact(ctx context.Context, _ *mcp.CallToolRequest
 	if err != nil {
 		return nil, mcpArtifactOutput{}, err
 	}
-	path := strings.TrimSpace(in.Path)
-	if path == "" {
+	path := in.Path
+	if strings.TrimSpace(path) == "" {
 		return nil, mcpArtifactOutput{}, fmt.Errorf("path is required")
 	}
 	user, err := mcpGuestUser(vm, in.User)
@@ -92,8 +92,8 @@ func (e *mcpEndpoint) importArtifact(ctx context.Context, _ *mcp.CallToolRequest
 	if err != nil {
 		return nil, mcpArtifactImportOutput{}, err
 	}
-	path := strings.TrimSpace(in.Path)
-	if path == "" {
+	path := in.Path
+	if strings.TrimSpace(path) == "" {
 		return nil, mcpArtifactImportOutput{}, fmt.Errorf("path is required")
 	}
 	artifact, err := e.artifact(in.ArtifactID)
@@ -134,9 +134,9 @@ func (e *mcpEndpoint) copyGuestPath(ctx context.Context, _ *mcp.CallToolRequest,
 	if err != nil {
 		return nil, mcpCopyOutput{}, err
 	}
-	sourcePath := strings.TrimSpace(in.SourcePath)
-	destinationPath := strings.TrimSpace(in.DestinationPath)
-	if sourcePath == "" || destinationPath == "" {
+	sourcePath := in.SourcePath
+	destinationPath := in.DestinationPath
+	if strings.TrimSpace(sourcePath) == "" || strings.TrimSpace(destinationPath) == "" {
 		return nil, mcpCopyOutput{}, fmt.Errorf("source_path and destination_path are required")
 	}
 	sourceUser, err := mcpGuestUser(sourceVM, in.SourceUser)

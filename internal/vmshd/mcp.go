@@ -24,6 +24,7 @@ import (
 
 const (
 	mcpMaxVMs             = 16
+	mcpMinRAMMB           = 128
 	mcpDefaultRAMMB       = 512
 	mcpMaxRAMMB           = 4096
 	mcpDefaultCPUs        = 1
@@ -298,7 +299,7 @@ func (e *mcpEndpoint) authorized(header string) bool {
 type mcpCreateVMInput struct {
 	Image              string  `json:"image" jsonschema:"guest image to boot, for example alpine or @freebsd"`
 	Name               string  `json:"name,omitempty" jsonschema:"optional human-readable name unique within this MCP session"`
-	MemoryMB           uint64  `json:"memory_mb,omitempty" jsonschema:"guest memory in MiB, default 512 and maximum 4096"`
+	MemoryMB           uint64  `json:"memory_mb,omitempty" jsonschema:"guest memory in MiB, minimum 128, default 512, and maximum 4096"`
 	CPUs               int     `json:"cpus,omitempty" jsonschema:"virtual CPU count, default 1 and maximum 8"`
 	BootTimeoutSeconds float64 `json:"boot_timeout_seconds,omitempty" jsonschema:"bounded VM boot deadline; built-in BSD guests default to 60 seconds"`
 }
@@ -319,6 +320,9 @@ func (e *mcpEndpoint) createVM(ctx context.Context, _ *mcp.CallToolRequest, in m
 	}
 	if in.CPUs == 0 {
 		in.CPUs = mcpDefaultCPUs
+	}
+	if in.MemoryMB < mcpMinRAMMB {
+		return nil, mcpCreateVMOutput{}, fmt.Errorf("memory_mb must be at least %d MiB", mcpMinRAMMB)
 	}
 	if in.MemoryMB > mcpMaxRAMMB || in.CPUs < 1 || in.CPUs > mcpMaxCPUs {
 		return nil, mcpCreateVMOutput{}, fmt.Errorf("requested resources exceed the MCP ceiling of %d MiB and %d CPUs", mcpMaxRAMMB, mcpMaxCPUs)
@@ -580,8 +584,8 @@ func isMCPRootUser(user string) bool {
 }
 
 func mcpGuestWorkDir(vm mcpVM, requested string) string {
-	if workDir := strings.TrimSpace(requested); workDir != "" {
-		return workDir
+	if strings.TrimSpace(requested) != "" {
+		return requested
 	}
 	if isMCPBuiltinBSDImage(vm.Image) {
 		return "/"

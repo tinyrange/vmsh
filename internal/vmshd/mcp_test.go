@@ -7,8 +7,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -255,6 +259,22 @@ func TestMCPEndpointIsScopedToOwnedIsolatedVMs(t *testing.T) {
 	if len(runs) != 1 {
 		mu.Unlock()
 		t.Fatalf("foreign command reached backend: %#v", runs)
+	}
+	mu.Unlock()
+
+	tooSmall, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "vm_create", Arguments: map[string]any{
+		"image": "alpine", "name": "too-small", "memory_mb": 1,
+	}})
+	if err != nil {
+		t.Fatalf("reject undersized VM: %v", err)
+	}
+	if !tooSmall.IsError {
+		t.Fatal("memory_mb below the supported minimum reached the backend")
+	}
+	mu.Lock()
+	if len(starts) != 1 {
+		mu.Unlock()
+		t.Fatalf("undersized VM reached backend: %#v", starts)
 	}
 	mu.Unlock()
 
@@ -540,12 +560,16 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 	var extracted []byte
 	var largestInput int
 	var shellExported bool
+	var archivedPath, extractedPath, contextWorkDir string
 	mux := http.NewServeMux()
 	streamHandler := websocket.Handler(func(ws *websocket.Conn) {
 		defer ws.Close()
 		var req client.ExecRequest
 		if err := websocket.JSON.Receive(ws, &req); err != nil {
 			return
+		}
+		if req.ControlFD {
+			contextWorkDir = req.WorkDir
 		}
 		if slices.Equal(req.Command, []string{"/bin/sh", "-c", ":"}) {
 			var input client.ExecInput
@@ -557,6 +581,7 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 		}
 		switch req.Kind {
 		case "fs_archive":
+			archivedPath = req.Path
 			var input client.ExecInput
 			if err := websocket.JSON.Receive(ws, &input); err != nil || input.Kind != "stdin_close" {
 				t.Errorf("archive stdin close = %#v, %v", input, err)
@@ -572,6 +597,7 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 0})
 			return
 		case "fs_extract":
+			extractedPath = req.Path
 			for {
 				var input client.ExecInput
 				if err := websocket.JSON.Receive(ws, &input); err != nil {
@@ -631,15 +657,18 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 		commands: make(map[string]*mcpCommand), artifacts: make(map[string]*mcpArtifact), contexts: make(map[string]*mcpGuestContext),
 	}
 
-	_, exported, err := endpoint.exportArtifact(context.Background(), nil, mcpArtifactExportInput{VMID: "one", Path: "/project"})
+	_, exported, err := endpoint.exportArtifact(context.Background(), nil, mcpArtifactExportInput{VMID: "one", Path: "/project "})
 	if err != nil {
 		t.Fatalf("export artifact: %v", err)
 	}
-	if exported.Artifact.Size != int64(len(archive)) || exported.Artifact.SHA256 == "" {
+	if exported.Artifact.Size != int64(len(archive)) || exported.Artifact.SHA256 == "" || exported.Artifact.Source != "/project " || archivedPath != "/project " {
 		t.Fatalf("artifact metadata = %#v", exported.Artifact)
 	}
-	if _, _, err := endpoint.importArtifact(context.Background(), nil, mcpArtifactImportInput{ArtifactID: exported.Artifact.ID, VMID: "two", Path: "/work"}); err != nil {
+	if _, _, err := endpoint.importArtifact(context.Background(), nil, mcpArtifactImportInput{ArtifactID: exported.Artifact.ID, VMID: "two", Path: "/work "}); err != nil {
 		t.Fatalf("import artifact: %v", err)
+	}
+	if extractedPath != "/work " {
+		t.Fatalf("artifact destination path = %q", extractedPath)
 	}
 	if !bytes.Equal(extracted, archive) {
 		t.Fatalf("extracted archive size = %d, want %d", len(extracted), len(archive))
@@ -648,9 +677,12 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 		t.Fatalf("largest artifact input = %d, want at most %d", largestInput, mcpArtifactInputChunk)
 	}
 
-	_, opened, err := endpoint.openGuestContext(context.Background(), nil, mcpContextOpenInput{VMID: "one"})
+	_, opened, err := endpoint.openGuestContext(context.Background(), nil, mcpContextOpenInput{VMID: "one", WorkDir: "/tmp/work "})
 	if err != nil {
 		t.Fatalf("open context: %v", err)
+	}
+	if contextWorkDir != "/tmp/work " {
+		t.Fatalf("context workdir = %q", contextWorkDir)
 	}
 	if _, _, err := endpoint.runGuestContext(context.Background(), nil, mcpContextRunInput{ContextID: opened.ContextID, CommandLine: "export ANSWER=42"}); err != nil {
 		t.Fatalf("export in context: %v", err)
@@ -716,6 +748,43 @@ func TestMCPContextOpenReportsInvalidWorkdirWithoutWaitingForShellProbe(t *testi
 	}
 }
 
+func TestMCPContextFramingSurvivesClosingControlDescriptor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell and inherited file descriptors")
+	}
+	controlR, controlW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controlR.Close()
+
+	cmd := exec.Command("/bin/sh")
+	cmd.Stdin = strings.NewReader(
+		mcpContextCommandScript("marker_first", "printf() { :; }; exec 3>&- 9>&-; echo protocol-fds-closed") +
+			mcpContextCommandScript("marker_second", "echo context-still-running"),
+	)
+	cmd.ExtraFiles = []*os.File{controlW}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run persistent shell framing: %v; stderr=%q", err, stderr.String())
+	}
+	if err := controlW.Close(); err != nil {
+		t.Fatal(err)
+	}
+	control, err := io.ReadAll(controlR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := stdout.String(), "protocol-fds-closed\ncontext-still-running\n"; got != want {
+		t.Fatalf("shell output = %q, want %q", got, want)
+	}
+	if got, want := string(control), "\x1emarker_first:0\x1f\n\x1emarker_second:0\x1f\n"; got != want {
+		t.Fatalf("control frames = %q, want %q", got, want)
+	}
+}
+
 func TestMCPContextPreservesOutputAccountingTimeoutBytesAndPrivateFraming(t *testing.T) {
 	const largeBytes = 5 << 20
 	mux := http.NewServeMux()
@@ -768,11 +837,9 @@ func TestMCPContextPreservesOutputAccountingTimeoutBytesAndPrivateFraming(t *tes
 					_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: chunk})
 				}
 			case strings.Contains(script, "printf() { :; }"):
-				if !strings.Contains(script, "/usr/bin/printf") || !strings.Contains(script, ">&3") {
-					t.Error("private status framing can still be intercepted by shell functions or redirections")
-					return
-				}
 				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: []byte("function-defined\n")})
+			case strings.Contains(script, "fd3-closed"):
+				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: []byte("fd3-closed\n")})
 			case strings.Contains(script, "before-timeout"):
 				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: []byte("before-timeout\n")})
 				continue
@@ -815,6 +882,15 @@ func TestMCPContextPreservesOutputAccountingTimeoutBytesAndPrivateFraming(t *tes
 	}
 	if framed.CommandStatus != "exited" || framed.ContextStatus != "running" || framed.Stdout != "function-defined\n" || framed.StdoutTotalBytes != int64(len(framed.Stdout)) {
 		t.Fatalf("function-safe context result = %#v", framed)
+	}
+	_, fdClosed, err := endpoint.runGuestContext(t.Context(), nil, mcpContextRunInput{
+		ContextID: opened.ContextID, CommandLine: "exec 3>&-; echo fd3-closed", TimeoutSeconds: 1,
+	})
+	if err != nil {
+		t.Fatalf("run after closing fd 3: %v", err)
+	}
+	if fdClosed.CommandStatus != "exited" || fdClosed.ContextStatus != "running" || fdClosed.ExitCode != 0 || fdClosed.Stdout != "fd3-closed\n" {
+		t.Fatalf("fd-3-safe context result = %#v", fdClosed)
 	}
 	_, timedStart, err := endpoint.startGuestContextCommand(t.Context(), nil, mcpContextRunInput{
 		ContextID: opened.ContextID, CommandLine: "echo before-timeout; sleep 20", TimeoutSeconds: 0.05,
