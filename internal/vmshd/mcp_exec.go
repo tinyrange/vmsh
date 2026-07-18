@@ -206,10 +206,7 @@ func (e *mcpEndpoint) cancelVMCommand(ctx context.Context, _ *mcp.CallToolReques
 }
 
 func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
-	id, err := e.ownedVMID(in.VMID)
-	if err != nil {
-		return nil, err
-	}
+	id := strings.TrimSpace(in.VMID)
 	if len(in.Command) == 0 || strings.TrimSpace(in.Command[0]) == "" {
 		return nil, fmt.Errorf("command is required")
 	}
@@ -238,7 +235,7 @@ func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
 		request: client.RunRequest{Command: append([]string(nil), in.Command...), Env: append([]string(nil), in.Env...), WorkDir: workDir, User: user, TimeoutSeconds: in.TimeoutSeconds},
 		stdin:   stdin, inputs: make(chan client.ExecInput),
 	}
-	if err := e.registerMCPCommand(command); err != nil {
+	if _, err := e.registerMCPCommand(command); err != nil {
 		cancel()
 		return nil, err
 	}
@@ -246,11 +243,31 @@ func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
 	return command, nil
 }
 
-func (e *mcpEndpoint) registerMCPCommand(command *mcpCommand) error {
+func (e *mcpEndpoint) registerMCPCommand(command *mcpCommand) (*mcpGuestContext, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
-		return fmt.Errorf("MCP endpoint is stopped")
+		return nil, fmt.Errorf("MCP endpoint is stopped")
+	}
+	var guest *mcpGuestContext
+	if command.contextID != "" {
+		guest = e.contexts[command.contextID]
+		if guest == nil {
+			return nil, fmt.Errorf("context %q is not owned by this MCP session", command.contextID)
+		}
+		command.vmID = guest.vmID
+		select {
+		case <-guest.done:
+			return nil, fmt.Errorf("context %q is closed", command.contextID)
+		default:
+		}
+		command.terminateOverride = guest.stop
+	}
+	if _, ok := e.vms[command.vmID]; !ok {
+		return nil, fmt.Errorf("VM %q is not owned by this MCP session", command.vmID)
+	}
+	if _, ok := e.stopping[command.vmID]; ok {
+		return nil, fmt.Errorf("VM %q is stopping", command.vmID)
 	}
 	for existingID, existing := range e.commands {
 		if len(e.commands) < mcpMaxCommands {
@@ -263,10 +280,10 @@ func (e *mcpEndpoint) registerMCPCommand(command *mcpCommand) error {
 		}
 	}
 	if len(e.commands) >= mcpMaxCommands {
-		return fmt.Errorf("MCP command limit reached (%d)", mcpMaxCommands)
+		return nil, fmt.Errorf("MCP command limit reached (%d)", mcpMaxCommands)
 	}
 	e.commands[command.id] = command
-	return nil
+	return guest, nil
 }
 
 func (e *mcpEndpoint) command(id string) (*mcpCommand, error) {

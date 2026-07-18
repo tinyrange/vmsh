@@ -200,10 +200,6 @@ func validateGuestContextCommand(in mcpContextRunInput) (string, error) {
 }
 
 func (e *mcpEndpoint) startGuestContextCommand(_ context.Context, _ *mcp.CallToolRequest, in mcpContextRunInput) (*mcp.CallToolResult, mcpCommandOutput, error) {
-	guest, err := e.guestContext(in.ContextID)
-	if err != nil {
-		return nil, mcpCommandOutput{}, err
-	}
 	line, err := validateGuestContextCommand(in)
 	if err != nil {
 		return nil, mcpCommandOutput{}, err
@@ -214,10 +210,11 @@ func (e *mcpEndpoint) startGuestContextCommand(_ context.Context, _ *mcp.CallToo
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	command := &mcpCommand{
-		id: commandID, vmID: guest.vmID, contextID: guest.id, cancel: cancel, done: make(chan struct{}),
-		status: "running", startedAt: time.Now().UTC(), terminateOverride: guest.stop,
+		id: commandID, contextID: strings.TrimSpace(in.ContextID), cancel: cancel, done: make(chan struct{}),
+		status: "running", startedAt: time.Now().UTC(),
 	}
-	if err := e.registerMCPCommand(command); err != nil {
+	guest, err := e.registerMCPCommand(command)
+	if err != nil {
 		cancel()
 		return nil, mcpCommandOutput{}, err
 	}
@@ -282,7 +279,7 @@ type mcpContextCloseOutput struct {
 	Closed bool `json:"closed"`
 }
 
-func (e *mcpEndpoint) closeGuestContext(_ context.Context, _ *mcp.CallToolRequest, in mcpContextStatusInput) (*mcp.CallToolResult, mcpContextCloseOutput, error) {
+func (e *mcpEndpoint) closeGuestContext(ctx context.Context, _ *mcp.CallToolRequest, in mcpContextStatusInput) (*mcp.CallToolResult, mcpContextCloseOutput, error) {
 	guest, err := e.guestContext(in.ContextID)
 	if err != nil {
 		return nil, mcpContextCloseOutput{}, err
@@ -296,7 +293,9 @@ func (e *mcpEndpoint) closeGuestContext(_ context.Context, _ *mcp.CallToolReques
 	}
 	delete(e.contexts, guest.id)
 	e.mu.Unlock()
-	cancelAndWaitMCPWork(commands, []*mcpGuestContext{guest})
+	if err := cancelAndWaitMCPWork(ctx, e.workCleanupTimeout(), commands, []*mcpGuestContext{guest}); err != nil {
+		return nil, mcpContextCloseOutput{}, fmt.Errorf("close guest context: %w", err)
+	}
 	return nil, mcpContextCloseOutput{Closed: true}, nil
 }
 

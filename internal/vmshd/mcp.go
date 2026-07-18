@@ -15,21 +15,24 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/tinyrange/vmsh/internal/version"
 	"github.com/tinyrange/vmsh/internal/vmconfig"
 	"github.com/tinyrange/vmsh/internal/vmshdprotocol"
 	"j5.nz/cc/client"
 )
 
 const (
-	mcpMaxVMs       = 16
-	mcpDefaultRAMMB = 512
-	mcpMaxRAMMB     = 4096
-	mcpDefaultCPUs  = 1
-	mcpMaxCPUs      = 8
+	mcpMaxVMs             = 16
+	mcpDefaultRAMMB       = 512
+	mcpMaxRAMMB           = 4096
+	mcpDefaultCPUs        = 1
+	mcpMaxCPUs            = 8
+	mcpWorkCleanupTimeout = 3 * time.Second
 )
 
 type MCPEndpointInfo struct {
 	URL       string    `json:"url"`
+	Version   string    `json:"version"`
 	VMs       int       `json:"vms"`
 	CreatedAt time.Time `json:"created_at"`
 }
@@ -54,15 +57,16 @@ type mcpEndpoint struct {
 	server    *http.Server
 	control   *client.Client
 
-	mu          sync.Mutex
-	credentials map[string]string
-	vms         map[string]mcpVM
-	commands    map[string]*mcpCommand
-	artifacts   map[string]*mcpArtifact
-	contexts    map[string]*mcpGuestContext
-	stopping    map[string]struct{}
-	starting    int
-	closed      bool
+	mu             sync.Mutex
+	credentials    map[string]string
+	vms            map[string]mcpVM
+	commands       map[string]*mcpCommand
+	artifacts      map[string]*mcpArtifact
+	contexts       map[string]*mcpGuestContext
+	stopping       map[string]struct{}
+	starting       int
+	closed         bool
+	cleanupTimeout time.Duration
 }
 
 type mcpVM struct {
@@ -211,11 +215,11 @@ func (m *mcpManager) Close() error {
 func (e *mcpEndpoint) info() MCPEndpointInfo {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return MCPEndpointInfo{URL: e.url, VMs: len(e.vms), CreatedAt: e.createdAt}
+	return MCPEndpointInfo{URL: e.url, Version: mcpImplementationVersion(), VMs: len(e.vms), CreatedAt: e.createdAt}
 }
 
 func (e *mcpEndpoint) handler() http.Handler {
-	server := mcp.NewServer(&mcp.Implementation{Name: "vmsh", Version: "0.1.0"}, nil)
+	server := mcp.NewServer(&mcp.Implementation{Name: "vmsh", Version: mcpImplementationVersion()}, nil)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_create", Description: "Create a regular vmsh isolated VM with internet access but no host access, filesystem shares, or port forwards."}, e.createVM)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_list", Description: "List VMs created through this MCP session."}, e.listVMs)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_run", Description: "Run any command inside a VM created through this MCP session and wait for it to finish."}, e.runVM)
@@ -246,6 +250,29 @@ func (e *mcpEndpoint) handler() http.Handler {
 		}
 		mcpHandler.ServeHTTP(w, r)
 	})
+}
+
+func mcpImplementationVersion() string {
+	build := version.Current()
+	base := strings.TrimSpace(build.Version)
+	if base == "" {
+		base = "devel"
+	}
+	var metadata []string
+	commit := strings.TrimSpace(build.Commit)
+	if len(commit) > 12 {
+		commit = commit[:12]
+	}
+	if commit != "" {
+		metadata = append(metadata, commit)
+	}
+	if build.Dirty && !strings.Contains(strings.ToLower(base), "dirty") {
+		metadata = append(metadata, "dirty")
+	}
+	if len(metadata) == 0 {
+		return base
+	}
+	return base + "+" + strings.Join(metadata, ".")
 }
 
 func (e *mcpEndpoint) authorized(header string) bool {
@@ -473,17 +500,20 @@ func (e *mcpEndpoint) stopVM(ctx context.Context, _ *mcp.CallToolRequest, in mcp
 	if err != nil {
 		return nil, mcpStopVMOutput{}, err
 	}
-	e.cancelVMWork(id)
+	cleanupErr := e.cancelVMWork(ctx, id)
 	if err := e.control.ShutdownInstanceWithIDContext(ctx, id); err != nil {
 		e.mu.Lock()
 		delete(e.stopping, id)
 		e.mu.Unlock()
-		return nil, mcpStopVMOutput{}, fmt.Errorf("stop VM: %w", err)
+		return nil, mcpStopVMOutput{}, errors.Join(cleanupErr, fmt.Errorf("stop VM: %w", err))
 	}
 	e.mu.Lock()
 	delete(e.vms, id)
 	delete(e.stopping, id)
 	e.mu.Unlock()
+	if cleanupErr != nil {
+		return nil, mcpStopVMOutput{}, fmt.Errorf("VM %q stopped but MCP cleanup was incomplete: %w", id, cleanupErr)
+	}
 	return nil, mcpStopVMOutput{Stopped: true}, nil
 }
 
@@ -542,8 +572,8 @@ func (e *mcpEndpoint) close() error {
 	}
 	e.vms = make(map[string]mcpVM)
 	e.mu.Unlock()
-	cancelAndWaitMCPWork(commands, contexts)
 	var errs []error
+	errs = append(errs, cancelAndWaitMCPWork(context.Background(), e.workCleanupTimeout(), commands, contexts))
 	if e.server != nil {
 		// Stop accepting and terminate active MCP transports before cleaning up
 		// their VMs. Graceful HTTP shutdown can otherwise wait indefinitely for a
@@ -558,7 +588,7 @@ func (e *mcpEndpoint) close() error {
 	return errors.Join(errs...)
 }
 
-func (e *mcpEndpoint) cancelVMWork(vmID string) {
+func (e *mcpEndpoint) cancelVMWork(ctx context.Context, vmID string) error {
 	e.mu.Lock()
 	commands := make([]*mcpCommand, 0)
 	for _, command := range e.commands {
@@ -574,38 +604,62 @@ func (e *mcpEndpoint) cancelVMWork(vmID string) {
 		}
 	}
 	e.mu.Unlock()
-	cancelAndWaitMCPWork(commands, contexts)
+	return cancelAndWaitMCPWork(ctx, e.workCleanupTimeout(), commands, contexts)
 }
 
-func cancelAndWaitMCPWork(commands []*mcpCommand, contexts []*mcpGuestContext) {
+func (e *mcpEndpoint) workCleanupTimeout() time.Duration {
+	if e.cleanupTimeout > 0 {
+		return e.cleanupTimeout
+	}
+	return mcpWorkCleanupTimeout
+}
+
+func cancelAndWaitMCPWork(ctx context.Context, timeout time.Duration, commands []*mcpCommand, contexts []*mcpGuestContext) error {
 	for _, command := range commands {
 		command.requestCancel()
 	}
 	for _, guest := range contexts {
 		guest.stop()
 	}
-	deadline := time.Now().Add(3 * time.Second)
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	for _, guest := range contexts {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return
-		}
-		timer := time.NewTimer(remaining)
 		select {
 		case <-guest.done:
-			if !timer.Stop() {
-				<-timer.C
-			}
-		case <-timer.C:
-			return
+		case <-waitCtx.Done():
+			return incompleteMCPWorkError(waitCtx.Err(), commands, contexts)
 		}
 	}
 	for _, command := range commands {
-		remaining := time.Until(deadline)
-		if remaining <= 0 || !command.waitDone(remaining) {
-			return
+		select {
+		case <-command.done:
+		case <-waitCtx.Done():
+			return incompleteMCPWorkError(waitCtx.Err(), commands, contexts)
 		}
 	}
+	return nil
+}
+
+func incompleteMCPWorkError(cause error, commands []*mcpCommand, contexts []*mcpGuestContext) error {
+	var pending []string
+	for _, guest := range contexts {
+		select {
+		case <-guest.done:
+		default:
+			pending = append(pending, "context "+guest.id)
+		}
+	}
+	for _, command := range commands {
+		select {
+		case <-command.done:
+		default:
+			pending = append(pending, "command "+command.id)
+		}
+	}
+	if len(pending) == 0 {
+		pending = append(pending, "work completion")
+	}
+	return fmt.Errorf("MCP cleanup did not finish for %s: %w", strings.Join(pending, ", "), cause)
 }
 
 func randomMCPID(prefix string) (string, error) {

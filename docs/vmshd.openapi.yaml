@@ -1096,11 +1096,13 @@ components:
     MCPEndpointInfo:
       type: object
       additionalProperties: false
-      required: [url, vms, created_at]
+      required: [url, version, vms, created_at]
       properties:
         url:
           type: string
           format: uri
+        version:
+          type: string
         vms:
           type: integer
           minimum: 0

@@ -3677,7 +3677,7 @@ func (s *shellState) runMCP(command string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		_, err = fmt.Fprintf(stdout, "MCP endpoint ready at %s (%d VMs)\n", info.URL, info.VMs)
+		_, err = fmt.Fprintf(stdout, "MCP endpoint ready at %s (%d VMs, server %s)\n", info.URL, info.VMs, firstNonEmpty(info.Version, "unknown"))
 		return err
 	}
 	switch fields[0] {
@@ -3689,7 +3689,7 @@ func (s *shellState) runMCP(command string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		_, err = fmt.Fprintf(stdout, "MCP endpoint running at %s (%d VMs)\n", info.URL, info.VMs)
+		_, err = fmt.Fprintf(stdout, "MCP endpoint running at %s (%d VMs, server %s)\n", info.URL, info.VMs, firstNonEmpty(info.Version, "unknown"))
 		return err
 	case "stop":
 		if len(fields) != 1 {

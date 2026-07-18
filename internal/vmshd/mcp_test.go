@@ -136,6 +136,9 @@ func TestMCPEndpointIsScopedToOwnedIsolatedVMs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start MCP endpoint: %v", err)
 	}
+	if info.Version != mcpImplementationVersion() {
+		t.Fatalf("MCP endpoint version = %q, want %q", info.Version, mcpImplementationVersion())
+	}
 	credential, err := manager.MintCredential("session-1")
 	if err != nil {
 		t.Fatalf("mint credential: %v", err)
@@ -173,6 +176,10 @@ func TestMCPEndpointIsScopedToOwnedIsolatedVMs(t *testing.T) {
 		t.Fatalf("connect MCP client: %v", err)
 	}
 	defer session.Close()
+	initialized := session.InitializeResult()
+	if initialized == nil || initialized.ServerInfo == nil || initialized.ServerInfo.Name != "vmsh" || initialized.ServerInfo.Version != mcpImplementationVersion() {
+		t.Fatalf("MCP server identity = %#v", initialized)
+	}
 
 	tools, err := session.ListTools(context.Background(), nil)
 	if err != nil {
@@ -764,6 +771,157 @@ func TestMCPAsyncContextCommandsAllowSequentialLifecycleInterruption(t *testing.
 	statusOutput = structuredToolOutput[mcpCommandOutput](t, status)
 	if statusOutput.Status != "canceled" || statusOutput.ExitCode == nil || *statusOutput.ExitCode != 130 {
 		t.Fatalf("context command after VM stop = %#v", statusOutput)
+	}
+}
+
+func TestMCPAsyncContextStartRacesWithCloseAndStop(t *testing.T) {
+	shutdown := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/vm/shutdown" {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"stopped": true})
+	}))
+	defer shutdown.Close()
+
+	for i := 0; i < 64; i++ {
+		t.Run(fmt.Sprintf("close-%d", i), func(t *testing.T) {
+			guest := inertMCPGuestContext("context", "one")
+			endpoint := &mcpEndpoint{
+				vms: map[string]mcpVM{"one": {ID: "one"}}, commands: make(map[string]*mcpCommand),
+				contexts: map[string]*mcpGuestContext{guest.id: guest}, stopping: make(map[string]struct{}),
+			}
+			startResult := make(chan mcpCommandOutput, 1)
+			startErr := make(chan error, 1)
+			go func() {
+				_, result, err := endpoint.startGuestContextCommand(t.Context(), nil, mcpContextRunInput{ContextID: guest.id, CommandLine: "sleep 60"})
+				startResult <- result
+				startErr <- err
+			}()
+			_, closed, closeErr := endpoint.closeGuestContext(t.Context(), nil, mcpContextStatusInput{ContextID: guest.id})
+			if closeErr != nil || !closed.Closed {
+				t.Fatalf("close context = %#v, %v", closed, closeErr)
+			}
+			result, err := <-startResult, <-startErr
+			if err == nil {
+				assertMCPCommandCanceled(t, endpoint, result.CommandID)
+			}
+			assertNoRunningMCPCommands(t, endpoint)
+		})
+
+		t.Run(fmt.Sprintf("stop-%d", i), func(t *testing.T) {
+			guest := inertMCPGuestContext("context", "one")
+			endpoint := &mcpEndpoint{
+				control: client.NewClient(shutdown.URL, nil), vms: map[string]mcpVM{"one": {ID: "one"}},
+				commands: make(map[string]*mcpCommand), contexts: map[string]*mcpGuestContext{guest.id: guest}, stopping: make(map[string]struct{}),
+			}
+			startResult := make(chan mcpCommandOutput, 1)
+			startErr := make(chan error, 1)
+			go func() {
+				_, result, err := endpoint.startGuestContextCommand(t.Context(), nil, mcpContextRunInput{ContextID: guest.id, CommandLine: "sleep 60"})
+				startResult <- result
+				startErr <- err
+			}()
+			_, stopped, stopErr := endpoint.stopVM(t.Context(), nil, mcpStopVMInput{VMID: "one"})
+			if stopErr != nil || !stopped.Stopped {
+				t.Fatalf("stop VM = %#v, %v", stopped, stopErr)
+			}
+			result, err := <-startResult, <-startErr
+			if err == nil {
+				assertMCPCommandCanceled(t, endpoint, result.CommandID)
+			}
+			assertNoRunningMCPCommands(t, endpoint)
+		})
+	}
+}
+
+func TestMCPCommandStartIsRejectedOnceVMStopBegins(t *testing.T) {
+	endpoint := &mcpEndpoint{
+		vms: map[string]mcpVM{"one": {ID: "one"}}, commands: make(map[string]*mcpCommand),
+		stopping: map[string]struct{}{"one": {}},
+	}
+	_, _, err := endpoint.startVMCommand(t.Context(), nil, mcpRunVMInput{VMID: "one", Command: []string{"true"}})
+	if err == nil {
+		t.Fatal("started a command after VM stop began")
+	}
+	assertNoRunningMCPCommands(t, endpoint)
+}
+
+func TestMCPLifecycleReportsIncompleteCleanup(t *testing.T) {
+	t.Run("context close", func(t *testing.T) {
+		guest := &mcpGuestContext{id: "wedged", vmID: "one", done: make(chan struct{}), cancel: func() {}}
+		endpoint := &mcpEndpoint{
+			vms: map[string]mcpVM{"one": {ID: "one"}}, commands: make(map[string]*mcpCommand),
+			contexts: map[string]*mcpGuestContext{guest.id: guest}, cleanupTimeout: 10 * time.Millisecond,
+		}
+		_, closed, err := endpoint.closeGuestContext(t.Context(), nil, mcpContextStatusInput{ContextID: guest.id})
+		if err == nil || closed.Closed {
+			t.Fatalf("wedged context close = %#v, %v", closed, err)
+		}
+	})
+
+	t.Run("VM stop", func(t *testing.T) {
+		shutdownCalled := make(chan struct{}, 1)
+		control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			shutdownCalled <- struct{}{}
+			writeJSON(w, http.StatusOK, map[string]bool{"stopped": true})
+		}))
+		defer control.Close()
+		guest := &mcpGuestContext{id: "wedged", vmID: "one", done: make(chan struct{}), cancel: func() {}}
+		endpoint := &mcpEndpoint{
+			control: client.NewClient(control.URL, nil), vms: map[string]mcpVM{"one": {ID: "one"}},
+			commands: make(map[string]*mcpCommand), contexts: map[string]*mcpGuestContext{guest.id: guest},
+			stopping: make(map[string]struct{}), cleanupTimeout: 10 * time.Millisecond,
+		}
+		_, stopped, err := endpoint.stopVM(t.Context(), nil, mcpStopVMInput{VMID: "one"})
+		if err == nil || stopped.Stopped {
+			t.Fatalf("wedged VM stop = %#v, %v", stopped, err)
+		}
+		select {
+		case <-shutdownCalled:
+		default:
+			t.Fatal("VM shutdown was skipped after cleanup timed out")
+		}
+	})
+}
+
+func inertMCPGuestContext(id, vmID string) *mcpGuestContext {
+	done := make(chan struct{})
+	return &mcpGuestContext{
+		id: id, vmID: vmID, inputs: make(chan client.ExecInput), events: make(chan client.ExecEvent), done: done,
+		cancel: func() { close(done) },
+	}
+}
+
+func assertMCPCommandCanceled(t *testing.T, endpoint *mcpEndpoint, commandID string) {
+	t.Helper()
+	command, err := endpoint.command(commandID)
+	if err != nil {
+		t.Fatalf("find raced command: %v", err)
+	}
+	select {
+	case <-command.done:
+	case <-time.After(time.Second):
+		t.Fatal("raced command did not settle")
+	}
+	result := command.snapshot(0, 0, mcpDefaultOutputChunk, false)
+	if result.Status != "canceled" || result.ExitCode == nil || *result.ExitCode != 130 {
+		t.Fatalf("raced command = %#v", result)
+	}
+}
+
+func assertNoRunningMCPCommands(t *testing.T, endpoint *mcpEndpoint) {
+	t.Helper()
+	endpoint.mu.Lock()
+	commands := make([]*mcpCommand, 0, len(endpoint.commands))
+	for _, command := range endpoint.commands {
+		commands = append(commands, command)
+	}
+	endpoint.mu.Unlock()
+	for _, command := range commands {
+		if status := command.snapshot(0, 0, mcpDefaultOutputChunk, false).Status; status == "running" {
+			t.Fatalf("command %q remained running", command.id)
+		}
 	}
 }
 
