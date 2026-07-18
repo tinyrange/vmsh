@@ -29,12 +29,21 @@ type mcpGuestContext struct {
 	events      chan client.ExecEvent
 	cancel      context.CancelFunc
 	done        chan struct{}
+	control     *client.Client
 
 	runMu    sync.Mutex
 	stopOnce sync.Once
 	mu       sync.Mutex
 	err      string
 	carry    []byte
+	captures []mcpContextCapture
+}
+
+type mcpContextCapture struct {
+	stdoutPath   string
+	stderrPath   string
+	stdoutOffset int64
+	stderrOffset int64
 }
 
 type mcpContextOpenInput struct {
@@ -54,6 +63,12 @@ type mcpContextInfo struct {
 }
 
 func (e *mcpEndpoint) openGuestContext(ctx context.Context, _ *mcp.CallToolRequest, in mcpContextOpenInput) (*mcp.CallToolResult, mcpContextInfo, error) {
+	if err := validateMCPStringBytes("environment", in.Env, mcpMaxEnvBytes); err != nil {
+		return nil, mcpContextInfo{}, err
+	}
+	if len(in.WorkDir) > mcpMaxPathBytes {
+		return nil, mcpContextInfo{}, fmt.Errorf("workdir exceeds the %d-byte limit", mcpMaxPathBytes)
+	}
 	vm, err := e.ownedVM(in.VMID)
 	if err != nil {
 		return nil, mcpContextInfo{}, err
@@ -82,7 +97,7 @@ func (e *mcpEndpoint) openGuestContext(ctx context.Context, _ *mcp.CallToolReque
 	streamCtx, cancel := context.WithCancel(context.Background())
 	guest := &mcpGuestContext{
 		id: id, vmID: vm.ID, user: user, workDir: workDir, env: append([]string(nil), in.Env...), controlPath: "/tmp/.vmsh-" + id + ".control",
-		inputs: make(chan client.ExecInput, 16), events: make(chan client.ExecEvent, mcpShellEventBuffer), cancel: cancel, done: make(chan struct{}),
+		inputs: make(chan client.ExecInput, 16), events: make(chan client.ExecEvent, mcpShellEventBuffer), cancel: cancel, done: make(chan struct{}), control: e.control,
 	}
 	e.mu.Lock()
 	e.openingContexts--
@@ -266,6 +281,9 @@ func validateGuestContextCommand(in mcpContextRunInput) (string, error) {
 	if strings.TrimSpace(line) == "" {
 		return "", fmt.Errorf("command_line or command is required")
 	}
+	if len(line) > mcpMaxCommandBytes {
+		return "", fmt.Errorf("context command exceeds the %d-byte limit", mcpMaxCommandBytes)
+	}
 	if in.TimeoutSeconds < 0 || in.TimeoutSeconds > mcpMaxTimeoutSeconds {
 		return "", fmt.Errorf("timeout_seconds must be between 0 and %d", mcpMaxTimeoutSeconds)
 	}
@@ -409,6 +427,12 @@ func (g *mcpGuestContext) serve(ctx context.Context, control *client.Client) {
 			return ctx.Err()
 		}
 	})
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_, _ = control.RunEventsInContext(cleanupCtx, g.vmID, client.RunRequest{
+		Command: []string{"/bin/sh", "-c", `rm -f "$1".marker_*.stdout "$1".marker_*.stderr "$1"`, "sh", g.controlPath},
+		WorkDir: "/", User: g.user,
+	})
+	cleanupCancel()
 	g.mu.Lock()
 	if err != nil && ctx.Err() == nil {
 		g.err = conciseCommandError(err)
@@ -427,7 +451,14 @@ func (g *mcpGuestContext) runLine(ctx context.Context, line string) (mcpContextR
 	}
 	marker := []byte("\x1e" + token + ":")
 	beginMarker := []byte("\x1e" + token + ":begin\x1f")
-	script := mcpContextCommandScript(token, line, g.controlPath)
+	capture := mcpContextCapture{
+		stdoutPath: g.controlPath + "." + token + ".stdout",
+		stderrPath: g.controlPath + "." + token + ".stderr",
+	}
+	if err := g.collectContextCaptures(ctx, &result); err != nil {
+		return result, err
+	}
+	script := mcpContextCommandCaptureScript(token, line, g.controlPath, capture.stdoutPath, capture.stderrPath)
 	g.mu.Lock()
 	initial := append([]byte(nil), g.carry...)
 	g.carry = nil
@@ -492,6 +523,12 @@ drained:
 					g.mu.Lock()
 					g.carry = append(g.carry[:0], scan[carryStart:]...)
 					g.mu.Unlock()
+					if err := g.collectCurrentCapture(ctx, &result, &capture); err != nil {
+						return result, err
+					}
+					g.mu.Lock()
+					g.captures = append(g.captures, capture)
+					g.mu.Unlock()
 					result.exitCode = code
 					return result, nil
 				}
@@ -522,6 +559,81 @@ drained:
 			return result, ctx.Err()
 		}
 	}
+}
+
+func (g *mcpGuestContext) collectContextCaptures(ctx context.Context, result *mcpContextResult) error {
+	g.mu.Lock()
+	captures := append([]mcpContextCapture(nil), g.captures...)
+	g.mu.Unlock()
+	for i := range captures {
+		stdout, err := g.readContextCapture(ctx, captures[i].stdoutPath, captures[i].stdoutOffset)
+		if err != nil {
+			return err
+		}
+		stderr, err := g.readContextCapture(ctx, captures[i].stderrPath, captures[i].stderrOffset)
+		if err != nil {
+			return err
+		}
+		result.asyncStdout, result.asyncStdoutTotal, result.asyncStdoutTruncated = appendCommandOutput(result.asyncStdout, result.asyncStdoutTotal, result.asyncStdoutTruncated, stdout)
+		result.asyncStderr, result.asyncStderrTotal, result.asyncStderrTruncated = appendCommandOutput(result.asyncStderr, result.asyncStderrTotal, result.asyncStderrTruncated, stderr)
+		captures[i].stdoutOffset += int64(len(stdout))
+		captures[i].stderrOffset += int64(len(stderr))
+	}
+	g.mu.Lock()
+	for i := range captures {
+		if i < len(g.captures) && g.captures[i].stdoutPath == captures[i].stdoutPath {
+			g.captures[i] = captures[i]
+		}
+	}
+	g.mu.Unlock()
+	return nil
+}
+
+func (g *mcpGuestContext) collectCurrentCapture(ctx context.Context, result *mcpContextResult, capture *mcpContextCapture) error {
+	stdout, err := g.readContextCapture(ctx, capture.stdoutPath, 0)
+	if err != nil {
+		return err
+	}
+	stderr, err := g.readContextCapture(ctx, capture.stderrPath, 0)
+	if err != nil {
+		return err
+	}
+	result.stdout, result.stdoutTotal, result.stdoutTruncated = appendCommandOutput(result.stdout, result.stdoutTotal, result.stdoutTruncated, stdout)
+	result.stderr, result.stderrTotal, result.stderrTruncated = appendCommandOutput(result.stderr, result.stderrTotal, result.stderrTruncated, stderr)
+	capture.stdoutOffset = int64(len(stdout))
+	capture.stderrOffset = int64(len(stderr))
+	return nil
+}
+
+func (g *mcpGuestContext) readContextCapture(ctx context.Context, path string, offset int64) ([]byte, error) {
+	if g.control == nil {
+		return nil, fmt.Errorf("guest context control client is unavailable")
+	}
+	script := `if [ -f "$1" ]; then tail -c "+$(( $2 + 1 ))" "$1"; fi`
+	events, err := g.control.RunEventsInContext(ctx, g.vmID, client.RunRequest{
+		Command: []string{"/bin/sh", "-c", script, "sh", path, strconv.FormatInt(offset, 10)},
+		WorkDir: "/", User: g.user,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read context output: %w", err)
+	}
+	var output []byte
+	for _, event := range events {
+		switch event.Kind {
+		case "stdout", "output":
+			if event.Stream == "stderr" {
+				continue
+			}
+			output = append(output, contextEventData(event)...)
+		case "error":
+			return nil, fmt.Errorf("read context output: %s", firstNonEmpty(event.Error, event.Output, "command failed"))
+		case "exit":
+			if event.ExitCode != 0 {
+				return nil, fmt.Errorf("read context output exited with status %d", event.ExitCode)
+			}
+		}
+	}
+	return output, nil
 }
 
 func contextEventData(event client.ExecEvent) []byte {
@@ -578,6 +690,17 @@ func mcpContextCommandScript(token, line, controlPath string) string {
 	statusVar := "__vmsh_mcp_status_" + strings.TrimPrefix(token, "marker_")
 	path := shellJoin([]string{controlPath})
 	return "/usr/bin/printf '\\036" + token + ":begin\\037\\n' >" + path + "\nif {\n" + line + "\n} </dev/null; then\n" + statusVar + "=0\nelse\n" + statusVar + "=$?\nfi\n/usr/bin/printf '\\036" + token + ":%s\\037\\n' \"$" + statusVar + "\" >" + path + "\nunset " + statusVar + "\n"
+}
+
+func mcpContextCommandCaptureScript(token, line, controlPath, stdoutPath, stderrPath string) string {
+	statusVar := "__vmsh_mcp_status_" + strings.TrimPrefix(token, "marker_")
+	path := shellJoin([]string{controlPath})
+	stdout := shellJoin([]string{stdoutPath})
+	stderr := shellJoin([]string{stderrPath})
+	return ": >" + stdout + "\n: >" + stderr + "\n" +
+		"/usr/bin/printf '\\036" + token + ":begin\\037\\n' >" + path + "\nif {\n" + line +
+		"\n} </dev/null >" + stdout + " 2>" + stderr + "; then\n" + statusVar + "=0\nelse\n" + statusVar + "=$?\nfi\n" +
+		"/usr/bin/printf '\\036" + token + ":%s\\037\\n' \"$" + statusVar + "\" >" + path + "\nunset " + statusVar + "\n"
 }
 
 func (g *mcpGuestContext) info() mcpContextInfo {

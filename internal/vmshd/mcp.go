@@ -33,6 +33,8 @@ const (
 	mcpBSDDefaultBootTime = 60 * time.Second
 	mcpMaxBootTime        = 5 * time.Minute
 	mcpWorkCleanupTimeout = 3 * time.Second
+	mcpMaxRequestBytes    = 8 << 20
+	mcpRequestReadTimeout = 30 * time.Second
 )
 
 type MCPEndpointInfo struct {
@@ -130,8 +132,8 @@ func (m *mcpManager) Start(sessionID string) (MCPEndpointInfo, error) {
 		contexts:    make(map[string]*mcpGuestContext),
 		stopping:    make(map[string]struct{}),
 	}
-	handler := endpoint.handler()
-	endpoint.server = &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 2 * time.Minute}
+	handler := http.MaxBytesHandler(endpoint.handler(), mcpMaxRequestBytes)
+	endpoint.server = &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: mcpRequestReadTimeout, IdleTimeout: 2 * time.Minute}
 	m.endpoints[sessionID] = endpoint
 	m.mu.Unlock()
 	go func() {

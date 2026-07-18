@@ -24,16 +24,20 @@ const (
 	// Managed input is base64-encoded in JSON before crossing guest vsock. Keep
 	// the encoded frame below the guest receive window.
 	mcpStdinChunkBytes = 16 << 10
+	mcpMaxStdinBytes   = 4 << 20
+	mcpMaxCommandBytes = 256 << 10
+	mcpMaxEnvBytes     = 256 << 10
+	mcpMaxPathBytes    = 16 << 10
 )
 
 type mcpRunVMInput struct {
 	VMID           string   `json:"vm_id" jsonschema:"ID returned by vm_create"`
-	Command        []string `json:"command" jsonschema:"command and arguments to execute without a shell"`
-	Env            []string `json:"env,omitempty" jsonschema:"environment entries in NAME=value form"`
+	Command        []string `json:"command" jsonschema:"command and arguments to execute without a shell; total encoded argument bytes are capped at 256 KiB"`
+	Env            []string `json:"env,omitempty" jsonschema:"environment entries in NAME=value form; total bytes are capped at 256 KiB"`
 	WorkDir        string   `json:"workdir,omitempty" jsonschema:"working directory inside the guest; defaults to / for built-in BSD guests and /home/cc otherwise"`
 	User           string   `json:"user,omitempty" jsonschema:"guest user name or uid[:gid]; built-in BSD guests currently support only root; defaults to 1000:1000 otherwise; use root for package installation"`
-	Stdin          string   `json:"stdin,omitempty" jsonschema:"UTF-8 standard input sent to the command"`
-	StdinBase64    string   `json:"stdin_base64,omitempty" jsonschema:"base64-encoded binary standard input; mutually exclusive with stdin"`
+	Stdin          string   `json:"stdin,omitempty" jsonschema:"UTF-8 standard input sent to the command; capped at 4 MiB"`
+	StdinBase64    string   `json:"stdin_base64,omitempty" jsonschema:"base64-encoded binary standard input capped at 4 MiB decoded; mutually exclusive with stdin"`
 	TimeoutSeconds float64  `json:"timeout_seconds,omitempty" jsonschema:"guest command deadline in seconds; zero means no command deadline"`
 }
 
@@ -221,6 +225,15 @@ func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
 	id := vm.ID
 	if len(in.Command) == 0 || strings.TrimSpace(in.Command[0]) == "" {
 		return nil, fmt.Errorf("command is required")
+	}
+	if err := validateMCPStringBytes("command", in.Command, mcpMaxCommandBytes); err != nil {
+		return nil, err
+	}
+	if err := validateMCPStringBytes("environment", in.Env, mcpMaxEnvBytes); err != nil {
+		return nil, err
+	}
+	if len(in.WorkDir) > mcpMaxPathBytes {
+		return nil, fmt.Errorf("workdir exceeds the %d-byte limit", mcpMaxPathBytes)
 	}
 	if in.TimeoutSeconds < 0 || in.TimeoutSeconds > mcpMaxTimeoutSeconds {
 		return nil, fmt.Errorf("timeout_seconds must be between 0 and %d", mcpMaxTimeoutSeconds)
@@ -511,13 +524,33 @@ func mcpCommandStdin(text, encoded string) ([]byte, error) {
 		return nil, fmt.Errorf("stdin and stdin_base64 are mutually exclusive")
 	}
 	if encoded == "" {
+		if len(text) > mcpMaxStdinBytes {
+			return nil, fmt.Errorf("stdin exceeds the %d-byte limit", mcpMaxStdinBytes)
+		}
 		return []byte(text), nil
+	}
+	if base64.StdEncoding.DecodedLen(len(encoded)) > mcpMaxStdinBytes {
+		return nil, fmt.Errorf("stdin_base64 exceeds the %d-byte decoded limit", mcpMaxStdinBytes)
 	}
 	data, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		return nil, fmt.Errorf("decode stdin_base64: %w", err)
 	}
+	if len(data) > mcpMaxStdinBytes {
+		return nil, fmt.Errorf("stdin_base64 exceeds the %d-byte decoded limit", mcpMaxStdinBytes)
+	}
 	return data, nil
+}
+
+func validateMCPStringBytes(field string, values []string, limit int) error {
+	total := 0
+	for _, value := range values {
+		if len(value) > limit-total {
+			return fmt.Errorf("%s exceeds the %d-byte limit", field, limit)
+		}
+		total += len(value)
+	}
+	return nil
 }
 
 func mcpOutputChunkSize(value int) (int, error) {

@@ -158,6 +158,22 @@ func TestMCPEndpointIsScopedToOwnedIsolatedVMs(t *testing.T) {
 		t.Fatalf("unauthorized status = %d, want %d", unauthorized.StatusCode, http.StatusUnauthorized)
 	}
 
+	oversizedJSON := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"vm_run","arguments":{"stdin":"` + strings.Repeat("x", mcpMaxRequestBytes) + `"}}}`
+	oversizedRequest, err := http.NewRequest(http.MethodPost, info.URL, strings.NewReader(oversizedJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oversizedRequest.Header.Set("Authorization", "Bearer "+credential.Token)
+	oversizedRequest.Header.Set("Content-Type", "application/json")
+	oversizedResponse, err := http.DefaultClient.Do(oversizedRequest)
+	if err != nil {
+		t.Fatalf("oversized MCP request: %v", err)
+	}
+	_ = oversizedResponse.Body.Close()
+	if oversizedResponse.StatusCode != http.StatusRequestEntityTooLarge && oversizedResponse.StatusCode != http.StatusBadRequest {
+		t.Fatalf("oversized MCP request status = %d, want a bounded-request rejection", oversizedResponse.StatusCode)
+	}
+
 	ordinary, err := http.NewRequest(http.MethodGet, control.URL+"/vm", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -585,6 +601,14 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 		if err := websocket.JSON.Receive(ws, &req); err != nil {
 			return
 		}
+		if len(req.Command) >= 3 && (strings.Contains(req.Command[2], `tail -c`) || strings.HasPrefix(req.Command[2], "rm -f ")) {
+			var input client.ExecInput
+			if err := websocket.JSON.Receive(ws, &input); err != nil || input.Kind != "stdin_close" {
+				return
+			}
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 0})
+			return
+		}
 		if req.ControlFD {
 			contextWorkDir = req.WorkDir
 		}
@@ -833,6 +857,49 @@ func testMCPContextFramingPreservesUserDescriptors(t *testing.T, shellPath strin
 	}
 	if got, want := string(userData), "first\nsecond\n"; got != want {
 		t.Fatalf("persistent fd 9 output = %q, want %q", got, want)
+	}
+}
+
+func TestMCPContextCaptureKeepsBackgroundOutputWithItsOriginatingCommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	tempDir := t.TempDir()
+	controlPath := filepath.Join(tempDir, "control")
+	firstOut := filepath.Join(tempDir, "first.stdout")
+	firstErr := filepath.Join(tempDir, "first.stderr")
+	secondOut := filepath.Join(tempDir, "second.stdout")
+	secondErr := filepath.Join(tempDir, "second.stderr")
+	controlR, controlW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controlR.Close()
+	cmd := exec.Command("/bin/sh", "-c", mcpContextShellScriptForShell(controlPath, "/bin/sh"))
+	cmd.Stdin = strings.NewReader(
+		mcpContextCommandCaptureScript("marker_first", "(sleep 0.1; printf late) & printf first", controlPath, firstOut, firstErr) +
+			mcpContextCommandCaptureScript("marker_second", "sleep 0.2; printf second", controlPath, secondOut, secondErr),
+	)
+	cmd.ExtraFiles = []*os.File{controlW}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run persistent capture shell: %v; stderr=%q", err, stderr.String())
+	}
+	_ = controlW.Close()
+	if stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("captured command output leaked onto the persistent stream: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	first, err := os.ReadFile(firstOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile(secondOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != "firstlate" || string(second) != "second" {
+		t.Fatalf("capture provenance first=%q second=%q", first, second)
 	}
 }
 
