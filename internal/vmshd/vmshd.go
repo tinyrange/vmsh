@@ -1256,7 +1256,9 @@ func (m *hostShellManager) Start(sessionID, requestedCWD string, term *Terminal)
 	go func() {
 		_ = cmd.Wait()
 		close(shell.exited)
-		shell.closeDone()
+		// The PTY reader owns natural stream completion so it can drain bytes
+		// already written by a shell that has just exited.
+		<-shell.done
 		m.mu.Lock()
 		if m.shells[sessionID] == shell {
 			delete(m.shells, sessionID)
@@ -1522,7 +1524,19 @@ func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 					return
 				}
 			case <-outputDone:
-				return
+				// readLoop publishes before it closes outputDone. Drain anything
+				// already queued so a fast `command; exit` cannot lose its tail.
+				for {
+					select {
+					case data := <-output:
+						if err := send(TerminalStreamMessage{Kind: "data", Data: data}); err != nil {
+							sendErr <- err
+							return
+						}
+					default:
+						return
+					}
+				}
 			}
 		}
 	}()
