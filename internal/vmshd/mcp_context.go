@@ -177,19 +177,27 @@ type mcpContextRunInput struct {
 }
 
 type mcpContextRunOutput struct {
-	ContextID        string `json:"context_id"`
-	VMID             string `json:"vm_id"`
-	ContextStatus    string `json:"context_status"`
-	CommandStatus    string `json:"command_status"`
-	ExitCode         int    `json:"exit_code"`
-	Stdout           string `json:"stdout,omitempty"`
-	StdoutBase64     string `json:"stdout_base64,omitempty"`
-	StdoutTotalBytes int64  `json:"stdout_total_bytes"`
-	StdoutTruncated  bool   `json:"stdout_truncated,omitempty"`
-	Stderr           string `json:"stderr,omitempty"`
-	StderrBase64     string `json:"stderr_base64,omitempty"`
-	StderrTotalBytes int64  `json:"stderr_total_bytes"`
-	StderrTruncated  bool   `json:"stderr_truncated,omitempty"`
+	ContextID             string `json:"context_id"`
+	VMID                  string `json:"vm_id"`
+	ContextStatus         string `json:"context_status"`
+	CommandStatus         string `json:"command_status"`
+	ExitCode              int    `json:"exit_code"`
+	Stdout                string `json:"stdout,omitempty"`
+	StdoutBase64          string `json:"stdout_base64,omitempty"`
+	StdoutTotalBytes      int64  `json:"stdout_total_bytes"`
+	StdoutTruncated       bool   `json:"stdout_truncated,omitempty"`
+	Stderr                string `json:"stderr,omitempty"`
+	StderrBase64          string `json:"stderr_base64,omitempty"`
+	StderrTotalBytes      int64  `json:"stderr_total_bytes"`
+	StderrTruncated       bool   `json:"stderr_truncated,omitempty"`
+	AsyncStdout           string `json:"async_stdout,omitempty"`
+	AsyncStdoutBase64     string `json:"async_stdout_base64,omitempty"`
+	AsyncStdoutTotalBytes int64  `json:"async_stdout_total_bytes"`
+	AsyncStdoutTruncated  bool   `json:"async_stdout_truncated,omitempty"`
+	AsyncStderr           string `json:"async_stderr,omitempty"`
+	AsyncStderrBase64     string `json:"async_stderr_base64,omitempty"`
+	AsyncStderrTotalBytes int64  `json:"async_stderr_total_bytes"`
+	AsyncStderrTruncated  bool   `json:"async_stderr_truncated,omitempty"`
 }
 
 func (e *mcpEndpoint) runGuestContext(ctx context.Context, _ *mcp.CallToolRequest, in mcpContextRunInput) (*mcp.CallToolResult, mcpContextRunOutput, error) {
@@ -239,6 +247,12 @@ func applyContextResult(out *mcpContextRunOutput, result mcpContextResult) {
 	out.StdoutTruncated = result.stdoutTruncated
 	out.StderrTotalBytes = result.stderrTotal
 	out.StderrTruncated = result.stderrTruncated
+	encodeContextOutput(result.asyncStdout, &out.AsyncStdout, &out.AsyncStdoutBase64)
+	encodeContextOutput(result.asyncStderr, &out.AsyncStderr, &out.AsyncStderrBase64)
+	out.AsyncStdoutTotalBytes = result.asyncStdoutTotal
+	out.AsyncStdoutTruncated = result.asyncStdoutTruncated
+	out.AsyncStderrTotalBytes = result.asyncStderrTotal
+	out.AsyncStderrTruncated = result.asyncStderrTruncated
 }
 
 func validateGuestContextCommand(in mcpContextRunInput) (string, error) {
@@ -304,6 +318,12 @@ func (c *mcpCommand) runGuestContext(ctx context.Context, guest *mcpGuestContext
 	c.stderrTotal = result.stderrTotal
 	c.stdoutTruncated = result.stdoutTruncated
 	c.stderrTruncated = result.stderrTruncated
+	c.asyncStdout = append(c.asyncStdout[:0], result.asyncStdout...)
+	c.asyncStderr = append(c.asyncStderr[:0], result.asyncStderr...)
+	c.asyncStdoutTotal = result.asyncStdoutTotal
+	c.asyncStderrTotal = result.asyncStderrTotal
+	c.asyncStdoutTruncated = result.asyncStdoutTruncated
+	c.asyncStderrTruncated = result.asyncStderrTruncated
 	if runCtx.Err() == context.DeadlineExceeded {
 		c.status = "timed_out"
 		code := 124
@@ -363,13 +383,19 @@ func (e *mcpEndpoint) closeGuestContext(ctx context.Context, _ *mcp.CallToolRequ
 }
 
 type mcpContextResult struct {
-	exitCode        int
-	stdout          []byte
-	stderr          []byte
-	stdoutTotal     int64
-	stderrTotal     int64
-	stdoutTruncated bool
-	stderrTruncated bool
+	exitCode             int
+	stdout               []byte
+	stderr               []byte
+	stdoutTotal          int64
+	stderrTotal          int64
+	stdoutTruncated      bool
+	stderrTruncated      bool
+	asyncStdout          []byte
+	asyncStderr          []byte
+	asyncStdoutTotal     int64
+	asyncStderrTotal     int64
+	asyncStdoutTruncated bool
+	asyncStderrTruncated bool
 }
 
 func (g *mcpGuestContext) serve(ctx context.Context, control *client.Client) {
@@ -394,68 +420,95 @@ func (g *mcpGuestContext) serve(ctx context.Context, control *client.Client) {
 func (g *mcpGuestContext) runLine(ctx context.Context, line string) (mcpContextResult, error) {
 	g.runMu.Lock()
 	defer g.runMu.Unlock()
+	var result mcpContextResult
 	token, err := randomMCPID("marker")
 	if err != nil {
 		return mcpContextResult{}, err
 	}
 	marker := []byte("\x1e" + token + ":")
+	beginMarker := []byte("\x1e" + token + ":begin\x1f")
 	script := mcpContextCommandScript(token, line, g.controlPath)
-	select {
-	case g.inputs <- client.ExecInput{Kind: "stdin", Data: []byte(script)}:
-	case <-g.done:
-		return mcpContextResult{}, g.closedError()
-	case <-ctx.Done():
-		return mcpContextResult{}, ctx.Err()
-	}
 	g.mu.Lock()
 	initial := append([]byte(nil), g.carry...)
 	g.carry = nil
 	g.mu.Unlock()
 	scan := append([]byte(nil), initial...)
-	var result mcpContextResult
+	// Anything already delivered before this command is submitted belongs to
+	// the persistent context, not to the new command. Drain it explicitly so a
+	// background writer cannot be charged to the next command.
 	for {
-		if start := bytes.Index(scan, marker); start >= 0 {
-			statusStart := start + len(marker)
-			if endRel := bytes.IndexByte(scan[statusStart:], '\x1f'); endRel >= 0 {
-				end := statusStart + endRel
-				code, parseErr := strconv.Atoi(string(scan[statusStart:end]))
-				if parseErr != nil {
-					return mcpContextResult{}, fmt.Errorf("invalid guest context status: %w", parseErr)
-				}
-				carryStart := end + 1
+		select {
+		case event := <-g.events:
+			data := contextEventData(event)
+			switch event.Kind {
+			case "stdout", "stderr", "output":
+				result.appendOutputEvent(event, data, true)
+			case "control":
+				scan = append(scan, data...)
+			case "error":
+				return result, fmt.Errorf("guest context: %s", firstNonEmpty(event.Error, event.Output, "shell failed"))
+			case "exit":
+				return result, fmt.Errorf("guest context shell exited with status %d", event.ExitCode)
+			}
+		default:
+			goto drained
+		}
+	}
+drained:
+	select {
+	case g.inputs <- client.ExecInput{Kind: "stdin", Data: []byte(script)}:
+	case <-g.done:
+		return result, g.closedError()
+	case <-ctx.Done():
+		return result, ctx.Err()
+	}
+	begun := false
+	for {
+		if !begun {
+			if start := bytes.Index(scan, beginMarker); start >= 0 {
+				carryStart := start + len(beginMarker)
 				if carryStart < len(scan) && scan[carryStart] == '\n' {
 					carryStart++
 				}
-				g.mu.Lock()
-				g.carry = append(g.carry[:0], scan[carryStart:]...)
-				g.mu.Unlock()
-				result.exitCode = code
-				return result, nil
+				scan = append(scan[:0], scan[carryStart:]...)
+				begun = true
+			} else if keep := len(beginMarker) - 1; len(scan) > keep {
+				scan = scan[len(scan)-keep:]
 			}
-			if start > 0 {
-				scan = scan[start:]
+		}
+		if begun {
+			if start := bytes.Index(scan, marker); start >= 0 {
+				statusStart := start + len(marker)
+				if endRel := bytes.IndexByte(scan[statusStart:], '\x1f'); endRel >= 0 {
+					end := statusStart + endRel
+					code, parseErr := strconv.Atoi(string(scan[statusStart:end]))
+					if parseErr != nil {
+						return mcpContextResult{}, fmt.Errorf("invalid guest context status: %w", parseErr)
+					}
+					carryStart := end + 1
+					if carryStart < len(scan) && scan[carryStart] == '\n' {
+						carryStart++
+					}
+					g.mu.Lock()
+					g.carry = append(g.carry[:0], scan[carryStart:]...)
+					g.mu.Unlock()
+					result.exitCode = code
+					return result, nil
+				}
+				if start > 0 {
+					scan = scan[start:]
+				}
+			} else if keep := len(marker) - 1; len(scan) > keep {
+				drop := len(scan) - keep
+				scan = scan[drop:]
 			}
-		} else if keep := len(marker) - 1; len(scan) > keep {
-			drop := len(scan) - keep
-			scan = scan[drop:]
 		}
 		select {
 		case event := <-g.events:
-			data := event.Data
-			if len(data) == 0 && event.Output != "" {
-				data = []byte(event.Output)
-			}
+			data := contextEventData(event)
 			switch event.Kind {
-			case "stdout":
-				result.stdout, result.stdoutTotal, result.stdoutTruncated = appendCommandOutput(result.stdout, result.stdoutTotal, result.stdoutTruncated, data)
-			case "stderr":
-				result.stderr, result.stderrTotal, result.stderrTruncated = appendCommandOutput(result.stderr, result.stderrTotal, result.stderrTruncated, data)
-			case "output":
-				if event.Stream == "stderr" {
-					result.stderr, result.stderrTotal, result.stderrTruncated = appendCommandOutput(result.stderr, result.stderrTotal, result.stderrTruncated, data)
-				} else {
-					result.stdout, result.stdoutTotal, result.stdoutTruncated = appendCommandOutput(result.stdout, result.stdoutTotal, result.stdoutTruncated, data)
-				}
+			case "stdout", "stderr", "output":
+				result.appendOutputEvent(event, data, false)
 			case "control":
 				scan = append(scan, data...)
 			case "error":
@@ -468,6 +521,30 @@ func (g *mcpGuestContext) runLine(ctx context.Context, line string) (mcpContextR
 		case <-ctx.Done():
 			return result, ctx.Err()
 		}
+	}
+}
+
+func contextEventData(event client.ExecEvent) []byte {
+	if len(event.Data) != 0 {
+		return event.Data
+	}
+	return []byte(event.Output)
+}
+
+func (r *mcpContextResult) appendOutputEvent(event client.ExecEvent, data []byte, async bool) {
+	stderr := event.Kind == "stderr" || event.Kind == "output" && event.Stream == "stderr"
+	if async {
+		if stderr {
+			r.asyncStderr, r.asyncStderrTotal, r.asyncStderrTruncated = appendCommandOutput(r.asyncStderr, r.asyncStderrTotal, r.asyncStderrTruncated, data)
+		} else {
+			r.asyncStdout, r.asyncStdoutTotal, r.asyncStdoutTruncated = appendCommandOutput(r.asyncStdout, r.asyncStdoutTotal, r.asyncStdoutTruncated, data)
+		}
+		return
+	}
+	if stderr {
+		r.stderr, r.stderrTotal, r.stderrTruncated = appendCommandOutput(r.stderr, r.stderrTotal, r.stderrTruncated, data)
+	} else {
+		r.stdout, r.stdoutTotal, r.stdoutTruncated = appendCommandOutput(r.stdout, r.stdoutTotal, r.stdoutTruncated, data)
 	}
 }
 
@@ -500,7 +577,7 @@ func mcpContextShellScriptForShell(controlPath, shellPath string) string {
 func mcpContextCommandScript(token, line, controlPath string) string {
 	statusVar := "__vmsh_mcp_status_" + strings.TrimPrefix(token, "marker_")
 	path := shellJoin([]string{controlPath})
-	return "if {\n" + line + "\n}; then\n" + statusVar + "=0\nelse\n" + statusVar + "=$?\nfi\n/usr/bin/printf '\\036" + token + ":%s\\037\\n' \"$" + statusVar + "\" >" + path + "\nunset " + statusVar + "\n"
+	return "/usr/bin/printf '\\036" + token + ":begin\\037\\n' >" + path + "\nif {\n" + line + "\n} </dev/null; then\n" + statusVar + "=0\nelse\n" + statusVar + "=$?\nfi\n/usr/bin/printf '\\036" + token + ":%s\\037\\n' \"$" + statusVar + "\" >" + path + "\nunset " + statusVar + "\n"
 }
 
 func (g *mcpGuestContext) info() mcpContextInfo {

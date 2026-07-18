@@ -327,6 +327,9 @@ func (e *mcpEndpoint) createVM(ctx context.Context, _ *mcp.CallToolRequest, in m
 	if in.MemoryMB > mcpMaxRAMMB || in.CPUs < 1 || in.CPUs > mcpMaxCPUs {
 		return nil, mcpCreateVMOutput{}, fmt.Errorf("requested resources exceed the MCP ceiling of %d MiB and %d CPUs", mcpMaxRAMMB, mcpMaxCPUs)
 	}
+	if isMCPBuiltinBSDImage(image) && in.CPUs != 1 {
+		return nil, mcpCreateVMOutput{}, fmt.Errorf("cpus must be 1 for built-in BSD guests")
+	}
 	if math.IsNaN(in.BootTimeoutSeconds) || math.IsInf(in.BootTimeoutSeconds, 0) || in.BootTimeoutSeconds < 0 || in.BootTimeoutSeconds > mcpMaxBootTime.Seconds() {
 		return nil, mcpCreateVMOutput{}, fmt.Errorf("boot_timeout_seconds must be between 0 and %g", mcpMaxBootTime.Seconds())
 	}
@@ -584,7 +587,7 @@ func isMCPRootUser(user string) bool {
 }
 
 func mcpGuestWorkDir(vm mcpVM, requested string) string {
-	if strings.TrimSpace(requested) != "" {
+	if requested != "" {
 		return requested
 	}
 	if isMCPBuiltinBSDImage(vm.Image) {

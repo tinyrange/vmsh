@@ -278,6 +278,21 @@ func TestMCPEndpointIsScopedToOwnedIsolatedVMs(t *testing.T) {
 		t.Fatalf("undersized VM reached backend: %#v", starts)
 	}
 	mu.Unlock()
+	bsdMultiCPU, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "vm_create", Arguments: map[string]any{
+		"image": "@freebsd", "name": "bsd-smp", "cpus": 2,
+	}})
+	if err != nil {
+		t.Fatalf("reject unsupported BSD CPU count: %v", err)
+	}
+	if !bsdMultiCPU.IsError {
+		t.Fatal("unsupported built-in BSD CPU count reached the backend")
+	}
+	mu.Lock()
+	if len(starts) != 1 {
+		mu.Unlock()
+		t.Fatalf("unsupported BSD CPU count reached backend: %#v", starts)
+	}
+	mu.Unlock()
 
 	bsdCreated, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "vm_create", Arguments: map[string]any{
 		"image": "@netbsd", "name": "bsd-worker",
@@ -561,6 +576,7 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 	var extracted []byte
 	var largestInput int
 	var shellExported bool
+	var lateContextOutputSent bool
 	var archivedPath, extractedPath, contextWorkDir string
 	mux := http.NewServeMux()
 	streamHandler := websocket.Handler(func(ws *websocket.Conn) {
@@ -624,12 +640,13 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 				continue
 			}
 			script := string(input.Data)
-			markerStart := strings.Index(script, `\036marker_`)
+			markerStart := strings.LastIndex(script, `\036marker_`)
 			markerEnd := strings.Index(script[markerStart+4:], ":%s")
 			if markerStart < 0 || markerEnd < 0 {
 				return
 			}
 			marker := script[markerStart+4 : markerStart+4+markerEnd]
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "control", Data: []byte("\x1e" + marker + ":begin\x1f\n")})
 			var stdout, stderr string
 			if strings.Contains(script, "export ANSWER=42") {
 				shellExported = true
@@ -647,6 +664,10 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte(stderr)})
 			}
 			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "control", Data: []byte("\x1e" + marker + ":0\x1f\n")})
+			if strings.Contains(script, "export ANSWER=42") && !lateContextOutputSent {
+				lateContextOutputSent = true
+				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: []byte("late-from-previous\n")})
+			}
 		}
 	})
 	mux.Handle("/vm/run", streamHandler)
@@ -688,11 +709,12 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 	if _, _, err := endpoint.runGuestContext(context.Background(), nil, mcpContextRunInput{ContextID: opened.ContextID, CommandLine: "export ANSWER=42"}); err != nil {
 		t.Fatalf("export in context: %v", err)
 	}
+	time.Sleep(10 * time.Millisecond)
 	_, result, err := endpoint.runGuestContext(context.Background(), nil, mcpContextRunInput{ContextID: opened.ContextID, CommandLine: `printf '%s' "$ANSWER"; printf problem >&2`})
 	if err != nil {
 		t.Fatalf("read context state: %v", err)
 	}
-	if result.Stdout != "42" || result.Stderr != "problem" || result.ExitCode != 0 || result.CommandStatus != "exited" || result.ContextStatus != "running" {
+	if result.Stdout != "42" || result.Stderr != "problem" || result.AsyncStdout != "late-from-previous\n" || result.ExitCode != 0 || result.CommandStatus != "exited" || result.ContextStatus != "running" {
 		t.Fatalf("context result = %#v", result)
 	}
 	_, asyncResult, err := endpoint.startGuestContextCommand(context.Background(), nil, mcpContextRunInput{
@@ -782,7 +804,8 @@ func testMCPContextFramingPreservesUserDescriptors(t *testing.T, shellPath strin
 	cmd := exec.Command("/bin/sh", "-c", mcpContextShellScriptForShell(controlPath, shellPath))
 	cmd.Stdin = strings.NewReader(
 		mcpContextCommandScript("marker_first", "exec 3>&-; exec 9>"+shellJoin([]string{userFile})+"; echo first >&9", controlPath) +
-			mcpContextCommandScript("marker_second", "echo second >&9; echo context-still-running", controlPath),
+			mcpContextCommandScript("marker_second", "echo second >&9; echo context-still-running", controlPath) +
+			mcpContextCommandScript("marker_third", "if IFS= read -r stolen; then echo unexpected-input; else echo stdin-eof; fi", controlPath),
 	)
 	cmd.ExtraFiles = []*os.File{controlW}
 	var stdout, stderr bytes.Buffer
@@ -798,10 +821,10 @@ func testMCPContextFramingPreservesUserDescriptors(t *testing.T, shellPath strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := stdout.String(), "context-still-running\n"; got != want {
+	if got, want := stdout.String(), "context-still-running\nstdin-eof\n"; got != want {
 		t.Fatalf("shell output = %q, want %q", got, want)
 	}
-	if got, want := string(control), "\x1emarker_first:0\x1f\n\x1emarker_second:0\x1f\n"; got != want {
+	if got, want := string(control), "\x1emarker_first:begin\x1f\n\x1emarker_first:0\x1f\n\x1emarker_second:begin\x1f\n\x1emarker_second:0\x1f\n\x1emarker_third:begin\x1f\n\x1emarker_third:0\x1f\n"; got != want {
 		t.Fatalf("control frames = %q, want %q", got, want)
 	}
 	userData, err := os.ReadFile(userFile)
@@ -810,6 +833,16 @@ func testMCPContextFramingPreservesUserDescriptors(t *testing.T, shellPath strin
 	}
 	if got, want := string(userData), "first\nsecond\n"; got != want {
 		t.Fatalf("persistent fd 9 output = %q, want %q", got, want)
+	}
+}
+
+func TestMCPGuestWorkDirPreservesNonemptyBytes(t *testing.T) {
+	linuxVM := mcpVM{Image: "alpine"}
+	if got := mcpGuestWorkDir(linuxVM, " "); got != " " {
+		t.Fatalf("whitespace workdir = %q", got)
+	}
+	if got := mcpGuestWorkDir(linuxVM, ""); got != "/home/cc" {
+		t.Fatalf("default Linux workdir = %q", got)
 	}
 }
 
@@ -847,7 +880,7 @@ func TestMCPContextPreservesOutputAccountingTimeoutBytesAndPrivateFraming(t *tes
 				continue
 			}
 			script := string(input.Data)
-			markerStart := strings.Index(script, `\036marker_`)
+			markerStart := strings.LastIndex(script, `\036marker_`)
 			if markerStart < 0 {
 				t.Error("context script omitted its status marker")
 				return
@@ -858,6 +891,7 @@ func TestMCPContextPreservesOutputAccountingTimeoutBytesAndPrivateFraming(t *tes
 				return
 			}
 			marker := script[markerStart+4 : markerStart+4+markerEnd]
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "control", Data: []byte("\x1e" + marker + ":begin\x1f\n")})
 			switch {
 			case strings.Contains(script, "large-context-output"):
 				chunk := bytes.Repeat([]byte{'x'}, 1<<20)
@@ -972,7 +1006,7 @@ func TestMCPAsyncContextCommandsAllowSequentialLifecycleInterruption(t *testing.
 			}
 			if count == 0 {
 				script := string(input.Data)
-				markerStart := strings.Index(script, `\036marker_`)
+				markerStart := strings.LastIndex(script, `\036marker_`)
 				if markerStart < 0 {
 					t.Errorf("probe did not contain a status marker")
 					return
@@ -983,6 +1017,7 @@ func TestMCPAsyncContextCommandsAllowSequentialLifecycleInterruption(t *testing.
 					return
 				}
 				marker := script[markerStart+4 : markerStart+4+markerEnd]
+				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "control", Data: []byte("\x1e" + marker + ":begin\x1f\n")})
 				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "control", Data: []byte("\x1e" + marker + ":0\x1f\n")})
 				continue
 			}

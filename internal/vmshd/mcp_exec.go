@@ -47,18 +47,20 @@ type mcpOutputChunk struct {
 }
 
 type mcpCommandOutput struct {
-	CommandID    string         `json:"command_id"`
-	VMID         string         `json:"vm_id"`
-	ContextID    string         `json:"context_id,omitempty"`
-	Status       string         `json:"status"`
-	ExitCode     *int           `json:"exit_code,omitempty"`
-	Stdout       mcpOutputChunk `json:"stdout"`
-	Stderr       mcpOutputChunk `json:"stderr"`
-	Output       string         `json:"output,omitempty"`
-	OutputBase64 string         `json:"output_base64,omitempty"`
-	Error        string         `json:"error,omitempty"`
-	StartedAt    time.Time      `json:"started_at"`
-	FinishedAt   *time.Time     `json:"finished_at,omitempty"`
+	CommandID    string          `json:"command_id"`
+	VMID         string          `json:"vm_id"`
+	ContextID    string          `json:"context_id,omitempty"`
+	Status       string          `json:"status"`
+	ExitCode     *int            `json:"exit_code,omitempty"`
+	Stdout       mcpOutputChunk  `json:"stdout"`
+	Stderr       mcpOutputChunk  `json:"stderr"`
+	AsyncStdout  *mcpOutputChunk `json:"async_stdout,omitempty"`
+	AsyncStderr  *mcpOutputChunk `json:"async_stderr,omitempty"`
+	Output       string          `json:"output,omitempty"`
+	OutputBase64 string          `json:"output_base64,omitempty"`
+	Error        string          `json:"error,omitempty"`
+	StartedAt    time.Time       `json:"started_at"`
+	FinishedAt   *time.Time      `json:"finished_at,omitempty"`
 }
 
 type mcpCommand struct {
@@ -71,21 +73,27 @@ type mcpCommand struct {
 	cancel    context.CancelFunc
 	done      chan struct{}
 
-	mu                sync.Mutex
-	status            string
-	exitCode          *int
-	stdout            []byte
-	stderr            []byte
-	stdoutTotal       int64
-	stderrTotal       int64
-	stdoutTruncated   bool
-	stderrTruncated   bool
-	err               string
-	startedAt         time.Time
-	finishedAt        *time.Time
-	cancelRequested   bool
-	cancelOnce        sync.Once
-	terminateOverride func()
+	mu                   sync.Mutex
+	status               string
+	exitCode             *int
+	stdout               []byte
+	stderr               []byte
+	stdoutTotal          int64
+	stderrTotal          int64
+	stdoutTruncated      bool
+	stderrTruncated      bool
+	asyncStdout          []byte
+	asyncStderr          []byte
+	asyncStdoutTotal     int64
+	asyncStderrTotal     int64
+	asyncStdoutTruncated bool
+	asyncStderrTruncated bool
+	err                  string
+	startedAt            time.Time
+	finishedAt           *time.Time
+	cancelRequested      bool
+	cancelOnce           sync.Once
+	terminateOverride    func()
 }
 
 func (e *mcpEndpoint) runVM(ctx context.Context, _ *mcp.CallToolRequest, in mcpRunVMInput) (*mcp.CallToolResult, mcpCommandOutput, error) {
@@ -442,6 +450,14 @@ func (c *mcpCommand) snapshot(stdoutOffset, stderrOffset int64, maxBytes int, in
 	out := mcpCommandOutput{
 		CommandID: c.id, VMID: c.vmID, ContextID: c.contextID, Status: c.status, ExitCode: cloneInt(c.exitCode), Stdout: stdout, Stderr: stderr,
 		Error: c.err, StartedAt: c.startedAt, FinishedAt: cloneTime(c.finishedAt),
+	}
+	if c.asyncStdoutTotal != 0 {
+		chunk := commandOutputChunk(c.asyncStdout, c.asyncStdoutTotal, c.asyncStdoutTruncated, 0, mcpMaxOutputChunk)
+		out.AsyncStdout = &chunk
+	}
+	if c.asyncStderrTotal != 0 {
+		chunk := commandOutputChunk(c.asyncStderr, c.asyncStderrTotal, c.asyncStderrTruncated, 0, mcpMaxOutputChunk)
+		out.AsyncStderr = &chunk
 	}
 	if includeCombined {
 		combined := make([]byte, 0, len(c.stdout)+len(c.stderr))
