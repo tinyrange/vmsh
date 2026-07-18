@@ -610,6 +610,10 @@ func TestMCPContextCloseCancelsActiveShellStreamOutOfBand(t *testing.T) {
 		if err := websocket.JSON.Receive(ws, &req); err != nil {
 			return
 		}
+		var input client.ExecInput
+		if err := websocket.JSON.Receive(ws, &input); err != nil || input.Kind != "stdin_close" {
+			return
+		}
 		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 0})
 	}))
 	mux.Handle("/vm/run/stream", websocket.Handler(func(ws *websocket.Conn) {
