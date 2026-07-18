@@ -30,8 +30,8 @@ type mcpRunVMInput struct {
 	VMID           string   `json:"vm_id" jsonschema:"ID returned by vm_create"`
 	Command        []string `json:"command" jsonschema:"command and arguments to execute without a shell"`
 	Env            []string `json:"env,omitempty" jsonschema:"environment entries in NAME=value form"`
-	WorkDir        string   `json:"workdir,omitempty" jsonschema:"working directory inside the guest; defaults to /home/cc"`
-	User           string   `json:"user,omitempty" jsonschema:"guest user name or uid[:gid]; defaults to 1000:1000; use root for package installation"`
+	WorkDir        string   `json:"workdir,omitempty" jsonschema:"working directory inside the guest; defaults to / for built-in BSD guests and /home/cc otherwise"`
+	User           string   `json:"user,omitempty" jsonschema:"guest user name or uid[:gid]; built-in BSD guests currently support only root; defaults to 1000:1000 otherwise; use root for package installation"`
 	Stdin          string   `json:"stdin,omitempty" jsonschema:"UTF-8 standard input sent to the command"`
 	StdinBase64    string   `json:"stdin_base64,omitempty" jsonschema:"base64-encoded binary standard input; mutually exclusive with stdin"`
 	TimeoutSeconds float64  `json:"timeout_seconds,omitempty" jsonschema:"guest command deadline in seconds; zero means no command deadline"`
@@ -206,7 +206,11 @@ func (e *mcpEndpoint) cancelVMCommand(ctx context.Context, _ *mcp.CallToolReques
 }
 
 func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
-	id := strings.TrimSpace(in.VMID)
+	vm, err := e.ownedVM(in.VMID)
+	if err != nil {
+		return nil, err
+	}
+	id := vm.ID
 	if len(in.Command) == 0 || strings.TrimSpace(in.Command[0]) == "" {
 		return nil, fmt.Errorf("command is required")
 	}
@@ -217,14 +221,11 @@ func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
 	if err != nil {
 		return nil, err
 	}
-	user := strings.TrimSpace(in.User)
-	workDir := strings.TrimSpace(in.WorkDir)
-	if user == "" {
-		user = "1000:1000"
+	user, err := mcpGuestUser(vm, in.User)
+	if err != nil {
+		return nil, err
 	}
-	if workDir == "" {
-		workDir = "/home/cc"
-	}
+	workDir := mcpGuestWorkDir(vm, in.WorkDir)
 	commandID, err := randomMCPID("cmd")
 	if err != nil {
 		return nil, err

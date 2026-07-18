@@ -38,8 +38,8 @@ type mcpGuestContext struct {
 
 type mcpContextOpenInput struct {
 	VMID    string   `json:"vm_id" jsonschema:"ID returned by vm_create"`
-	WorkDir string   `json:"workdir,omitempty" jsonschema:"initial working directory; defaults to /home/cc"`
-	User    string   `json:"user,omitempty" jsonschema:"guest user name or uid[:gid]; defaults to 1000:1000"`
+	WorkDir string   `json:"workdir,omitempty" jsonschema:"initial working directory; defaults to / for built-in BSD guests and /home/cc otherwise"`
+	User    string   `json:"user,omitempty" jsonschema:"guest user name or uid[:gid]; built-in BSD guests currently support only root; defaults to 1000:1000 otherwise"`
 	Env     []string `json:"env,omitempty" jsonschema:"initial exported environment entries in NAME=value form"`
 }
 
@@ -53,13 +53,25 @@ type mcpContextInfo struct {
 }
 
 func (e *mcpEndpoint) openGuestContext(ctx context.Context, _ *mcp.CallToolRequest, in mcpContextOpenInput) (*mcp.CallToolResult, mcpContextInfo, error) {
-	vmID, err := e.ownedVMID(in.VMID)
+	vm, err := e.ownedVM(in.VMID)
 	if err != nil {
 		return nil, mcpContextInfo{}, err
 	}
-	user := firstNonEmpty(strings.TrimSpace(in.User), "1000:1000")
-	workDir := firstNonEmpty(strings.TrimSpace(in.WorkDir), "/home/cc")
-	if err := validateGuestContextStart(ctx, e.control, vmID, user, workDir, in.Env); err != nil {
+	user, err := mcpGuestUser(vm, in.User)
+	if err != nil {
+		return nil, mcpContextInfo{}, err
+	}
+	workDir := mcpGuestWorkDir(vm, in.WorkDir)
+	if err := e.reserveGuestContext(); err != nil {
+		return nil, mcpContextInfo{}, err
+	}
+	reserved := true
+	defer func() {
+		if reserved {
+			e.releaseGuestContextReservation()
+		}
+	}()
+	if err := validateGuestContextStart(ctx, e.control, vm.ID, user, workDir, in.Env); err != nil {
 		return nil, mcpContextInfo{}, fmt.Errorf("open guest context: %w", err)
 	}
 	id, err := randomMCPID("context")
@@ -68,10 +80,12 @@ func (e *mcpEndpoint) openGuestContext(ctx context.Context, _ *mcp.CallToolReque
 	}
 	streamCtx, cancel := context.WithCancel(context.Background())
 	guest := &mcpGuestContext{
-		id: id, vmID: vmID, user: user, workDir: workDir, env: append([]string(nil), in.Env...),
+		id: id, vmID: vm.ID, user: user, workDir: workDir, env: append([]string(nil), in.Env...),
 		inputs: make(chan client.ExecInput, 16), events: make(chan client.ExecEvent, mcpShellEventBuffer), cancel: cancel, done: make(chan struct{}),
 	}
 	e.mu.Lock()
+	e.openingContexts--
+	reserved = false
 	if e.closed {
 		e.mu.Unlock()
 		cancel()
@@ -90,6 +104,32 @@ func (e *mcpEndpoint) openGuestContext(ctx context.Context, _ *mcp.CallToolReque
 		return nil, mcpContextInfo{}, fmt.Errorf("open guest context: %w", err)
 	}
 	return nil, guest.info(), nil
+}
+
+func (e *mcpEndpoint) reserveGuestContext() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return fmt.Errorf("MCP endpoint is stopped")
+	}
+	for id, guest := range e.contexts {
+		select {
+		case <-guest.done:
+			delete(e.contexts, id)
+		default:
+		}
+	}
+	if len(e.contexts)+e.openingContexts >= mcpMaxContexts {
+		return fmt.Errorf("MCP session context limit of %d reached", mcpMaxContexts)
+	}
+	e.openingContexts++
+	return nil
+}
+
+func (e *mcpEndpoint) releaseGuestContextReservation() {
+	e.mu.Lock()
+	e.openingContexts--
+	e.mu.Unlock()
 }
 
 func validateGuestContextStart(ctx context.Context, control *client.Client, vmID, user, workDir string, env []string) error {
@@ -136,15 +176,19 @@ type mcpContextRunInput struct {
 }
 
 type mcpContextRunOutput struct {
-	ContextID     string `json:"context_id"`
-	VMID          string `json:"vm_id"`
-	ContextStatus string `json:"context_status"`
-	CommandStatus string `json:"command_status"`
-	ExitCode      int    `json:"exit_code"`
-	Stdout        string `json:"stdout,omitempty"`
-	StdoutBase64  string `json:"stdout_base64,omitempty"`
-	Stderr        string `json:"stderr,omitempty"`
-	StderrBase64  string `json:"stderr_base64,omitempty"`
+	ContextID        string `json:"context_id"`
+	VMID             string `json:"vm_id"`
+	ContextStatus    string `json:"context_status"`
+	CommandStatus    string `json:"command_status"`
+	ExitCode         int    `json:"exit_code"`
+	Stdout           string `json:"stdout,omitempty"`
+	StdoutBase64     string `json:"stdout_base64,omitempty"`
+	StdoutTotalBytes int64  `json:"stdout_total_bytes"`
+	StdoutTruncated  bool   `json:"stdout_truncated,omitempty"`
+	Stderr           string `json:"stderr,omitempty"`
+	StderrBase64     string `json:"stderr_base64,omitempty"`
+	StderrTotalBytes int64  `json:"stderr_total_bytes"`
+	StderrTruncated  bool   `json:"stderr_truncated,omitempty"`
 }
 
 func (e *mcpEndpoint) runGuestContext(ctx context.Context, _ *mcp.CallToolRequest, in mcpContextRunInput) (*mcp.CallToolResult, mcpContextRunOutput, error) {
@@ -163,6 +207,8 @@ func (e *mcpEndpoint) runGuestContext(ctx context.Context, _ *mcp.CallToolReques
 		defer cancel()
 	}
 	result, err := guest.runLine(runCtx, line)
+	out := mcpContextRunOutput{ContextID: guest.id, VMID: guest.vmID}
+	applyContextResult(&out, result)
 	if err != nil {
 		if runCtx.Err() != nil {
 			guest.stopAndWait(3 * time.Second)
@@ -172,14 +218,26 @@ func (e *mcpEndpoint) runGuestContext(ctx context.Context, _ *mcp.CallToolReques
 				status = "timed_out"
 				exitCode = 124
 			}
-			return nil, mcpContextRunOutput{ContextID: guest.id, VMID: guest.vmID, ContextStatus: "closed", CommandStatus: status, ExitCode: exitCode}, nil
+			out.ContextStatus = "closed"
+			out.CommandStatus = status
+			out.ExitCode = exitCode
+			return nil, out, nil
 		}
 		return nil, mcpContextRunOutput{}, err
 	}
-	out := mcpContextRunOutput{ContextID: guest.id, VMID: guest.vmID, ContextStatus: "running", CommandStatus: "exited", ExitCode: result.exitCode}
+	out.ContextStatus = "running"
+	out.CommandStatus = "exited"
+	out.ExitCode = result.exitCode
+	return nil, out, nil
+}
+
+func applyContextResult(out *mcpContextRunOutput, result mcpContextResult) {
 	encodeContextOutput(result.stdout, &out.Stdout, &out.StdoutBase64)
 	encodeContextOutput(result.stderr, &out.Stderr, &out.StderrBase64)
-	return nil, out, nil
+	out.StdoutTotalBytes = result.stdoutTotal
+	out.StdoutTruncated = result.stdoutTruncated
+	out.StderrTotalBytes = result.stderrTotal
+	out.StderrTruncated = result.stderrTruncated
 }
 
 func validateGuestContextCommand(in mcpContextRunInput) (string, error) {
@@ -239,6 +297,12 @@ func (c *mcpCommand) runGuestContext(ctx context.Context, guest *mcpGuestContext
 	defer c.mu.Unlock()
 	defer close(c.done)
 	c.finishedAt = &now
+	c.stdout = append(c.stdout[:0], result.stdout...)
+	c.stderr = append(c.stderr[:0], result.stderr...)
+	c.stdoutTotal = result.stdoutTotal
+	c.stderrTotal = result.stderrTotal
+	c.stdoutTruncated = result.stdoutTruncated
+	c.stderrTruncated = result.stderrTruncated
 	if runCtx.Err() == context.DeadlineExceeded {
 		c.status = "timed_out"
 		code := 124
@@ -259,8 +323,6 @@ func (c *mcpCommand) runGuestContext(ctx context.Context, guest *mcpGuestContext
 	c.status = "exited"
 	code := result.exitCode
 	c.exitCode = &code
-	c.stdout, c.stdoutTotal, c.stdoutTruncated = appendCommandOutput(c.stdout, c.stdoutTotal, c.stdoutTruncated, result.stdout)
-	c.stderr, c.stderrTotal, c.stderrTruncated = appendCommandOutput(c.stderr, c.stderrTotal, c.stderrTruncated, result.stderr)
 }
 
 type mcpContextStatusInput struct {
@@ -300,14 +362,18 @@ func (e *mcpEndpoint) closeGuestContext(ctx context.Context, _ *mcp.CallToolRequ
 }
 
 type mcpContextResult struct {
-	exitCode int
-	stdout   []byte
-	stderr   []byte
+	exitCode        int
+	stdout          []byte
+	stderr          []byte
+	stdoutTotal     int64
+	stderrTotal     int64
+	stdoutTruncated bool
+	stderrTruncated bool
 }
 
 func (g *mcpGuestContext) serve(ctx context.Context, control *client.Client) {
 	err := control.RunInteractiveStreamInContext(ctx, g.vmID, client.RunRequest{
-		Command: []string{"/bin/sh"}, Env: append([]string(nil), g.env...), WorkDir: g.workDir, User: g.user,
+		Command: []string{"/bin/sh"}, Env: append([]string(nil), g.env...), WorkDir: g.workDir, User: g.user, ControlFD: true,
 	}, g.inputs, func(event client.ExecEvent) error {
 		select {
 		case g.events <- event:
@@ -332,7 +398,8 @@ func (g *mcpGuestContext) runLine(ctx context.Context, line string) (mcpContextR
 		return mcpContextResult{}, err
 	}
 	marker := []byte("\x1e" + token + ":")
-	script := "{\n" + line + "\n}\n__vmsh_mcp_status=$?\nprintf '\\036" + token + ":%s\\037\\n' \"$__vmsh_mcp_status\"\n"
+	statusVar := "__vmsh_mcp_status_" + strings.TrimPrefix(token, "marker_")
+	script := "if {\n" + line + "\n}; then\n" + statusVar + "=0\nelse\n" + statusVar + "=$?\nfi\n/usr/bin/printf '\\036" + token + ":%s\\037\\n' \"$" + statusVar + "\" >&3\n"
 	select {
 	case g.inputs <- client.ExecInput{Kind: "stdin", Data: []byte(script)}:
 	case <-g.done:
@@ -344,10 +411,8 @@ func (g *mcpGuestContext) runLine(ctx context.Context, line string) (mcpContextR
 	initial := append([]byte(nil), g.carry...)
 	g.carry = nil
 	g.mu.Unlock()
-	stdout := appendBoundedContextOutput(nil, initial)
 	scan := append([]byte(nil), initial...)
-	var scanBase int64
-	var stderr []byte
+	var result mcpContextResult
 	for {
 		if start := bytes.Index(scan, marker); start >= 0 {
 			statusStart := start + len(marker)
@@ -364,20 +429,15 @@ func (g *mcpGuestContext) runLine(ctx context.Context, line string) (mcpContextR
 				g.mu.Lock()
 				g.carry = append(g.carry[:0], scan[carryStart:]...)
 				g.mu.Unlock()
-				markerOffset := scanBase + int64(start)
-				if markerOffset < int64(len(stdout)) {
-					stdout = stdout[:markerOffset]
-				}
-				return mcpContextResult{exitCode: code, stdout: stdout, stderr: stderr}, nil
+				result.exitCode = code
+				return result, nil
 			}
 			if start > 0 {
 				scan = scan[start:]
-				scanBase += int64(start)
 			}
 		} else if keep := len(marker) - 1; len(scan) > keep {
 			drop := len(scan) - keep
 			scan = scan[drop:]
-			scanBase += int64(drop)
 		}
 		select {
 		case event := <-g.events:
@@ -386,24 +446,27 @@ func (g *mcpGuestContext) runLine(ctx context.Context, line string) (mcpContextR
 				data = []byte(event.Output)
 			}
 			switch event.Kind {
-			case "stdout", "output":
-				if event.Stream == "stderr" {
-					stderr = appendBoundedContextOutput(stderr, data)
-				} else {
-					stdout = appendBoundedContextOutput(stdout, data)
-					scan = append(scan, data...)
-				}
+			case "stdout":
+				result.stdout, result.stdoutTotal, result.stdoutTruncated = appendCommandOutput(result.stdout, result.stdoutTotal, result.stdoutTruncated, data)
 			case "stderr":
-				stderr = appendBoundedContextOutput(stderr, data)
+				result.stderr, result.stderrTotal, result.stderrTruncated = appendCommandOutput(result.stderr, result.stderrTotal, result.stderrTruncated, data)
+			case "output":
+				if event.Stream == "stderr" {
+					result.stderr, result.stderrTotal, result.stderrTruncated = appendCommandOutput(result.stderr, result.stderrTotal, result.stderrTruncated, data)
+				} else {
+					result.stdout, result.stdoutTotal, result.stdoutTruncated = appendCommandOutput(result.stdout, result.stdoutTotal, result.stdoutTruncated, data)
+				}
+			case "control":
+				scan = append(scan, data...)
 			case "error":
-				return mcpContextResult{}, fmt.Errorf("guest context: %s", firstNonEmpty(event.Error, event.Output, "shell failed"))
+				return result, fmt.Errorf("guest context: %s", firstNonEmpty(event.Error, event.Output, "shell failed"))
 			case "exit":
-				return mcpContextResult{}, fmt.Errorf("guest context shell exited with status %d", event.ExitCode)
+				return result, fmt.Errorf("guest context shell exited with status %d", event.ExitCode)
 			}
 		case <-g.done:
-			return mcpContextResult{}, g.closedError()
+			return result, g.closedError()
 		case <-ctx.Done():
-			return mcpContextResult{}, ctx.Err()
+			return result, ctx.Err()
 		}
 	}
 }
@@ -458,17 +521,6 @@ func shellJoin(command []string) string {
 		quoted[i] = "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
 	}
 	return strings.Join(quoted, " ")
-}
-
-func appendBoundedContextOutput(dst, data []byte) []byte {
-	if len(dst)+len(data) > mcpMaxCommandStreamBytes {
-		remaining := mcpMaxCommandStreamBytes - len(dst)
-		if remaining > 0 {
-			dst = append(dst, data[:remaining]...)
-		}
-		return dst
-	}
-	return append(dst, data...)
 }
 
 func encodeContextOutput(data []byte, text, encoded *string) {

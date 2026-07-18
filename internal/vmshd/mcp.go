@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"sort"
@@ -27,6 +28,9 @@ const (
 	mcpMaxRAMMB           = 4096
 	mcpDefaultCPUs        = 1
 	mcpMaxCPUs            = 8
+	mcpMaxContexts        = 64
+	mcpBSDDefaultBootTime = 60 * time.Second
+	mcpMaxBootTime        = 5 * time.Minute
 	mcpWorkCleanupTimeout = 3 * time.Second
 )
 
@@ -57,16 +61,17 @@ type mcpEndpoint struct {
 	server    *http.Server
 	control   *client.Client
 
-	mu             sync.Mutex
-	credentials    map[string]string
-	vms            map[string]mcpVM
-	commands       map[string]*mcpCommand
-	artifacts      map[string]*mcpArtifact
-	contexts       map[string]*mcpGuestContext
-	stopping       map[string]struct{}
-	starting       int
-	closed         bool
-	cleanupTimeout time.Duration
+	mu              sync.Mutex
+	credentials     map[string]string
+	vms             map[string]mcpVM
+	commands        map[string]*mcpCommand
+	artifacts       map[string]*mcpArtifact
+	contexts        map[string]*mcpGuestContext
+	stopping        map[string]struct{}
+	starting        int
+	openingContexts int
+	closed          bool
+	cleanupTimeout  time.Duration
 }
 
 type mcpVM struct {
@@ -291,10 +296,11 @@ func (e *mcpEndpoint) authorized(header string) bool {
 }
 
 type mcpCreateVMInput struct {
-	Image    string `json:"image" jsonschema:"guest image to boot, for example alpine or @freebsd"`
-	Name     string `json:"name,omitempty" jsonschema:"optional human-readable name unique within this MCP session"`
-	MemoryMB uint64 `json:"memory_mb,omitempty" jsonschema:"guest memory in MiB, default 512 and maximum 4096"`
-	CPUs     int    `json:"cpus,omitempty" jsonschema:"virtual CPU count, default 1 and maximum 8"`
+	Image              string  `json:"image" jsonschema:"guest image to boot, for example alpine or @freebsd"`
+	Name               string  `json:"name,omitempty" jsonschema:"optional human-readable name unique within this MCP session"`
+	MemoryMB           uint64  `json:"memory_mb,omitempty" jsonschema:"guest memory in MiB, default 512 and maximum 4096"`
+	CPUs               int     `json:"cpus,omitempty" jsonschema:"virtual CPU count, default 1 and maximum 8"`
+	BootTimeoutSeconds float64 `json:"boot_timeout_seconds,omitempty" jsonschema:"bounded VM boot deadline; built-in BSD guests default to 60 seconds"`
 }
 
 type mcpCreateVMOutput struct {
@@ -316,6 +322,12 @@ func (e *mcpEndpoint) createVM(ctx context.Context, _ *mcp.CallToolRequest, in m
 	}
 	if in.MemoryMB > mcpMaxRAMMB || in.CPUs < 1 || in.CPUs > mcpMaxCPUs {
 		return nil, mcpCreateVMOutput{}, fmt.Errorf("requested resources exceed the MCP ceiling of %d MiB and %d CPUs", mcpMaxRAMMB, mcpMaxCPUs)
+	}
+	if math.IsNaN(in.BootTimeoutSeconds) || math.IsInf(in.BootTimeoutSeconds, 0) || in.BootTimeoutSeconds < 0 || in.BootTimeoutSeconds > mcpMaxBootTime.Seconds() {
+		return nil, mcpCreateVMOutput{}, fmt.Errorf("boot_timeout_seconds must be between 0 and %g", mcpMaxBootTime.Seconds())
+	}
+	if in.BootTimeoutSeconds == 0 && isMCPBuiltinBSDImage(image) {
+		in.BootTimeoutSeconds = mcpBSDDefaultBootTime.Seconds()
 	}
 	e.mu.Lock()
 	if e.closed {
@@ -362,7 +374,7 @@ func (e *mcpEndpoint) createVM(ctx context.Context, _ *mcp.CallToolRequest, in m
 	}
 	_, err = e.control.StartInstanceWithIDContext(ctx, id, client.StartInstanceRequest{
 		Image: image, MemoryMB: in.MemoryMB, CPUs: in.CPUs,
-		Network: vmconfig.IsolatedNetworkConfig(),
+		Network: vmconfig.IsolatedNetworkConfig(), TimeoutSeconds: in.BootTimeoutSeconds,
 	})
 	if err != nil {
 		return nil, mcpCreateVMOutput{}, fmt.Errorf("create VM: %w", err)
@@ -518,16 +530,63 @@ func (e *mcpEndpoint) stopVM(ctx context.Context, _ *mcp.CallToolRequest, in mcp
 }
 
 func (e *mcpEndpoint) ownedVMID(id string) (string, error) {
+	vm, err := e.ownedVM(id)
+	return vm.ID, err
+}
+
+func (e *mcpEndpoint) ownedVM(id string) (mcpVM, error) {
 	id = strings.TrimSpace(id)
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, ok := e.vms[id]; !ok {
-		return "", fmt.Errorf("VM %q is not owned by this MCP session", id)
+	vm, ok := e.vms[id]
+	if !ok {
+		return mcpVM{}, fmt.Errorf("VM %q is not owned by this MCP session", id)
 	}
 	if _, ok := e.stopping[id]; ok {
-		return "", fmt.Errorf("VM %q is stopping", id)
+		return mcpVM{}, fmt.Errorf("VM %q is stopping", id)
 	}
-	return id, nil
+	return vm, nil
+}
+
+func isMCPBuiltinBSDImage(image string) bool {
+	switch canonicalMCPBuiltinImage(image) {
+	case "@freebsd", "@openbsd", "@netbsd":
+		return true
+	default:
+		return false
+	}
+}
+
+func mcpGuestUser(vm mcpVM, requested string) (string, error) {
+	user := strings.TrimSpace(requested)
+	if user == "" {
+		if isMCPBuiltinBSDImage(vm.Image) {
+			return "root", nil
+		}
+		return "1000:1000", nil
+	}
+	if isMCPBuiltinBSDImage(vm.Image) && !isMCPRootUser(user) {
+		return "", fmt.Errorf("guest user %q is unsupported for %s; only root is currently available", user, vm.Image)
+	}
+	return user, nil
+}
+
+func isMCPRootUser(user string) bool {
+	identity, group, hasGroup := strings.Cut(strings.ToLower(strings.TrimSpace(user)), ":")
+	if identity != "root" && identity != "0" {
+		return false
+	}
+	return !hasGroup || group == "root" || group == "wheel" || group == "0"
+}
+
+func mcpGuestWorkDir(vm mcpVM, requested string) string {
+	if workDir := strings.TrimSpace(requested); workDir != "" {
+		return workDir
+	}
+	if isMCPBuiltinBSDImage(vm.Image) {
+		return "/"
+	}
+	return "/home/cc"
 }
 
 func (e *mcpEndpoint) beginVMStop(id string) (string, error) {

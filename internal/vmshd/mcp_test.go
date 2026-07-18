@@ -258,6 +258,50 @@ func TestMCPEndpointIsScopedToOwnedIsolatedVMs(t *testing.T) {
 	}
 	mu.Unlock()
 
+	bsdCreated, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "vm_create", Arguments: map[string]any{
+		"image": "@netbsd", "name": "bsd-worker",
+	}})
+	if err != nil || bsdCreated.IsError {
+		t.Fatalf("create built-in BSD VM = %#v, %v", bsdCreated, err)
+	}
+	mu.Lock()
+	if len(starts) != 2 {
+		mu.Unlock()
+		t.Fatalf("start requests after BSD create = %#v", starts)
+	}
+	bsdStart := starts[1]
+	mu.Unlock()
+	if bsdStart.Image != "@netbsd" || bsdStart.CPUs != 1 || bsdStart.TimeoutSeconds != mcpBSDDefaultBootTime.Seconds() {
+		t.Fatalf("built-in BSD start request = %#v", bsdStart)
+	}
+	bsdRun, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "vm_run", Arguments: map[string]any{
+		"vm_id": bsdStart.ID, "command": []string{"id"},
+	}})
+	if err != nil || bsdRun.IsError {
+		t.Fatalf("run default BSD command = %#v, %v", bsdRun, err)
+	}
+	mu.Lock()
+	if len(runs) != 2 || runs[1].User != "root" || runs[1].WorkDir != "/" {
+		mu.Unlock()
+		t.Fatalf("default BSD run request = %#v", runs)
+	}
+	mu.Unlock()
+	bsdEscalation, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "vm_run", Arguments: map[string]any{
+		"vm_id": bsdStart.ID, "command": []string{"id"}, "user": "1000:1000",
+	}})
+	if err != nil {
+		t.Fatalf("run rejected BSD user: %v", err)
+	}
+	if !bsdEscalation.IsError {
+		t.Fatal("built-in BSD accepted an unsupported non-root user")
+	}
+	mu.Lock()
+	if len(runs) != 2 {
+		mu.Unlock()
+		t.Fatalf("rejected BSD command reached backend: %#v", runs)
+	}
+	mu.Unlock()
+
 	if err := manager.Stop("session-1"); err != nil {
 		t.Fatalf("stop endpoint: %v", err)
 	}
@@ -530,7 +574,7 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 			if stderr != "" {
 				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte(stderr)})
 			}
-			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: []byte("\x1e" + marker + ":0\x1f\n")})
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "control", Data: []byte("\x1e" + marker + ":0\x1f\n")})
 		}
 	})
 	mux.Handle("/vm/run", streamHandler)
@@ -627,6 +671,127 @@ func TestMCPContextOpenReportsInvalidWorkdirWithoutWaitingForShellProbe(t *testi
 	}
 }
 
+func TestMCPContextPreservesOutputAccountingTimeoutBytesAndPrivateFraming(t *testing.T) {
+	const largeBytes = 5 << 20
+	mux := http.NewServeMux()
+	mux.Handle("/vm/run", websocket.Handler(func(ws *websocket.Conn) {
+		defer ws.Close()
+		var req client.ExecRequest
+		if err := websocket.JSON.Receive(ws, &req); err != nil {
+			return
+		}
+		var input client.ExecInput
+		if err := websocket.JSON.Receive(ws, &input); err != nil || input.Kind != "stdin_close" {
+			return
+		}
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 0})
+	}))
+	mux.Handle("/vm/run/stream", websocket.Handler(func(ws *websocket.Conn) {
+		defer ws.Close()
+		var req client.RunRequest
+		if err := websocket.JSON.Receive(ws, &req); err != nil {
+			return
+		}
+		if !req.ControlFD {
+			t.Error("persistent shell did not request a private control fd")
+			return
+		}
+		for {
+			var input client.ExecInput
+			if err := websocket.JSON.Receive(ws, &input); err != nil {
+				return
+			}
+			if input.Kind != "stdin" {
+				continue
+			}
+			script := string(input.Data)
+			markerStart := strings.Index(script, `\036marker_`)
+			if markerStart < 0 {
+				t.Error("context script omitted its status marker")
+				return
+			}
+			markerEnd := strings.Index(script[markerStart+4:], ":%s")
+			if markerEnd < 0 {
+				t.Error("context script contained an incomplete status marker")
+				return
+			}
+			marker := script[markerStart+4 : markerStart+4+markerEnd]
+			switch {
+			case strings.Contains(script, "large-context-output"):
+				chunk := bytes.Repeat([]byte{'x'}, 1<<20)
+				for sent := 0; sent < largeBytes; sent += len(chunk) {
+					_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: chunk})
+				}
+			case strings.Contains(script, "printf() { :; }"):
+				if !strings.Contains(script, "/usr/bin/printf") || !strings.Contains(script, ">&3") {
+					t.Error("private status framing can still be intercepted by shell functions or redirections")
+					return
+				}
+				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: []byte("function-defined\n")})
+			case strings.Contains(script, "before-timeout"):
+				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: []byte("before-timeout\n")})
+				continue
+			}
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "control", Data: []byte("\x1e" + marker + ":0\x1f\n")})
+		}
+	}))
+	control := httptest.NewServer(mux)
+	defer control.Close()
+	endpoint := &mcpEndpoint{
+		control: client.NewClient(control.URL, nil), vms: map[string]mcpVM{"one": {ID: "one", Image: "alpine"}},
+		commands: make(map[string]*mcpCommand), contexts: make(map[string]*mcpGuestContext), stopping: make(map[string]struct{}),
+	}
+	_, opened, err := endpoint.openGuestContext(t.Context(), nil, mcpContextOpenInput{VMID: "one"})
+	if err != nil {
+		t.Fatalf("open context: %v", err)
+	}
+	_, started, err := endpoint.startGuestContextCommand(t.Context(), nil, mcpContextRunInput{ContextID: opened.ContextID, CommandLine: "large-context-output"})
+	if err != nil {
+		t.Fatalf("start large context output: %v", err)
+	}
+	largeCommand, err := endpoint.command(started.CommandID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-largeCommand.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("large context output did not finish")
+	}
+	large := largeCommand.snapshot(0, 0, mcpMaxOutputChunk, false)
+	if large.Status != "exited" || large.Stdout.TotalBytes != largeBytes || !large.Stdout.Truncated || large.Stdout.NextOffset != mcpMaxCommandStreamBytes {
+		t.Fatalf("large context output accounting = %#v", large)
+	}
+	_, framed, err := endpoint.runGuestContext(t.Context(), nil, mcpContextRunInput{
+		ContextID: opened.ContextID, CommandLine: "printf() { :; }; echo function-defined", TimeoutSeconds: 1,
+	})
+	if err != nil {
+		t.Fatalf("run with colliding shell function: %v", err)
+	}
+	if framed.CommandStatus != "exited" || framed.ContextStatus != "running" || framed.Stdout != "function-defined\n" || framed.StdoutTotalBytes != int64(len(framed.Stdout)) {
+		t.Fatalf("function-safe context result = %#v", framed)
+	}
+	_, timedStart, err := endpoint.startGuestContextCommand(t.Context(), nil, mcpContextRunInput{
+		ContextID: opened.ContextID, CommandLine: "echo before-timeout; sleep 20", TimeoutSeconds: 0.05,
+	})
+	if err != nil {
+		t.Fatalf("start timed context command: %v", err)
+	}
+	timedCommand, err := endpoint.command(timedStart.CommandID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-timedCommand.done:
+	case <-time.After(time.Second):
+		t.Fatal("timed context command did not settle")
+	}
+	timed := timedCommand.snapshot(0, 0, mcpDefaultOutputChunk, false)
+	if timed.Status != "timed_out" || timed.ExitCode == nil || *timed.ExitCode != 124 || timed.Stdout.Text != "before-timeout\n" || timed.Stdout.TotalBytes != int64(len("before-timeout\n")) {
+		t.Fatalf("timed context output = %#v", timed)
+	}
+}
+
 func TestMCPAsyncContextCommandsAllowSequentialLifecycleInterruption(t *testing.T) {
 	active := make(chan struct{}, 2)
 	mux := http.NewServeMux()
@@ -669,7 +834,7 @@ func TestMCPAsyncContextCommandsAllowSequentialLifecycleInterruption(t *testing.
 					return
 				}
 				marker := script[markerStart+4 : markerStart+4+markerEnd]
-				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: []byte("\x1e" + marker + ":0\x1f\n")})
+				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "control", Data: []byte("\x1e" + marker + ":0\x1f\n")})
 				continue
 			}
 			active <- struct{}{}
@@ -845,6 +1010,25 @@ func TestMCPCommandStartIsRejectedOnceVMStopBegins(t *testing.T) {
 		t.Fatal("started a command after VM stop began")
 	}
 	assertNoRunningMCPCommands(t, endpoint)
+}
+
+func TestMCPContextAdmissionPrunesClosedContextsAndEnforcesLimit(t *testing.T) {
+	endpoint := &mcpEndpoint{contexts: make(map[string]*mcpGuestContext)}
+	for i := 0; i < mcpMaxContexts; i++ {
+		id := fmt.Sprintf("context-%d", i)
+		endpoint.contexts[id] = &mcpGuestContext{id: id, done: make(chan struct{})}
+	}
+	if err := endpoint.reserveGuestContext(); err == nil {
+		t.Fatal("reserved a context beyond the session limit")
+	}
+	close(endpoint.contexts["context-0"].done)
+	if err := endpoint.reserveGuestContext(); err != nil {
+		t.Fatalf("reserve after a closed context became prunable: %v", err)
+	}
+	endpoint.releaseGuestContextReservation()
+	if _, ok := endpoint.contexts["context-0"]; ok {
+		t.Fatal("closed context was not pruned during admission")
+	}
 }
 
 func TestMCPLifecycleReportsIncompleteCleanup(t *testing.T) {

@@ -43,7 +43,7 @@ type mcpArtifactExportInput struct {
 	VMID string `json:"vm_id" jsonschema:"ID returned by vm_create"`
 	Path string `json:"path" jsonschema:"file or directory path inside the source guest"`
 	Name string `json:"name,omitempty" jsonschema:"optional artifact label"`
-	User string `json:"user,omitempty" jsonschema:"guest user used to read the source; defaults to 1000:1000"`
+	User string `json:"user,omitempty" jsonschema:"guest user used to read the source; built-in BSD guests currently support only root; defaults to 1000:1000 otherwise"`
 }
 
 type mcpArtifactOutput struct {
@@ -51,7 +51,7 @@ type mcpArtifactOutput struct {
 }
 
 func (e *mcpEndpoint) exportArtifact(ctx context.Context, _ *mcp.CallToolRequest, in mcpArtifactExportInput) (*mcp.CallToolResult, mcpArtifactOutput, error) {
-	id, err := e.ownedVMID(in.VMID)
+	vm, err := e.ownedVM(in.VMID)
 	if err != nil {
 		return nil, mcpArtifactOutput{}, err
 	}
@@ -59,15 +59,15 @@ func (e *mcpEndpoint) exportArtifact(ctx context.Context, _ *mcp.CallToolRequest
 	if path == "" {
 		return nil, mcpArtifactOutput{}, fmt.Errorf("path is required")
 	}
-	user := strings.TrimSpace(in.User)
-	if user == "" {
-		user = "1000:1000"
-	}
-	data, err := e.archiveGuestPath(ctx, id, path, user)
+	user, err := mcpGuestUser(vm, in.User)
 	if err != nil {
 		return nil, mcpArtifactOutput{}, err
 	}
-	artifact, err := e.storeArtifact(in.Name, id, path, data)
+	data, err := e.archiveGuestPath(ctx, vm.ID, path, user)
+	if err != nil {
+		return nil, mcpArtifactOutput{}, err
+	}
+	artifact, err := e.storeArtifact(in.Name, vm.ID, path, data)
 	if err != nil {
 		return nil, mcpArtifactOutput{}, err
 	}
@@ -79,7 +79,7 @@ type mcpArtifactImportInput struct {
 	VMID       string `json:"vm_id" jsonschema:"ID returned by vm_create"`
 	Path       string `json:"path" jsonschema:"destination path inside the guest"`
 	Directory  bool   `json:"directory,omitempty" jsonschema:"treat path as an existing destination directory"`
-	User       string `json:"user,omitempty" jsonschema:"guest user used to write the destination; defaults to 1000:1000"`
+	User       string `json:"user,omitempty" jsonschema:"guest user used to write the destination; built-in BSD guests currently support only root; defaults to 1000:1000 otherwise"`
 }
 
 type mcpArtifactImportOutput struct {
@@ -88,7 +88,7 @@ type mcpArtifactImportOutput struct {
 }
 
 func (e *mcpEndpoint) importArtifact(ctx context.Context, _ *mcp.CallToolRequest, in mcpArtifactImportInput) (*mcp.CallToolResult, mcpArtifactImportOutput, error) {
-	id, err := e.ownedVMID(in.VMID)
+	vm, err := e.ownedVM(in.VMID)
 	if err != nil {
 		return nil, mcpArtifactImportOutput{}, err
 	}
@@ -100,11 +100,11 @@ func (e *mcpEndpoint) importArtifact(ctx context.Context, _ *mcp.CallToolRequest
 	if err != nil {
 		return nil, mcpArtifactImportOutput{}, err
 	}
-	user := strings.TrimSpace(in.User)
-	if user == "" {
-		user = "1000:1000"
+	user, err := mcpGuestUser(vm, in.User)
+	if err != nil {
+		return nil, mcpArtifactImportOutput{}, err
 	}
-	if err := e.extractGuestArchive(ctx, id, path, in.Directory, user, artifact.data); err != nil {
+	if err := e.extractGuestArchive(ctx, vm.ID, path, in.Directory, user, artifact.data); err != nil {
 		return nil, mcpArtifactImportOutput{}, err
 	}
 	return nil, mcpArtifactImportOutput{Imported: true, Bytes: int64(len(artifact.data))}, nil
@@ -116,8 +116,8 @@ type mcpCopyInput struct {
 	DestinationVM        string `json:"destination_vm" jsonschema:"destination VM ID returned by vm_create"`
 	DestinationPath      string `json:"destination_path" jsonschema:"destination path inside the destination guest"`
 	DestinationDirectory bool   `json:"destination_directory,omitempty" jsonschema:"treat destination_path as an existing directory"`
-	SourceUser           string `json:"source_user,omitempty" jsonschema:"source guest user; defaults to 1000:1000"`
-	DestinationUser      string `json:"destination_user,omitempty" jsonschema:"destination guest user; defaults to 1000:1000"`
+	SourceUser           string `json:"source_user,omitempty" jsonschema:"source guest user; built-in BSD guests currently support only root; defaults to 1000:1000 otherwise"`
+	DestinationUser      string `json:"destination_user,omitempty" jsonschema:"destination guest user; built-in BSD guests currently support only root; defaults to 1000:1000 otherwise"`
 }
 
 type mcpCopyOutput struct {
@@ -126,11 +126,11 @@ type mcpCopyOutput struct {
 }
 
 func (e *mcpEndpoint) copyGuestPath(ctx context.Context, _ *mcp.CallToolRequest, in mcpCopyInput) (*mcp.CallToolResult, mcpCopyOutput, error) {
-	sourceID, err := e.ownedVMID(in.SourceVM)
+	sourceVM, err := e.ownedVM(in.SourceVM)
 	if err != nil {
 		return nil, mcpCopyOutput{}, err
 	}
-	destinationID, err := e.ownedVMID(in.DestinationVM)
+	destinationVM, err := e.ownedVM(in.DestinationVM)
 	if err != nil {
 		return nil, mcpCopyOutput{}, err
 	}
@@ -139,13 +139,19 @@ func (e *mcpEndpoint) copyGuestPath(ctx context.Context, _ *mcp.CallToolRequest,
 	if sourcePath == "" || destinationPath == "" {
 		return nil, mcpCopyOutput{}, fmt.Errorf("source_path and destination_path are required")
 	}
-	sourceUser := firstNonEmpty(strings.TrimSpace(in.SourceUser), "1000:1000")
-	destinationUser := firstNonEmpty(strings.TrimSpace(in.DestinationUser), "1000:1000")
-	data, err := e.archiveGuestPath(ctx, sourceID, sourcePath, sourceUser)
+	sourceUser, err := mcpGuestUser(sourceVM, in.SourceUser)
 	if err != nil {
 		return nil, mcpCopyOutput{}, err
 	}
-	if err := e.extractGuestArchive(ctx, destinationID, destinationPath, in.DestinationDirectory, destinationUser, data); err != nil {
+	destinationUser, err := mcpGuestUser(destinationVM, in.DestinationUser)
+	if err != nil {
+		return nil, mcpCopyOutput{}, err
+	}
+	data, err := e.archiveGuestPath(ctx, sourceVM.ID, sourcePath, sourceUser)
+	if err != nil {
+		return nil, mcpCopyOutput{}, err
+	}
+	if err := e.extractGuestArchive(ctx, destinationVM.ID, destinationPath, in.DestinationDirectory, destinationUser, data); err != nil {
 		return nil, mcpCopyOutput{}, err
 	}
 	return nil, mcpCopyOutput{Copied: true, Bytes: int64(len(data))}, nil
