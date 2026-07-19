@@ -126,6 +126,12 @@ func TestRuntimePolicyAppliesDefaultMemoryAndInitialBalloon(t *testing.T) {
 
 	req := client.StartInstanceRequest{ID: "new", Image: "alpine"}
 	srv.normalizeStartRequest(&req, runtime)
+	if !supportsAutomaticBalloon(req.Image) {
+		if req.MemoryMB != defaultFixedGuestMemoryMB || req.BalloonMB != 0 || srv.balloon.isAutomatic(req.ID) {
+			t.Fatalf("unsupported-host request = %+v policy=%+v", req, srv.balloon.state(req.ID))
+		}
+		return
+	}
 	if req.MemoryMB != 4096 {
 		t.Fatalf("memory_mb = %d, want 4096", req.MemoryMB)
 	}

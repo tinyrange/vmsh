@@ -686,18 +686,19 @@ func mcpContextShellScriptForShell(controlPath, shellPath string) string {
 	dir := shellJoin([]string{pathpkg.Dir(controlPath)})
 	shell := shellJoin([]string{shellPath})
 	return "__vmsh_mcp_fifo=" + path + "\n" +
+		"__vmsh_mcp_relay_stop=__vmsh_mcp_relay_stop__\n" +
 		"__vmsh_mcp_initial_umask=$(umask)\n" +
 		"umask 077\n" +
 		"rm -rf " + dir + "\n" +
 		"mkdir -m 700 " + dir + " || exit 126\n" +
 		"mkfifo \"$__vmsh_mcp_fifo\" || exit 126\n" +
-		"(exec 8<>\"$__vmsh_mcp_fifo\"; while IFS= read -r __vmsh_mcp_frame <&8; do command printf '%s\\n' \"$__vmsh_mcp_frame\"; done) >&3 &\n" +
+		"(exec 8<>\"$__vmsh_mcp_fifo\"; while IFS= read -r __vmsh_mcp_frame <&8; do [ \"$__vmsh_mcp_frame\" = \"$__vmsh_mcp_relay_stop\" ] && break; command printf '%s\\n' \"$__vmsh_mcp_frame\"; done) >&3 &\n" +
 		"__vmsh_mcp_relay=$!\n" +
 		// Keep fd 3 occupied so shells such as BusyBox ash do not reuse it as
 		// an internal script-reader descriptor. The user may freely close or
 		// replace this harmless placeholder without affecting the relay.
 		"exec 3</dev/null\n" +
-		"__vmsh_mcp_cleanup() { kill \"$__vmsh_mcp_relay\" 2>/dev/null; wait \"$__vmsh_mcp_relay\" 2>/dev/null; rm -f \"$__vmsh_mcp_fifo\"; }\n" +
+		"__vmsh_mcp_cleanup() { (command printf '%s\\n' \"$__vmsh_mcp_relay_stop\" >\"$__vmsh_mcp_fifo\") & __vmsh_mcp_stop_writer=$!; wait \"$__vmsh_mcp_relay\" 2>/dev/null; kill \"$__vmsh_mcp_stop_writer\" 2>/dev/null; wait \"$__vmsh_mcp_stop_writer\" 2>/dev/null; rm -f \"$__vmsh_mcp_fifo\"; }\n" +
 		"trap '__vmsh_mcp_cleanup; exit 143' HUP INT TERM\n" +
 		"umask \"$__vmsh_mcp_initial_umask\"\n" +
 		"unset __vmsh_mcp_initial_umask\n" +
