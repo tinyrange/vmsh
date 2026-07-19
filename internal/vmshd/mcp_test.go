@@ -433,6 +433,38 @@ func TestMCPListReportsObservedMemoryAndBackingUsage(t *testing.T) {
 	}
 }
 
+func TestMCPStopReapsCrashedBackendAndReleasesName(t *testing.T) {
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/vm/shutdown":
+			http.Error(w, `no VM "dead" is running`, http.StatusConflict)
+		case "/vm":
+			writeJSON(w, http.StatusOK, []client.InstanceState{{ID: "dead", Status: "crashed", Error: "guest exited", ExitReason: "guest exited", ExitedAt: "2026-07-19T00:00:00Z"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer control.Close()
+	endpoint := &mcpEndpoint{
+		control:     client.NewClient(control.URL, nil),
+		vms:         map[string]mcpVM{"dead": {ID: "dead", Name: "reusable", Image: "alpine", Status: "crashed"}},
+		commands:    make(map[string]*mcpCommand),
+		contexts:    make(map[string]*mcpGuestContext),
+		stopping:    make(map[string]struct{}),
+		quarantined: make(map[string]struct{}),
+	}
+	_, output, err := endpoint.stopVM(t.Context(), nil, mcpStopVMInput{VMID: "dead"})
+	if err != nil || !output.Stopped || output.PreviousState != "crashed" || output.ExitReason != "guest exited" {
+		t.Fatalf("reap crashed VM = %#v, %v", output, err)
+	}
+	endpoint.mu.Lock()
+	_, retained := endpoint.vms["dead"]
+	endpoint.mu.Unlock()
+	if retained {
+		t.Fatal("crashed VM ownership was retained")
+	}
+}
+
 func TestMCPAutoPullRejectsHostFacingSources(t *testing.T) {
 	for _, image := range []string{
 		"file:///etc/passwd",
@@ -1549,12 +1581,8 @@ func TestMCPAsyncContextCommandsAllowSequentialLifecycleInterruption(t *testing.
 	status, err = session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_exec_status", Arguments: map[string]any{
 		"command_id": startedOutput.CommandID,
 	}})
-	if err != nil || status.IsError {
-		t.Fatalf("read context command after VM stop = %#v, %v", status, err)
-	}
-	statusOutput = structuredToolOutput[mcpCommandOutput](t, status)
-	if statusOutput.Status != "canceled" || statusOutput.ExitCode == nil || *statusOutput.ExitCode != 130 {
-		t.Fatalf("context command after VM stop = %#v", statusOutput)
+	if err != nil || !status.IsError {
+		t.Fatalf("VM stop retained context command metadata = %#v, %v", status, err)
 	}
 }
 

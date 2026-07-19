@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -18,6 +19,9 @@ const (
 	defaultPolicyStepMB         = 128
 	defaultPolicyHysteresisMB   = 256
 	defaultMinimumGuestUsableMB = 512
+	defaultFixedGuestMemoryMB   = 512
+	defaultBSDGuestMemoryMB     = 1024
+	defaultBalloonConvergence   = 15 * time.Second
 )
 
 type memorySnapshot struct {
@@ -37,9 +41,20 @@ type balloonController struct {
 }
 
 type balloonPolicyEntry struct {
-	automatic bool
-	createdAt time.Time
-	seen      bool
+	automatic      bool
+	createdAt      time.Time
+	seen           bool
+	inFlight       bool
+	requestedMB    uint64
+	requestedAt    time.Time
+	lastActualMB   uint64
+	degradedReason string
+}
+
+type balloonPolicyState struct {
+	Automatic      bool
+	InFlight       bool
+	DegradedReason string
 }
 
 type balloonPolicyConfig struct {
@@ -47,6 +62,7 @@ type balloonPolicyConfig struct {
 	StepMB         uint64
 	HysteresisMB   uint64
 	MinUsableMB    uint64
+	Convergence    time.Duration
 }
 
 type balloonVM struct {
@@ -99,6 +115,11 @@ func (c *balloonController) applyStartRequest(req *client.StartInstanceRequest, 
 		return
 	}
 	automatic := req.MemoryMB == 0 && req.BalloonMB == 0
+	if automatic && !supportsAutomaticBalloon(req.Image) {
+		req.MemoryMB = fixedGuestMemoryMB(req.Image)
+		c.setAutomatic(req.ID, false)
+		return
+	}
 	c.setAutomatic(req.ID, automatic)
 	if !automatic {
 		return
@@ -114,6 +135,9 @@ func (c *balloonController) applyStartRequest(req *client.StartInstanceRequest, 
 		return
 	}
 	req.BalloonMB = c.initialBalloonTarget(snapshot, current, req.ID, req.MemoryMB)
+	if req.BalloonMB != 0 {
+		c.markBalloonRequest(req.ID, req.BalloonMB, time.Now())
+	}
 }
 
 func (c *balloonController) applyCreateRequest(req *client.CreateInstanceRequest, current []client.InstanceState) {
@@ -122,6 +146,7 @@ func (c *balloonController) applyCreateRequest(req *client.CreateInstanceRequest
 	}
 	start := client.StartInstanceRequest{
 		ID:        req.ID,
+		Image:     req.Image,
 		MemoryMB:  req.MemoryMB,
 		BalloonMB: req.BalloonMB,
 	}
@@ -134,22 +159,29 @@ func (c *balloonController) applyRunRequest(req *client.RunRequest, current []cl
 	if c == nil || c.memory == nil || req == nil {
 		return
 	}
-	automatic := req.MemoryMB == 0 && req.BalloonMB == 0
-	c.setAutomatic(req.ID, automatic)
-	if !automatic {
+	// A run request without an image executes in an existing instance. Its
+	// zero-valued resource fields mean "leave the instance alone", not
+	// "re-enrol this VM in automatic memory management".
+	if strings.TrimSpace(req.Image) == "" {
 		return
 	}
-	snapshot, err := c.memory.Snapshot()
-	if err != nil || snapshot.TotalMB == 0 {
-		return
+	start := client.StartInstanceRequest{ID: req.ID, Image: req.Image, MemoryMB: req.MemoryMB, BalloonMB: req.BalloonMB}
+	c.applyStartRequest(&start, current)
+	req.MemoryMB, req.BalloonMB = start.MemoryMB, start.BalloonMB
+}
+
+func supportsAutomaticBalloon(image string) bool {
+	if isMCPBuiltinBSDImage(image) {
+		return false
 	}
-	if req.MemoryMB == 0 {
-		req.MemoryMB = defaultGuestMemoryMB(snapshot.TotalMB)
+	return runtime.GOOS == "linux" && runtime.GOARCH == "amd64" || runtime.GOOS == "darwin" && runtime.GOARCH == "arm64"
+}
+
+func fixedGuestMemoryMB(image string) uint64 {
+	if isMCPBuiltinBSDImage(image) {
+		return defaultBSDGuestMemoryMB
 	}
-	if req.MemoryMB == 0 {
-		return
-	}
-	req.BalloonMB = c.initialBalloonTarget(snapshot, current, req.ID, req.MemoryMB)
+	return defaultFixedGuestMemoryMB
 }
 
 func (c *balloonController) setAutomatic(id string, automatic bool) {
@@ -170,9 +202,84 @@ func (c *balloonController) isAutomatic(id string) bool {
 		return false
 	}
 	c.mu.Lock()
-	automatic := c.automatic[strings.TrimSpace(id)].automatic
+	entry := c.automatic[strings.TrimSpace(id)]
+	automatic := entry.automatic && entry.degradedReason == ""
 	c.mu.Unlock()
 	return automatic
+}
+
+func (c *balloonController) state(id string) balloonPolicyState {
+	if c == nil {
+		return balloonPolicyState{}
+	}
+	c.mu.Lock()
+	entry := c.automatic[strings.TrimSpace(id)]
+	c.mu.Unlock()
+	return balloonPolicyState{Automatic: entry.automatic, InFlight: entry.inFlight, DegradedReason: entry.degradedReason}
+}
+
+func (c *balloonController) markBalloonRequest(id string, targetMB uint64, now time.Time) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = "default"
+	}
+	c.mu.Lock()
+	entry := c.automatic[id]
+	entry.inFlight = true
+	entry.requestedMB = targetMB
+	entry.requestedAt = now
+	c.automatic[id] = entry
+	c.mu.Unlock()
+}
+
+func (c *balloonController) adjustmentReady(state client.InstanceState, now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.automatic[strings.TrimSpace(state.ID)]
+	if !ok || !entry.automatic || entry.degradedReason != "" {
+		return false
+	}
+	if state.BalloonStatus == "unsupported" {
+		entry.degradedReason = "dynamic ballooning is unsupported by this VM"
+		c.automatic[state.ID] = entry
+		return false
+	}
+	actual := state.BalloonActualMB
+	if state.BalloonStatus == "" {
+		actual = state.BalloonMB
+	}
+	if !entry.inFlight && state.BalloonMB != actual {
+		entry.inFlight = true
+		entry.requestedMB = state.BalloonMB
+		entry.requestedAt = now
+	}
+	if entry.inFlight {
+		entry.lastActualMB = actual
+		if actual == entry.requestedMB && state.BalloonStatus != "driver_unavailable" {
+			entry.inFlight = false
+			c.automatic[state.ID] = entry
+			return true
+		} else if now.Sub(entry.requestedAt) >= normalizeBalloonPolicyConfig(c.config).Convergence {
+			entry.degradedReason = "guest did not acknowledge the balloon target before the convergence deadline"
+		}
+		c.automatic[state.ID] = entry
+		return false
+	}
+	entry.lastActualMB = actual
+	c.automatic[state.ID] = entry
+	return state.BalloonStatus != "driver_unavailable"
+}
+
+func (c *balloonController) markBalloonFailure(id string, err error) {
+	if err == nil {
+		return
+	}
+	c.mu.Lock()
+	entry := c.automatic[strings.TrimSpace(id)]
+	entry.degradedReason = err.Error()
+	entry.inFlight = false
+	c.automatic[strings.TrimSpace(id)] = entry
+	c.mu.Unlock()
 }
 
 func (c *balloonController) reconcileLifecycle(states []client.InstanceState, now time.Time) {
@@ -187,8 +294,13 @@ func (c *balloonController) reconcileLifecycle(states []client.InstanceState, no
 	defer c.mu.Unlock()
 	for id, entry := range c.automatic {
 		state, ok := present[id]
-		if ok && state.Status == "running" {
-			entry.seen = true
+		if ok && (state.Status == "running" || state.Status == "starting") {
+			if state.Status == "running" && !entry.seen {
+				entry.seen = true
+				if entry.inFlight {
+					entry.requestedAt = now
+				}
+			}
 			c.automatic[id] = entry
 			continue
 		}
@@ -229,7 +341,11 @@ func balloonVMsFromInstances(states []client.InstanceState) []balloonVM {
 		if strings.TrimSpace(state.ID) == "" || state.MemoryMB == 0 || state.Status != "running" {
 			continue
 		}
-		out = append(out, balloonVM{ID: state.ID, ConfiguredMB: state.MemoryMB, BalloonMB: state.BalloonMB, Eligible: true})
+		actual := state.BalloonActualMB
+		if state.BalloonStatus == "" {
+			actual = state.BalloonMB
+		}
+		out = append(out, balloonVM{ID: state.ID, ConfiguredMB: state.MemoryMB, BalloonMB: actual, Eligible: state.BalloonStatus != "unsupported"})
 	}
 	return out
 }
@@ -264,49 +380,38 @@ func normalizeBalloonPolicyConfig(cfg balloonPolicyConfig) balloonPolicyConfig {
 	if cfg.MinUsableMB == 0 {
 		cfg.MinUsableMB = defaultMinimumGuestUsableMB
 	}
+	if cfg.Convergence <= 0 {
+		cfg.Convergence = defaultBalloonConvergence
+	}
 	return cfg
 }
 
 func distributeBalloonIncrease(decisions []balloonDecision, vms []balloonVM, cfg balloonPolicyConfig, needMB uint64) {
-	for needMB > 0 {
-		progress := false
-		for i, vm := range vms {
-			if needMB == 0 {
-				return
-			}
-			capacity := balloonCapacity(vm, cfg)
-			if !vm.Eligible || decisions[i].BalloonMB >= capacity {
-				continue
-			}
-			delta := min(cfg.StepMB, needMB, capacity-decisions[i].BalloonMB)
-			decisions[i].BalloonMB += delta
-			needMB -= delta
-			progress = true
-		}
-		if !progress {
+	for i, vm := range vms {
+		if needMB == 0 {
 			return
 		}
+		capacity := balloonCapacity(vm, cfg)
+		if !vm.Eligible || decisions[i].BalloonMB >= capacity {
+			continue
+		}
+		delta := min(cfg.StepMB, needMB, capacity-decisions[i].BalloonMB)
+		decisions[i].BalloonMB += delta
+		needMB -= delta
 	}
 }
 
 func distributeBalloonDecrease(decisions []balloonDecision, cfg balloonPolicyConfig, releaseMB uint64) {
-	for releaseMB > 0 {
-		progress := false
-		for i := range decisions {
-			if releaseMB == 0 {
-				return
-			}
-			if decisions[i].BalloonMB == 0 {
-				continue
-			}
-			delta := min(cfg.StepMB, releaseMB, decisions[i].BalloonMB)
-			decisions[i].BalloonMB -= delta
-			releaseMB -= delta
-			progress = true
-		}
-		if !progress {
+	for i := range decisions {
+		if releaseMB == 0 {
 			return
 		}
+		if decisions[i].BalloonMB == 0 {
+			continue
+		}
+		delta := min(cfg.StepMB, releaseMB, decisions[i].BalloonMB)
+		decisions[i].BalloonMB -= delta
+		releaseMB -= delta
 	}
 }
 
@@ -379,9 +484,16 @@ func (s *Server) reconcileBalloonPressure(runtime balloonRuntime) error {
 		return err
 	}
 	states := runtime.InstanceStatuses()
-	s.balloon.reconcileLifecycle(states, time.Now())
+	now := time.Now()
+	s.balloon.reconcileLifecycle(states, now)
 	vms := balloonVMsFromInstances(states)
-	vms = slices.DeleteFunc(vms, func(vm balloonVM) bool { return !s.balloon.isAutomatic(vm.ID) })
+	stateByID := make(map[string]client.InstanceState, len(states))
+	for _, state := range states {
+		stateByID[state.ID] = state
+	}
+	vms = slices.DeleteFunc(vms, func(vm balloonVM) bool {
+		return !s.balloon.adjustmentReady(stateByID[vm.ID], now)
+	})
 	decisions := planBalloonTargets(snapshot, vms, s.balloon.config)
 	current := make(map[string]uint64, len(vms))
 	for _, vm := range vms {
@@ -394,6 +506,9 @@ func (s *Server) reconcileBalloonPressure(runtime balloonRuntime) error {
 		}
 		if err := runtime.SetInstanceBalloon(decision.ID, decision.BalloonMB); err != nil {
 			errs = append(errs, err)
+			s.balloon.markBalloonFailure(decision.ID, err)
+		} else {
+			s.balloon.markBalloonRequest(decision.ID, decision.BalloonMB, now)
 		}
 	}
 	return errors.Join(errs...)

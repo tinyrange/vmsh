@@ -621,7 +621,7 @@ func isLoopbackListenAddr(addr string) bool {
 
 func NewServer(token string) *Server {
 	trustedManager, _ := newTrustedManager()
-	return &Server{
+	server := &Server{
 		token:     token,
 		registry:  newSessionRegistry(),
 		events:    newEventHub(),
@@ -633,6 +633,8 @@ func NewServer(token string) *Server {
 		mcp:       newMCPManager(token),
 		startedAt: time.Now(),
 	}
+	server.mcp.SetBalloonController(server.balloon)
+	return server
 }
 
 func (s *Server) RegisterHandlers(rawMux *http.ServeMux, runtime ccvmd.RuntimeView) {

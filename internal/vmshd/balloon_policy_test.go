@@ -98,8 +98,8 @@ func TestBalloonPolicySimulationUsesExistingTargets(t *testing.T) {
 		t.Fatalf("decisions = %+v, want one decision per VM", decisions)
 	}
 	for _, decision := range decisions {
-		if decision.BalloonMB != 128 {
-			t.Fatalf("decision = %+v, want policy to deflate from current target", decision)
+		if decision.BalloonMB != 384 {
+			t.Fatalf("decision = %+v, want one acknowledged policy step", decision)
 		}
 	}
 }
@@ -155,6 +155,70 @@ func TestRuntimePolicyDoesNotClassifyExplicitMemoryAsAutomatic(t *testing.T) {
 	}
 	if srv.balloon.isAutomatic(req.ID) {
 		t.Fatal("explicit memory request was enrolled in automatic ballooning")
+	}
+}
+
+func TestExistingInstanceRunDoesNotMutateMemoryPolicy(t *testing.T) {
+	srv := NewServer("secret")
+	srv.balloon = newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 0}})
+	srv.balloon.setAutomatic("explicit", false)
+	req := client.RunRequest{ID: "explicit", Command: []string{"true"}}
+	srv.normalizeRunRequest(&req, fakeRuntimeView{statuses: []client.InstanceState{{ID: "explicit", Status: "running", MemoryMB: 2048}}})
+	if req.MemoryMB != 0 || req.BalloonMB != 0 || srv.balloon.isAutomatic("explicit") {
+		t.Fatalf("existing run mutated resources or policy: request=%+v policy=%+v", req, srv.balloon.state("explicit"))
+	}
+}
+
+func TestBSDDefaultUsesFixedMemoryWithoutBalloon(t *testing.T) {
+	srv := NewServer("secret")
+	srv.balloon = newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 32768, AvailableMB: 32768}})
+	req := client.StartInstanceRequest{ID: "bsd", Image: "@freebsd"}
+	srv.normalizeStartRequest(&req, nil)
+	if req.MemoryMB != defaultBSDGuestMemoryMB || req.BalloonMB != 0 || srv.balloon.isAutomatic("bsd") {
+		t.Fatalf("BSD automatic request = %+v policy=%+v", req, srv.balloon.state("bsd"))
+	}
+}
+
+func TestBSDCreateDefaultUsesFixedMemoryWithoutBalloon(t *testing.T) {
+	srv := NewServer("secret")
+	srv.balloon = newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 32768, AvailableMB: 32768}})
+	req := client.CreateInstanceRequest{ID: "bsd-create", Image: "@netbsd"}
+	srv.normalizeCreateRequest(&req, nil)
+	if req.MemoryMB != defaultBSDGuestMemoryMB || req.BalloonMB != 0 || srv.balloon.isAutomatic("bsd-create") {
+		t.Fatalf("BSD create request = %+v policy=%+v", req, srv.balloon.state("bsd-create"))
+	}
+}
+
+func TestRuntimePressureWaitsForGuestAcknowledgement(t *testing.T) {
+	srv := NewServer("secret")
+	srv.balloon = newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 0}})
+	srv.balloon.setAutomatic("one", true)
+	var targets []uint64
+	runtime := fakeRuntimeView{
+		statuses: []client.InstanceState{{ID: "one", Status: "running", MemoryMB: 4096, BalloonStatus: "converged"}},
+		balloon:  func(_ string, target uint64) error { targets = append(targets, target); return nil },
+	}
+	if err := srv.reconcileBalloonPressure(runtime); err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0] != defaultPolicyStepMB {
+		t.Fatalf("first targets = %v", targets)
+	}
+	runtime.statuses[0].BalloonMB = targets[0]
+	runtime.statuses[0].BalloonStatus = "inflating"
+	if err := srv.reconcileBalloonPressure(runtime); err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 {
+		t.Fatalf("unacknowledged target advanced again: %v", targets)
+	}
+	runtime.statuses[0].BalloonActualMB = targets[0]
+	runtime.statuses[0].BalloonStatus = "converged"
+	if err := srv.reconcileBalloonPressure(runtime); err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 2 || targets[1] != 2*defaultPolicyStepMB {
+		t.Fatalf("acknowledged targets = %v", targets)
 	}
 }
 

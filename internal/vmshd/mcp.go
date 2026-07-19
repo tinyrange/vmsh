@@ -48,6 +48,7 @@ type mcpManager struct {
 	controlURL string
 	token      string
 	endpoints  map[string]*mcpEndpoint
+	balloon    *balloonController
 }
 
 type mcpEndpoint struct {
@@ -57,6 +58,7 @@ type mcpEndpoint struct {
 	listener  net.Listener
 	server    *http.Server
 	control   *client.Client
+	balloon   *balloonController
 
 	mu               sync.Mutex
 	credentials      map[string]string
@@ -81,13 +83,26 @@ type mcpVM struct {
 	Status                string `json:"status,omitempty"`
 	MemoryMB              uint64 `json:"memory_mb,omitempty"`
 	BalloonMB             uint64 `json:"balloon_mb,omitempty"`
+	BalloonActualMB       uint64 `json:"balloon_actual_mb,omitempty"`
+	BalloonStatus         string `json:"balloon_status,omitempty"`
+	AutomaticMemory       bool   `json:"automatic_memory,omitempty"`
+	BalloonPolicyError    string `json:"balloon_policy_error,omitempty"`
 	BackingBytes          uint64 `json:"backing_bytes,omitempty"`
 	BackingHighWaterBytes uint64 `json:"backing_high_water_bytes,omitempty"`
 	BackingReclaimError   string `json:"backing_reclaim_error,omitempty"`
+	Error                 string `json:"error,omitempty"`
+	ExitReason            string `json:"exit_reason,omitempty"`
+	ExitedAt              string `json:"exited_at,omitempty"`
 }
 
 func newMCPManager(token string) *mcpManager {
 	return &mcpManager{token: token, endpoints: make(map[string]*mcpEndpoint)}
+}
+
+func (m *mcpManager) SetBalloonController(controller *balloonController) {
+	m.mu.Lock()
+	m.balloon = controller
+	m.mu.Unlock()
 }
 
 func (m *mcpManager) SetControlURL(rawURL string) {
@@ -128,6 +143,7 @@ func (m *mcpManager) Start(sessionID string) (MCPEndpointInfo, error) {
 		createdAt:   time.Now().UTC(),
 		listener:    listener,
 		control:     control,
+		balloon:     m.balloon,
 		credentials: make(map[string]string),
 		vms:         make(map[string]mcpVM),
 		commands:    make(map[string]*mcpCommand),
@@ -389,7 +405,7 @@ func (e *mcpEndpoint) createVM(ctx context.Context, _ *mcp.CallToolRequest, in m
 	if err != nil {
 		return nil, mcpCreateVMOutput{}, fmt.Errorf("create VM: %w", err)
 	}
-	vm := mcpVM{ID: id, Name: baseName, Image: image, Status: state.Status, MemoryMB: state.MemoryMB, BalloonMB: state.BalloonMB}
+	vm := mcpVM{ID: id, Name: baseName, Image: image, Status: state.Status, MemoryMB: state.MemoryMB, BalloonMB: state.BalloonMB, BalloonActualMB: state.BalloonActualMB, BalloonStatus: state.BalloonStatus}
 	e.mu.Lock()
 	if e.closed {
 		e.mu.Unlock()
@@ -524,17 +540,31 @@ func (e *mcpEndpoint) listVMs(ctx context.Context, _ *mcp.CallToolRequest, _ mcp
 	for _, vm := range e.vms {
 		if _, quarantined := e.quarantined[vm.ID]; quarantined {
 			vm.Status = "quarantined"
-		} else {
+		} else if vm.Status == "" {
 			vm.Status = "running"
 		}
 		if state, ok := observed[vm.ID]; ok {
 			vm.Status = state.Status
 			vm.MemoryMB = state.MemoryMB
 			vm.BalloonMB = state.BalloonMB
+			vm.BalloonActualMB = state.BalloonActualMB
+			vm.BalloonStatus = state.BalloonStatus
 			vm.BackingBytes = state.BackingBytes
 			vm.BackingHighWaterBytes = state.BackingHighWaterBytes
 			vm.BackingReclaimError = state.BackingReclaimError
+			vm.Error = state.Error
+			vm.ExitReason = state.ExitReason
+			vm.ExitedAt = state.ExitedAt
+		} else if observationErr == nil {
+			vm.Status = "absent"
+			vm.ExitReason = "backend no longer owns the VM"
 		}
+		if e.balloon != nil {
+			policy := e.balloon.state(vm.ID)
+			vm.AutomaticMemory = policy.Automatic
+			vm.BalloonPolicyError = policy.DegradedReason
+		}
+		e.vms[vm.ID] = vm
 		vms = append(vms, vm)
 	}
 	e.mu.Unlock()
@@ -550,7 +580,9 @@ type mcpStopVMInput struct {
 	VMID string `json:"vm_id" jsonschema:"ID returned by vm_create"`
 }
 type mcpStopVMOutput struct {
-	Stopped bool `json:"stopped"`
+	Stopped       bool   `json:"stopped"`
+	PreviousState string `json:"previous_state,omitempty"`
+	ExitReason    string `json:"exit_reason,omitempty"`
 }
 
 func (e *mcpEndpoint) stopVM(ctx context.Context, _ *mcp.CallToolRequest, in mcpStopVMInput) (*mcp.CallToolResult, mcpStopVMOutput, error) {
@@ -560,28 +592,67 @@ func (e *mcpEndpoint) stopVM(ctx context.Context, _ *mcp.CallToolRequest, in mcp
 	}
 	cleanupErr := e.cancelVMWork(ctx, id)
 	if err := e.control.ShutdownInstanceWithIDContext(ctx, id); err != nil {
+		state, terminal, observationErr := e.observeTerminalVM(ctx, id)
+		if observationErr == nil && terminal {
+			e.reapOwnedVM(id)
+			if cleanupErr != nil {
+				return nil, mcpStopVMOutput{}, fmt.Errorf("VM %q was already %s and was reaped, but MCP cleanup was incomplete: %w", id, terminalVMState(state), cleanupErr)
+			}
+			return nil, mcpStopVMOutput{Stopped: true, PreviousState: terminalVMState(state), ExitReason: state.ExitReason}, nil
+		}
 		e.mu.Lock()
 		if e.quarantined == nil {
 			e.quarantined = make(map[string]struct{})
 		}
 		e.quarantined[id] = struct{}{}
 		e.mu.Unlock()
-		return nil, mcpStopVMOutput{}, errors.Join(cleanupErr, fmt.Errorf("stop VM: %w", err))
+		return nil, mcpStopVMOutput{}, errors.Join(cleanupErr, fmt.Errorf("stop VM: %w", err), observationErr)
 	}
-	e.mu.Lock()
-	delete(e.vms, id)
-	delete(e.stopping, id)
-	delete(e.quarantined, id)
-	for _, command := range e.commands {
-		if command.vmID == id {
-			command.releasePayload()
-		}
-	}
-	e.mu.Unlock()
+	e.reapOwnedVM(id)
 	if cleanupErr != nil {
 		return nil, mcpStopVMOutput{}, fmt.Errorf("VM %q stopped but MCP cleanup was incomplete: %w", id, cleanupErr)
 	}
 	return nil, mcpStopVMOutput{Stopped: true}, nil
+}
+
+func (e *mcpEndpoint) observeTerminalVM(ctx context.Context, id string) (client.InstanceState, bool, error) {
+	states, err := e.control.InstanceStatusesContext(ctx)
+	if err != nil {
+		return client.InstanceState{}, false, fmt.Errorf("observe VM after failed stop: %w", err)
+	}
+	for _, state := range states {
+		if state.ID != id {
+			continue
+		}
+		return state, state.Status == "stopped" || state.Status == "crashed", nil
+	}
+	return client.InstanceState{ID: id, Status: "absent", ExitReason: "backend no longer owns the VM"}, true, nil
+}
+
+func terminalVMState(state client.InstanceState) string {
+	if state.Status == "" {
+		return "absent"
+	}
+	return state.Status
+}
+
+func (e *mcpEndpoint) reapOwnedVM(id string) {
+	e.mu.Lock()
+	delete(e.vms, id)
+	delete(e.stopping, id)
+	delete(e.quarantined, id)
+	for commandID, command := range e.commands {
+		if command.vmID == id {
+			command.releasePayload()
+			delete(e.commands, commandID)
+		}
+	}
+	for contextID, guest := range e.contexts {
+		if guest.vmID == id {
+			delete(e.contexts, contextID)
+		}
+	}
+	e.mu.Unlock()
 }
 
 func (e *mcpEndpoint) ownedVMID(id string) (string, error) {
@@ -599,6 +670,13 @@ func (e *mcpEndpoint) ownedVM(id string) (mcpVM, error) {
 	}
 	if _, ok := e.stopping[id]; ok {
 		return mcpVM{}, fmt.Errorf("VM %q is stopping", id)
+	}
+	if vm.Status == "stopped" || vm.Status == "crashed" || vm.Status == "absent" {
+		reason := vm.ExitReason
+		if reason == "" {
+			reason = vm.Error
+		}
+		return mcpVM{}, fmt.Errorf("VM %q is %s and must be reaped with vm_stop before it can be used: %s", id, vm.Status, reason)
 	}
 	return vm, nil
 }
