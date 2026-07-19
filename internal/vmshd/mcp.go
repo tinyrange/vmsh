@@ -74,6 +74,7 @@ type mcpEndpoint struct {
 	artifactInFlight int64
 	closed           bool
 	cleanupTimeout   time.Duration
+	shutdownTimeout  time.Duration
 }
 
 type mcpVM struct {
@@ -220,27 +221,48 @@ func (m *mcpManager) RevokeCredential(sessionID, credentialID string) bool {
 }
 
 func (m *mcpManager) Stop(sessionID string) error {
+	sessionID = strings.TrimSpace(sessionID)
 	m.mu.Lock()
-	endpoint := m.endpoints[strings.TrimSpace(sessionID)]
-	delete(m.endpoints, strings.TrimSpace(sessionID))
+	endpoint := m.endpoints[sessionID]
 	m.mu.Unlock()
 	if endpoint == nil {
 		return nil
 	}
-	return endpoint.close()
+	if err := endpoint.close(); err != nil {
+		// Keep the closed endpoint as a host-visible recovery handle. A later
+		// stop retries only the VMs whose backend absence was not confirmed.
+		return err
+	}
+	m.mu.Lock()
+	if m.endpoints[sessionID] == endpoint {
+		delete(m.endpoints, sessionID)
+	}
+	m.mu.Unlock()
+	return nil
 }
 
 func (m *mcpManager) Close() error {
 	m.mu.Lock()
-	endpoints := make([]*mcpEndpoint, 0, len(m.endpoints))
-	for _, endpoint := range m.endpoints {
-		endpoints = append(endpoints, endpoint)
+	type namedEndpoint struct {
+		id       string
+		endpoint *mcpEndpoint
 	}
-	m.endpoints = make(map[string]*mcpEndpoint)
+	endpoints := make([]namedEndpoint, 0, len(m.endpoints))
+	for id, endpoint := range m.endpoints {
+		endpoints = append(endpoints, namedEndpoint{id: id, endpoint: endpoint})
+	}
 	m.mu.Unlock()
 	var errs []error
-	for _, endpoint := range endpoints {
-		errs = append(errs, endpoint.close())
+	for _, named := range endpoints {
+		if err := named.endpoint.close(); err != nil {
+			errs = append(errs, fmt.Errorf("close MCP endpoint %q: %w", named.id, err))
+			continue
+		}
+		m.mu.Lock()
+		if m.endpoints[named.id] == named.endpoint {
+			delete(m.endpoints, named.id)
+		}
+		m.mu.Unlock()
 	}
 	return errors.Join(errs...)
 }
@@ -593,6 +615,11 @@ func (e *mcpEndpoint) applyBalloonPolicy(vm *mcpVM) {
 	vm.BalloonPolicyInFlight = policy.InFlight
 	vm.BalloonPolicyError = policy.DegradedReason
 	vm.BalloonPolicyLastError = policy.LastFailure
+	if policy.Automatic && vm.BackendStatus != "running" && vm.BackendStatus != "starting" && vm.BackendStatus != "stopping" {
+		vm.BalloonMB = policy.TargetMB
+		vm.BalloonActualMB = policy.ActualMB
+		vm.BalloonStatus = policy.Status
+	}
 }
 
 type mcpStopVMInput struct {
@@ -672,6 +699,9 @@ func (e *mcpEndpoint) reapOwnedVM(id string) {
 		}
 	}
 	e.mu.Unlock()
+	if e.balloon != nil {
+		e.balloon.forget(id)
+	}
 }
 
 func (e *mcpEndpoint) ownedVMID(id string) (string, error) {
@@ -764,44 +794,95 @@ func (e *mcpEndpoint) beginVMStop(id string) (string, error) {
 
 func (e *mcpEndpoint) close() error {
 	e.mu.Lock()
-	if e.closed {
-		e.mu.Unlock()
-		return nil
-	}
+	firstClose := !e.closed
 	e.closed = true
-	e.credentials = make(map[string]string)
 	commands := make([]*mcpCommand, 0, len(e.commands))
-	for _, command := range e.commands {
-		commands = append(commands, command)
-	}
-	e.commands = make(map[string]*mcpCommand)
 	contexts := make([]*mcpGuestContext, 0, len(e.contexts))
-	for _, guest := range e.contexts {
-		contexts = append(contexts, guest)
+	if firstClose {
+		e.credentials = make(map[string]string)
+		for _, command := range e.commands {
+			commands = append(commands, command)
+		}
+		for _, guest := range e.contexts {
+			contexts = append(contexts, guest)
+		}
+		e.commands = make(map[string]*mcpCommand)
+		e.artifacts = make(map[string]*mcpArtifact)
+		e.contexts = make(map[string]*mcpGuestContext)
 	}
-	e.artifacts = make(map[string]*mcpArtifact)
-	e.contexts = make(map[string]*mcpGuestContext)
 	ids := make([]string, 0, len(e.vms))
+	if e.stopping == nil {
+		e.stopping = make(map[string]struct{})
+	}
 	for id := range e.vms {
 		ids = append(ids, id)
+		e.stopping[id] = struct{}{}
 	}
-	e.vms = make(map[string]mcpVM)
-	e.quarantined = make(map[string]struct{})
 	e.mu.Unlock()
 	var errs []error
-	errs = append(errs, cancelAndWaitMCPWork(context.Background(), e.workCleanupTimeout(), commands, contexts))
-	if e.server != nil {
+	if firstClose {
+		errs = append(errs, cancelAndWaitMCPWork(context.Background(), e.workCleanupTimeout(), commands, contexts))
+		for _, command := range commands {
+			command.releasePayload()
+		}
+	}
+	if firstClose && e.server != nil {
 		// Stop accepting and terminate active MCP transports before cleaning up
 		// their VMs. Graceful HTTP shutdown can otherwise wait indefinitely for a
 		// long-lived MCP session that is itself waiting on this cleanup.
 		errs = append(errs, e.server.Close())
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	errs = append(errs, e.shutdownOwnedVMs(ids))
+	return errors.Join(errs...)
+}
+
+func (e *mcpEndpoint) shutdownOwnedVMs(ids []string) error {
+	type result struct {
+		id  string
+		err error
+	}
+	results := make(chan result, len(ids))
 	for _, id := range ids {
-		errs = append(errs, e.control.ShutdownInstanceWithIDContext(ctx, id))
+		go func(id string) {
+			ctx, cancel := context.WithTimeout(context.Background(), e.vmShutdownTimeout())
+			err := e.control.ShutdownInstanceWithIDContext(ctx, id)
+			cancel()
+			if err != nil {
+				observeCtx, observeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_, terminal, observeErr := e.observeTerminalVM(observeCtx, id)
+				observeCancel()
+				if terminal && observeErr == nil {
+					err = nil
+				} else {
+					err = errors.Join(fmt.Errorf("shutdown VM %q: %w", id, err), observeErr)
+				}
+			}
+			results <- result{id: id, err: err}
+		}(id)
+	}
+	var errs []error
+	for range ids {
+		result := <-results
+		if result.err == nil {
+			e.reapOwnedVM(result.id)
+			continue
+		}
+		e.mu.Lock()
+		if e.quarantined == nil {
+			e.quarantined = make(map[string]struct{})
+		}
+		e.quarantined[result.id] = struct{}{}
+		e.mu.Unlock()
+		errs = append(errs, result.err)
 	}
 	return errors.Join(errs...)
+}
+
+func (e *mcpEndpoint) vmShutdownTimeout() time.Duration {
+	if e.shutdownTimeout > 0 {
+		return e.shutdownTimeout
+	}
+	return 10 * time.Second
 }
 
 func (e *mcpEndpoint) cancelVMWork(ctx context.Context, vmID string) error {

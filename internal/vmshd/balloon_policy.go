@@ -48,6 +48,8 @@ type balloonPolicyEntry struct {
 	requestedMB    uint64
 	requestedAt    time.Time
 	lastActualMB   uint64
+	lastTargetMB   uint64
+	lastStatus     string
 	initialRequest bool
 	degradedReason string
 	lastFailure    string
@@ -58,6 +60,9 @@ type balloonPolicyState struct {
 	InFlight       bool
 	DegradedReason string
 	LastFailure    string
+	TargetMB       uint64
+	ActualMB       uint64
+	Status         string
 }
 
 type balloonPolicyConfig struct {
@@ -137,7 +142,7 @@ func (c *balloonController) applyStartRequest(req *client.StartInstanceRequest, 
 	if req.MemoryMB == 0 {
 		return
 	}
-	req.BalloonMB = c.initialBalloonTarget(snapshot, current, req.ID, req.MemoryMB)
+	req.BalloonMB = c.initialBalloonTarget(snapshot, req.MemoryMB)
 	if req.BalloonMB != 0 {
 		c.markInitialBalloonRequest(req.ID, req.BalloonMB, time.Now())
 	}
@@ -218,7 +223,10 @@ func (c *balloonController) state(id string) balloonPolicyState {
 	c.mu.Lock()
 	entry := c.automatic[strings.TrimSpace(id)]
 	c.mu.Unlock()
-	return balloonPolicyState{Automatic: entry.automatic, InFlight: entry.inFlight, DegradedReason: entry.degradedReason, LastFailure: entry.lastFailure}
+	return balloonPolicyState{
+		Automatic: entry.automatic, InFlight: entry.inFlight, DegradedReason: entry.degradedReason, LastFailure: entry.lastFailure,
+		TargetMB: entry.lastTargetMB, ActualMB: entry.lastActualMB, Status: entry.lastStatus,
+	}
 }
 
 func (c *balloonController) markInitialBalloonRequest(id string, targetMB uint64, now time.Time) {
@@ -243,6 +251,7 @@ func (c *balloonController) markBalloonRequest(id string, targetMB uint64, now t
 	entry := c.automatic[id]
 	entry.inFlight = true
 	entry.requestedMB = targetMB
+	entry.lastTargetMB = targetMB
 	entry.requestedAt = now
 	c.automatic[id] = entry
 	c.mu.Unlock()
@@ -264,6 +273,9 @@ func (c *balloonController) adjustmentReady(state client.InstanceState, now time
 	if state.BalloonStatus == "" {
 		actual = state.BalloonMB
 	}
+	entry.lastTargetMB = state.BalloonMB
+	entry.lastActualMB = actual
+	entry.lastStatus = state.BalloonStatus
 	if entry.degradedReason != "" {
 		if state.BalloonStatus == "driver_unavailable" || state.BalloonMB != actual {
 			return false
@@ -320,6 +332,13 @@ func (c *balloonController) reconcileLifecycle(states []client.InstanceState, no
 	for id, entry := range c.automatic {
 		state, ok := present[id]
 		if ok && (state.Status == "running" || state.Status == "starting" || state.Status == "stopping") {
+			actual := state.BalloonActualMB
+			if state.BalloonStatus == "" {
+				actual = state.BalloonMB
+			}
+			entry.lastTargetMB = state.BalloonMB
+			entry.lastActualMB = actual
+			entry.lastStatus = state.BalloonStatus
 			if state.Status == "running" && !entry.seen {
 				entry.seen = true
 				if entry.inFlight && entry.initialRequest {
@@ -344,35 +363,48 @@ func (c *balloonController) reconcileLifecycle(states []client.InstanceState, no
 			c.automatic[id] = entry
 			continue
 		}
-		// A policy entry which reached the runtime can be removed as soon as
-		// the VM disappears. Entries for failed starts receive a short grace
-		// period so the monitor cannot race request normalization and startup.
-		if ok || entry.seen || now.Sub(entry.createdAt) >= time.Minute {
+		// Preserve policy identity and the last live device state alongside a
+		// stopped/crashed backend tombstone. MCP reaping explicitly forgets the
+		// policy. Only requests which never reached a runtime are aged out here.
+		if entry.seen {
+			c.automatic[id] = entry
+			continue
+		}
+		if ok {
+			// A guest may shut down before the monitor samples its brief running
+			// state. A backend tombstone still proves the request reached the
+			// runtime, so retain its automatic identity until MCP reaps it.
+			c.automatic[id] = entry
+			continue
+		}
+		if now.Sub(entry.createdAt) >= time.Minute {
 			delete(c.automatic, id)
 		}
 	}
 }
 
-func (c *balloonController) initialBalloonTarget(snapshot memorySnapshot, current []client.InstanceState, id string, memoryMB uint64) uint64 {
-	projected := snapshot
-	if projected.AvailableMB > memoryMB {
-		projected.AvailableMB -= memoryMB
-	} else {
-		projected.AvailableMB = 0
+func (c *balloonController) forget(id string) {
+	if c == nil {
+		return
 	}
-	vms := balloonVMsFromInstances(current)
-	id = strings.TrimSpace(id)
-	if id == "" {
-		id = "__new__"
+	c.mu.Lock()
+	delete(c.automatic, strings.TrimSpace(id))
+	c.mu.Unlock()
+}
+
+func (c *balloonController) initialBalloonTarget(snapshot memorySnapshot, memoryMB uint64) uint64 {
+	cfg := normalizeBalloonPolicyConfig(c.config)
+	reserve := snapshot.TotalMB * cfg.ReservePercent / 100
+	var safelyBackable uint64
+	if snapshot.AvailableMB > reserve {
+		safelyBackable = snapshot.AvailableMB - reserve
 	}
-	vms = append(vms, balloonVM{ID: id, ConfiguredMB: memoryMB, Eligible: true})
-	decisions := planBalloonTargets(projected, vms, c.config)
-	for _, decision := range decisions {
-		if decision.ID == id {
-			return decision.BalloonMB
-		}
-	}
-	return 0
+	// Automatic memory is a dynamic ceiling, not a promise that the host can
+	// immediately back every configured guest page. Start with enough balloon
+	// to preserve observed host headroom even if the guest dirties memory in a
+	// tight loop before the reactive monitor gets another scheduling turn.
+	needed := memoryMB - min(memoryMB, safelyBackable)
+	return min(needed, balloonCapacity(balloonVM{ConfiguredMB: memoryMB}, cfg))
 }
 
 func balloonVMsFromInstances(states []client.InstanceState) []balloonVM {
@@ -427,17 +459,31 @@ func normalizeBalloonPolicyConfig(cfg balloonPolicyConfig) balloonPolicyConfig {
 }
 
 func distributeBalloonIncrease(decisions []balloonDecision, vms []balloonVM, cfg balloonPolicyConfig, needMB uint64) {
-	for i, vm := range vms {
-		if needMB == 0 {
+	for needMB > 0 {
+		eligible := 0
+		for i, vm := range vms {
+			if vm.Eligible && decisions[i].BalloonMB < balloonCapacity(vm, cfg) {
+				eligible++
+			}
+		}
+		if eligible == 0 {
 			return
 		}
-		capacity := balloonCapacity(vm, cfg)
-		if !vm.Eligible || decisions[i].BalloonMB >= capacity {
-			continue
+		share := (needMB + uint64(eligible) - 1) / uint64(eligible)
+		progress := uint64(0)
+		for i, vm := range vms {
+			capacity := balloonCapacity(vm, cfg)
+			if !vm.Eligible || decisions[i].BalloonMB >= capacity {
+				continue
+			}
+			delta := min(share, needMB, capacity-decisions[i].BalloonMB)
+			decisions[i].BalloonMB += delta
+			needMB -= delta
+			progress += delta
 		}
-		delta := min(cfg.StepMB, needMB, capacity-decisions[i].BalloonMB)
-		decisions[i].BalloonMB += delta
-		needMB -= delta
+		if progress == 0 {
+			return
+		}
 	}
 }
 

@@ -140,6 +140,14 @@ func TestRuntimePolicyAppliesDefaultMemoryAndInitialBalloon(t *testing.T) {
 	}
 }
 
+func TestInitialAutomaticBalloonPreservesObservedHostHeadroom(t *testing.T) {
+	controller := newBalloonController(fakeMemoryObserver{})
+	target := controller.initialBalloonTarget(memorySnapshot{TotalMB: 32768, AvailableMB: 10900}, 20480)
+	if target != 12856 {
+		t.Fatalf("initial balloon target = %d, want 12856 MiB to preserve the host reserve", target)
+	}
+}
+
 func TestAutomaticPolicyReconcilesInitialTargetWithLiveDevice(t *testing.T) {
 	controller := newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 0}})
 	controller.setAutomatic("new", true)
@@ -246,7 +254,7 @@ func TestRuntimePressureWaitsForGuestAcknowledgement(t *testing.T) {
 	if err := srv.reconcileBalloonPressure(runtime); err != nil {
 		t.Fatal(err)
 	}
-	if len(targets) != 1 || targets[0] != defaultPolicyStepMB {
+	if len(targets) != 1 || targets[0] != 819 {
 		t.Fatalf("first targets = %v", targets)
 	}
 	runtime.statuses[0].BalloonMB = targets[0]
@@ -262,7 +270,7 @@ func TestRuntimePressureWaitsForGuestAcknowledgement(t *testing.T) {
 	if err := srv.reconcileBalloonPressure(runtime); err != nil {
 		t.Fatal(err)
 	}
-	if len(targets) != 2 || targets[1] != 2*defaultPolicyStepMB {
+	if len(targets) != 2 || targets[1] != 1638 {
 		t.Fatalf("acknowledged targets = %v", targets)
 	}
 }
@@ -338,7 +346,7 @@ func TestRuntimePressureContinuesAfterIndependentBalloonFailure(t *testing.T) {
 	}
 }
 
-func TestBalloonPolicyPrunesStoppedAndFailedStartEntries(t *testing.T) {
+func TestBalloonPolicyKeepsBackendTombstonesAndPrunesFailedStarts(t *testing.T) {
 	srv := NewServer("secret")
 	srv.balloon = newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 4096}})
 	for _, id := range []string{"active", "stopped", "failed-start"} {
@@ -356,8 +364,30 @@ func TestBalloonPolicyPrunesStoppedAndFailedStartEntries(t *testing.T) {
 	if err := srv.reconcileBalloonPressure(runtime); err != nil {
 		t.Fatal(err)
 	}
-	if !srv.balloon.isAutomatic("active") || srv.balloon.isAutomatic("stopped") || srv.balloon.isAutomatic("failed-start") {
+	if !srv.balloon.isAutomatic("active") || !srv.balloon.isAutomatic("stopped") || srv.balloon.isAutomatic("failed-start") {
 		t.Fatalf("policy lifecycle entries = %+v", srv.balloon.automatic)
+	}
+}
+
+func TestAutomaticPolicySurvivesBackendTombstoneUntilMCPReap(t *testing.T) {
+	controller := newBalloonController(fakeMemoryObserver{})
+	controller.setAutomatic("automatic", true)
+	running := client.InstanceState{
+		ID: "automatic", Status: "running", MemoryMB: 4096,
+		BalloonMB: 768, BalloonActualMB: 768, BalloonStatus: "converged",
+	}
+	controller.reconcileLifecycle([]client.InstanceState{running}, time.Now())
+	if !controller.adjustmentReady(running, time.Now()) {
+		t.Fatal("live automatic VM was not ready")
+	}
+	controller.reconcileLifecycle([]client.InstanceState{{ID: "automatic", Status: "stopped", MemoryMB: 4096, BalloonMB: 128}}, time.Now())
+	state := controller.state("automatic")
+	if !state.Automatic || state.TargetMB != 768 || state.ActualMB != 768 || state.Status != "converged" {
+		t.Fatalf("tombstone policy = %+v", state)
+	}
+	controller.forget("automatic")
+	if controller.state("automatic").Automatic {
+		t.Fatal("explicit MCP reap retained automatic policy state")
 	}
 }
 

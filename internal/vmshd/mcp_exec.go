@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -23,11 +24,16 @@ const (
 	mcpMaxWaitSeconds        = 30
 	// Managed input is base64-encoded in JSON before crossing guest vsock. Keep
 	// the encoded frame below the guest receive window.
-	mcpStdinChunkBytes = 16 << 10
-	mcpMaxStdinBytes   = 4 << 20
-	mcpMaxCommandBytes = 256 << 10
-	mcpMaxEnvBytes     = 256 << 10
-	mcpMaxPathBytes    = 16 << 10
+	mcpStdinChunkBytes            = 16 << 10
+	mcpMaxStdinBytes              = 4 << 20
+	mcpMaxCommandBytes            = 256 << 10
+	mcpMaxEnvBytes                = 256 << 10
+	mcpMaxPathBytes               = 16 << 10
+	mcpCompletedOutputRetention   = 15 * time.Minute
+	mcpCompletedMetadataRetention = time.Hour
+	mcpCompletedOutputBudget      = 64 << 20
+	mcpCompletedOutputCount       = 64
+	mcpCompletedMetadataCount     = 1024
 )
 
 type mcpRunVMInput struct {
@@ -67,6 +73,7 @@ type mcpCommandOutput struct {
 	ContainmentError  string          `json:"containment_error,omitempty"`
 	StartedAt         time.Time       `json:"started_at"`
 	FinishedAt        *time.Time      `json:"finished_at,omitempty"`
+	OutputExpired     bool            `json:"output_expired,omitempty"`
 }
 
 type mcpCommand struct {
@@ -104,6 +111,7 @@ type mcpCommand struct {
 	containmentAction        string
 	containmentError         string
 	cancellationUnverifiable bool
+	outputExpired            bool
 }
 
 func (e *mcpEndpoint) runVM(ctx context.Context, _ *mcp.CallToolRequest, in mcpRunVMInput) (*mcp.CallToolResult, mcpCommandOutput, error) {
@@ -296,13 +304,17 @@ func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
 		cancel()
 		return nil, err
 	}
-	go command.run(ctx, e.control)
+	go func() {
+		command.run(ctx, e.control)
+		e.pruneCompletedCommands(time.Now())
+	}()
 	return command, nil
 }
 
 func (e *mcpEndpoint) registerMCPCommand(command *mcpCommand) (*mcpGuestContext, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.pruneCompletedCommandsLocked(time.Now())
 	if e.closed {
 		return nil, fmt.Errorf("MCP endpoint is stopped")
 	}
@@ -329,6 +341,75 @@ func (e *mcpEndpoint) registerMCPCommand(command *mcpCommand) (*mcpGuestContext,
 	}
 	e.commands[command.id] = command
 	return guest, nil
+}
+
+func (e *mcpEndpoint) pruneCompletedCommands(now time.Time) {
+	e.mu.Lock()
+	e.pruneCompletedCommandsLocked(now)
+	e.mu.Unlock()
+}
+
+func (e *mcpEndpoint) pruneCompletedCommandsLocked(now time.Time) {
+	type completedCommand struct {
+		id       string
+		command  *mcpCommand
+		finished time.Time
+		bytes    int
+		expired  bool
+	}
+	completed := make([]completedCommand, 0, len(e.commands))
+	for id, command := range e.commands {
+		command.mu.Lock()
+		if command.finishedAt != nil {
+			completed = append(completed, completedCommand{
+				id: id, command: command, finished: *command.finishedAt,
+				bytes:   len(command.stdout) + len(command.stderr) + len(command.asyncStdout) + len(command.asyncStderr),
+				expired: command.outputExpired,
+			})
+		}
+		command.mu.Unlock()
+	}
+	sort.Slice(completed, func(i, j int) bool { return completed[i].finished.Before(completed[j].finished) })
+	retainedCount, retainedBytes := 0, 0
+	for i := range completed {
+		entry := &completed[i]
+		if !entry.expired && now.Sub(entry.finished) >= mcpCompletedOutputRetention {
+			entry.command.expirePayload()
+			entry.expired = true
+			entry.bytes = 0
+		}
+		if !entry.expired {
+			retainedCount++
+			retainedBytes += entry.bytes
+		}
+	}
+	for i := range completed {
+		if retainedCount <= mcpCompletedOutputCount && retainedBytes <= mcpCompletedOutputBudget {
+			break
+		}
+		entry := &completed[i]
+		if entry.expired {
+			continue
+		}
+		entry.command.expirePayload()
+		entry.expired = true
+		retainedCount--
+		retainedBytes -= entry.bytes
+		entry.bytes = 0
+	}
+	metadataExcess := len(completed) - mcpCompletedMetadataCount
+	for _, entry := range completed {
+		if !entry.expired {
+			continue
+		}
+		if metadataExcess <= 0 && now.Sub(entry.finished) < mcpCompletedMetadataRetention {
+			continue
+		}
+		delete(e.commands, entry.id)
+		if metadataExcess > 0 {
+			metadataExcess--
+		}
+	}
 }
 
 func (e *mcpEndpoint) command(id string) (*mcpCommand, error) {
@@ -525,6 +606,22 @@ func (c *mcpCommand) releasePayload() {
 	c.mu.Unlock()
 }
 
+func (c *mcpCommand) expirePayload() {
+	c.mu.Lock()
+	c.outputExpired = true
+	c.stdin = nil
+	c.request = client.RunRequest{}
+	c.stdout = nil
+	c.stderr = nil
+	c.asyncStdout = nil
+	c.asyncStderr = nil
+	c.stdoutTruncated = c.stdoutTruncated || c.stdoutTotal > 0
+	c.stderrTruncated = c.stderrTruncated || c.stderrTotal > 0
+	c.asyncStdoutTruncated = c.asyncStdoutTruncated || c.asyncStdoutTotal > 0
+	c.asyncStderrTruncated = c.asyncStderrTruncated || c.asyncStderrTotal > 0
+	c.mu.Unlock()
+}
+
 func (c *mcpCommand) sendInput(input client.ExecInput, timeout time.Duration) bool {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -557,7 +654,7 @@ func (c *mcpCommand) snapshot(stdoutOffset, stderrOffset int64, maxBytes int, in
 	out := mcpCommandOutput{
 		CommandID: c.id, VMID: c.vmID, ContextID: c.contextID, Status: c.status, ExitCode: cloneInt(c.exitCode), Stdout: stdout, Stderr: stderr,
 		Error: c.err, ContainmentAction: c.containmentAction, ContainmentError: c.containmentError,
-		StartedAt: c.startedAt, FinishedAt: cloneTime(c.finishedAt),
+		StartedAt: c.startedAt, FinishedAt: cloneTime(c.finishedAt), OutputExpired: c.outputExpired,
 	}
 	if c.asyncStdoutTotal != 0 {
 		chunk := commandOutputChunk(c.asyncStdout, c.asyncStdoutTotal, c.asyncStdoutTruncated, 0, mcpMaxOutputChunk)

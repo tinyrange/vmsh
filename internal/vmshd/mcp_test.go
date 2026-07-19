@@ -725,6 +725,73 @@ func TestMCPCompletedOutputCanBeReplayedUntilForgotten(t *testing.T) {
 	}
 }
 
+func TestMCPCompletedReplayEvictsPayloadButKeepsObservableStatus(t *testing.T) {
+	now := time.Now().UTC()
+	endpoint := &mcpEndpoint{commands: make(map[string]*mcpCommand)}
+	for i := 0; i < mcpCompletedOutputCount+1; i++ {
+		finished := now.Add(time.Duration(i) * time.Second)
+		id := fmt.Sprintf("command-%02d", i)
+		endpoint.commands[id] = &mcpCommand{
+			id: id, vmID: "one", status: "exited", finishedAt: &finished,
+			stdout: make([]byte, 1<<20), stdoutTotal: 1 << 20,
+		}
+	}
+	endpoint.pruneCompletedCommands(now.Add(time.Duration(mcpCompletedOutputCount+2) * time.Second))
+	oldest := endpoint.commands["command-00"].snapshot(0, 0, 1024, false)
+	if !oldest.OutputExpired || oldest.Status != "exited" || oldest.Stdout.TotalBytes != 1<<20 || !oldest.Stdout.Truncated {
+		t.Fatalf("expired replay status = %#v", oldest)
+	}
+	newest := endpoint.commands[fmt.Sprintf("command-%02d", mcpCompletedOutputCount)].snapshot(0, 0, 1024, false)
+	if newest.OutputExpired || newest.Stdout.NextOffset != 1024 {
+		t.Fatalf("newest replay was not retained: %#v", newest)
+	}
+}
+
+func TestMCPEndpointCloseShutsVMsConcurrentlyAndRetainsFailedOwnership(t *testing.T) {
+	fastCalled := make(chan struct{}, 1)
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/vm/shutdown":
+			if r.URL.Query().Get("id") == "wedged" {
+				<-r.Context().Done()
+				return
+			}
+			fastCalled <- struct{}{}
+			writeJSON(w, http.StatusOK, map[string]bool{"stopped": true})
+		case "/vm":
+			writeJSON(w, http.StatusOK, []client.InstanceState{{ID: "wedged", Status: "running"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer control.Close()
+	endpoint := &mcpEndpoint{
+		control: client.NewClient(control.URL, nil), vms: map[string]mcpVM{"wedged": {ID: "wedged"}, "fast": {ID: "fast"}},
+		commands: make(map[string]*mcpCommand), contexts: make(map[string]*mcpGuestContext), stopping: make(map[string]struct{}), quarantined: make(map[string]struct{}),
+		shutdownTimeout: 40 * time.Millisecond,
+	}
+	started := time.Now()
+	if err := endpoint.close(); err == nil {
+		t.Fatal("endpoint close hid the failed backend shutdown")
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("concurrent endpoint close took %s", time.Since(started))
+	}
+	select {
+	case <-fastCalled:
+	default:
+		t.Fatal("a wedged VM prevented shutdown of another VM")
+	}
+	endpoint.mu.Lock()
+	_, fastRetained := endpoint.vms["fast"]
+	_, wedgedRetained := endpoint.vms["wedged"]
+	_, quarantined := endpoint.quarantined["wedged"]
+	endpoint.mu.Unlock()
+	if fastRetained || !wedgedRetained || !quarantined {
+		t.Fatalf("close recovery state: fast=%v wedged=%v quarantined=%v", fastRetained, wedgedRetained, quarantined)
+	}
+}
+
 func TestMCPUnconfirmedTerminationIsNotReportedAsCanceled(t *testing.T) {
 	started := make(chan struct{})
 	control := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
@@ -1962,6 +2029,73 @@ func TestMCPKVMContextFanout(t *testing.T) {
 	_, _ = session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_run", Arguments: map[string]any{
 		"vm_id": vm.ID, "user": "root", "command": []string{"sh", "-c", `test ! -f /tmp/vmsh-escaped.pid || kill -KILL "$(cat /tmp/vmsh-escaped.pid)" 2>/dev/null || true`},
 	}})
+}
+
+func TestMCPKVMAutomaticHeadroomAndContextCaptureRecovery(t *testing.T) {
+	endpoint, token := os.Getenv("VMSH_MCP_INTEGRATION_URL"), os.Getenv("VMSH_MCP_INTEGRATION_TOKEN")
+	if endpoint == "" || token == "" {
+		t.Skip("set VMSH_MCP_INTEGRATION_URL and VMSH_MCP_INTEGRATION_TOKEN for live KVM coverage")
+	}
+	hostMemory, err := (systemMemoryObserver{}).Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcpClient := mcp.NewClient(&mcp.Implementation{Name: "vmsh-memory-capture-test", Version: "1"}, nil)
+	session, err := mcpClient.Connect(t.Context(), &mcp.StreamableClientTransport{
+		Endpoint: endpoint, HTTPClient: &http.Client{Transport: mcpBearerTransport{token: token}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	created, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_create", Arguments: map[string]any{
+		"image": "alpine", "name": "memory-capture-recovery",
+	}})
+	if err != nil || created.IsError {
+		t.Fatalf("create VM = %#v, %v", created, err)
+	}
+	vm := structuredToolOutput[mcpCreateVMOutput](t, created).VM
+	defer func() {
+		_, _ = session.CallTool(context.Background(), &mcp.CallToolParams{Name: "vm_stop", Arguments: map[string]any{"vm_id": vm.ID}})
+	}()
+	reserve := hostMemory.TotalMB * defaultReservePercent / 100
+	safelyBackable := uint64(0)
+	if hostMemory.AvailableMB > reserve {
+		safelyBackable = hostMemory.AvailableMB - reserve
+	}
+	usable := vm.MemoryMB - min(vm.MemoryMB, vm.BalloonMB)
+	if !vm.AutomaticMemory || usable > safelyBackable+512 {
+		t.Fatalf("automatic admission memory=%d balloon=%d usable=%d host-safe=%d policy=%#v", vm.MemoryMB, vm.BalloonMB, usable, safelyBackable, vm)
+	}
+
+	opened, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_context_open", Arguments: map[string]any{"vm_id": vm.ID}})
+	if err != nil || opened.IsError {
+		t.Fatalf("open context = %#v, %v", opened, err)
+	}
+	contextID := structuredToolOutput[mcpContextInfo](t, opened).ContextID
+	defer func() {
+		_, _ = session.CallTool(context.Background(), &mcp.CallToolParams{Name: "vm_context_close", Arguments: map[string]any{"context_id": contextID}})
+	}()
+	produced, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_context_run", Arguments: map[string]any{
+		"context_id": contextID, "command_line": "dd if=/dev/zero bs=1M count=32 2>/dev/null", "timeout_seconds": 30,
+	}})
+	if err != nil || produced.IsError {
+		t.Fatalf("produce context output = %#v, %v", produced, err)
+	}
+	output := structuredToolOutput[mcpContextRunOutput](t, produced)
+	if output.CommandStatus != "exited" || output.ExitCode != 0 || output.StdoutTotalBytes != 32<<20 || !output.StdoutTruncated {
+		t.Fatalf("bulk context output = %#v", output)
+	}
+	checked, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_run", Arguments: map[string]any{
+		"vm_id": vm.ID, "command": []string{"sh", "-c", `find /var/tmp -maxdepth 2 -type f \( -name '*.stdout' -o -name '*.stderr' \) -path '/var/tmp/.vmsh-*/*' -print`},
+	}})
+	if err != nil || checked.IsError {
+		t.Fatalf("inspect captures = %#v, %v", checked, err)
+	}
+	checkOutput := structuredToolOutput[mcpCommandOutput](t, checked)
+	if checkOutput.ExitCode == nil || *checkOutput.ExitCode != 0 || checkOutput.Stdout.TotalBytes != 0 {
+		t.Fatalf("completed capture files were retained: %#v", checkOutput)
+	}
 }
 
 func TestMCPArchiveRejectsUnsupportedEntriesBeforeImport(t *testing.T) {
