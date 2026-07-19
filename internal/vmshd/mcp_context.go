@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	pathpkg "path"
 	"strconv"
@@ -91,9 +90,6 @@ func (e *mcpEndpoint) openGuestContext(ctx context.Context, _ *mcp.CallToolReque
 			e.releaseGuestContextReservation()
 		}
 	}()
-	if err := validateGuestContextStart(ctx, e.control, vm.ID, user, workDir, in.Env); err != nil {
-		return nil, mcpContextInfo{}, fmt.Errorf("open guest context: %w", err)
-	}
 	id, err := randomMCPID("context")
 	if err != nil {
 		return nil, mcpContextInfo{}, err
@@ -148,42 +144,6 @@ func (e *mcpEndpoint) releaseGuestContextReservation() {
 	e.mu.Lock()
 	e.openingContexts--
 	e.mu.Unlock()
-}
-
-func validateGuestContextStart(ctx context.Context, control *client.Client, vmID, user, workDir string, env []string) error {
-	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	events, err := control.RunEventsInContext(probeCtx, vmID, client.RunRequest{
-		Command: []string{"/bin/sh", "-c", ":"}, Env: append([]string(nil), env...), WorkDir: workDir, User: user,
-	})
-	if err != nil {
-		return errors.New(conciseCommandError(err))
-	}
-	exitCode := -1
-	var diagnostic strings.Builder
-	for _, event := range events {
-		switch event.Kind {
-		case "stderr", "error":
-			data := event.Data
-			if len(data) == 0 {
-				data = []byte(firstNonEmpty(event.Error, event.Output))
-			}
-			diagnostic.Write(data)
-		case "exit":
-			exitCode = event.ExitCode
-		}
-	}
-	if exitCode == 0 {
-		return nil
-	}
-	message := strings.TrimSpace(diagnostic.String())
-	if message != "" {
-		return fmt.Errorf("%s", message)
-	}
-	if exitCode >= 0 {
-		return fmt.Errorf("workdir validation exited with status %d", exitCode)
-	}
-	return fmt.Errorf("workdir validation ended without an exit status")
 }
 
 type mcpContextRunInput struct {

@@ -339,17 +339,19 @@ type streamRecord struct {
 }
 
 type Server struct {
-	token    string
-	registry *sessionRegistry
-	events   *eventHub
-	streams  *streamRegistry
-	jobs     *hostJobRunner
-	shells   *hostShellManager
-	balloon  *balloonController
-	trusted  *trustedManager
-	mcp      *mcpManager
-	routeMu  sync.RWMutex
-	routes   []apiRoute
+	token                string
+	registry             *sessionRegistry
+	events               *eventHub
+	streams              *streamRegistry
+	jobs                 *hostJobRunner
+	shells               *hostShellManager
+	balloon              *balloonController
+	balloonMonitorOnce   sync.Once
+	balloonMonitorCancel context.CancelFunc
+	trusted              *trustedManager
+	mcp                  *mcpManager
+	routeMu              sync.RWMutex
+	routes               []apiRoute
 
 	startedAt time.Time
 }
@@ -456,6 +458,7 @@ func Run(args []string) (bool, error) {
 	defer os.Remove(tokenPath)
 
 	srv := NewServer(token)
+	defer srv.stopBalloonMonitor()
 	defer func() {
 		if srv.mcp != nil {
 			_ = srv.mcp.Close()
@@ -633,6 +636,7 @@ func NewServer(token string) *Server {
 }
 
 func (s *Server) RegisterHandlers(rawMux *http.ServeMux, runtime ccvmd.RuntimeView) {
+	s.startBalloonMonitor(runtime)
 	mux := &trackedServeMux{ServeMux: rawMux}
 	if s.trusted != nil {
 		s.trusted.register(mux, runtime)

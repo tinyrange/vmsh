@@ -215,7 +215,7 @@ func TestMCPEndpointIsScopedToOwnedIsolatedVMs(t *testing.T) {
 	wantNames := []string{
 		"vm_artifact_delete", "vm_artifact_export", "vm_artifact_import", "vm_artifact_list",
 		"vm_context_close", "vm_context_exec_start", "vm_context_open", "vm_context_run", "vm_context_status", "vm_copy",
-		"vm_create", "vm_exec_cancel", "vm_exec_start", "vm_exec_status", "vm_exec_wait", "vm_list", "vm_run", "vm_stop",
+		"vm_create", "vm_exec_cancel", "vm_exec_forget", "vm_exec_start", "vm_exec_status", "vm_exec_wait", "vm_list", "vm_run", "vm_stop",
 	}
 	if !slices.Equal(names, wantNames) {
 		t.Fatalf("tools = %v, want %v", names, wantNames)
@@ -554,6 +554,99 @@ func TestMCPAsyncCommandSeparatesOutputAndCancels(t *testing.T) {
 	canceled := blocked.snapshot(0, 0, 1024, false)
 	if canceled.Status != "canceled" || canceled.ExitCode == nil || *canceled.ExitCode != 130 || canceled.Stdout.Text != "ready\n" {
 		t.Fatalf("canceled command result = %#v", canceled)
+	}
+}
+
+func TestMCPForgetReleasesCompletedCommandPayload(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	command := &mcpCommand{
+		id: "finished", vmID: "one", done: done, status: "exited",
+		request: client.RunRequest{Command: []string{"large"}, Env: []string{"TOKEN=value"}},
+		stdin:   make([]byte, 1<<20), stdout: make([]byte, 4<<20), stderr: make([]byte, 2<<20),
+	}
+	endpoint := &mcpEndpoint{commands: map[string]*mcpCommand{command.id: command}}
+	_, result, err := endpoint.forgetVMCommand(t.Context(), nil, mcpCommandForgetInput{CommandID: command.id})
+	if err != nil || !result.Forgotten {
+		t.Fatalf("forget = %#v, %v", result, err)
+	}
+	if _, err := endpoint.command(command.id); err == nil {
+		t.Fatal("forgotten command remained addressable")
+	}
+	command.mu.Lock()
+	defer command.mu.Unlock()
+	if command.stdin != nil || command.stdout != nil || command.stderr != nil || len(command.request.Command) != 0 || len(command.request.Env) != 0 {
+		t.Fatal("forgotten command retained request or stream payloads")
+	}
+}
+
+func TestMCPFinalOutputDeliveryReleasesCompletedPayload(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	command := &mcpCommand{
+		id: "delivered", vmID: "one", done: done, status: "exited",
+		stdout: []byte("stdout"), stderr: []byte("stderr"), stdoutTotal: 6, stderrTotal: 6,
+		request: client.RunRequest{Command: []string{"complete"}}, stdin: []byte("input"),
+	}
+	first := command.deliver(0, 0, 3, false)
+	if first.Stdout.Text != "std" || first.Stderr.Text != "std" || command.stdout == nil {
+		t.Fatalf("first page = %#v", first)
+	}
+	last := command.deliver(3, 3, 3, false)
+	if last.Stdout.Text != "out" || last.Stderr.Text != "err" {
+		t.Fatalf("last page = %#v", last)
+	}
+	command.mu.Lock()
+	defer command.mu.Unlock()
+	if command.stdout != nil || command.stderr != nil || command.stdin != nil || len(command.request.Command) != 0 {
+		t.Fatal("fully delivered command retained payloads")
+	}
+}
+
+func TestMCPUnconfirmedTerminationIsNotReportedAsCanceled(t *testing.T) {
+	started := make(chan struct{})
+	control := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		defer ws.Close()
+		var req client.RunRequest
+		if websocket.JSON.Receive(ws, &req) != nil {
+			return
+		}
+		var input client.ExecInput
+		if websocket.JSON.Receive(ws, &input) != nil {
+			return
+		}
+		close(started)
+		for {
+			if websocket.JSON.Receive(ws, &input) != nil {
+				return
+			}
+		}
+	}))
+	defer control.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	command := &mcpCommand{
+		id: "escaped", vmID: "one", request: client.RunRequest{Command: []string{"daemonize"}},
+		inputs: make(chan client.ExecInput), cancel: cancel, done: make(chan struct{}), status: "running", startedAt: time.Now(),
+	}
+	go command.run(ctx, client.NewClient(control.URL, nil))
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("command did not start")
+	}
+	command.mu.Lock()
+	command.cancelRequested = true
+	command.mu.Unlock()
+	command.markTerminationUnconfirmed("host could not confirm descendant termination")
+	cancel()
+	select {
+	case <-command.done:
+	case <-time.After(time.Second):
+		t.Fatal("command stream did not end")
+	}
+	result := command.snapshot(0, 0, 1024, false)
+	if result.Status != "termination_unconfirmed" || result.ExitCode != nil || result.ContainmentError == "" {
+		t.Fatalf("unconfirmed termination = %#v", result)
 	}
 }
 

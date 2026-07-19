@@ -112,14 +112,14 @@ func (e *mcpEndpoint) runVM(ctx context.Context, _ *mcp.CallToolRequest, in mcpR
 	}
 	select {
 	case <-command.done:
-		return nil, command.snapshot(0, 0, mcpMaxOutputChunk, true), nil
+		return nil, command.deliver(0, 0, mcpMaxOutputChunk, true), nil
 	case <-ctx.Done():
 		command.requestCancel()
 		select {
 		case <-command.done:
 		case <-time.After(3 * time.Second):
 		}
-		return nil, command.snapshot(0, 0, mcpMaxOutputChunk, true), ctx.Err()
+		return nil, command.deliver(0, 0, mcpMaxOutputChunk, true), ctx.Err()
 	}
 }
 
@@ -150,7 +150,7 @@ func (e *mcpEndpoint) statusVMCommand(_ context.Context, _ *mcp.CallToolRequest,
 	if in.StdoutOffset < 0 || in.StderrOffset < 0 {
 		return nil, mcpCommandOutput{}, fmt.Errorf("output offsets must be non-negative")
 	}
-	return nil, command.snapshot(in.StdoutOffset, in.StderrOffset, maxBytes, false), nil
+	return nil, command.deliver(in.StdoutOffset, in.StderrOffset, maxBytes, false), nil
 }
 
 type mcpCommandWaitInput struct {
@@ -188,7 +188,7 @@ func (e *mcpEndpoint) waitVMCommand(ctx context.Context, _ *mcp.CallToolRequest,
 	case <-ctx.Done():
 		return nil, mcpCommandOutput{}, ctx.Err()
 	}
-	return nil, command.snapshot(in.StdoutOffset, in.StderrOffset, maxBytes, false), nil
+	return nil, command.deliver(in.StdoutOffset, in.StderrOffset, maxBytes, false), nil
 }
 
 type mcpCommandCancelInput struct {
@@ -196,6 +196,34 @@ type mcpCommandCancelInput struct {
 	StdoutOffset int64  `json:"stdout_offset,omitempty" jsonschema:"next stdout byte offset previously returned"`
 	StderrOffset int64  `json:"stderr_offset,omitempty" jsonschema:"next stderr byte offset previously returned"`
 	MaxBytes     int    `json:"max_bytes,omitempty" jsonschema:"maximum bytes returned per stream"`
+}
+
+type mcpCommandForgetInput struct {
+	CommandID string `json:"command_id" jsonschema:"completed command ID whose retained output and metadata should be released"`
+}
+
+type mcpCommandForgetOutput struct {
+	Forgotten bool `json:"forgotten"`
+}
+
+func (e *mcpEndpoint) forgetVMCommand(_ context.Context, _ *mcp.CallToolRequest, in mcpCommandForgetInput) (*mcp.CallToolResult, mcpCommandForgetOutput, error) {
+	id := strings.TrimSpace(in.CommandID)
+	e.mu.Lock()
+	command := e.commands[id]
+	if command == nil {
+		e.mu.Unlock()
+		return nil, mcpCommandForgetOutput{}, fmt.Errorf("command %q is not owned by this MCP session", id)
+	}
+	select {
+	case <-command.done:
+		delete(e.commands, id)
+		e.mu.Unlock()
+		command.releasePayload()
+		return nil, mcpCommandForgetOutput{Forgotten: true}, nil
+	default:
+		e.mu.Unlock()
+		return nil, mcpCommandForgetOutput{}, fmt.Errorf("command %q is still running", id)
+	}
 }
 
 func (e *mcpEndpoint) cancelVMCommand(ctx context.Context, _ *mcp.CallToolRequest, in mcpCommandCancelInput) (*mcp.CallToolResult, mcpCommandOutput, error) {
@@ -219,7 +247,7 @@ func (e *mcpEndpoint) cancelVMCommand(ctx context.Context, _ *mcp.CallToolReques
 	case <-ctx.Done():
 		return nil, mcpCommandOutput{}, ctx.Err()
 	}
-	return nil, command.snapshot(in.StdoutOffset, in.StderrOffset, maxBytes, false), nil
+	return nil, command.deliver(in.StdoutOffset, in.StderrOffset, maxBytes, false), nil
 }
 
 func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
@@ -316,14 +344,23 @@ func (c *mcpCommand) run(ctx context.Context, control *client.Client) {
 		c.accept(event)
 		return nil
 	}
-	go streamMCPCommandStdin(ctx, c.inputs, c.stdin)
+	go c.streamStdin(ctx)
 	err := control.RunInteractiveStreamInContext(ctx, c.vmID, c.request, c.inputs, onEvent)
 	now := time.Now().UTC()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	defer close(c.done)
 	c.finishedAt = &now
+	c.stdin = nil
+	c.request = client.RunRequest{}
 	if c.cancelRequested || (ctx.Err() != nil && c.status == "running") {
+		if c.containmentError != "" {
+			c.status = "termination_unconfirmed"
+			if err != nil && c.err == "" && !strings.Contains(err.Error(), "context canceled") {
+				c.err = conciseCommandError(err)
+			}
+			return
+		}
 		c.status = "canceled"
 		code := 130
 		c.exitCode = &code
@@ -347,6 +384,16 @@ func (c *mcpCommand) run(ctx context.Context, control *client.Client) {
 		return
 	}
 	c.status = "exited"
+}
+
+func (c *mcpCommand) streamStdin(ctx context.Context) {
+	c.mu.Lock()
+	stdin := c.stdin
+	c.mu.Unlock()
+	streamMCPCommandStdin(ctx, c.inputs, stdin)
+	c.mu.Lock()
+	c.stdin = nil
+	c.mu.Unlock()
 }
 
 func streamMCPCommandStdin(ctx context.Context, inputs chan<- client.ExecInput, stdin []byte) {
@@ -447,6 +494,21 @@ func (c *mcpCommand) markTerminationUnconfirmed(message string) {
 	c.mu.Unlock()
 }
 
+func (c *mcpCommand) releasePayload() {
+	c.mu.Lock()
+	c.stdin = nil
+	c.request = client.RunRequest{}
+	c.stdout = nil
+	c.stderr = nil
+	c.asyncStdout = nil
+	c.asyncStderr = nil
+	c.stdoutTruncated = c.stdoutTruncated || c.stdoutTotal > 0
+	c.stderrTruncated = c.stderrTruncated || c.stderrTotal > 0
+	c.asyncStdoutTruncated = c.asyncStdoutTruncated || c.asyncStdoutTotal > 0
+	c.asyncStderrTruncated = c.asyncStderrTruncated || c.asyncStderrTotal > 0
+	c.mu.Unlock()
+}
+
 func (c *mcpCommand) sendInput(input client.ExecInput, timeout time.Duration) bool {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -501,6 +563,18 @@ func (c *mcpCommand) snapshot(stdoutOffset, stderrOffset int64, maxBytes int, in
 		} else if len(combined) > 0 {
 			out.OutputBase64 = base64.StdEncoding.EncodeToString(combined)
 		}
+	}
+	return out
+}
+
+func (c *mcpCommand) deliver(stdoutOffset, stderrOffset int64, maxBytes int, includeCombined bool) mcpCommandOutput {
+	out := c.snapshot(stdoutOffset, stderrOffset, maxBytes, includeCombined)
+	c.mu.Lock()
+	terminal := c.status != "running"
+	allDelivered := out.Stdout.NextOffset >= int64(len(c.stdout)) && out.Stderr.NextOffset >= int64(len(c.stderr))
+	c.mu.Unlock()
+	if terminal && allDelivered {
+		c.releasePayload()
 	}
 	return out
 }

@@ -235,6 +235,7 @@ func (e *mcpEndpoint) handler() http.Handler {
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_exec_status", Description: "Read status and binary-safe output for a command ID returned by vm_exec_start or vm_context_exec_start."}, e.statusVMCommand)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_exec_wait", Description: "Wait briefly for a command ID returned by vm_exec_start or vm_context_exec_start."}, e.waitVMCommand)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_exec_cancel", Description: "Terminate and reap a command; canceling a persistent-context command also closes that context."}, e.cancelVMCommand)
+	mcp.AddTool(server, &mcp.Tool{Name: "vm_exec_forget", Description: "Release retained output and metadata for a completed command ID."}, e.forgetVMCommand)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_artifact_export", Description: "Archive a guest file or directory into binary-safe storage scoped to this MCP session."}, e.exportArtifact)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_artifact_import", Description: "Extract a session artifact into an MCP-owned VM without exposing the host filesystem."}, e.importArtifact)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_artifact_list", Description: "List metadata for artifacts owned by this MCP session."}, e.listArtifacts)
@@ -552,6 +553,11 @@ func (e *mcpEndpoint) stopVM(ctx context.Context, _ *mcp.CallToolRequest, in mcp
 	delete(e.vms, id)
 	delete(e.stopping, id)
 	delete(e.quarantined, id)
+	for _, command := range e.commands {
+		if command.vmID == id {
+			command.releasePayload()
+		}
+	}
 	e.mu.Unlock()
 	if cleanupErr != nil {
 		return nil, mcpStopVMOutput{}, fmt.Errorf("VM %q stopped but MCP cleanup was incomplete: %w", id, cleanupErr)

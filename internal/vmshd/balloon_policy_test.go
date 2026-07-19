@@ -143,6 +143,49 @@ func TestRuntimePolicyPreservesExplicitMemoryAndBalloon(t *testing.T) {
 	}
 }
 
+func TestRuntimePolicyReclaimsAndRestoresMemoryFromObservedHostPressure(t *testing.T) {
+	memory := fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 256}}
+	srv := NewServer("secret")
+	srv.balloon = newBalloonController(memory)
+	srv.balloon.setAutomatic("one", true)
+	srv.balloon.setAutomatic("two", true)
+	var changes []balloonDecision
+	runtime := fakeRuntimeView{
+		statuses: []client.InstanceState{
+			{ID: "one", Status: "running", MemoryMB: 2048},
+			{ID: "two", Status: "running", MemoryMB: 2048},
+		},
+		balloon: func(id string, target uint64) error {
+			changes = append(changes, balloonDecision{ID: id, BalloonMB: target})
+			return nil
+		},
+	}
+	if err := srv.reconcileBalloonPressure(runtime); err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 2 || changes[0].BalloonMB == 0 || changes[1].BalloonMB == 0 {
+		t.Fatalf("pressure changes = %+v", changes)
+	}
+}
+
+func TestRuntimePressureDoesNotOverrideExplicitBalloonTarget(t *testing.T) {
+	srv := NewServer("secret")
+	srv.balloon = newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 128}})
+	req := client.StartInstanceRequest{ID: "explicit", MemoryMB: 2048, BalloonMB: 256}
+	srv.normalizeStartRequest(&req, nil)
+	called := false
+	runtime := fakeRuntimeView{
+		statuses: []client.InstanceState{{ID: "explicit", Status: "running", MemoryMB: 2048, BalloonMB: 256}},
+		balloon:  func(string, uint64) error { called = true; return nil },
+	}
+	if err := srv.reconcileBalloonPressure(runtime); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Fatal("host pressure policy changed an explicit balloon target")
+	}
+}
+
 func applyDecisions(vms []balloonVM, decisions []balloonDecision) uint64 {
 	var reclaimed uint64
 	index := make(map[string]int, len(vms))

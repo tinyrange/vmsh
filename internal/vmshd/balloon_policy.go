@@ -1,7 +1,12 @@
 package vmshd
 
 import (
+	"context"
+	"log/slog"
+	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"j5.nz/cc/ccvmd"
 	"j5.nz/cc/client"
@@ -24,8 +29,10 @@ type memoryObserver interface {
 }
 
 type balloonController struct {
-	memory memoryObserver
-	config balloonPolicyConfig
+	memory    memoryObserver
+	config    balloonPolicyConfig
+	mu        sync.Mutex
+	automatic map[string]bool
 }
 
 type balloonPolicyConfig struct {
@@ -47,6 +54,11 @@ type balloonDecision struct {
 	BalloonMB uint64
 }
 
+type balloonRuntime interface {
+	InstanceStatuses() []client.InstanceState
+	SetInstanceBalloon(string, uint64) error
+}
+
 func newBalloonController(memory memoryObserver) *balloonController {
 	return &balloonController{
 		memory: memory,
@@ -56,6 +68,7 @@ func newBalloonController(memory memoryObserver) *balloonController {
 			HysteresisMB:   defaultPolicyHysteresisMB,
 			MinUsableMB:    defaultMinimumGuestUsableMB,
 		},
+		automatic: make(map[string]bool),
 	}
 }
 
@@ -86,9 +99,11 @@ func (c *balloonController) applyStartRequest(req *client.StartInstanceRequest, 
 		req.MemoryMB = defaultGuestMemoryMB(snapshot.TotalMB)
 	}
 	if req.BalloonMB != 0 || req.MemoryMB == 0 {
+		c.setAutomatic(req.ID, false)
 		return
 	}
 	req.BalloonMB = c.initialBalloonTarget(snapshot, current, req.ID, req.MemoryMB)
+	c.setAutomatic(req.ID, true)
 }
 
 func (c *balloonController) applyCreateRequest(req *client.CreateInstanceRequest, current []client.InstanceState) {
@@ -117,9 +132,34 @@ func (c *balloonController) applyRunRequest(req *client.RunRequest, current []cl
 		req.MemoryMB = defaultGuestMemoryMB(snapshot.TotalMB)
 	}
 	if req.BalloonMB != 0 || req.MemoryMB == 0 {
+		c.setAutomatic(req.ID, false)
 		return
 	}
 	req.BalloonMB = c.initialBalloonTarget(snapshot, current, req.ID, req.MemoryMB)
+	c.setAutomatic(req.ID, true)
+}
+
+func (c *balloonController) setAutomatic(id string, automatic bool) {
+	if c == nil {
+		return
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = "default"
+	}
+	c.mu.Lock()
+	c.automatic[id] = automatic
+	c.mu.Unlock()
+}
+
+func (c *balloonController) isAutomatic(id string) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	automatic := c.automatic[strings.TrimSpace(id)]
+	c.mu.Unlock()
+	return automatic
 }
 
 func (c *balloonController) initialBalloonTarget(snapshot memorySnapshot, current []client.InstanceState, id string, memoryMB uint64) uint64 {
@@ -257,6 +297,65 @@ func (s *Server) normalizeRunRequest(req *client.RunRequest, runtime ccvmd.Runti
 		return
 	}
 	s.balloon.applyRunRequest(req, runtimeInstanceStatuses(runtime))
+}
+
+func (s *Server) startBalloonMonitor(runtime balloonRuntime) {
+	if s == nil || s.balloon == nil || runtime == nil {
+		return
+	}
+	s.balloonMonitorOnce.Do(func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		s.balloonMonitorCancel = cancel
+		go s.monitorBalloonPressure(ctx, runtime)
+	})
+}
+
+func (s *Server) stopBalloonMonitor() {
+	if s != nil && s.balloonMonitorCancel != nil {
+		s.balloonMonitorCancel()
+	}
+}
+
+func (s *Server) monitorBalloonPressure(ctx context.Context, runtime balloonRuntime) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := s.reconcileBalloonPressure(runtime); err != nil {
+			slog.Warn("dynamic VM memory recovery failed", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Server) reconcileBalloonPressure(runtime balloonRuntime) error {
+	if s == nil || s.balloon == nil || s.balloon.memory == nil || runtime == nil {
+		return nil
+	}
+	snapshot, err := s.balloon.memory.Snapshot()
+	if err != nil || snapshot.TotalMB == 0 {
+		return err
+	}
+	states := runtime.InstanceStatuses()
+	vms := balloonVMsFromInstances(states)
+	vms = slices.DeleteFunc(vms, func(vm balloonVM) bool { return !s.balloon.isAutomatic(vm.ID) })
+	decisions := planBalloonTargets(snapshot, vms, s.balloon.config)
+	current := make(map[string]uint64, len(vms))
+	for _, vm := range vms {
+		current[vm.ID] = vm.BalloonMB
+	}
+	for _, decision := range decisions {
+		if current[decision.ID] == decision.BalloonMB {
+			continue
+		}
+		if err := runtime.SetInstanceBalloon(decision.ID, decision.BalloonMB); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func min[T ~uint64](values ...T) T {

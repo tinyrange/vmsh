@@ -1952,6 +1952,14 @@ type fakeRuntimeView struct {
 	runStream func(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	shutdown  func(context.Context, string) error
 	allowPort func(context.Context, string, int) error
+	balloon   func(string, uint64) error
+}
+
+func (f fakeRuntimeView) SetInstanceBalloon(id string, targetMB uint64) error {
+	if f.balloon != nil {
+		return f.balloon(id, targetMB)
+	}
+	return nil
 }
 
 func (f fakeRuntimeView) InstanceStatuses() []client.InstanceState {
