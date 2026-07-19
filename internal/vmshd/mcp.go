@@ -23,15 +23,10 @@ import (
 )
 
 const (
-	mcpMaxVMs             = 16
 	mcpMinRAMMB           = 128
 	mcpDefaultRAMMB       = 512
-	mcpMaxRAMMB           = 4096
 	mcpDefaultCPUs        = 1
-	mcpMaxCPUs            = 8
-	mcpMaxContexts        = 64
 	mcpBSDDefaultBootTime = 60 * time.Second
-	mcpMaxBootTime        = 5 * time.Minute
 	mcpWorkCleanupTimeout = 3 * time.Second
 	mcpMaxRequestBytes    = 8 << 20
 	mcpRequestReadTimeout = 30 * time.Second
@@ -306,8 +301,8 @@ func (e *mcpEndpoint) authorized(header string) bool {
 type mcpCreateVMInput struct {
 	Image              string  `json:"image" jsonschema:"guest image to boot, for example alpine or @freebsd"`
 	Name               string  `json:"name,omitempty" jsonschema:"optional human-readable name unique within this MCP session"`
-	MemoryMB           uint64  `json:"memory_mb,omitempty" jsonschema:"guest memory in MiB, minimum 128, default 512, and maximum 4096"`
-	CPUs               int     `json:"cpus,omitempty" jsonschema:"virtual CPU count, default 1 and maximum 8"`
+	MemoryMB           uint64  `json:"memory_mb,omitempty" jsonschema:"guest memory in MiB, minimum 128 and default 512; the host reports allocation failures"`
+	CPUs               int     `json:"cpus,omitempty" jsonschema:"virtual CPU count, default 1; CPU oversubscription is allowed"`
 	BootTimeoutSeconds float64 `json:"boot_timeout_seconds,omitempty" jsonschema:"bounded VM boot deadline; built-in BSD guests default to 60 seconds"`
 }
 
@@ -321,6 +316,9 @@ func (e *mcpEndpoint) createVM(ctx context.Context, _ *mcp.CallToolRequest, in m
 	if image == "" {
 		return nil, mcpCreateVMOutput{}, fmt.Errorf("image is required")
 	}
+	if strings.HasPrefix(image, "vmsh-mcp-recovery-") {
+		return nil, mcpCreateVMOutput{}, fmt.Errorf("%q is a legacy recovery image, not an isolated guest image; inspect or delete it with the host vmsh image APIs", image)
+	}
 	image = canonicalMCPBuiltinImage(image)
 	if in.MemoryMB == 0 {
 		in.MemoryMB = mcpDefaultRAMMB
@@ -331,14 +329,14 @@ func (e *mcpEndpoint) createVM(ctx context.Context, _ *mcp.CallToolRequest, in m
 	if in.MemoryMB < mcpMinRAMMB {
 		return nil, mcpCreateVMOutput{}, fmt.Errorf("memory_mb must be at least %d MiB", mcpMinRAMMB)
 	}
-	if in.MemoryMB > mcpMaxRAMMB || in.CPUs < 1 || in.CPUs > mcpMaxCPUs {
-		return nil, mcpCreateVMOutput{}, fmt.Errorf("requested resources exceed the MCP ceiling of %d MiB and %d CPUs", mcpMaxRAMMB, mcpMaxCPUs)
+	if in.CPUs < 1 {
+		return nil, mcpCreateVMOutput{}, fmt.Errorf("cpus must be positive")
 	}
 	if isMCPBuiltinBSDImage(image) && in.CPUs != 1 {
 		return nil, mcpCreateVMOutput{}, fmt.Errorf("cpus must be 1 for built-in BSD guests")
 	}
-	if math.IsNaN(in.BootTimeoutSeconds) || math.IsInf(in.BootTimeoutSeconds, 0) || in.BootTimeoutSeconds < 0 || in.BootTimeoutSeconds > mcpMaxBootTime.Seconds() {
-		return nil, mcpCreateVMOutput{}, fmt.Errorf("boot_timeout_seconds must be between 0 and %g", mcpMaxBootTime.Seconds())
+	if err := validateMCPDurationSeconds("boot_timeout_seconds", in.BootTimeoutSeconds); err != nil {
+		return nil, mcpCreateVMOutput{}, err
 	}
 	if in.BootTimeoutSeconds == 0 && isMCPBuiltinBSDImage(image) {
 		in.BootTimeoutSeconds = mcpBSDDefaultBootTime.Seconds()
@@ -347,10 +345,6 @@ func (e *mcpEndpoint) createVM(ctx context.Context, _ *mcp.CallToolRequest, in m
 	if e.closed {
 		e.mu.Unlock()
 		return nil, mcpCreateVMOutput{}, fmt.Errorf("MCP endpoint is stopped")
-	}
-	if len(e.vms)+e.starting >= mcpMaxVMs {
-		e.mu.Unlock()
-		return nil, mcpCreateVMOutput{}, fmt.Errorf("MCP session VM limit of %d reached", mcpMaxVMs)
 	}
 	for _, vm := range e.vms {
 		if name != "" && vm.Name == name {
@@ -420,6 +414,19 @@ func validateMCPVMName(name string) error {
 			continue
 		}
 		return fmt.Errorf("invalid isolated VM name %q", name)
+	}
+	return nil
+}
+
+func validateMCPDurationSeconds(name string, seconds float64) error {
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds < 0 {
+		return fmt.Errorf("%s must be finite and non-negative", name)
+	}
+	// Keep the conversion below time.Duration's positive boundary. Integer
+	// division deliberately leaves the sub-second tail unused rather than
+	// allowing float64 rounding to wrap a valid-looking deadline negative.
+	if seconds > float64(math.MaxInt64/int64(time.Second)) {
+		return fmt.Errorf("%s cannot be represented as a host duration", name)
 	}
 	return nil
 }
@@ -692,80 +699,6 @@ func (e *mcpEndpoint) cancelVMWork(ctx context.Context, vmID string) error {
 	}
 	e.mu.Unlock()
 	return cancelAndWaitMCPWork(ctx, e.workCleanupTimeout(), commands, contexts)
-}
-
-func (e *mcpEndpoint) containPrivilegedCancellation(vmID, commandID string) mcpContainmentResult {
-	e.mu.Lock()
-	if _, ok := e.vms[vmID]; !ok {
-		e.mu.Unlock()
-		return mcpContainmentResult{action: "VM was already stopped"}
-	}
-	if _, stopping := e.stopping[vmID]; stopping {
-		e.mu.Unlock()
-		return mcpContainmentResult{action: "VM stop was already in progress"}
-	}
-	e.stopping[vmID] = struct{}{}
-	var commands []*mcpCommand
-	for id, command := range e.commands {
-		if id != commandID && command.vmID == vmID {
-			commands = append(commands, command)
-		}
-	}
-	var contexts []*mcpGuestContext
-	for id, guest := range e.contexts {
-		if guest.vmID == vmID {
-			contexts = append(contexts, guest)
-			delete(e.contexts, id)
-		}
-	}
-	e.mu.Unlock()
-
-	for _, command := range commands {
-		command.requestCancel()
-	}
-	for _, guest := range contexts {
-		guest.stop()
-	}
-
-	recoveryID, idErr := randomMCPID("recovery")
-	recoveryImage := ""
-	var preserveErr error
-	if idErr != nil {
-		preserveErr = fmt.Errorf("allocate recovery image name: %w", idErr)
-	} else {
-		recoveryImage = "vmsh-mcp-" + strings.ReplaceAll(recoveryID, "_", "-")
-		preserveCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		flushErr := e.control.FlushInstanceContext(preserveCtx, vmID)
-		_, saveErr := e.control.SaveInstanceImageContext(preserveCtx, vmID, client.SaveImageRequest{Name: recoveryImage})
-		cancel()
-		if saveErr != nil {
-			recoveryImage = ""
-			preserveErr = errors.Join(flushErr, fmt.Errorf("preserve COW filesystem: %w", saveErr))
-		} else if flushErr != nil {
-			preserveErr = fmt.Errorf("recovery image was saved after flush failed: %w", flushErr)
-		}
-	}
-
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	stopErr := e.control.ShutdownInstanceWithIDContext(stopCtx, vmID)
-	stopCancel()
-	e.mu.Lock()
-	if stopErr == nil {
-		delete(e.vms, vmID)
-		delete(e.stopping, vmID)
-		delete(e.quarantined, vmID)
-	} else {
-		if e.quarantined == nil {
-			e.quarantined = make(map[string]struct{})
-		}
-		e.quarantined[vmID] = struct{}{}
-	}
-	e.mu.Unlock()
-	action := "VM stopped after privileged command cancellation"
-	if stopErr != nil {
-		action = "VM quarantined after privileged command cancellation; host stop failed"
-	}
-	return mcpContainmentResult{action: action, recoveryImage: recoveryImage, err: errors.Join(preserveErr, stopErr)}
 }
 
 func (e *mcpEndpoint) workCleanupTimeout() time.Duration {

@@ -19,10 +19,6 @@ import (
 const (
 	mcpShellEventBuffer   = 256
 	mcpMaxContextCaptures = 8
-	// POSIX specifies 512-byte units for ulimit -f, but some supported shells
-	// expose the limit in 1 KiB units. Use the larger unit here so either
-	// interpretation keeps capture files at or below the intended limit.
-	mcpContextCaptureLimitUnits = mcpMaxCommandStreamBytes / 1024
 )
 
 type mcpGuestContext struct {
@@ -144,9 +140,6 @@ func (e *mcpEndpoint) reserveGuestContext() error {
 		default:
 		}
 	}
-	if len(e.contexts)+e.openingContexts >= mcpMaxContexts {
-		return fmt.Errorf("MCP session context limit of %d reached", mcpMaxContexts)
-	}
 	e.openingContexts++
 	return nil
 }
@@ -222,9 +215,7 @@ type mcpContextRunOutput struct {
 	AsyncStderrBase64     string `json:"async_stderr_base64,omitempty"`
 	AsyncStderrTotalBytes int64  `json:"async_stderr_total_bytes"`
 	AsyncStderrTruncated  bool   `json:"async_stderr_truncated,omitempty"`
-	ContainmentAction     string `json:"containment_action,omitempty"`
-	RecoveryImage         string `json:"recovery_image,omitempty"`
-	ContainmentError      string `json:"containment_error,omitempty"`
+	Error                 string `json:"error,omitempty"`
 }
 
 func (e *mcpEndpoint) runGuestContext(ctx context.Context, _ *mcp.CallToolRequest, in mcpContextRunInput) (*mcp.CallToolResult, mcpContextRunOutput, error) {
@@ -247,15 +238,7 @@ func (e *mcpEndpoint) runGuestContext(ctx context.Context, _ *mcp.CallToolReques
 	applyContextResult(&out, result)
 	if err != nil {
 		if runCtx.Err() != nil {
-			guest.stopAndWait(3 * time.Second)
-			if isMCPRootUser(guest.user) {
-				containment := e.containPrivilegedCancellation(guest.vmID, "")
-				out.ContainmentAction = containment.action
-				out.RecoveryImage = containment.recoveryImage
-				if containment.err != nil {
-					out.ContainmentError = containment.err.Error()
-				}
-			}
+			closed := guest.stopAndWait(3 * time.Second)
 			status := "canceled"
 			exitCode := 130
 			if runCtx.Err() == context.DeadlineExceeded {
@@ -263,6 +246,10 @@ func (e *mcpEndpoint) runGuestContext(ctx context.Context, _ *mcp.CallToolReques
 				exitCode = 124
 			}
 			out.ContextStatus = "closed"
+			if !closed {
+				out.ContextStatus = "closing"
+				out.Error = "persistent context termination was not confirmed; VM retained with its filesystem intact and the command may still be running"
+			}
 			out.CommandStatus = status
 			out.ExitCode = exitCode
 			return nil, out, nil
@@ -304,8 +291,8 @@ func validateGuestContextCommand(in mcpContextRunInput) (string, error) {
 	if len(line) > mcpMaxCommandBytes {
 		return "", fmt.Errorf("context command exceeds the %d-byte limit", mcpMaxCommandBytes)
 	}
-	if in.TimeoutSeconds < 0 || in.TimeoutSeconds > mcpMaxTimeoutSeconds {
-		return "", fmt.Errorf("timeout_seconds must be between 0 and %d", mcpMaxTimeoutSeconds)
+	if err := validateMCPDurationSeconds("timeout_seconds", in.TimeoutSeconds); err != nil {
+		return "", err
 	}
 	return line, nil
 }
@@ -731,6 +718,7 @@ func mcpContextShellScriptForShell(controlPath, shellPath string) string {
 	dir := shellJoin([]string{pathpkg.Dir(controlPath)})
 	shell := shellJoin([]string{shellPath})
 	return "__vmsh_mcp_fifo=" + path + "\n" +
+		"__vmsh_mcp_initial_umask=$(umask)\n" +
 		"umask 077\n" +
 		"rm -rf " + dir + "\n" +
 		"mkdir -m 700 " + dir + " || exit 126\n" +
@@ -743,6 +731,8 @@ func mcpContextShellScriptForShell(controlPath, shellPath string) string {
 		"exec 3</dev/null\n" +
 		"__vmsh_mcp_cleanup() { kill \"$__vmsh_mcp_relay\" 2>/dev/null; wait \"$__vmsh_mcp_relay\" 2>/dev/null; rm -f \"$__vmsh_mcp_fifo\"; }\n" +
 		"trap '__vmsh_mcp_cleanup; exit 143' HUP INT TERM\n" +
+		"umask \"$__vmsh_mcp_initial_umask\"\n" +
+		"unset __vmsh_mcp_initial_umask\n" +
 		shell + "\n" +
 		"__vmsh_mcp_shell_status=$?\n" +
 		"trap - HUP INT TERM\n" +
@@ -759,16 +749,13 @@ func mcpContextCommandScript(token, line, controlPath string) string {
 func mcpContextCommandCaptureScript(token, line, controlPath, stdoutPath, stderrPath string) string {
 	statusVar := "__vmsh_mcp_status_" + strings.TrimPrefix(token, "marker_")
 	umaskVar := "__vmsh_mcp_umask_" + strings.TrimPrefix(token, "marker_")
-	limitVar := "__vmsh_mcp_flimit_" + strings.TrimPrefix(token, "marker_")
-	appliedLimitVar := "__vmsh_mcp_applied_flimit_" + strings.TrimPrefix(token, "marker_")
 	path := shellJoin([]string{controlPath})
 	stdout := shellJoin([]string{stdoutPath})
 	stderr := shellJoin([]string{stderrPath})
 	return umaskVar + "=$(umask)\numask 077\n: >" + stdout + "\n: >" + stderr + "\nchmod 600 " + stdout + " " + stderr + "\numask \"$" + umaskVar + "\"\n" +
-		limitVar + "=$(ulimit -f)\nulimit -f " + strconv.Itoa(mcpContextCaptureLimitUnits) + " 2>/dev/null || :\n" + appliedLimitVar + "=$(ulimit -f)\n" +
 		"/usr/bin/printf '\\036" + token + ":begin\\037\\n' >" + path + "\nif {\n" + line +
 		"\n} </dev/null >" + stdout + " 2>" + stderr + "; then\n" + statusVar + "=0\nelse\n" + statusVar + "=$?\nfi\n" +
-		"if [ \"$(ulimit -f)\" = \"$" + appliedLimitVar + "\" ]; then ulimit -f \"$" + limitVar + "\" 2>/dev/null || :; fi\n/usr/bin/printf '\\036" + token + ":%s\\037\\n' \"$" + statusVar + "\" >" + path + "\nunset " + statusVar + " " + umaskVar + " " + limitVar + " " + appliedLimitVar + "\n"
+		"/usr/bin/printf '\\036" + token + ":%s\\037\\n' \"$" + statusVar + "\" >" + path + "\nunset " + statusVar + " " + umaskVar + "\n"
 }
 
 func (g *mcpGuestContext) info() mcpContextInfo {
@@ -788,13 +775,15 @@ func (g *mcpGuestContext) stop() {
 	g.stopOnce.Do(g.cancel)
 }
 
-func (g *mcpGuestContext) stopAndWait(timeout time.Duration) {
+func (g *mcpGuestContext) stopAndWait(timeout time.Duration) bool {
 	g.stop()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case <-g.done:
+		return true
 	case <-timer.C:
+		return false
 	}
 }
 

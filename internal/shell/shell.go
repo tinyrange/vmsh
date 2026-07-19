@@ -8073,6 +8073,10 @@ func (s *shellState) startInstanceWithSnapshotFallback(ctx context.Context, id s
 const (
 	startupSnapshotMemoryMB = 512
 	startupSnapshotCPUs     = 1
+	// Increment when restored guest memory is incompatible with the current
+	// runtime contract. Version 2 changes the Linux virtio-fs root mount tag so
+	// standard tools such as BusyBox df recognize the mounted root filesystem.
+	startupSnapshotFormatVersion = 2
 )
 
 func (s *shellState) applyStartupSnapshotDefaults(req *client.StartInstanceRequest) {
@@ -8121,7 +8125,10 @@ func startupSnapshotRoot(rootCache string, req client.StartInstanceRequest) (str
 	if keyReq.CPUs == 0 {
 		keyReq.CPUs = startupSnapshotCPUs
 	}
-	data, err := json.Marshal(keyReq)
+	data, err := json.Marshal(struct {
+		Version int                         `json:"version"`
+		Request client.StartInstanceRequest `json:"request"`
+	}{Version: startupSnapshotFormatVersion, Request: keyReq})
 	if err != nil {
 		return "", err
 	}

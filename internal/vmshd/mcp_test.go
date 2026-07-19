@@ -439,6 +439,23 @@ func TestMCPAsyncCommandSeparatesOutputAndCancels(t *testing.T) {
 		if err := websocket.JSON.Receive(ws, &req); err != nil {
 			return
 		}
+		if len(req.Command) != 0 && req.Command[0] == "exit124" {
+			var input client.ExecInput
+			if err := websocket.JSON.Receive(ws, &input); err != nil || input.Kind != "stdin_close" {
+				return
+			}
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 124})
+			return
+		}
+		if len(req.Command) != 0 && req.Command[0] == "timeout" {
+			var input client.ExecInput
+			if err := websocket.JSON.Receive(ws, &input); err != nil || input.Kind != "stdin_close" {
+				return
+			}
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "timeout"})
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 124})
+			return
+		}
 		if len(req.Command) != 0 && req.Command[0] == "block" {
 			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: []byte("ready\n")})
 			close(started)
@@ -480,6 +497,27 @@ func TestMCPAsyncCommandSeparatesOutputAndCancels(t *testing.T) {
 	if result.Output != "" || result.OutputBase64 != "" {
 		t.Fatalf("paginated command result duplicated output: %#v", result)
 	}
+	ordinary124, err := endpoint.startCommand(mcpRunVMInput{VMID: "owned", Command: []string{"exit124"}, User: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-ordinary124.done
+	ordinaryResult := ordinary124.snapshot(0, 0, 1024, false)
+	if ordinaryResult.Status != "exited" || ordinaryResult.ExitCode == nil || *ordinaryResult.ExitCode != 124 {
+		t.Fatalf("ordinary exit 124 result = %#v", ordinaryResult)
+	}
+	if _, err := endpoint.ownedVM("owned"); err != nil {
+		t.Fatalf("ordinary exit 124 stopped its VM: %v", err)
+	}
+	timeoutCommand, err := endpoint.startCommand(mcpRunVMInput{VMID: "owned", Command: []string{"timeout"}, TimeoutSeconds: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-timeoutCommand.done
+	timeoutResult := timeoutCommand.snapshot(0, 0, 1024, false)
+	if timeoutResult.Status != "timed_out" || timeoutResult.ExitCode == nil || *timeoutResult.ExitCode != 124 {
+		t.Fatalf("structured timeout result = %#v", timeoutResult)
+	}
 	paged := command.snapshot(1, 0, 2, false)
 	if paged.Stdout.Text != "ut" || paged.Stdout.NextOffset != 3 || paged.Stdout.TotalBytes != 4 || paged.Output != "" {
 		t.Fatalf("paged command result = %#v", paged)
@@ -519,10 +557,8 @@ func TestMCPAsyncCommandSeparatesOutputAndCancels(t *testing.T) {
 	}
 }
 
-func TestMCPPrivilegedCancellationPreservesFilesystemThenStopsVM(t *testing.T) {
+func TestMCPPrivilegedCancellationReapsCommandWithoutStoppingVM(t *testing.T) {
 	started := make(chan struct{})
-	var lifecycle []string
-	var lifecycleMu sync.Mutex
 	mux := http.NewServeMux()
 	commandHandler := websocket.Handler(func(ws *websocket.Conn) {
 		defer ws.Close()
@@ -544,29 +580,6 @@ func TestMCPPrivilegedCancellationPreservesFilesystemThenStopsVM(t *testing.T) {
 	})
 	mux.Handle("/vm/run", commandHandler)
 	mux.Handle("/vm/run/stream", commandHandler)
-	mux.HandleFunc("POST /vm/owned/flush", func(w http.ResponseWriter, _ *http.Request) {
-		lifecycleMu.Lock()
-		lifecycle = append(lifecycle, "flush")
-		lifecycleMu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]string{"status": "flushed"})
-	})
-	mux.HandleFunc("POST /vm/owned/save", func(w http.ResponseWriter, r *http.Request) {
-		var req client.SaveImageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
-			http.Error(w, "invalid recovery request", http.StatusBadRequest)
-			return
-		}
-		lifecycleMu.Lock()
-		lifecycle = append(lifecycle, "save")
-		lifecycleMu.Unlock()
-		writeJSON(w, http.StatusOK, client.ImageState{Name: req.Name, Status: "ready"})
-	})
-	mux.HandleFunc("POST /vm/shutdown", func(w http.ResponseWriter, _ *http.Request) {
-		lifecycleMu.Lock()
-		lifecycle = append(lifecycle, "stop")
-		lifecycleMu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]bool{"stopped": true})
-	})
 	control := httptest.NewServer(mux)
 	defer control.Close()
 	endpoint := &mcpEndpoint{
@@ -586,69 +599,39 @@ func TestMCPPrivilegedCancellationPreservesFilesystemThenStopsVM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.RecoveryImage == "" || result.ContainmentAction == "" || result.ContainmentError != "" {
+	if result.Status != "canceled" || result.ContainmentAction != "" || result.ContainmentError != "" {
 		t.Fatalf("privileged cancellation result = %#v", result)
 	}
-	if _, err := endpoint.ownedVM("owned"); err == nil {
-		t.Fatal("privileged cancellation left the VM runnable")
-	}
-	lifecycleMu.Lock()
-	defer lifecycleMu.Unlock()
-	if !slices.Equal(lifecycle, []string{"flush", "save", "stop"}) {
-		t.Fatalf("containment lifecycle = %#v", lifecycle)
+	if _, err := endpoint.ownedVM("owned"); err != nil {
+		t.Fatalf("privileged cancellation stopped its VM: %v", err)
 	}
 }
 
-func TestMCPPrivilegedContainmentFailuresAreExplicit(t *testing.T) {
-	for _, tc := range []struct {
-		name         string
-		failSave     bool
-		failStop     bool
-		wantRecovery bool
-		wantRetained bool
-	}{
-		{name: "filesystem preservation fails", failSave: true},
-		{name: "host stop fails after preservation", failStop: true, wantRecovery: true, wantRetained: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			mux := http.NewServeMux()
-			mux.HandleFunc("POST /vm/owned/flush", func(w http.ResponseWriter, _ *http.Request) {
-				writeJSON(w, http.StatusOK, map[string]string{"status": "flushed"})
-			})
-			mux.HandleFunc("POST /vm/owned/save", func(w http.ResponseWriter, r *http.Request) {
-				if tc.failSave {
-					http.Error(w, "save failed", http.StatusInternalServerError)
-					return
-				}
-				var req client.SaveImageRequest
-				_ = json.NewDecoder(r.Body).Decode(&req)
-				writeJSON(w, http.StatusOK, client.ImageState{Name: req.Name, Status: "ready"})
-			})
-			mux.HandleFunc("POST /vm/shutdown", func(w http.ResponseWriter, _ *http.Request) {
-				if tc.failStop {
-					http.Error(w, "stop failed", http.StatusInternalServerError)
-					return
-				}
-				writeJSON(w, http.StatusOK, map[string]bool{"stopped": true})
-			})
-			control := httptest.NewServer(mux)
-			defer control.Close()
-			endpoint := &mcpEndpoint{
-				control: client.NewClient(control.URL, nil), vms: map[string]mcpVM{"owned": {ID: "owned"}}, stopping: make(map[string]struct{}),
-				commands: make(map[string]*mcpCommand), contexts: make(map[string]*mcpGuestContext),
-			}
-			result := endpoint.containPrivilegedCancellation("owned", "command")
-			if result.err == nil || result.action == "" || (result.recoveryImage != "") != tc.wantRecovery {
-				t.Fatalf("containment failure result = %#v", result)
-			}
-			endpoint.mu.Lock()
-			_, retained := endpoint.vms["owned"]
-			_, quarantined := endpoint.stopping["owned"]
-			endpoint.mu.Unlock()
-			if retained != tc.wantRetained || quarantined != tc.wantRetained {
-				t.Fatalf("retained/quarantined = %v/%v", retained, quarantined)
-			}
-		})
+func TestMCPCommandCancellationReportsUnresponsiveControlStream(t *testing.T) {
+	command := &mcpCommand{
+		id: "blocked", vmID: "owned", inputs: make(chan client.ExecInput), done: make(chan struct{}),
+		status: "running", cancel: func() {}, startedAt: time.Now().UTC(),
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		command.terminate()
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancellation blocked forever on an unresponsive guest control stream")
+	}
+	result := command.snapshot(0, 0, 1024, false)
+	if result.ContainmentAction == "" || result.ContainmentError == "" {
+		t.Fatalf("unconfirmed cancellation result = %#v", result)
+	}
+}
+
+func TestMCPCreateRefusesLegacyRecoveryAsAnIsolatedGuest(t *testing.T) {
+	endpoint := &mcpEndpoint{vms: make(map[string]mcpVM), stopping: make(map[string]struct{})}
+	if _, _, err := endpoint.createVM(t.Context(), nil, mcpCreateVMInput{Image: "vmsh-mcp-recovery-freebsd-test"}); err == nil {
+		t.Fatal("legacy recovery filesystem export was presented as an isolated bootable guest")
 	}
 }
 
@@ -1102,7 +1085,7 @@ func TestMCPContextCaptureKeepsBackgroundOutputWithItsOriginatingCommand(t *test
 	}
 }
 
-func TestMCPContextCaptureIgnoresPersistentUmaskAndBoundsFiles(t *testing.T) {
+func TestMCPContextCaptureDoesNotAlterUserResourceLimitsOrInitialUmask(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX shell")
 	}
@@ -1114,16 +1097,17 @@ func TestMCPContextCaptureIgnoresPersistentUmaskAndBoundsFiles(t *testing.T) {
 	secondErr := filepath.Join(tempDir, "private", "second.stderr")
 	thirdOut := filepath.Join(tempDir, "private", "third.stdout")
 	thirdErr := filepath.Join(tempDir, "private", "third.stderr")
+	userFile := filepath.Join(tempDir, "user.data")
 	controlR, controlW, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer controlR.Close()
-	cmd := exec.Command("/bin/sh", "-c", mcpContextShellScriptForShell(controlPath, "/bin/sh"))
+	cmd := exec.Command("/bin/sh", "-c", "umask 022; "+mcpContextShellScriptForShell(controlPath, "/bin/sh"))
 	cmd.Stdin = strings.NewReader(
-		mcpContextCommandCaptureScript("marker_one", "umask 022", controlPath, firstOut, firstErr) +
+		mcpContextCommandCaptureScript("marker_one", "umask; ulimit -f", controlPath, firstOut, firstErr) +
 			mcpContextCommandCaptureScript("marker_two", "umask 777", controlPath, secondOut, secondErr) +
-			mcpContextCommandCaptureScript("marker_three", "dd if=/dev/zero bs=1048576 count=5 2>/dev/null || :", controlPath, thirdOut, thirdErr),
+			mcpContextCommandCaptureScript("marker_three", "ulimit -f; dd if=/dev/zero of="+shellJoin([]string{userFile})+" bs=1048576 count=5 2>/dev/null", controlPath, thirdOut, thirdErr),
 	)
 	cmd.ExtraFiles = []*os.File{controlW}
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -1138,9 +1122,21 @@ func TestMCPContextCaptureIgnoresPersistentUmaskAndBoundsFiles(t *testing.T) {
 		if info.Mode().Perm() != 0o600 {
 			t.Fatalf("capture %s mode = %#o", filepath.Base(name), info.Mode().Perm())
 		}
-		if info.Size() > mcpMaxCommandStreamBytes {
-			t.Fatalf("capture %s grew to %d bytes", filepath.Base(name), info.Size())
-		}
+	}
+	first, err := os.ReadFile(firstOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Fields(string(first))
+	if len(lines) < 2 || lines[0] != "0022" {
+		t.Fatalf("initial context umask/resource output = %q", first)
+	}
+	third, err := os.Stat(userFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Size() != 5<<20 {
+		t.Fatalf("user output file was restricted to %d bytes", third.Size())
 	}
 }
 
@@ -1510,15 +1506,16 @@ func TestMCPCommandStartIsRejectedOnceVMStopBegins(t *testing.T) {
 	assertNoRunningMCPCommands(t, endpoint)
 }
 
-func TestMCPContextAdmissionPrunesClosedContextsAndEnforcesLimit(t *testing.T) {
+func TestMCPContextAdmissionPrunesClosedContextsWithoutArbitraryCeiling(t *testing.T) {
 	endpoint := &mcpEndpoint{contexts: make(map[string]*mcpGuestContext)}
-	for i := 0; i < mcpMaxContexts; i++ {
+	for i := 0; i < 1000; i++ {
 		id := fmt.Sprintf("context-%d", i)
 		endpoint.contexts[id] = &mcpGuestContext{id: id, done: make(chan struct{})}
 	}
-	if err := endpoint.reserveGuestContext(); err == nil {
-		t.Fatal("reserved a context beyond the session limit")
+	if err := endpoint.reserveGuestContext(); err != nil {
+		t.Fatalf("arbitrary context count prevented admission: %v", err)
 	}
+	endpoint.releaseGuestContextReservation()
 	close(endpoint.contexts["context-0"].done)
 	if err := endpoint.reserveGuestContext(); err != nil {
 		t.Fatalf("reserve after a closed context became prunable: %v", err)

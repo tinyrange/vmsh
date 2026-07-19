@@ -15,14 +15,12 @@ import (
 )
 
 const (
-	mcpMaxCommands           = 64
 	mcpMaxCommandStreamBytes = 4 << 20
 	mcpDefaultOutputChunk    = 1 << 20
 	mcpMaxOutputChunk        = 4 << 20
 	mcpMaxCombinedOutput     = 64 << 10
 	mcpDefaultWaitSeconds    = 20
 	mcpMaxWaitSeconds        = 30
-	mcpMaxTimeoutSeconds     = 24 * 60 * 60
 	// Managed input is base64-encoded in JSON before crossing guest vsock. Keep
 	// the encoded frame below the guest receive window.
 	mcpStdinChunkBytes = 16 << 10
@@ -66,7 +64,6 @@ type mcpCommandOutput struct {
 	OutputBase64      string          `json:"output_base64,omitempty"`
 	Error             string          `json:"error,omitempty"`
 	ContainmentAction string          `json:"containment_action,omitempty"`
-	RecoveryImage     string          `json:"recovery_image,omitempty"`
 	ContainmentError  string          `json:"containment_error,omitempty"`
 	StartedAt         time.Time       `json:"started_at"`
 	FinishedAt        *time.Time      `json:"finished_at,omitempty"`
@@ -91,6 +88,7 @@ type mcpCommand struct {
 	stderrTotal          int64
 	stdoutTruncated      bool
 	stderrTruncated      bool
+	timedOut             bool
 	asyncStdout          []byte
 	asyncStderr          []byte
 	asyncStdoutTotal     int64
@@ -103,18 +101,8 @@ type mcpCommand struct {
 	cancelRequested      bool
 	cancelOnce           sync.Once
 	terminateOverride    func()
-	containmentFallback  func() mcpContainmentResult
-	containmentDone      chan struct{}
-	containmentOnce      sync.Once
 	containmentAction    string
-	recoveryImage        string
 	containmentError     string
-}
-
-type mcpContainmentResult struct {
-	action        string
-	recoveryImage string
-	err           error
 }
 
 func (e *mcpEndpoint) runVM(ctx context.Context, _ *mcp.CallToolRequest, in mcpRunVMInput) (*mcp.CallToolResult, mcpCommandOutput, error) {
@@ -231,13 +219,6 @@ func (e *mcpEndpoint) cancelVMCommand(ctx context.Context, _ *mcp.CallToolReques
 	case <-ctx.Done():
 		return nil, mcpCommandOutput{}, ctx.Err()
 	}
-	if command.containmentDone != nil {
-		select {
-		case <-command.containmentDone:
-		case <-ctx.Done():
-			return nil, mcpCommandOutput{}, ctx.Err()
-		}
-	}
 	return nil, command.snapshot(in.StdoutOffset, in.StderrOffset, maxBytes, false), nil
 }
 
@@ -259,8 +240,8 @@ func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
 	if len(in.WorkDir) > mcpMaxPathBytes {
 		return nil, fmt.Errorf("workdir exceeds the %d-byte limit", mcpMaxPathBytes)
 	}
-	if in.TimeoutSeconds < 0 || in.TimeoutSeconds > mcpMaxTimeoutSeconds {
-		return nil, fmt.Errorf("timeout_seconds must be between 0 and %d", mcpMaxTimeoutSeconds)
+	if err := validateMCPDurationSeconds("timeout_seconds", in.TimeoutSeconds); err != nil {
+		return nil, err
 	}
 	stdin, err := mcpCommandStdin(in.Stdin, in.StdinBase64)
 	if err != nil {
@@ -280,10 +261,6 @@ func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
 		id: commandID, vmID: id, cancel: cancel, done: make(chan struct{}), status: "running", startedAt: time.Now().UTC(),
 		request: client.RunRequest{Command: append([]string(nil), in.Command...), Env: append([]string(nil), in.Env...), WorkDir: workDir, User: user, TimeoutSeconds: in.TimeoutSeconds},
 		stdin:   stdin, inputs: make(chan client.ExecInput),
-	}
-	if isMCPRootUser(user) {
-		command.containmentDone = make(chan struct{})
-		command.containmentFallback = func() mcpContainmentResult { return e.containPrivilegedCancellation(id, commandID) }
 	}
 	if _, err := e.registerMCPCommand(command); err != nil {
 		cancel()
@@ -312,29 +289,12 @@ func (e *mcpEndpoint) registerMCPCommand(command *mcpCommand) (*mcpGuestContext,
 		default:
 		}
 		command.terminateOverride = guest.stop
-		if isMCPRootUser(guest.user) {
-			command.containmentDone = make(chan struct{})
-			command.containmentFallback = func() mcpContainmentResult { return e.containPrivilegedCancellation(command.vmID, command.id) }
-		}
 	}
 	if _, ok := e.vms[command.vmID]; !ok {
 		return nil, fmt.Errorf("VM %q is not owned by this MCP session", command.vmID)
 	}
 	if _, ok := e.stopping[command.vmID]; ok {
 		return nil, fmt.Errorf("VM %q is stopping", command.vmID)
-	}
-	for existingID, existing := range e.commands {
-		if len(e.commands) < mcpMaxCommands {
-			break
-		}
-		select {
-		case <-existing.done:
-			delete(e.commands, existingID)
-		default:
-		}
-	}
-	if len(e.commands) >= mcpMaxCommands {
-		return nil, fmt.Errorf("MCP command limit reached (%d)", mcpMaxCommands)
 	}
 	e.commands[command.id] = command
 	return guest, nil
@@ -358,12 +318,6 @@ func (c *mcpCommand) run(ctx context.Context, control *client.Client) {
 	}
 	go streamMCPCommandStdin(ctx, c.inputs, c.stdin)
 	err := control.RunInteractiveStreamInContext(ctx, c.vmID, c.request, c.inputs, onEvent)
-	c.mu.Lock()
-	timedOut := c.exitCode != nil && *c.exitCode == 124
-	c.mu.Unlock()
-	if timedOut && c.containmentFallback != nil {
-		c.applyContainmentFallback()
-	}
 	now := time.Now().UTC()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -388,7 +342,7 @@ func (c *mcpCommand) run(ctx context.Context, control *client.Client) {
 		c.err = "command stream ended without an exit status"
 		return
 	}
-	if *c.exitCode == 124 {
+	if c.timedOut {
 		c.status = "timed_out"
 		return
 	}
@@ -436,6 +390,8 @@ func (c *mcpCommand) accept(event client.ExecEvent) {
 	case "exit":
 		code := event.ExitCode
 		c.exitCode = &code
+	case "timeout":
+		c.timedOut = true
 	case "error":
 		c.err = firstNonEmpty(event.Error, event.Output, "guest command failed")
 	}
@@ -451,50 +407,55 @@ func (c *mcpCommand) requestCancel() {
 }
 
 func (c *mcpCommand) terminate() {
-	if c.containmentFallback != nil {
-		defer c.applyContainmentFallback()
-	}
 	if c.terminateOverride != nil {
 		c.terminateOverride()
 		if !c.waitDone(3 * time.Second) {
+			c.markTerminationUnconfirmed("persistent context did not close after cancellation; VM was retained with its filesystem intact")
 			c.cancel()
 		}
 		return
 	}
-	if !c.sendInput(client.ExecInput{Kind: "signal", Signal: "TERM"}) {
+	if !c.sendInput(client.ExecInput{Kind: "signal", Signal: "TERM"}, 500*time.Millisecond) {
+		c.markTerminationUnconfirmed("guest command stream did not accept TERM; VM was retained with its filesystem intact and the command may still be running")
+		c.cancel()
 		return
 	}
 	if c.waitDone(500 * time.Millisecond) {
 		return
 	}
-	if !c.sendInput(client.ExecInput{Kind: "signal", Signal: "KILL"}) {
+	if !c.sendInput(client.ExecInput{Kind: "signal", Signal: "KILL"}, 500*time.Millisecond) {
+		c.markTerminationUnconfirmed("guest command stream did not accept KILL; VM was retained with its filesystem intact and the command may still be running")
+		c.cancel()
 		return
 	}
 	if c.waitDone(2500 * time.Millisecond) {
 		return
 	}
+	c.markTerminationUnconfirmed("guest did not confirm command termination after TERM and KILL; VM was retained with its filesystem intact and the command may still be running")
 	c.cancel()
 }
 
-func (c *mcpCommand) applyContainmentFallback() {
-	c.containmentOnce.Do(func() {
-		result := c.containmentFallback()
-		c.mu.Lock()
-		c.containmentAction = result.action
-		c.recoveryImage = result.recoveryImage
-		if result.err != nil {
-			c.containmentError = result.err.Error()
-		}
+func (c *mcpCommand) markTerminationUnconfirmed(message string) {
+	c.mu.Lock()
+	if c.status != "running" {
 		c.mu.Unlock()
-		close(c.containmentDone)
-	})
+		return
+	}
+	c.containmentAction = "VM retained after unconfirmed command cancellation"
+	c.containmentError = message
+	c.err = message
+	c.mu.Unlock()
 }
 
-func (c *mcpCommand) sendInput(input client.ExecInput) bool {
+func (c *mcpCommand) sendInput(input client.ExecInput, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case c.inputs <- input:
 		return true
 	case <-c.done:
+		return false
+	case <-timer.C:
 		return false
 	}
 }
@@ -517,7 +478,7 @@ func (c *mcpCommand) snapshot(stdoutOffset, stderrOffset int64, maxBytes int, in
 	stderr := commandOutputChunk(c.stderr, c.stderrTotal, c.stderrTruncated, stderrOffset, maxBytes)
 	out := mcpCommandOutput{
 		CommandID: c.id, VMID: c.vmID, ContextID: c.contextID, Status: c.status, ExitCode: cloneInt(c.exitCode), Stdout: stdout, Stderr: stderr,
-		Error: c.err, ContainmentAction: c.containmentAction, RecoveryImage: c.recoveryImage, ContainmentError: c.containmentError,
+		Error: c.err, ContainmentAction: c.containmentAction, ContainmentError: c.containmentError,
 		StartedAt: c.startedAt, FinishedAt: cloneTime(c.finishedAt),
 	}
 	if c.asyncStdoutTotal != 0 {
