@@ -1077,6 +1077,32 @@ func TestMCPArtifactOperationsReserveSessionMemory(t *testing.T) {
 	}
 }
 
+func TestMCPEndpointCloseCancelsAndJoinsArtifactOperations(t *testing.T) {
+	endpoint := &mcpEndpoint{
+		credentials: make(map[string]string), vms: make(map[string]mcpVM), commands: make(map[string]*mcpCommand),
+		artifacts: make(map[string]*mcpArtifact), contexts: make(map[string]*mcpGuestContext), starting: make(map[string]*mcpVMStart),
+		cleanupTimeout: time.Second,
+	}
+	reservation, err := endpoint.beginArtifactOperationContext(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan struct{})
+	go func() {
+		<-reservation.ctx.Done()
+		reservation.release()
+		close(released)
+	}()
+	if err := endpoint.close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-released:
+	default:
+		t.Fatal("endpoint close returned before artifact operation completed")
+	}
+}
+
 func TestMCPArchiveRejectsOversizedSparseLogicalFile(t *testing.T) {
 	var archive bytes.Buffer
 	tw := tar.NewWriter(&archive)
@@ -1554,6 +1580,22 @@ func TestMCPContextCaptureCursorDoesNotReadPastSizeSnapshot(t *testing.T) {
 	want := append(bytes.Repeat([]byte{'a'}, 8192), bytes.Repeat([]byte{'b'}, 8192)...)
 	if firstSize != 8192 || secondSize != 16384 || !bytes.Equal(combined, want) {
 		t.Fatalf("capture cursor first=%d/%d second=%d/%d combined=%d", len(first), firstSize, len(second), secondSize, len(combined))
+	}
+}
+
+func TestMCPContextKeepsEveryCaptureWithAnOpenWriterObservable(t *testing.T) {
+	captures := []mcpContextCapture{{stdoutPath: "closed-cleared"}}
+	captures[0].stdoutPath = ""
+	for i := 0; i < 12; i++ {
+		captures = retainObservableContextCaptures(captures, mcpContextCapture{stdoutPath: fmt.Sprintf("capture-%d", i)})
+	}
+	if len(captures) != 12 {
+		t.Fatalf("observable captures = %d, want all 12 live writers", len(captures))
+	}
+	for i, capture := range captures {
+		if capture.stdoutPath != fmt.Sprintf("capture-%d", i) {
+			t.Fatalf("capture %d = %+v", i, capture)
+		}
 	}
 }
 

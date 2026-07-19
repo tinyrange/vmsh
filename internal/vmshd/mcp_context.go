@@ -16,8 +16,7 @@ import (
 )
 
 const (
-	mcpShellEventBuffer   = 256
-	mcpMaxContextCaptures = 8
+	mcpShellEventBuffer = 256
 )
 
 type mcpGuestContext struct {
@@ -531,13 +530,11 @@ drained:
 						return result, err
 					}
 					g.mu.Lock()
-					g.captures = append(g.captures, capture)
-					retired := append([]mcpContextCapture(nil), g.captures[:max(0, len(g.captures)-mcpMaxContextCaptures)]...)
-					if len(retired) != 0 {
-						g.captures = append([]mcpContextCapture(nil), g.captures[len(retired):]...)
-					}
+					// A pathname with an inherited writer is part of the live context,
+					// not disposable bookkeeping. Keep it observable until the writer
+					// closes; unlinking merely creates an unbounded hidden inode.
+					g.captures = retainObservableContextCaptures(g.captures, capture)
 					g.mu.Unlock()
-					g.removeContextCaptures(retired)
 					result.exitCode = code
 					return result, nil
 				}
@@ -570,6 +567,19 @@ drained:
 	}
 }
 
+func retainObservableContextCaptures(existing []mcpContextCapture, next mcpContextCapture) []mcpContextCapture {
+	kept := existing[:0]
+	for _, capture := range existing {
+		if capture.stdoutPath != "" || capture.stderrPath != "" {
+			kept = append(kept, capture)
+		}
+	}
+	if next.stdoutPath != "" || next.stderrPath != "" {
+		kept = append(kept, next)
+	}
+	return kept
+}
+
 func (g *mcpGuestContext) collectContextCaptures(ctx context.Context, result *mcpContextResult) error {
 	g.mu.Lock()
 	captures := append([]mcpContextCapture(nil), g.captures...)
@@ -600,11 +610,13 @@ func (g *mcpGuestContext) collectContextCaptures(ctx context.Context, result *mc
 		g.removeContextCaptures([]mcpContextCapture{{stdoutPath: emptyUnless(stdoutClosed, stdoutPath), stderrPath: emptyUnless(stderrClosed, stderrPath)}})
 	}
 	g.mu.Lock()
-	for i := range captures {
-		if i < len(g.captures) && g.captures[i].stdoutPath == captures[i].stdoutPath {
-			g.captures[i] = captures[i]
+	kept := captures[:0]
+	for _, capture := range captures {
+		if capture.stdoutPath != "" || capture.stderrPath != "" {
+			kept = append(kept, capture)
 		}
 	}
+	g.captures = append(g.captures[:0], kept...)
 	g.mu.Unlock()
 	return nil
 }

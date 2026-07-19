@@ -176,6 +176,61 @@ func TestExplicitDuplicateNormalizationDoesNotChangeAutomaticOwner(t *testing.T)
 	}
 }
 
+func TestAutomaticNormalizationCannotClaimRunningExplicitVM(t *testing.T) {
+	controller := newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 4096}})
+	req := client.StartInstanceRequest{ID: "shared", Image: "alpine"}
+	err := controller.applyStartRequest(&req, []client.InstanceState{{ID: "shared", Status: "running", MemoryMB: 2048}})
+	if err == nil {
+		t.Fatal("automatic duplicate start was admitted")
+	}
+	if state := controller.state("shared"); state.Automatic {
+		t.Fatalf("failed start claimed explicit VM policy: %+v", state)
+	}
+}
+
+func TestFailedAutomaticReservationRollsBackExactGeneration(t *testing.T) {
+	controller := newBalloonController(fakeMemoryObserver{})
+	token, _, err := controller.reserveStart("replacement", 4096, memorySnapshot{TotalMB: 8192, AvailableMB: 4096}, true, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.completeStart("replacement", token, false)
+	if state := controller.state("replacement"); state.Automatic {
+		t.Fatalf("failed start retained policy: %+v", state)
+	}
+	if _, exists := controller.starts["replacement"]; exists {
+		t.Fatal("failed start retained admission reservation")
+	}
+}
+
+func TestStaleBalloonCompletionCannotMutateReplacementGeneration(t *testing.T) {
+	controller := newBalloonController(fakeMemoryObserver{})
+	controller.setAutomatic("replacement", true)
+	old, ok := controller.beginBalloonAdjustment("replacement", 512, time.Now())
+	if !ok {
+		t.Fatal("old adjustment was not admitted")
+	}
+	controller.forget("replacement")
+	controller.setAutomatic("replacement", true)
+	controller.finishBalloonAdjustment("replacement", old, errors.New("late backend failure"))
+	state := controller.state("replacement")
+	if state.DegradedReason != "" || state.LastFailure != "" {
+		t.Fatalf("stale completion mutated replacement: %+v", state)
+	}
+}
+
+func TestAutomaticNormalizationReportsMemoryObservationFailure(t *testing.T) {
+	want := errors.New("memory telemetry unavailable")
+	controller := newBalloonController(fakeMemoryObserver{err: want})
+	req := client.StartInstanceRequest{ID: "automatic", Image: "alpine"}
+	if err := controller.applyStartRequest(&req, nil); !errors.Is(err, want) {
+		t.Fatalf("normalization error = %v, want %v", err, want)
+	}
+	if req.MemoryMB != 0 || req.PolicyToken != 0 {
+		t.Fatalf("failed normalization silently chose fixed resources: %+v", req)
+	}
+}
+
 func TestBalloonVMsFromInstancesCarriesCurrentTarget(t *testing.T) {
 	vms := balloonVMsFromInstances([]client.InstanceState{
 		{ID: "running", Status: "running", MemoryMB: 4096, BalloonMB: 768},

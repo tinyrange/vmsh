@@ -2,6 +2,7 @@ package vmshd
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"runtime"
 	"slices"
@@ -37,6 +38,9 @@ type balloonController struct {
 	config            balloonPolicyConfig
 	mu                sync.Mutex
 	automatic         map[string]balloonPolicyEntry
+	starts            map[string]uint64
+	nextToken         uint64
+	nextAdjustment    uint64
 	commitmentLimitMB uint64
 }
 
@@ -56,6 +60,9 @@ type balloonPolicyEntry struct {
 	committedMB          uint64
 	active               bool
 	adjusting            bool
+	generation           uint64
+	adjustmentToken      uint64
+	provisional          bool
 	degradedReason       string
 	lastFailure          string
 }
@@ -106,6 +113,7 @@ func newBalloonController(memory memoryObserver) *balloonController {
 			MinUsableMB:    defaultMinimumGuestUsableMB,
 		},
 		automatic: make(map[string]balloonPolicyEntry),
+		starts:    make(map[string]uint64),
 	}
 }
 
@@ -124,34 +132,55 @@ func defaultGuestMemoryMB(hostMemoryMB uint64) uint64 {
 	return rounded
 }
 
-func (c *balloonController) applyStartRequest(req *client.StartInstanceRequest, current []client.InstanceState) {
+func (c *balloonController) applyStartRequest(req *client.StartInstanceRequest, current []client.InstanceState) error {
 	if c == nil || c.memory == nil || req == nil {
-		return
+		return nil
+	}
+	id := strings.TrimSpace(req.ID)
+	if id == "" {
+		id = "default"
+	}
+	for _, state := range current {
+		if strings.TrimSpace(state.ID) == id && (state.Status == "running" || state.Status == "starting" || state.Status == "stopping") {
+			return fmt.Errorf("VM %q is already %s", id, state.Status)
+		}
 	}
 	automatic := req.MemoryMB == 0 && req.BalloonMB == 0
 	if automatic && !supportsAutomaticBalloon(req.Image) {
 		req.MemoryMB = fixedGuestMemoryMB(req.Image)
-		return
+		automatic = false
 	}
-	if !automatic {
-		return
+	var snapshot memorySnapshot
+	if automatic {
+		var err error
+		snapshot, err = c.memory.Snapshot()
+		if err != nil {
+			return fmt.Errorf("observe host memory for automatic VM %q: %w", id, err)
+		}
+		if snapshot.TotalMB == 0 {
+			return fmt.Errorf("observe host memory for automatic VM %q: total memory is unavailable", id)
+		}
+		if req.MemoryMB == 0 {
+			req.MemoryMB = defaultGuestMemoryMB(snapshot.TotalMB)
+		}
+		if req.MemoryMB == 0 {
+			return fmt.Errorf("choose automatic memory for VM %q: host memory is unavailable", id)
+		}
 	}
-	snapshot, err := c.memory.Snapshot()
-	if err != nil || snapshot.TotalMB == 0 {
-		return
+	token, target, err := c.reserveStart(id, req.MemoryMB, snapshot, automatic, time.Now())
+	if err != nil {
+		return err
 	}
-	if req.MemoryMB == 0 {
-		req.MemoryMB = defaultGuestMemoryMB(snapshot.TotalMB)
+	req.PolicyToken = token
+	if automatic {
+		req.BalloonMB = target
 	}
-	if req.MemoryMB == 0 {
-		return
-	}
-	req.BalloonMB = c.reserveAutomaticStart(req.ID, req.MemoryMB, snapshot, time.Now())
+	return nil
 }
 
-func (c *balloonController) applyCreateRequest(req *client.CreateInstanceRequest, current []client.InstanceState) {
+func (c *balloonController) applyCreateRequest(req *client.CreateInstanceRequest, current []client.InstanceState) error {
 	if req == nil {
-		return
+		return nil
 	}
 	start := client.StartInstanceRequest{
 		ID:        req.ID,
@@ -159,24 +188,32 @@ func (c *balloonController) applyCreateRequest(req *client.CreateInstanceRequest
 		MemoryMB:  req.MemoryMB,
 		BalloonMB: req.BalloonMB,
 	}
-	c.applyStartRequest(&start, current)
+	if err := c.applyStartRequest(&start, current); err != nil {
+		return err
+	}
 	req.MemoryMB = start.MemoryMB
 	req.BalloonMB = start.BalloonMB
+	req.PolicyToken = start.PolicyToken
+	return nil
 }
 
-func (c *balloonController) applyRunRequest(req *client.RunRequest, current []client.InstanceState) {
+func (c *balloonController) applyRunRequest(req *client.RunRequest, current []client.InstanceState) error {
 	if c == nil || c.memory == nil || req == nil {
-		return
+		return nil
 	}
 	// A run request without an image executes in an existing instance. Its
 	// zero-valued resource fields mean "leave the instance alone", not
 	// "re-enrol this VM in automatic memory management".
 	if strings.TrimSpace(req.Image) == "" {
-		return
+		return nil
 	}
 	start := client.StartInstanceRequest{ID: req.ID, Image: req.Image, MemoryMB: req.MemoryMB, BalloonMB: req.BalloonMB}
-	c.applyStartRequest(&start, current)
+	if err := c.applyStartRequest(&start, current); err != nil {
+		return err
+	}
 	req.MemoryMB, req.BalloonMB = start.MemoryMB, start.BalloonMB
+	req.PolicyToken = start.PolicyToken
+	return nil
 }
 
 func supportsAutomaticBalloon(image string) bool {
@@ -202,25 +239,41 @@ func (c *balloonController) setAutomatic(id string, automatic bool) {
 		id = "default"
 	}
 	c.mu.Lock()
-	c.automatic[id] = balloonPolicyEntry{automatic: automatic, createdAt: time.Now(), active: automatic}
+	c.nextToken++
+	c.automatic[id] = balloonPolicyEntry{automatic: automatic, createdAt: time.Now(), active: automatic, generation: c.nextToken}
 	c.mu.Unlock()
 }
 
 func (c *balloonController) reserveAutomaticStart(id string, memoryMB uint64, snapshot memorySnapshot, now time.Time) uint64 {
+	_, target, _ := c.reserveStart(id, memoryMB, snapshot, true, now)
+	return target
+}
+
+func (c *balloonController) reserveStart(id string, memoryMB uint64, snapshot memorySnapshot, automatic bool, now time.Time) (uint64, uint64, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		id = "default"
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.starts[id]; exists {
+		return 0, 0, fmt.Errorf("VM %q already has a start in progress", id)
+	}
+	c.nextToken++
+	token := c.nextToken
+	c.starts[id] = token
+	if !automatic {
+		return token, 0, nil
+	}
+	if existing, ok := c.automatic[id]; ok && existing.active {
+		delete(c.starts, id)
+		return 0, 0, fmt.Errorf("VM %q already has an automatic memory owner", id)
 	}
 	cfg := normalizeBalloonPolicyConfig(c.config)
 	reserve := snapshot.TotalMB * cfg.ReservePercent / 100
 	var safelyBackable uint64
 	if snapshot.AvailableMB > reserve {
 		safelyBackable = snapshot.AvailableMB - reserve
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if existing, ok := c.automatic[id]; ok && existing.automatic {
-		return existing.lastTargetMB
 	}
 	if !c.hasActiveAutomaticLocked() {
 		c.commitmentLimitMB = safelyBackable
@@ -236,8 +289,35 @@ func (c *balloonController) reserveAutomaticStart(id string, memoryMB uint64, sn
 	c.automatic[id] = balloonPolicyEntry{
 		automatic: true, createdAt: now, active: true, configuredMB: memoryMB, committedMB: usable,
 		inFlight: target != 0, requestedMB: target, requestedAt: now, lastTargetMB: target, initialRequest: target != 0,
+		generation: token, provisional: true,
 	}
-	return target
+	return token, target, nil
+}
+
+func (c *balloonController) completeStart(id string, token uint64, running bool) {
+	if c == nil || token == 0 {
+		return
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = "default"
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.starts[id] != token {
+		return
+	}
+	delete(c.starts, id)
+	entry, ok := c.automatic[id]
+	if !ok || entry.generation != token || !entry.provisional {
+		return
+	}
+	if !running {
+		delete(c.automatic, id)
+		return
+	}
+	entry.provisional = false
+	c.automatic[id] = entry
 }
 
 func (c *balloonController) hasActiveAutomaticLocked() bool {
@@ -374,46 +454,43 @@ func (c *balloonController) adjustmentReady(state client.InstanceState, now time
 	return state.BalloonStatus != "driver_unavailable"
 }
 
-func (c *balloonController) markBalloonFailure(id string, err error) {
-	if err == nil {
-		return
-	}
-	c.mu.Lock()
-	entry := c.automatic[strings.TrimSpace(id)]
-	entry.degradedReason = err.Error()
-	entry.lastFailure = err.Error()
-	entry.inFlight = false
-	entry.adjusting = false
-	c.automatic[strings.TrimSpace(id)] = entry
-	c.mu.Unlock()
+type balloonAdjustmentToken struct {
+	generation uint64
+	request    uint64
 }
 
-func (c *balloonController) beginBalloonAdjustment(id string, targetMB uint64, now time.Time) bool {
+func (c *balloonController) beginBalloonAdjustment(id string, targetMB uint64, now time.Time) (balloonAdjustmentToken, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok := c.automatic[strings.TrimSpace(id)]
 	if !ok || !entry.automatic || !entry.active || entry.adjusting {
-		return false
+		return balloonAdjustmentToken{}, false
 	}
+	c.nextAdjustment++
 	entry.adjusting = true
+	entry.adjustmentToken = c.nextAdjustment
 	entry.inFlight = true
 	entry.requestedMB = targetMB
 	entry.lastTargetMB = targetMB
 	entry.requestedAt = now
 	c.automatic[strings.TrimSpace(id)] = entry
-	return true
+	return balloonAdjustmentToken{generation: entry.generation, request: entry.adjustmentToken}, true
 }
 
-func (c *balloonController) finishBalloonAdjustment(id string, err error) {
-	if err != nil {
-		c.markBalloonFailure(id, err)
+func (c *balloonController) finishBalloonAdjustment(id string, token balloonAdjustmentToken, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry := c.automatic[strings.TrimSpace(id)]
+	if !entry.automatic || entry.generation != token.generation || entry.adjustmentToken != token.request || !entry.adjusting {
 		return
 	}
-	c.mu.Lock()
-	entry := c.automatic[strings.TrimSpace(id)]
 	entry.adjusting = false
+	if err != nil {
+		entry.degradedReason = err.Error()
+		entry.lastFailure = err.Error()
+		entry.inFlight = false
+	}
 	c.automatic[strings.TrimSpace(id)] = entry
-	c.mu.Unlock()
 }
 
 func (c *balloonController) reconcileLifecycle(states []client.InstanceState, now time.Time) {
@@ -493,6 +570,7 @@ func (c *balloonController) forget(id string) {
 	}
 	c.mu.Lock()
 	delete(c.automatic, strings.TrimSpace(id))
+	delete(c.starts, strings.TrimSpace(id))
 	if !c.hasActiveAutomaticLocked() {
 		c.commitmentLimitMB = 0
 	}
@@ -667,25 +745,47 @@ func minimumBalloonUsableMB(configuredMB uint64, cfg balloonPolicyConfig) uint64
 	return min(configuredMB, minimum)
 }
 
-func (s *Server) normalizeStartRequest(req *client.StartInstanceRequest, runtime ccvmd.RuntimeView) {
+func (s *Server) normalizeStartRequest(req *client.StartInstanceRequest, runtime ccvmd.RuntimeView) error {
 	if s == nil || s.balloon == nil {
-		return
+		return nil
 	}
-	s.balloon.applyStartRequest(req, runtimeInstanceStatuses(runtime))
+	return s.balloon.applyStartRequest(req, runtimeInstanceStatuses(runtime))
 }
 
-func (s *Server) normalizeCreateRequest(req *client.CreateInstanceRequest, runtime ccvmd.RuntimeView) {
+func (s *Server) normalizeCreateRequest(req *client.CreateInstanceRequest, runtime ccvmd.RuntimeView) error {
 	if s == nil || s.balloon == nil {
-		return
+		return nil
 	}
-	s.balloon.applyCreateRequest(req, runtimeInstanceStatuses(runtime))
+	return s.balloon.applyCreateRequest(req, runtimeInstanceStatuses(runtime))
 }
 
-func (s *Server) normalizeRunRequest(req *client.RunRequest, runtime ccvmd.RuntimeView) {
+func (s *Server) normalizeRunRequest(req *client.RunRequest, runtime ccvmd.RuntimeView) error {
 	if s == nil || s.balloon == nil {
+		return nil
+	}
+	return s.balloon.applyRunRequest(req, runtimeInstanceStatuses(runtime))
+}
+
+func (s *Server) completeStartRequest(id string, token uint64, runtime ccvmd.RuntimeView) {
+	if s == nil || s.balloon == nil || token == 0 {
 		return
 	}
-	s.balloon.applyRunRequest(req, runtimeInstanceStatuses(runtime))
+	running := false
+	canonicalID := strings.TrimSpace(id)
+	if canonicalID == "" {
+		canonicalID = "default"
+	}
+	for _, state := range runtimeInstanceStatuses(runtime) {
+		stateID := strings.TrimSpace(state.ID)
+		if stateID == "" {
+			stateID = "default"
+		}
+		if stateID == canonicalID && (state.Status == "running" || state.Status == "starting") {
+			running = true
+			break
+		}
+	}
+	s.balloon.completeStart(canonicalID, token, running)
 }
 
 func (s *Server) startBalloonMonitor(runtime balloonRuntime) {
@@ -748,12 +848,13 @@ func (s *Server) reconcileBalloonPressure(runtime balloonRuntime) error {
 		if current[decision.ID] == decision.BalloonMB {
 			continue
 		}
-		if !s.balloon.beginBalloonAdjustment(decision.ID, decision.BalloonMB, now) {
+		token, ok := s.balloon.beginBalloonAdjustment(decision.ID, decision.BalloonMB, now)
+		if !ok {
 			continue
 		}
-		go func(id string, targetMB uint64) {
-			s.balloon.finishBalloonAdjustment(id, runtime.SetInstanceBalloon(id, targetMB))
-		}(decision.ID, decision.BalloonMB)
+		go func(id string, targetMB uint64, token balloonAdjustmentToken) {
+			s.balloon.finishBalloonAdjustment(id, token, runtime.SetInstanceBalloon(id, targetMB))
+		}(decision.ID, decision.BalloonMB, token)
 	}
 	return nil
 }

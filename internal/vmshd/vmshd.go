@@ -526,18 +526,16 @@ func Run(args []string) (bool, error) {
 			srv.RegisterHandlers(mux, runtime)
 		},
 		NormalizeCreateRequest: func(req *client.CreateInstanceRequest, runtime ccvmd.RuntimeView) error {
-			srv.normalizeCreateRequest(req, runtime)
-			return nil
+			return srv.normalizeCreateRequest(req, runtime)
 		},
 		NormalizeStartRequest: func(req *client.StartInstanceRequest, runtime ccvmd.RuntimeView) error {
-			srv.normalizeStartRequest(req, runtime)
-			return nil
+			return srv.normalizeStartRequest(req, runtime)
 		},
 		NormalizeRunRequest: func(req *client.RunRequest, runtime ccvmd.RuntimeView) error {
-			srv.normalizeRunRequest(req, runtime)
-			return nil
+			return srv.normalizeRunRequest(req, runtime)
 		},
-		WrapHandler: srv.Authenticate,
+		CompleteRequest: srv.completeStartRequest,
+		WrapHandler:     srv.Authenticate,
 	})
 }
 

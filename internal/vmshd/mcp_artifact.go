@@ -54,7 +54,7 @@ type mcpArtifactOutput struct {
 }
 
 func (e *mcpEndpoint) exportArtifact(ctx context.Context, _ *mcp.CallToolRequest, in mcpArtifactExportInput) (*mcp.CallToolResult, mcpArtifactOutput, error) {
-	reservation, err := e.beginArtifactOperation(mcpMaxArtifactBytes)
+	reservation, err := e.beginArtifactOperationContext(ctx, mcpMaxArtifactBytes)
 	if err != nil {
 		return nil, mcpArtifactOutput{}, err
 	}
@@ -77,7 +77,7 @@ func (e *mcpEndpoint) exportArtifact(ctx context.Context, _ *mcp.CallToolRequest
 	if err != nil {
 		return nil, mcpArtifactOutput{}, err
 	}
-	data, err := e.archiveGuestPath(ctx, vm.ID, path, user)
+	data, err := e.archiveGuestPath(reservation.ctx, vm.ID, path, user)
 	if err != nil {
 		return nil, mcpArtifactOutput{}, err
 	}
@@ -102,7 +102,7 @@ type mcpArtifactImportOutput struct {
 }
 
 func (e *mcpEndpoint) importArtifact(ctx context.Context, _ *mcp.CallToolRequest, in mcpArtifactImportInput) (*mcp.CallToolResult, mcpArtifactImportOutput, error) {
-	reservation, err := e.beginArtifactOperation(0)
+	reservation, err := e.beginArtifactOperationContext(ctx, 0)
 	if err != nil {
 		return nil, mcpArtifactImportOutput{}, err
 	}
@@ -126,7 +126,7 @@ func (e *mcpEndpoint) importArtifact(ctx context.Context, _ *mcp.CallToolRequest
 	if err != nil {
 		return nil, mcpArtifactImportOutput{}, err
 	}
-	if err := e.extractGuestArchive(ctx, vm.ID, path, in.Directory, user, artifact.data); err != nil {
+	if err := e.extractGuestArchive(reservation.ctx, vm.ID, path, in.Directory, user, artifact.data); err != nil {
 		return nil, mcpArtifactImportOutput{}, err
 	}
 	return nil, mcpArtifactImportOutput{Imported: true, Bytes: int64(len(artifact.data))}, nil
@@ -148,7 +148,7 @@ type mcpCopyOutput struct {
 }
 
 func (e *mcpEndpoint) copyGuestPath(ctx context.Context, _ *mcp.CallToolRequest, in mcpCopyInput) (*mcp.CallToolResult, mcpCopyOutput, error) {
-	reservation, err := e.beginArtifactOperation(mcpMaxArtifactBytes)
+	reservation, err := e.beginArtifactOperationContext(ctx, mcpMaxArtifactBytes)
 	if err != nil {
 		return nil, mcpCopyOutput{}, err
 	}
@@ -177,11 +177,11 @@ func (e *mcpEndpoint) copyGuestPath(ctx context.Context, _ *mcp.CallToolRequest,
 	if err != nil {
 		return nil, mcpCopyOutput{}, err
 	}
-	data, err := e.archiveGuestPath(ctx, sourceVM.ID, sourcePath, sourceUser)
+	data, err := e.archiveGuestPath(reservation.ctx, sourceVM.ID, sourcePath, sourceUser)
 	if err != nil {
 		return nil, mcpCopyOutput{}, err
 	}
-	if err := e.extractGuestArchive(ctx, destinationVM.ID, destinationPath, in.DestinationDirectory, destinationUser, data); err != nil {
+	if err := e.extractGuestArchive(reservation.ctx, destinationVM.ID, destinationPath, in.DestinationDirectory, destinationUser, data); err != nil {
 		return nil, mcpCopyOutput{}, err
 	}
 	return nil, mcpCopyOutput{Copied: true, Bytes: int64(len(data))}, nil
@@ -479,11 +479,18 @@ func tarEntryTypeName(typeflag byte) string {
 
 type mcpArtifactReservation struct {
 	endpoint *mcpEndpoint
+	ctx      context.Context
+	cancel   context.CancelFunc
+	done     chan struct{}
 	bytes    int64
 	released bool
 }
 
 func (e *mcpEndpoint) beginArtifactOperation(reserve int64) (*mcpArtifactReservation, error) {
+	return e.beginArtifactOperationContext(context.Background(), reserve)
+}
+
+func (e *mcpEndpoint) beginArtifactOperationContext(ctx context.Context, reserve int64) (*mcpArtifactReservation, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
@@ -497,7 +504,13 @@ func (e *mcpEndpoint) beginArtifactOperation(reserve int64) (*mcpArtifactReserva
 	}
 	e.artifactOps++
 	e.artifactInFlight += reserve
-	return &mcpArtifactReservation{endpoint: e, bytes: reserve}, nil
+	operationCtx, cancel := context.WithCancel(ctx)
+	reservation := &mcpArtifactReservation{endpoint: e, ctx: operationCtx, cancel: cancel, done: make(chan struct{}), bytes: reserve}
+	if e.artifactWork == nil {
+		e.artifactWork = make(map[*mcpArtifactReservation]struct{})
+	}
+	e.artifactWork[reservation] = struct{}{}
+	return reservation, nil
 }
 
 func (r *mcpArtifactReservation) release() {
@@ -509,6 +522,9 @@ func (r *mcpArtifactReservation) release() {
 		r.endpoint.artifactOps--
 		r.endpoint.artifactInFlight -= r.bytes
 		r.released = true
+		delete(r.endpoint.artifactWork, r)
+		r.cancel()
+		close(r.done)
 	}
 	r.endpoint.mu.Unlock()
 }

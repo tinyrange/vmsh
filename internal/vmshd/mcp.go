@@ -71,6 +71,7 @@ type mcpEndpoint struct {
 	starting         map[string]*mcpVMStart
 	openingContexts  int
 	artifactOps      int
+	artifactWork     map[*mcpArtifactReservation]struct{}
 	artifactInFlight int64
 	closed           bool
 	cleanupTimeout   time.Duration
@@ -151,20 +152,21 @@ func (m *mcpManager) Start(sessionID string) (MCPEndpointInfo, error) {
 		return MCPEndpointInfo{}, fmt.Errorf("listen for MCP: %w", err)
 	}
 	endpoint := &mcpEndpoint{
-		sessionID:   sessionID,
-		url:         "http://" + listener.Addr().String() + "/mcp",
-		createdAt:   time.Now().UTC(),
-		listener:    listener,
-		control:     control,
-		balloon:     m.balloon,
-		credentials: make(map[string]string),
-		vms:         make(map[string]mcpVM),
-		commands:    make(map[string]*mcpCommand),
-		artifacts:   make(map[string]*mcpArtifact),
-		contexts:    make(map[string]*mcpGuestContext),
-		stopping:    make(map[string]struct{}),
-		quarantined: make(map[string]struct{}),
-		starting:    make(map[string]*mcpVMStart),
+		sessionID:    sessionID,
+		url:          "http://" + listener.Addr().String() + "/mcp",
+		createdAt:    time.Now().UTC(),
+		listener:     listener,
+		control:      control,
+		balloon:      m.balloon,
+		credentials:  make(map[string]string),
+		vms:          make(map[string]mcpVM),
+		commands:     make(map[string]*mcpCommand),
+		artifacts:    make(map[string]*mcpArtifact),
+		artifactWork: make(map[*mcpArtifactReservation]struct{}),
+		contexts:     make(map[string]*mcpGuestContext),
+		stopping:     make(map[string]struct{}),
+		quarantined:  make(map[string]struct{}),
+		starting:     make(map[string]*mcpVMStart),
 	}
 	handler := http.MaxBytesHandler(endpoint.handler(), mcpMaxRequestBytes)
 	endpoint.server = &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: mcpRequestReadTimeout, IdleTimeout: 2 * time.Minute}
@@ -888,8 +890,12 @@ func (e *mcpEndpoint) close() error {
 	commands := make([]*mcpCommand, 0, len(e.commands))
 	contexts := make([]*mcpGuestContext, 0, len(e.contexts))
 	starts := make([]*mcpVMStart, 0, len(e.starting))
+	artifactWork := make([]*mcpArtifactReservation, 0, len(e.artifactWork))
 	for _, start := range e.starting {
 		starts = append(starts, start)
+	}
+	for operation := range e.artifactWork {
+		artifactWork = append(artifactWork, operation)
 	}
 	if firstClose {
 		e.credentials = make(map[string]string)
@@ -907,6 +913,9 @@ func (e *mcpEndpoint) close() error {
 	var errs []error
 	for _, start := range starts {
 		start.cancel()
+	}
+	for _, operation := range artifactWork {
+		operation.cancel()
 	}
 	if firstClose {
 		errs = append(errs, cancelAndWaitMCPWork(context.Background(), e.workCleanupTimeout(), commands, contexts))
@@ -938,6 +947,29 @@ func (e *mcpEndpoint) close() error {
 		}
 	}
 startsDone:
+	artifactCleanupTimedOut := false
+	if len(artifactWork) != 0 {
+		deadline := time.NewTimer(e.workCleanupTimeout())
+		for _, operation := range artifactWork {
+			select {
+			case <-operation.done:
+			case <-deadline.C:
+				errs = append(errs, fmt.Errorf("%d artifact operation(s) did not stop before endpoint cleanup deadline; VM ownership was retained for retry", len(artifactWork)))
+				artifactCleanupTimedOut = true
+				goto artifactsDone
+			}
+		}
+		if !deadline.Stop() {
+			select {
+			case <-deadline.C:
+			default:
+			}
+		}
+	}
+artifactsDone:
+	if artifactCleanupTimedOut {
+		return errors.Join(errs...)
+	}
 	e.mu.Lock()
 	ids := make([]string, 0, len(e.vms))
 	if e.stopping == nil {
