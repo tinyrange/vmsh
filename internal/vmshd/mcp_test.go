@@ -1698,7 +1698,7 @@ func TestMCPAsyncContextStartRacesWithCloseAndStop(t *testing.T) {
 			}
 			result, err := <-startResult, <-startErr
 			if err == nil {
-				assertMCPCommandCanceled(t, endpoint, result.CommandID)
+				assertMCPCommandCanceledOrReaped(t, endpoint, result.CommandID)
 			}
 			assertNoRunningMCPCommands(t, endpoint)
 		})
@@ -1788,6 +1788,26 @@ func assertMCPCommandCanceled(t *testing.T, endpoint *mcpEndpoint, commandID str
 	command, err := endpoint.command(commandID)
 	if err != nil {
 		t.Fatalf("find raced command: %v", err)
+	}
+	select {
+	case <-command.done:
+	case <-time.After(time.Second):
+		t.Fatal("raced command did not settle")
+	}
+	result := command.snapshot(0, 0, mcpDefaultOutputChunk, false)
+	if result.Status != "canceled" || result.ExitCode == nil || *result.ExitCode != 130 {
+		t.Fatalf("raced command = %#v", result)
+	}
+}
+
+func assertMCPCommandCanceledOrReaped(t *testing.T, endpoint *mcpEndpoint, commandID string) {
+	t.Helper()
+	command, err := endpoint.command(commandID)
+	if err != nil {
+		// A successful VM stop reaps all command metadata after canceling the
+		// command. The concurrent start may observe success just before that
+		// final reap, so absence is also a completed cleanup outcome.
+		return
 	}
 	select {
 	case <-command.done:
