@@ -220,6 +220,9 @@ func TestStaleBalloonCompletionCannotMutateReplacementGeneration(t *testing.T) {
 }
 
 func TestAutomaticNormalizationReportsMemoryObservationFailure(t *testing.T) {
+	if !supportsAutomaticBalloon("alpine") {
+		t.Skip("automatic balloon admission is not supported on this platform")
+	}
 	want := errors.New("memory telemetry unavailable")
 	controller := newBalloonController(fakeMemoryObserver{err: want})
 	req := client.StartInstanceRequest{ID: "automatic", Image: "alpine"}
