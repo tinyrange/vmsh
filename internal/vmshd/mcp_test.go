@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,6 +27,12 @@ import (
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
 )
+
+func closedSignal() chan struct{} {
+	done := make(chan struct{})
+	close(done)
+	return done
+}
 
 type mcpBearerTransport struct {
 	token string
@@ -405,8 +412,8 @@ func TestMCPCreateVMCancelsBootStreamWithoutClaimingTheVM(t *testing.T) {
 	}
 	endpoint.mu.Lock()
 	defer endpoint.mu.Unlock()
-	if len(endpoint.vms) != 0 || endpoint.starting != 0 {
-		t.Fatalf("canceled boot retained MCP ownership: vms=%v starting=%d", endpoint.vms, endpoint.starting)
+	if len(endpoint.vms) != 0 || len(endpoint.starting) != 0 {
+		t.Fatalf("canceled boot retained MCP ownership: vms=%v starting=%d", endpoint.vms, len(endpoint.starting))
 	}
 }
 
@@ -469,6 +476,8 @@ func TestMCPCreateReturnsAutomaticMemoryPolicyState(t *testing.T) {
 			balloon.setAutomatic(req.ID, true)
 			balloon.markBalloonRequest(req.ID, 128, time.Now())
 			writeMCPBootReady(t, w, r, client.InstanceState{ID: req.ID, Status: "running", Image: req.Image, MemoryMB: 4096, BalloonMB: 128, BalloonStatus: "inflating"})
+		case "/vm/status":
+			writeJSON(w, http.StatusOK, client.InstanceState{ID: "automatic-isolated", Status: "running", Image: "alpine", MemoryMB: 4096, BalloonMB: 128, BalloonActualMB: 128, BalloonStatus: "converged"})
 		default:
 			http.NotFound(w, r)
 		}
@@ -479,7 +488,7 @@ func TestMCPCreateReturnsAutomaticMemoryPolicyState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !created.VM.AutomaticMemory || !created.VM.BalloonPolicyInFlight {
+	if !created.VM.AutomaticMemory || created.VM.BalloonPolicyInFlight || created.VM.BalloonStatus != "converged" || created.VM.BalloonMB != created.VM.BalloonActualMB {
 		t.Fatalf("create response policy = %#v", created.VM)
 	}
 }
@@ -596,7 +605,7 @@ func TestMCPAsyncCommandSeparatesOutputAndCancels(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-command.done
-	result := command.snapshot(0, 0, 1024, false)
+	result := command.snapshot(0, 0, 0, 0, 1024, false)
 	if result.Status != "exited" || result.ExitCode == nil || *result.ExitCode != 3 || result.Stdout.Text != "out\n" || result.Stderr.Text != "err\n" {
 		t.Fatalf("command result = %#v", result)
 	}
@@ -608,7 +617,7 @@ func TestMCPAsyncCommandSeparatesOutputAndCancels(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-ordinary124.done
-	ordinaryResult := ordinary124.snapshot(0, 0, 1024, false)
+	ordinaryResult := ordinary124.snapshot(0, 0, 0, 0, 1024, false)
 	if ordinaryResult.Status != "exited" || ordinaryResult.ExitCode == nil || *ordinaryResult.ExitCode != 124 {
 		t.Fatalf("ordinary exit 124 result = %#v", ordinaryResult)
 	}
@@ -620,7 +629,7 @@ func TestMCPAsyncCommandSeparatesOutputAndCancels(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-timeoutCommand.done
-	timeoutResult := timeoutCommand.snapshot(0, 0, 1024, false)
+	timeoutResult := timeoutCommand.snapshot(0, 0, 0, 0, 1024, false)
 	if timeoutResult.Status != "timed_out" || timeoutResult.ExitCode == nil || *timeoutResult.ExitCode != 124 {
 		t.Fatalf("structured timeout result = %#v", timeoutResult)
 	}
@@ -629,11 +638,11 @@ func TestMCPAsyncCommandSeparatesOutputAndCancels(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-rootTimeout.done
-	rootTimeoutResult := rootTimeout.snapshot(0, 0, 1024, false)
+	rootTimeoutResult := rootTimeout.snapshot(0, 0, 0, 0, 1024, false)
 	if rootTimeoutResult.Status != "termination_unconfirmed" || rootTimeoutResult.ExitCode != nil || rootTimeoutResult.ContainmentError == "" {
 		t.Fatalf("privileged timeout result = %#v", rootTimeoutResult)
 	}
-	paged := command.snapshot(1, 0, 2, false)
+	paged := command.snapshot(1, 0, 0, 0, 2, false)
 	if paged.Stdout.Text != "ut" || paged.Stdout.NextOffset != 3 || paged.Stdout.TotalBytes != 4 || paged.Output != "" {
 		t.Fatalf("paged command result = %#v", paged)
 	}
@@ -657,7 +666,7 @@ func TestMCPAsyncCommandSeparatesOutputAndCancels(t *testing.T) {
 		t.Fatal("blocking command did not stream its first output")
 	}
 	deadline := time.Now().Add(time.Second)
-	for blocked.snapshot(0, 0, 1024, false).Stdout.Text != "ready\n" && time.Now().Before(deadline) {
+	for blocked.snapshot(0, 0, 0, 0, 1024, false).Stdout.Text != "ready\n" && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	blocked.requestCancel()
@@ -666,7 +675,7 @@ func TestMCPAsyncCommandSeparatesOutputAndCancels(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("canceled command was not reaped")
 	}
-	canceled := blocked.snapshot(0, 0, 1024, false)
+	canceled := blocked.snapshot(0, 0, 0, 0, 1024, false)
 	if canceled.Status != "canceled" || canceled.ExitCode == nil || *canceled.ExitCode != 130 || canceled.Stdout.Text != "ready\n" {
 		t.Fatalf("canceled command result = %#v", canceled)
 	}
@@ -703,25 +712,92 @@ func TestMCPCompletedOutputCanBeReplayedUntilForgotten(t *testing.T) {
 		stdout: []byte("stdout"), stderr: []byte("stderr"), stdoutTotal: 6, stderrTotal: 6,
 		request: client.RunRequest{Command: []string{"complete"}}, stdin: []byte("input"),
 	}
-	first := command.deliver(0, 0, 3, false)
+	first := command.deliver(0, 0, 0, 0, 3, false)
 	if first.Stdout.Text != "std" || first.Stderr.Text != "std" || command.stdout == nil {
 		t.Fatalf("first page = %#v", first)
 	}
-	last := command.deliver(3, 3, 3, false)
+	last := command.deliver(3, 3, 0, 0, 3, false)
 	if last.Stdout.Text != "out" || last.Stderr.Text != "err" {
 		t.Fatalf("last page = %#v", last)
 	}
-	replayed := command.deliver(0, 0, 16, false)
+	replayed := command.deliver(0, 0, 0, 0, 16, false)
 	if replayed.Stdout.Text != "stdout" || replayed.Stderr.Text != "stderr" || replayed.Stdout.Truncated || replayed.Stderr.Truncated {
 		t.Fatalf("replayed output = %#v", replayed)
 	}
-	oversized := command.deliver(1<<20, 1<<20, 16, false)
+	oversized := command.deliver(1<<20, 1<<20, 0, 0, 16, false)
 	if oversized.Stdout.NextOffset != 6 || oversized.Stderr.NextOffset != 6 {
 		t.Fatalf("oversized cursor = %#v", oversized)
 	}
-	replayed = command.deliver(0, 0, 16, false)
+	replayed = command.deliver(0, 0, 0, 0, 16, false)
 	if replayed.Stdout.Text != "stdout" || replayed.Stderr.Text != "stderr" {
 		t.Fatalf("output after oversized cursor = %#v", replayed)
+	}
+}
+
+func TestMCPAsyncOutputUsesIndependentBoundedCursors(t *testing.T) {
+	finished := time.Now().UTC()
+	command := &mcpCommand{
+		id: "async", vmID: "one", status: "exited", done: closedSignal(), startedAt: finished.Add(-time.Second), finishedAt: &finished,
+		asyncStdout: []byte("abcdef"), asyncStdoutTotal: 6,
+	}
+	first := command.deliver(0, 0, 0, 0, 1, false)
+	if first.AsyncStdout == nil || first.AsyncStdout.Text != "a" || first.AsyncStdout.NextOffset != 1 || first.AsyncStdout.TotalBytes != 6 {
+		t.Fatalf("first async page = %#v", first.AsyncStdout)
+	}
+	second := command.deliver(0, 0, 1, 0, 1, false)
+	if second.AsyncStdout == nil || second.AsyncStdout.Text != "b" || second.AsyncStdout.Offset != 1 || second.AsyncStdout.NextOffset != 2 {
+		t.Fatalf("second async page = %#v", second.AsyncStdout)
+	}
+}
+
+func TestMCPCompletedOutputCannotBePrunedBeforeFirstDelivery(t *testing.T) {
+	endpoint := &mcpEndpoint{commands: make(map[string]*mcpCommand)}
+	now := time.Now().UTC()
+	for i := 0; i <= mcpCompletedOutputCount; i++ {
+		finished := now.Add(time.Duration(i) * time.Millisecond)
+		id := fmt.Sprintf("first-delivery-%02d", i)
+		endpoint.commands[id] = &mcpCommand{id: id, status: "exited", done: closedSignal(), startedAt: finished, finishedAt: &finished, stdout: []byte("payload"), stdoutTotal: 7, deliveryRequired: i == 0}
+	}
+	endpoint.pruneCompletedCommands(now.Add(10 * time.Second))
+	if endpoint.commands["first-delivery-00"].snapshot(0, 0, 0, 0, 32, false).OutputExpired {
+		t.Fatal("completed output was evicted before its first response could be delivered")
+	}
+	_ = endpoint.commands["first-delivery-00"].deliver(0, 0, 0, 0, 32, false)
+	endpoint.pruneCompletedCommands(now.Add(mcpCompletedOutputRetention + time.Second))
+	if !endpoint.commands["first-delivery-00"].snapshot(0, 0, 0, 0, 32, false).OutputExpired {
+		t.Fatal("delivered oldest payload was not eligible for deterministic budget eviction")
+	}
+}
+
+func TestMCPActiveCommandAdmissionPreservesControlCapacity(t *testing.T) {
+	endpoint := &mcpEndpoint{
+		vms: map[string]mcpVM{"one": {ID: "one"}}, commands: make(map[string]*mcpCommand), stopping: make(map[string]struct{}),
+	}
+	for i := 0; i < mcpMaxActiveCommandsPerVM; i++ {
+		command := &mcpCommand{id: fmt.Sprintf("active-%02d", i), vmID: "one", done: make(chan struct{})}
+		if _, err := endpoint.registerMCPCommand(command); err != nil {
+			t.Fatalf("admit command %d: %v", i, err)
+		}
+	}
+	extra := &mcpCommand{id: "active-extra", vmID: "one", done: make(chan struct{})}
+	if _, err := endpoint.registerMCPCommand(extra); err == nil {
+		t.Fatal("per-VM active command backpressure did not reject excess fan-out")
+	}
+	if _, err := endpoint.beginVMStop("one"); err != nil {
+		t.Fatalf("lifecycle control was blocked by command admission capacity: %v", err)
+	}
+}
+
+func TestMCPRootCancellationRiskIgnoresPrimaryGroup(t *testing.T) {
+	for _, user := range []string{"root", "root:1000", "0", "0:1000"} {
+		if !isMCPRootUser(user) {
+			t.Fatalf("UID 0 identity %q was treated as safely contained", user)
+		}
+	}
+	for _, user := range []string{"1000:0", "nobody"} {
+		if isMCPRootUser(user) {
+			t.Fatalf("non-root identity %q was treated as UID 0", user)
+		}
 	}
 }
 
@@ -737,11 +813,11 @@ func TestMCPCompletedReplayEvictsPayloadButKeepsObservableStatus(t *testing.T) {
 		}
 	}
 	endpoint.pruneCompletedCommands(now.Add(time.Duration(mcpCompletedOutputCount+2) * time.Second))
-	oldest := endpoint.commands["command-00"].snapshot(0, 0, 1024, false)
+	oldest := endpoint.commands["command-00"].snapshot(0, 0, 0, 0, 1024, false)
 	if !oldest.OutputExpired || oldest.Status != "exited" || oldest.Stdout.TotalBytes != 1<<20 || !oldest.Stdout.Truncated {
 		t.Fatalf("expired replay status = %#v", oldest)
 	}
-	newest := endpoint.commands[fmt.Sprintf("command-%02d", mcpCompletedOutputCount)].snapshot(0, 0, 1024, false)
+	newest := endpoint.commands[fmt.Sprintf("command-%02d", mcpCompletedOutputCount)].snapshot(0, 0, 0, 0, 1024, false)
 	if newest.OutputExpired || newest.Stdout.NextOffset != 1024 {
 		t.Fatalf("newest replay was not retained: %#v", newest)
 	}
@@ -792,6 +868,52 @@ func TestMCPEndpointCloseShutsVMsConcurrentlyAndRetainsFailedOwnership(t *testin
 	}
 }
 
+func TestMCPEndpointCloseJoinsStartsBeforeSnapshottingOwnedVMs(t *testing.T) {
+	var shutdownID string
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/vm/shutdown" {
+			http.NotFound(w, r)
+			return
+		}
+		shutdownID = r.URL.Query().Get("id")
+		writeJSON(w, http.StatusOK, map[string]bool{"stopped": true})
+	}))
+	defer control.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	start := &mcpVMStart{id: "late", cancel: cancel, done: make(chan struct{})}
+	endpoint := &mcpEndpoint{
+		control: client.NewClient(control.URL, nil), starting: map[string]*mcpVMStart{"late": start}, vms: make(map[string]mcpVM),
+		commands: make(map[string]*mcpCommand), contexts: make(map[string]*mcpGuestContext), stopping: make(map[string]struct{}), quarantined: make(map[string]struct{}),
+		cleanupTimeout: time.Second, shutdownTimeout: time.Second,
+	}
+	go func() {
+		<-ctx.Done()
+		endpoint.mu.Lock()
+		endpoint.vms["late"] = mcpVM{ID: "late", Status: "running"}
+		delete(endpoint.starting, "late")
+		close(start.done)
+		endpoint.mu.Unlock()
+	}()
+	if err := endpoint.close(); err != nil {
+		t.Fatal(err)
+	}
+	if shutdownID != "late" || len(endpoint.vms) != 0 {
+		t.Fatalf("late start shutdown id=%q retained=%v", shutdownID, endpoint.vms)
+	}
+}
+
+func TestMCPUnexpectedListenerFailureRemovesCleanEndpoint(t *testing.T) {
+	endpoint := &mcpEndpoint{
+		credentials: make(map[string]string), vms: make(map[string]mcpVM), commands: make(map[string]*mcpCommand), artifacts: make(map[string]*mcpArtifact),
+		contexts: make(map[string]*mcpGuestContext), starting: make(map[string]*mcpVMStart), stopping: make(map[string]struct{}), quarantined: make(map[string]struct{}),
+	}
+	manager := &mcpManager{endpoints: map[string]*mcpEndpoint{"session": endpoint}}
+	manager.handleEndpointServeExit("session", endpoint, errors.New("listener failed"))
+	if _, ok := manager.endpoints["session"]; ok {
+		t.Fatal("cleanly recovered listener failure left a stale endpoint entry")
+	}
+}
+
 func TestMCPUnconfirmedTerminationIsNotReportedAsCanceled(t *testing.T) {
 	started := make(chan struct{})
 	control := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
@@ -833,7 +955,7 @@ func TestMCPUnconfirmedTerminationIsNotReportedAsCanceled(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("command stream did not end")
 	}
-	result := command.snapshot(0, 0, 1024, false)
+	result := command.snapshot(0, 0, 0, 0, 1024, false)
 	if result.Status != "termination_unconfirmed" || result.ExitCode != nil || result.ContainmentError == "" {
 		t.Fatalf("unconfirmed termination = %#v", result)
 	}
@@ -904,7 +1026,7 @@ func TestMCPCommandCancellationReportsUnresponsiveControlStream(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("cancellation blocked forever on an unresponsive guest control stream")
 	}
-	result := command.snapshot(0, 0, 1024, false)
+	result := command.snapshot(0, 0, 0, 0, 1024, false)
 	if result.ContainmentAction == "" || result.ContainmentError == "" {
 		t.Fatalf("unconfirmed cancellation result = %#v", result)
 	}
@@ -1032,7 +1154,7 @@ func TestMCPCommandStreamsLargeStdinToEOF(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("large stdin command did not finish")
 	}
-	if result := command.snapshot(0, 0, 1024, false); result.Status != "exited" || result.ExitCode == nil || *result.ExitCode != 0 {
+	if result := command.snapshot(0, 0, 0, 0, 1024, false); result.Status != "exited" || result.ExitCode == nil || *result.ExitCode != 0 {
 		t.Fatalf("command result = %#v", result)
 	}
 	select {
@@ -1062,7 +1184,7 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 		if err := websocket.JSON.Receive(ws, &req); err != nil {
 			return
 		}
-		if len(req.Command) >= 3 && (strings.Contains(req.Command[2], `tail -c`) || strings.Contains(req.Command[2], `wc -c`) || strings.HasPrefix(req.Command[2], "rm -f ") || slices.Equal(req.Command[:2], []string{"/bin/rm", "-f"})) {
+		if len(req.Command) >= 3 && (strings.Contains(req.Command[2], `tail -c`) || strings.Contains(req.Command[2], `wc -c`) || strings.Contains(req.Command[2], `base=$1; leaf=$2; owner=$3`) || strings.HasPrefix(req.Command[2], "rm -f ") || slices.Equal(req.Command[:2], []string{"/bin/rm", "-f"})) {
 			var input client.ExecInput
 			if err := websocket.JSON.Receive(ws, &input); err != nil || input.Kind != "stdin_close" {
 				return
@@ -1220,7 +1342,7 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("async context command did not finish")
 	}
-	asyncResult = asyncCommand.snapshot(0, 0, mcpDefaultOutputChunk, false)
+	asyncResult = asyncCommand.snapshot(0, 0, 0, 0, mcpDefaultOutputChunk, false)
 	if asyncResult.ContextID != opened.ContextID || asyncResult.Status != "exited" || asyncResult.ExitCode == nil || *asyncResult.ExitCode != 0 || asyncResult.Stdout.Text != "42" || asyncResult.Stderr.Text != "problem" {
 		t.Fatalf("async context result = %#v", asyncResult)
 	}
@@ -1364,6 +1486,74 @@ func TestMCPContextCaptureKeepsBackgroundOutputWithItsOriginatingCommand(t *test
 	}
 	if string(first) != "firstlate" || string(second) != "second" {
 		t.Fatalf("capture provenance first=%q second=%q", first, second)
+	}
+}
+
+func TestMCPContextCaptureCursorDoesNotReadPastSizeSnapshot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	capture := filepath.Join(dir, "capture")
+	signal := filepath.Join(dir, "wc-observed")
+	if err := os.WriteFile(capture, bytes.Repeat([]byte{'a'}, 8192), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(dir, "bin")
+	if err := os.Mkdir(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	wc := filepath.Join(bin, "wc")
+	if err := os.WriteFile(wc, []byte("#!/bin/sh\n/usr/bin/wc \"$@\"\n: >\"$VMSH_TEST_WC_SIGNAL\"\nsleep 0.1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runRead := func(offset int64, appendBlock bool) ([]byte, int64) {
+		t.Helper()
+		_ = os.Remove(signal)
+		cmd := exec.Command("/bin/sh", "-c", mcpContextCaptureReadScript(), "sh", capture, strconv.FormatInt(offset, 10), strconv.Itoa(1<<20))
+		cmd.Env = append(os.Environ(), "PATH="+bin+":/usr/bin:/bin", "VMSH_TEST_WC_SIGNAL="+signal)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(signal); err == nil {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if appendBlock {
+			file, err := os.OpenFile(capture, os.O_APPEND|os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = file.Write(bytes.Repeat([]byte{'b'}, 8192))
+			_ = file.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := cmd.Wait(); err != nil {
+			t.Fatalf("capture read: %v; stderr=%q", err, stderr.String())
+		}
+		fields := strings.Fields(stderr.String())
+		if len(fields) < 1 {
+			t.Fatalf("capture diagnostic = %q", stderr.String())
+		}
+		size, err := strconv.ParseInt(fields[0], 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return stdout.Bytes(), size
+	}
+	first, firstSize := runRead(0, true)
+	second, secondSize := runRead(firstSize, false)
+	combined := append(append([]byte(nil), first...), second...)
+	want := append(bytes.Repeat([]byte{'a'}, 8192), bytes.Repeat([]byte{'b'}, 8192)...)
+	if firstSize != 8192 || secondSize != 16384 || !bytes.Equal(combined, want) {
+		t.Fatalf("capture cursor first=%d/%d second=%d/%d combined=%d", len(first), firstSize, len(second), secondSize, len(combined))
 	}
 }
 
@@ -1521,7 +1711,7 @@ func TestMCPContextPreservesOutputAccountingTimeoutBytesAndPrivateFraming(t *tes
 	case <-time.After(3 * time.Second):
 		t.Fatal("large context output did not finish")
 	}
-	large := largeCommand.snapshot(0, 0, mcpMaxOutputChunk, false)
+	large := largeCommand.snapshot(0, 0, 0, 0, mcpMaxOutputChunk, false)
 	if large.Status != "exited" || large.Stdout.TotalBytes != largeBytes || !large.Stdout.Truncated || large.Stdout.NextOffset != mcpMaxCommandStreamBytes {
 		t.Fatalf("large context output accounting = %#v", large)
 	}
@@ -1558,7 +1748,7 @@ func TestMCPContextPreservesOutputAccountingTimeoutBytesAndPrivateFraming(t *tes
 	case <-time.After(time.Second):
 		t.Fatal("timed context command did not settle")
 	}
-	timed := timedCommand.snapshot(0, 0, mcpDefaultOutputChunk, false)
+	timed := timedCommand.snapshot(0, 0, 0, 0, mcpDefaultOutputChunk, false)
 	if timed.Status != "timed_out" || timed.ExitCode == nil || *timed.ExitCode != 124 || timed.Stdout.Text != "before-timeout\n" || timed.Stdout.TotalBytes != int64(len("before-timeout\n")) {
 		t.Fatalf("timed context output = %#v", timed)
 	}
@@ -1861,7 +2051,7 @@ func assertMCPCommandCanceled(t *testing.T, endpoint *mcpEndpoint, commandID str
 	case <-time.After(time.Second):
 		t.Fatal("raced command did not settle")
 	}
-	result := command.snapshot(0, 0, mcpDefaultOutputChunk, false)
+	result := command.snapshot(0, 0, 0, 0, mcpDefaultOutputChunk, false)
 	if result.Status != "canceled" || result.ExitCode == nil || *result.ExitCode != 130 {
 		t.Fatalf("raced command = %#v", result)
 	}
@@ -1881,7 +2071,7 @@ func assertMCPCommandCanceledOrReaped(t *testing.T, endpoint *mcpEndpoint, comma
 	case <-time.After(time.Second):
 		t.Fatal("raced command did not settle")
 	}
-	result := command.snapshot(0, 0, mcpDefaultOutputChunk, false)
+	result := command.snapshot(0, 0, 0, 0, mcpDefaultOutputChunk, false)
 	if result.Status != "canceled" || result.ExitCode == nil || *result.ExitCode != 130 {
 		t.Fatalf("raced command = %#v", result)
 	}
@@ -1896,7 +2086,7 @@ func assertNoRunningMCPCommands(t *testing.T, endpoint *mcpEndpoint) {
 	}
 	endpoint.mu.Unlock()
 	for _, command := range commands {
-		if status := command.snapshot(0, 0, mcpDefaultOutputChunk, false).Status; status == "running" {
+		if status := command.snapshot(0, 0, 0, 0, mcpDefaultOutputChunk, false).Status; status == "running" {
 			t.Fatalf("command %q remained running", command.id)
 		}
 	}
@@ -1921,6 +2111,19 @@ func decodeStructuredToolOutput[T any](result *mcp.CallToolResult) (T, error) {
 		return output, fmt.Errorf("decode structured tool output: %w", err)
 	}
 	return output, nil
+}
+
+func toolResultDiagnostic(result *mcp.CallToolResult) string {
+	if result == nil {
+		return "<nil>"
+	}
+	var diagnostics []string
+	for _, content := range result.Content {
+		if text, ok := content.(*mcp.TextContent); ok {
+			diagnostics = append(diagnostics, text.Text)
+		}
+	}
+	return strings.Join(diagnostics, "\n")
 }
 
 func TestMCPKVMContextFanout(t *testing.T) {
@@ -2064,13 +2267,44 @@ func TestMCPKVMAutomaticHeadroomAndContextCaptureRecovery(t *testing.T) {
 		safelyBackable = hostMemory.AvailableMB - reserve
 	}
 	usable := vm.MemoryMB - min(vm.MemoryMB, vm.BalloonMB)
-	if !vm.AutomaticMemory || usable > safelyBackable+512 {
+	if !vm.AutomaticMemory || vm.BalloonPolicyInFlight || vm.BalloonStatus != "converged" || vm.BalloonMB != vm.BalloonActualMB || usable > safelyBackable+512 {
 		t.Fatalf("automatic admission memory=%d balloon=%d usable=%d host-safe=%d policy=%#v", vm.MemoryMB, vm.BalloonMB, usable, safelyBackable, vm)
+	}
+	secondCreated, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_create", Arguments: map[string]any{
+		"image": "alpine", "name": "memory-capture-reservation-two",
+	}})
+	if err != nil || secondCreated.IsError {
+		t.Fatalf("create second automatic VM = %s, %v", toolResultDiagnostic(secondCreated), err)
+	}
+	secondVM := structuredToolOutput[mcpCreateVMOutput](t, secondCreated).VM
+	defer func() {
+		_, _ = session.CallTool(context.Background(), &mcp.CallToolParams{Name: "vm_stop", Arguments: map[string]any{"vm_id": secondVM.ID}})
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		listed, listErr := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_list", Arguments: map[string]any{}})
+		if listErr != nil || listed.IsError {
+			t.Fatalf("list automatic commitments = %#v, %v", listed, listErr)
+		}
+		vms := structuredToolOutput[mcpListVMsOutput](t, listed).VMs
+		var committed uint64
+		converged := len(vms) == 2
+		for _, listedVM := range vms {
+			committed += listedVM.MemoryMB - min(listedVM.MemoryMB, listedVM.BalloonMB)
+			converged = converged && !listedVM.BalloonPolicyInFlight && listedVM.BalloonStatus == "converged"
+		}
+		if converged && committed <= safelyBackable+defaultMinimumGuestUsableMB {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("automatic commitments did not settle safely: committed=%d host-safe=%d VMs=%#v", committed, safelyBackable, vms)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	opened, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_context_open", Arguments: map[string]any{"vm_id": vm.ID}})
 	if err != nil || opened.IsError {
-		t.Fatalf("open context = %#v, %v", opened, err)
+		t.Fatalf("open context = %s, %v", toolResultDiagnostic(opened), err)
 	}
 	contextID := structuredToolOutput[mcpContextInfo](t, opened).ContextID
 	defer func() {
@@ -2087,7 +2321,7 @@ func TestMCPKVMAutomaticHeadroomAndContextCaptureRecovery(t *testing.T) {
 		t.Fatalf("bulk context output = %#v", output)
 	}
 	checked, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_run", Arguments: map[string]any{
-		"vm_id": vm.ID, "command": []string{"sh", "-c", `find /var/tmp -maxdepth 2 -type f \( -name '*.stdout' -o -name '*.stderr' \) -path '/var/tmp/.vmsh-*/*' -print`},
+		"vm_id": vm.ID, "user": "root", "command": []string{"sh", "-c", `find /var/lib/vmsh-mcp -maxdepth 2 -type f \( -name '*.stdout' -o -name '*.stderr' \) -print 2>/dev/null`},
 	}})
 	if err != nil || checked.IsError {
 		t.Fatalf("inspect captures = %#v, %v", checked, err)

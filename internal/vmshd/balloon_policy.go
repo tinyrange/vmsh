@@ -2,7 +2,6 @@ package vmshd
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"runtime"
 	"slices"
@@ -34,35 +33,42 @@ type memoryObserver interface {
 }
 
 type balloonController struct {
-	memory    memoryObserver
-	config    balloonPolicyConfig
-	mu        sync.Mutex
-	automatic map[string]balloonPolicyEntry
+	memory            memoryObserver
+	config            balloonPolicyConfig
+	mu                sync.Mutex
+	automatic         map[string]balloonPolicyEntry
+	commitmentLimitMB uint64
 }
 
 type balloonPolicyEntry struct {
-	automatic      bool
-	createdAt      time.Time
-	seen           bool
-	inFlight       bool
-	requestedMB    uint64
-	requestedAt    time.Time
-	lastActualMB   uint64
-	lastTargetMB   uint64
-	lastStatus     string
-	initialRequest bool
-	degradedReason string
-	lastFailure    string
+	automatic            bool
+	createdAt            time.Time
+	seen                 bool
+	inFlight             bool
+	requestedMB          uint64
+	requestedAt          time.Time
+	lastActualMB         uint64
+	lastTargetMB         uint64
+	lastObservedTargetMB uint64
+	lastStatus           string
+	initialRequest       bool
+	configuredMB         uint64
+	committedMB          uint64
+	active               bool
+	adjusting            bool
+	degradedReason       string
+	lastFailure          string
 }
 
 type balloonPolicyState struct {
-	Automatic      bool
-	InFlight       bool
-	DegradedReason string
-	LastFailure    string
-	TargetMB       uint64
-	ActualMB       uint64
-	Status         string
+	Automatic        bool
+	InFlight         bool
+	DegradedReason   string
+	LastFailure      string
+	TargetMB         uint64
+	ActualMB         uint64
+	Status           string
+	ObservedTargetMB uint64
 }
 
 type balloonPolicyConfig struct {
@@ -125,10 +131,8 @@ func (c *balloonController) applyStartRequest(req *client.StartInstanceRequest, 
 	automatic := req.MemoryMB == 0 && req.BalloonMB == 0
 	if automatic && !supportsAutomaticBalloon(req.Image) {
 		req.MemoryMB = fixedGuestMemoryMB(req.Image)
-		c.setAutomatic(req.ID, false)
 		return
 	}
-	c.setAutomatic(req.ID, automatic)
 	if !automatic {
 		return
 	}
@@ -142,10 +146,7 @@ func (c *balloonController) applyStartRequest(req *client.StartInstanceRequest, 
 	if req.MemoryMB == 0 {
 		return
 	}
-	req.BalloonMB = c.initialBalloonTarget(snapshot, req.MemoryMB)
-	if req.BalloonMB != 0 {
-		c.markInitialBalloonRequest(req.ID, req.BalloonMB, time.Now())
-	}
+	req.BalloonMB = c.reserveAutomaticStart(req.ID, req.MemoryMB, snapshot, time.Now())
 }
 
 func (c *balloonController) applyCreateRequest(req *client.CreateInstanceRequest, current []client.InstanceState) {
@@ -201,8 +202,67 @@ func (c *balloonController) setAutomatic(id string, automatic bool) {
 		id = "default"
 	}
 	c.mu.Lock()
-	c.automatic[id] = balloonPolicyEntry{automatic: automatic, createdAt: time.Now()}
+	c.automatic[id] = balloonPolicyEntry{automatic: automatic, createdAt: time.Now(), active: automatic}
 	c.mu.Unlock()
+}
+
+func (c *balloonController) reserveAutomaticStart(id string, memoryMB uint64, snapshot memorySnapshot, now time.Time) uint64 {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = "default"
+	}
+	cfg := normalizeBalloonPolicyConfig(c.config)
+	reserve := snapshot.TotalMB * cfg.ReservePercent / 100
+	var safelyBackable uint64
+	if snapshot.AvailableMB > reserve {
+		safelyBackable = snapshot.AvailableMB - reserve
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if existing, ok := c.automatic[id]; ok && existing.automatic {
+		return existing.lastTargetMB
+	}
+	if !c.hasActiveAutomaticLocked() {
+		c.commitmentLimitMB = safelyBackable
+	}
+	committed := c.activeCommitmentLocked()
+	available := uint64(0)
+	if c.commitmentLimitMB > committed {
+		available = c.commitmentLimitMB - committed
+	}
+	usable := min(memoryMB, available)
+	target := min(memoryMB-usable, balloonCapacity(balloonVM{ConfiguredMB: memoryMB}, cfg))
+	usable = memoryMB - target
+	c.automatic[id] = balloonPolicyEntry{
+		automatic: true, createdAt: now, active: true, configuredMB: memoryMB, committedMB: usable,
+		inFlight: target != 0, requestedMB: target, requestedAt: now, lastTargetMB: target, initialRequest: target != 0,
+	}
+	return target
+}
+
+func (c *balloonController) hasActiveAutomaticLocked() bool {
+	for _, entry := range c.automatic {
+		if entry.automatic && entry.active {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *balloonController) activeCommitmentLocked() uint64 {
+	var committed uint64
+	for _, entry := range c.automatic {
+		if entry.automatic && entry.active {
+			committed += entry.committedMB
+		}
+	}
+	return committed
+}
+
+func (c *balloonController) commitmentLimit() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.commitmentLimitMB
 }
 
 func (c *balloonController) isAutomatic(id string) bool {
@@ -226,6 +286,7 @@ func (c *balloonController) state(id string) balloonPolicyState {
 	return balloonPolicyState{
 		Automatic: entry.automatic, InFlight: entry.inFlight, DegradedReason: entry.degradedReason, LastFailure: entry.lastFailure,
 		TargetMB: entry.lastTargetMB, ActualMB: entry.lastActualMB, Status: entry.lastStatus,
+		ObservedTargetMB: entry.lastObservedTargetMB,
 	}
 }
 
@@ -273,7 +334,10 @@ func (c *balloonController) adjustmentReady(state client.InstanceState, now time
 	if state.BalloonStatus == "" {
 		actual = state.BalloonMB
 	}
-	entry.lastTargetMB = state.BalloonMB
+	entry.lastObservedTargetMB = state.BalloonMB
+	if !entry.inFlight {
+		entry.lastTargetMB = state.BalloonMB
+	}
 	entry.lastActualMB = actual
 	entry.lastStatus = state.BalloonStatus
 	if entry.degradedReason != "" {
@@ -301,6 +365,10 @@ func (c *balloonController) adjustmentReady(state client.InstanceState, now time
 		c.automatic[state.ID] = entry
 		return false
 	}
+	if entry.adjusting {
+		c.automatic[state.ID] = entry
+		return false
+	}
 	entry.lastActualMB = actual
 	c.automatic[state.ID] = entry
 	return state.BalloonStatus != "driver_unavailable"
@@ -315,6 +383,35 @@ func (c *balloonController) markBalloonFailure(id string, err error) {
 	entry.degradedReason = err.Error()
 	entry.lastFailure = err.Error()
 	entry.inFlight = false
+	entry.adjusting = false
+	c.automatic[strings.TrimSpace(id)] = entry
+	c.mu.Unlock()
+}
+
+func (c *balloonController) beginBalloonAdjustment(id string, targetMB uint64, now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.automatic[strings.TrimSpace(id)]
+	if !ok || !entry.automatic || !entry.active || entry.adjusting {
+		return false
+	}
+	entry.adjusting = true
+	entry.inFlight = true
+	entry.requestedMB = targetMB
+	entry.lastTargetMB = targetMB
+	entry.requestedAt = now
+	c.automatic[strings.TrimSpace(id)] = entry
+	return true
+}
+
+func (c *balloonController) finishBalloonAdjustment(id string, err error) {
+	if err != nil {
+		c.markBalloonFailure(id, err)
+		return
+	}
+	c.mu.Lock()
+	entry := c.automatic[strings.TrimSpace(id)]
+	entry.adjusting = false
 	c.automatic[strings.TrimSpace(id)] = entry
 	c.mu.Unlock()
 }
@@ -332,11 +429,16 @@ func (c *balloonController) reconcileLifecycle(states []client.InstanceState, no
 	for id, entry := range c.automatic {
 		state, ok := present[id]
 		if ok && (state.Status == "running" || state.Status == "starting" || state.Status == "stopping") {
+			entry.active = true
+			entry.configuredMB = state.MemoryMB
 			actual := state.BalloonActualMB
 			if state.BalloonStatus == "" {
 				actual = state.BalloonMB
 			}
-			entry.lastTargetMB = state.BalloonMB
+			entry.lastObservedTargetMB = state.BalloonMB
+			if !entry.inFlight {
+				entry.lastTargetMB = state.BalloonMB
+			}
 			entry.lastActualMB = actual
 			entry.lastStatus = state.BalloonStatus
 			if state.Status == "running" && !entry.seen {
@@ -367,6 +469,7 @@ func (c *balloonController) reconcileLifecycle(states []client.InstanceState, no
 		// stopped/crashed backend tombstone. MCP reaping explicitly forgets the
 		// policy. Only requests which never reached a runtime are aged out here.
 		if entry.seen {
+			entry.active = false
 			c.automatic[id] = entry
 			continue
 		}
@@ -374,6 +477,7 @@ func (c *balloonController) reconcileLifecycle(states []client.InstanceState, no
 			// A guest may shut down before the monitor samples its brief running
 			// state. A backend tombstone still proves the request reached the
 			// runtime, so retain its automatic identity until MCP reaps it.
+			entry.active = false
 			c.automatic[id] = entry
 			continue
 		}
@@ -389,6 +493,9 @@ func (c *balloonController) forget(id string) {
 	}
 	c.mu.Lock()
 	delete(c.automatic, strings.TrimSpace(id))
+	if !c.hasActiveAutomaticLocked() {
+		c.commitmentLimitMB = 0
+	}
 	c.mu.Unlock()
 }
 
@@ -423,18 +530,39 @@ func balloonVMsFromInstances(states []client.InstanceState) []balloonVM {
 }
 
 func planBalloonTargets(snapshot memorySnapshot, vms []balloonVM, cfg balloonPolicyConfig) []balloonDecision {
+	return planBalloonTargetsWithinCommitment(snapshot, vms, cfg, ^uint64(0))
+}
+
+func planBalloonTargetsWithinCommitment(snapshot memorySnapshot, vms []balloonVM, cfg balloonPolicyConfig, commitmentLimitMB uint64) []balloonDecision {
 	cfg = normalizeBalloonPolicyConfig(cfg)
 	decisions := make([]balloonDecision, len(vms))
 	for i, vm := range vms {
 		decisions[i] = balloonDecision{ID: vm.ID, BalloonMB: min(vm.BalloonMB, balloonCapacity(vm, cfg))}
 	}
+	var committedUsable uint64
+	for i, vm := range vms {
+		committedUsable += vm.ConfiguredMB - decisions[i].BalloonMB
+	}
 	targetAvailable := snapshot.TotalMB * cfg.ReservePercent / 100
+	pressureNeed := uint64(0)
 	if snapshot.AvailableMB < targetAvailable {
-		distributeBalloonIncrease(decisions, vms, cfg, targetAvailable-snapshot.AvailableMB)
+		pressureNeed = targetAvailable - snapshot.AvailableMB
+	}
+	commitmentNeed := uint64(0)
+	if committedUsable > commitmentLimitMB {
+		commitmentNeed = committedUsable - commitmentLimitMB
+	}
+	if need := max(pressureNeed, commitmentNeed); need != 0 {
+		distributeBalloonIncrease(decisions, vms, cfg, need)
 		return decisions
 	}
 	if snapshot.AvailableMB > targetAvailable+cfg.HysteresisMB {
-		distributeBalloonDecrease(decisions, cfg, snapshot.AvailableMB-targetAvailable-cfg.HysteresisMB)
+		unusedCommitment := uint64(0)
+		if commitmentLimitMB > committedUsable {
+			unusedCommitment = commitmentLimitMB - committedUsable
+		}
+		release := min(unusedCommitment, snapshot.AvailableMB-targetAvailable-cfg.HysteresisMB)
+		distributeBalloonDecrease(decisions, vms, cfg, release)
 	}
 	return decisions
 }
@@ -487,25 +615,56 @@ func distributeBalloonIncrease(decisions []balloonDecision, vms []balloonVM, cfg
 	}
 }
 
-func distributeBalloonDecrease(decisions []balloonDecision, cfg balloonPolicyConfig, releaseMB uint64) {
-	for i := range decisions {
-		if releaseMB == 0 {
+func distributeBalloonDecrease(decisions []balloonDecision, vms []balloonVM, cfg balloonPolicyConfig, releaseMB uint64) {
+	eligible := 0
+	for i, vm := range vms {
+		if vm.Eligible && decisions[i].BalloonMB != 0 {
+			eligible++
+		}
+	}
+	releaseMB = min(releaseMB, cfg.StepMB*uint64(eligible))
+	for releaseMB > 0 && eligible > 0 {
+		share := (releaseMB + uint64(eligible) - 1) / uint64(eligible)
+		progress := uint64(0)
+		eligible = 0
+		for i, vm := range vms {
+			if !vm.Eligible || decisions[i].BalloonMB == 0 {
+				continue
+			}
+			delta := min(share, releaseMB, decisions[i].BalloonMB)
+			decisions[i].BalloonMB -= delta
+			releaseMB -= delta
+			progress += delta
+			if decisions[i].BalloonMB != 0 {
+				eligible++
+			}
+		}
+		if progress == 0 {
 			return
 		}
-		if decisions[i].BalloonMB == 0 {
-			continue
-		}
-		delta := min(cfg.StepMB, releaseMB, decisions[i].BalloonMB)
-		decisions[i].BalloonMB -= delta
-		releaseMB -= delta
 	}
 }
 
 func balloonCapacity(vm balloonVM, cfg balloonPolicyConfig) uint64 {
-	if vm.ConfiguredMB <= cfg.MinUsableMB {
+	minimum := minimumBalloonUsableMB(vm.ConfiguredMB, cfg)
+	if vm.ConfiguredMB <= minimum {
 		return 0
 	}
-	return vm.ConfiguredMB - cfg.MinUsableMB
+	return vm.ConfiguredMB - minimum
+}
+
+func minimumBalloonUsableMB(configuredMB uint64, cfg balloonPolicyConfig) uint64 {
+	cfg = normalizeBalloonPolicyConfig(cfg)
+	// A balloon target counts memory that Linux cannot make available to
+	// userspace: struct page metadata and other boot-time allocations grow with
+	// the configured physical address space. Keeping only a fixed 512 MiB from a
+	// 20 GiB guest therefore leaves roughly 100 MiB allocatable and can panic the
+	// kernel while the guest agent starts. Account for that scaling overhead in
+	// addition to the actual working floor. This is a minimum availability
+	// guarantee, not a guest resource cap; the controller can still deflate the
+	// balloon up to the configured memory when durable host backing is available.
+	minimum := cfg.MinUsableMB + configuredMB/32
+	return min(configuredMB, minimum)
 }
 
 func (s *Server) normalizeStartRequest(req *client.StartInstanceRequest, runtime ccvmd.RuntimeView) {
@@ -580,24 +739,23 @@ func (s *Server) reconcileBalloonPressure(runtime balloonRuntime) error {
 	vms = slices.DeleteFunc(vms, func(vm balloonVM) bool {
 		return !s.balloon.adjustmentReady(stateByID[vm.ID], now)
 	})
-	decisions := planBalloonTargets(snapshot, vms, s.balloon.config)
+	decisions := planBalloonTargetsWithinCommitment(snapshot, vms, s.balloon.config, s.balloon.commitmentLimit())
 	current := make(map[string]uint64, len(vms))
 	for _, vm := range vms {
 		current[vm.ID] = vm.BalloonMB
 	}
-	var errs []error
 	for _, decision := range decisions {
 		if current[decision.ID] == decision.BalloonMB {
 			continue
 		}
-		if err := runtime.SetInstanceBalloon(decision.ID, decision.BalloonMB); err != nil {
-			errs = append(errs, err)
-			s.balloon.markBalloonFailure(decision.ID, err)
-		} else {
-			s.balloon.markBalloonRequest(decision.ID, decision.BalloonMB, now)
+		if !s.balloon.beginBalloonAdjustment(decision.ID, decision.BalloonMB, now) {
+			continue
 		}
+		go func(id string, targetMB uint64) {
+			s.balloon.finishBalloonAdjustment(id, runtime.SetInstanceBalloon(id, targetMB))
+		}(decision.ID, decision.BalloonMB)
 	}
-	return errors.Join(errs...)
+	return nil
 }
 
 func min[T ~uint64](values ...T) T {

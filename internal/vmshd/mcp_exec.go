@@ -24,16 +24,19 @@ const (
 	mcpMaxWaitSeconds        = 30
 	// Managed input is base64-encoded in JSON before crossing guest vsock. Keep
 	// the encoded frame below the guest receive window.
-	mcpStdinChunkBytes            = 16 << 10
-	mcpMaxStdinBytes              = 4 << 20
-	mcpMaxCommandBytes            = 256 << 10
-	mcpMaxEnvBytes                = 256 << 10
-	mcpMaxPathBytes               = 16 << 10
-	mcpCompletedOutputRetention   = 15 * time.Minute
-	mcpCompletedMetadataRetention = time.Hour
-	mcpCompletedOutputBudget      = 64 << 20
-	mcpCompletedOutputCount       = 64
-	mcpCompletedMetadataCount     = 1024
+	mcpStdinChunkBytes             = 16 << 10
+	mcpMaxStdinBytes               = 4 << 20
+	mcpMaxCommandBytes             = 256 << 10
+	mcpMaxEnvBytes                 = 256 << 10
+	mcpMaxPathBytes                = 16 << 10
+	mcpCompletedOutputRetention    = 15 * time.Minute
+	mcpCompletedMetadataRetention  = time.Hour
+	mcpCompletedFirstDeliveryGrace = 5 * time.Second
+	mcpCompletedOutputBudget       = 64 << 20
+	mcpCompletedOutputCount        = 64
+	mcpCompletedMetadataCount      = 1024
+	mcpMaxActiveCommandsPerVM      = 64
+	mcpMaxActiveCommandsPerSession = 256
 )
 
 type mcpRunVMInput struct {
@@ -112,23 +115,25 @@ type mcpCommand struct {
 	containmentError         string
 	cancellationUnverifiable bool
 	outputExpired            bool
+	delivered                bool
+	deliveryRequired         bool
 }
 
 func (e *mcpEndpoint) runVM(ctx context.Context, _ *mcp.CallToolRequest, in mcpRunVMInput) (*mcp.CallToolResult, mcpCommandOutput, error) {
-	command, err := e.startCommand(in)
+	command, err := e.startCommandForDelivery(in)
 	if err != nil {
 		return nil, mcpCommandOutput{}, err
 	}
 	select {
 	case <-command.done:
-		return nil, command.deliver(0, 0, mcpMaxOutputChunk, true), nil
+		return nil, command.deliver(0, 0, 0, 0, mcpMaxOutputChunk, true), nil
 	case <-ctx.Done():
 		command.requestCancel()
 		select {
 		case <-command.done:
 		case <-time.After(3 * time.Second):
 		}
-		return nil, command.deliver(0, 0, mcpMaxOutputChunk, true), ctx.Err()
+		return nil, command.deliver(0, 0, 0, 0, mcpMaxOutputChunk, true), ctx.Err()
 	}
 }
 
@@ -137,14 +142,16 @@ func (e *mcpEndpoint) startVMCommand(_ context.Context, _ *mcp.CallToolRequest, 
 	if err != nil {
 		return nil, mcpCommandOutput{}, err
 	}
-	return nil, command.snapshot(0, 0, mcpDefaultOutputChunk, false), nil
+	return nil, command.snapshot(0, 0, 0, 0, mcpDefaultOutputChunk, false), nil
 }
 
 type mcpCommandStatusInput struct {
-	CommandID    string `json:"command_id" jsonschema:"ID returned by vm_exec_start, vm_run, or vm_context_exec_start"`
-	StdoutOffset int64  `json:"stdout_offset,omitempty" jsonschema:"next stdout byte offset previously returned"`
-	StderrOffset int64  `json:"stderr_offset,omitempty" jsonschema:"next stderr byte offset previously returned"`
-	MaxBytes     int    `json:"max_bytes,omitempty" jsonschema:"maximum bytes returned per stream"`
+	CommandID         string `json:"command_id" jsonschema:"ID returned by vm_exec_start, vm_run, or vm_context_exec_start"`
+	StdoutOffset      int64  `json:"stdout_offset,omitempty" jsonschema:"next stdout byte offset previously returned"`
+	StderrOffset      int64  `json:"stderr_offset,omitempty" jsonschema:"next stderr byte offset previously returned"`
+	AsyncStdoutOffset int64  `json:"async_stdout_offset,omitempty" jsonschema:"next asynchronous stdout byte offset previously returned"`
+	AsyncStderrOffset int64  `json:"async_stderr_offset,omitempty" jsonschema:"next asynchronous stderr byte offset previously returned"`
+	MaxBytes          int    `json:"max_bytes,omitempty" jsonschema:"maximum bytes returned per stream"`
 }
 
 func (e *mcpEndpoint) statusVMCommand(_ context.Context, _ *mcp.CallToolRequest, in mcpCommandStatusInput) (*mcp.CallToolResult, mcpCommandOutput, error) {
@@ -156,18 +163,20 @@ func (e *mcpEndpoint) statusVMCommand(_ context.Context, _ *mcp.CallToolRequest,
 	if err != nil {
 		return nil, mcpCommandOutput{}, err
 	}
-	if in.StdoutOffset < 0 || in.StderrOffset < 0 {
+	if in.StdoutOffset < 0 || in.StderrOffset < 0 || in.AsyncStdoutOffset < 0 || in.AsyncStderrOffset < 0 {
 		return nil, mcpCommandOutput{}, fmt.Errorf("output offsets must be non-negative")
 	}
-	return nil, command.deliver(in.StdoutOffset, in.StderrOffset, maxBytes, false), nil
+	return nil, command.deliver(in.StdoutOffset, in.StderrOffset, in.AsyncStdoutOffset, in.AsyncStderrOffset, maxBytes, false), nil
 }
 
 type mcpCommandWaitInput struct {
-	CommandID    string  `json:"command_id" jsonschema:"ID returned by vm_exec_start, vm_run, or vm_context_exec_start"`
-	WaitSeconds  float64 `json:"wait_seconds,omitempty" jsonschema:"maximum seconds to wait in this call; defaults to 20 and is capped at 30"`
-	StdoutOffset int64   `json:"stdout_offset,omitempty"`
-	StderrOffset int64   `json:"stderr_offset,omitempty"`
-	MaxBytes     int     `json:"max_bytes,omitempty"`
+	CommandID         string  `json:"command_id" jsonschema:"ID returned by vm_exec_start, vm_run, or vm_context_exec_start"`
+	WaitSeconds       float64 `json:"wait_seconds,omitempty" jsonschema:"maximum seconds to wait in this call; defaults to 20 and is capped at 30"`
+	StdoutOffset      int64   `json:"stdout_offset,omitempty"`
+	StderrOffset      int64   `json:"stderr_offset,omitempty"`
+	AsyncStdoutOffset int64   `json:"async_stdout_offset,omitempty"`
+	AsyncStderrOffset int64   `json:"async_stderr_offset,omitempty"`
+	MaxBytes          int     `json:"max_bytes,omitempty"`
 }
 
 func (e *mcpEndpoint) waitVMCommand(ctx context.Context, _ *mcp.CallToolRequest, in mcpCommandWaitInput) (*mcp.CallToolResult, mcpCommandOutput, error) {
@@ -179,7 +188,7 @@ func (e *mcpEndpoint) waitVMCommand(ctx context.Context, _ *mcp.CallToolRequest,
 	if err != nil {
 		return nil, mcpCommandOutput{}, err
 	}
-	if in.StdoutOffset < 0 || in.StderrOffset < 0 {
+	if in.StdoutOffset < 0 || in.StderrOffset < 0 || in.AsyncStdoutOffset < 0 || in.AsyncStderrOffset < 0 {
 		return nil, mcpCommandOutput{}, fmt.Errorf("output offsets must be non-negative")
 	}
 	wait := in.WaitSeconds
@@ -197,14 +206,16 @@ func (e *mcpEndpoint) waitVMCommand(ctx context.Context, _ *mcp.CallToolRequest,
 	case <-ctx.Done():
 		return nil, mcpCommandOutput{}, ctx.Err()
 	}
-	return nil, command.deliver(in.StdoutOffset, in.StderrOffset, maxBytes, false), nil
+	return nil, command.deliver(in.StdoutOffset, in.StderrOffset, in.AsyncStdoutOffset, in.AsyncStderrOffset, maxBytes, false), nil
 }
 
 type mcpCommandCancelInput struct {
-	CommandID    string `json:"command_id" jsonschema:"ID returned by vm_exec_start, vm_run, or vm_context_exec_start"`
-	StdoutOffset int64  `json:"stdout_offset,omitempty" jsonschema:"next stdout byte offset previously returned"`
-	StderrOffset int64  `json:"stderr_offset,omitempty" jsonschema:"next stderr byte offset previously returned"`
-	MaxBytes     int    `json:"max_bytes,omitempty" jsonschema:"maximum bytes returned per stream"`
+	CommandID         string `json:"command_id" jsonschema:"ID returned by vm_exec_start, vm_run, or vm_context_exec_start"`
+	StdoutOffset      int64  `json:"stdout_offset,omitempty" jsonschema:"next stdout byte offset previously returned"`
+	StderrOffset      int64  `json:"stderr_offset,omitempty" jsonschema:"next stderr byte offset previously returned"`
+	AsyncStdoutOffset int64  `json:"async_stdout_offset,omitempty" jsonschema:"next asynchronous stdout byte offset previously returned"`
+	AsyncStderrOffset int64  `json:"async_stderr_offset,omitempty" jsonschema:"next asynchronous stderr byte offset previously returned"`
+	MaxBytes          int    `json:"max_bytes,omitempty" jsonschema:"maximum bytes returned per stream"`
 }
 
 type mcpCommandForgetInput struct {
@@ -244,7 +255,7 @@ func (e *mcpEndpoint) cancelVMCommand(ctx context.Context, _ *mcp.CallToolReques
 	if err != nil {
 		return nil, mcpCommandOutput{}, err
 	}
-	if in.StdoutOffset < 0 || in.StderrOffset < 0 {
+	if in.StdoutOffset < 0 || in.StderrOffset < 0 || in.AsyncStdoutOffset < 0 || in.AsyncStderrOffset < 0 {
 		return nil, mcpCommandOutput{}, fmt.Errorf("output offsets must be non-negative")
 	}
 	command.requestCancel()
@@ -256,10 +267,18 @@ func (e *mcpEndpoint) cancelVMCommand(ctx context.Context, _ *mcp.CallToolReques
 	case <-ctx.Done():
 		return nil, mcpCommandOutput{}, ctx.Err()
 	}
-	return nil, command.deliver(in.StdoutOffset, in.StderrOffset, maxBytes, false), nil
+	return nil, command.deliver(in.StdoutOffset, in.StderrOffset, in.AsyncStdoutOffset, in.AsyncStderrOffset, maxBytes, false), nil
 }
 
 func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
+	return e.startCommandWithDelivery(in, false)
+}
+
+func (e *mcpEndpoint) startCommandForDelivery(in mcpRunVMInput) (*mcpCommand, error) {
+	return e.startCommandWithDelivery(in, true)
+}
+
+func (e *mcpEndpoint) startCommandWithDelivery(in mcpRunVMInput, deliveryRequired bool) (*mcpCommand, error) {
 	vm, err := e.ownedVM(in.VMID)
 	if err != nil {
 		return nil, err
@@ -297,7 +316,7 @@ func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
 	command := &mcpCommand{
 		id: commandID, vmID: id, cancel: cancel, done: make(chan struct{}), status: "running", startedAt: time.Now().UTC(),
 		request: client.RunRequest{Command: append([]string(nil), in.Command...), Env: append([]string(nil), in.Env...), WorkDir: workDir, User: user, TimeoutSeconds: in.TimeoutSeconds},
-		stdin:   stdin, inputs: make(chan client.ExecInput),
+		stdin:   stdin, inputs: make(chan client.ExecInput), deliveryRequired: deliveryRequired,
 		cancellationUnverifiable: isMCPRootUser(user),
 	}
 	if _, err := e.registerMCPCommand(command); err != nil {
@@ -339,6 +358,24 @@ func (e *mcpEndpoint) registerMCPCommand(command *mcpCommand) (*mcpGuestContext,
 	if _, ok := e.stopping[command.vmID]; ok {
 		return nil, fmt.Errorf("VM %q is stopping", command.vmID)
 	}
+	activeSession, activeVM := 0, 0
+	for _, existing := range e.commands {
+		select {
+		case <-existing.done:
+			continue
+		default:
+		}
+		activeSession++
+		if existing.vmID == command.vmID {
+			activeVM++
+		}
+	}
+	if activeVM >= mcpMaxActiveCommandsPerVM {
+		return nil, fmt.Errorf("VM %q has %d active commands; wait for or cancel existing commands before starting another", command.vmID, activeVM)
+	}
+	if activeSession >= mcpMaxActiveCommandsPerSession {
+		return nil, fmt.Errorf("MCP session has %d active commands; wait for or cancel existing commands before starting another", activeSession)
+	}
 	e.commands[command.id] = command
 	return guest, nil
 }
@@ -351,11 +388,13 @@ func (e *mcpEndpoint) pruneCompletedCommands(now time.Time) {
 
 func (e *mcpEndpoint) pruneCompletedCommandsLocked(now time.Time) {
 	type completedCommand struct {
-		id       string
-		command  *mcpCommand
-		finished time.Time
-		bytes    int
-		expired  bool
+		id        string
+		command   *mcpCommand
+		finished  time.Time
+		bytes     int
+		expired   bool
+		delivered bool
+		required  bool
 	}
 	completed := make([]completedCommand, 0, len(e.commands))
 	for id, command := range e.commands {
@@ -364,7 +403,7 @@ func (e *mcpEndpoint) pruneCompletedCommandsLocked(now time.Time) {
 			completed = append(completed, completedCommand{
 				id: id, command: command, finished: *command.finishedAt,
 				bytes:   len(command.stdout) + len(command.stderr) + len(command.asyncStdout) + len(command.asyncStderr),
-				expired: command.outputExpired,
+				expired: command.outputExpired, delivered: command.delivered, required: command.deliveryRequired,
 			})
 		}
 		command.mu.Unlock()
@@ -373,7 +412,7 @@ func (e *mcpEndpoint) pruneCompletedCommandsLocked(now time.Time) {
 	retainedCount, retainedBytes := 0, 0
 	for i := range completed {
 		entry := &completed[i]
-		if !entry.expired && now.Sub(entry.finished) >= mcpCompletedOutputRetention {
+		if !entry.expired && now.Sub(entry.finished) >= mcpCompletedOutputRetention && (entry.delivered || !entry.required) {
 			entry.command.expirePayload()
 			entry.expired = true
 			entry.bytes = 0
@@ -389,6 +428,9 @@ func (e *mcpEndpoint) pruneCompletedCommandsLocked(now time.Time) {
 		}
 		entry := &completed[i]
 		if entry.expired {
+			continue
+		}
+		if !entry.delivered && (entry.required || now.Sub(entry.finished) < mcpCompletedFirstDeliveryGrace) {
 			continue
 		}
 		entry.command.expirePayload()
@@ -646,9 +688,13 @@ func (c *mcpCommand) waitDone(timeout time.Duration) bool {
 	}
 }
 
-func (c *mcpCommand) snapshot(stdoutOffset, stderrOffset int64, maxBytes int, includeCombined bool) mcpCommandOutput {
+func (c *mcpCommand) snapshot(stdoutOffset, stderrOffset, asyncStdoutOffset, asyncStderrOffset int64, maxBytes int, includeCombined bool) mcpCommandOutput {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.snapshotLocked(stdoutOffset, stderrOffset, asyncStdoutOffset, asyncStderrOffset, maxBytes, includeCombined)
+}
+
+func (c *mcpCommand) snapshotLocked(stdoutOffset, stderrOffset, asyncStdoutOffset, asyncStderrOffset int64, maxBytes int, includeCombined bool) mcpCommandOutput {
 	stdout := commandOutputChunk(c.stdout, c.stdoutTotal, c.stdoutTruncated, stdoutOffset, maxBytes)
 	stderr := commandOutputChunk(c.stderr, c.stderrTotal, c.stderrTruncated, stderrOffset, maxBytes)
 	out := mcpCommandOutput{
@@ -657,11 +703,11 @@ func (c *mcpCommand) snapshot(stdoutOffset, stderrOffset int64, maxBytes int, in
 		StartedAt: c.startedAt, FinishedAt: cloneTime(c.finishedAt), OutputExpired: c.outputExpired,
 	}
 	if c.asyncStdoutTotal != 0 {
-		chunk := commandOutputChunk(c.asyncStdout, c.asyncStdoutTotal, c.asyncStdoutTruncated, 0, mcpMaxOutputChunk)
+		chunk := commandOutputChunk(c.asyncStdout, c.asyncStdoutTotal, c.asyncStdoutTruncated, asyncStdoutOffset, maxBytes)
 		out.AsyncStdout = &chunk
 	}
 	if c.asyncStderrTotal != 0 {
-		chunk := commandOutputChunk(c.asyncStderr, c.asyncStderrTotal, c.asyncStderrTruncated, 0, mcpMaxOutputChunk)
+		chunk := commandOutputChunk(c.asyncStderr, c.asyncStderrTotal, c.asyncStderrTruncated, asyncStderrOffset, maxBytes)
 		out.AsyncStderr = &chunk
 	}
 	if includeCombined {
@@ -680,8 +726,14 @@ func (c *mcpCommand) snapshot(stdoutOffset, stderrOffset int64, maxBytes int, in
 	return out
 }
 
-func (c *mcpCommand) deliver(stdoutOffset, stderrOffset int64, maxBytes int, includeCombined bool) mcpCommandOutput {
-	return c.snapshot(stdoutOffset, stderrOffset, maxBytes, includeCombined)
+func (c *mcpCommand) deliver(stdoutOffset, stderrOffset, asyncStdoutOffset, asyncStderrOffset int64, maxBytes int, includeCombined bool) mcpCommandOutput {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.finishedAt != nil {
+		c.delivered = true
+		c.deliveryRequired = false
+	}
+	return c.snapshotLocked(stdoutOffset, stderrOffset, asyncStdoutOffset, asyncStderrOffset, maxBytes, includeCombined)
 }
 
 func appendCommandOutput(dst []byte, total int64, truncated bool, data []byte) ([]byte, int64, bool) {

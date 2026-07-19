@@ -95,14 +95,17 @@ func (e *mcpEndpoint) openGuestContext(ctx context.Context, _ *mcp.CallToolReque
 		return nil, mcpContextInfo{}, err
 	}
 	streamCtx, cancel := context.WithCancel(context.Background())
-	// Persistent command attribution needs files that can outlive a foreground
-	// shell turn. /tmp is RAM-backed on common Linux guests, so bulk output can
-	// otherwise consume guest memory and change unrelated command semantics.
-	// /var/tmp is part of the recoverable imageFS backing on built-in guests.
-	captureDir := "/var/tmp/.vmsh-" + id
+	// Built-in Linux guests mount both /tmp and /var/tmp as tmpfs. Keep capture
+	// files under /var/lib, which belongs to the recoverable imageFS root, and
+	// prepare the private leaf as root for the requested execution identity.
+	captureDir := "/var/lib/vmsh-mcp/" + id
 	guest := &mcpGuestContext{
 		id: id, vmID: vm.ID, user: user, workDir: workDir, env: append([]string(nil), in.Env...), captureDir: captureDir, controlPath: captureDir + "/control",
 		inputs: make(chan client.ExecInput, 16), events: make(chan client.ExecEvent, mcpShellEventBuffer), cancel: cancel, done: make(chan struct{}), control: e.control,
+	}
+	if err := guest.prepareCaptureDir(ctx); err != nil {
+		cancel()
+		return nil, mcpContextInfo{}, fmt.Errorf("prepare guest context storage: %w", err)
 	}
 	e.mu.Lock()
 	e.openingContexts--
@@ -125,6 +128,25 @@ func (e *mcpEndpoint) openGuestContext(ctx context.Context, _ *mcp.CallToolReque
 		return nil, mcpContextInfo{}, fmt.Errorf("open guest context: %w", err)
 	}
 	return nil, guest.info(), nil
+}
+
+func (g *mcpGuestContext) prepareCaptureDir(ctx context.Context) error {
+	script := `umask 077; base=$1; leaf=$2; owner=$3; mkdir -p "$base" || exit; chmod 711 "$base" || exit; rm -rf "$leaf" || exit; mkdir "$leaf" || exit; chown "$owner" "$leaf" || exit; chmod 700 "$leaf"`
+	var diagnostic string
+	err := g.control.ExecStreamInContext(ctx, g.vmID, client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", script, "sh", pathpkg.Dir(g.captureDir), g.captureDir, g.user}, WorkDir: "/", User: "root",
+	}, nil, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "stderr", "error":
+			diagnostic += string(contextEventData(event))
+		case "exit":
+			if event.ExitCode != 0 {
+				return fmt.Errorf("capture storage setup exited with status %d: %s", event.ExitCode, strings.TrimSpace(diagnostic))
+			}
+		}
+		return nil
+	})
+	return err
 }
 
 func (e *mcpEndpoint) reserveGuestContext() error {
@@ -284,7 +306,7 @@ func (e *mcpEndpoint) startGuestContextCommand(_ context.Context, _ *mcp.CallToo
 		command.runGuestContext(ctx, guest, line, in.TimeoutSeconds)
 		e.pruneCompletedCommands(time.Now())
 	}()
-	return nil, command.snapshot(0, 0, mcpDefaultOutputChunk, false), nil
+	return nil, command.snapshot(0, 0, 0, 0, mcpDefaultOutputChunk, false), nil
 }
 
 func (c *mcpCommand) runGuestContext(ctx context.Context, guest *mcpGuestContext, line string, timeoutSeconds float64) {
@@ -412,7 +434,7 @@ func (g *mcpGuestContext) serve(ctx context.Context, control *client.Client) {
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	_, _ = control.RunEventsInContext(cleanupCtx, g.vmID, client.RunRequest{
 		Command: []string{"/bin/sh", "-c", `rm -rf "$1"`, "sh", g.captureDir},
-		WorkDir: "/", User: g.user,
+		WorkDir: "/", User: "root",
 	})
 	cleanupCancel()
 	g.mu.Lock()
@@ -638,7 +660,7 @@ func (g *mcpGuestContext) readContextCapture(ctx context.Context, capturePath st
 	if limit < 0 {
 		limit = 0
 	}
-	script := `if [ ! -f "$1" ]; then printf '0 closed\n' >&2; exit; fi; size=$(wc -c <"$1") || exit; if [ "$3" -gt 0 ] && [ "$size" -gt "$2" ]; then tail -c "+$(( $2 + 1 ))" "$1" | head -c "$3"; fi; writer=unknown; if [ -d /proc ]; then writer=closed; for fd in /proc/[0-9]*/fd/*; do [ -L "$fd" ] || continue; target=$(readlink "$fd" 2>/dev/null) || continue; if [ "$target" = "$1" ]; then writer=open; break; fi; done; fi; printf '%s %s\n' "$size" "$writer" >&2`
+	script := mcpContextCaptureReadScript()
 	var output, diagnostic []byte
 	err := g.control.ExecStreamInContext(ctx, g.vmID, client.ExecRequest{
 		Command: []string{"/bin/sh", "-c", script, "sh", capturePath, strconv.FormatInt(offset, 10), strconv.Itoa(limit)},
@@ -677,6 +699,10 @@ func (g *mcpGuestContext) readContextCapture(ctx context.Context, capturePath st
 		return nil, 0, false, fmt.Errorf("read context output returned invalid size")
 	}
 	return output, size, len(fields) == 2 && fields[1] == "closed", nil
+}
+
+func mcpContextCaptureReadScript() string {
+	return `if [ ! -f "$1" ]; then printf '0 closed\n' >&2; exit; fi; size=$(wc -c <"$1") || exit; count=$((size - $2)); [ "$count" -lt 0 ] && count=0; [ "$count" -gt "$3" ] && count=$3; if [ "$count" -gt 0 ]; then tail -c "+$(( $2 + 1 ))" "$1" | head -c "$count"; fi; writer=unknown; if [ -d /proc ]; then writer=closed; for fd in /proc/[0-9]*/fd/*; do [ -L "$fd" ] || continue; target=$(readlink "$fd" 2>/dev/null) || continue; if [ "$target" = "$1" ]; then writer=open; break; fi; done; fi; printf '%s %s\n' "$size" "$writer" >&2`
 }
 
 func (g *mcpGuestContext) removeContextCaptures(captures []mcpContextCapture) {
@@ -736,8 +762,8 @@ func mcpContextShellScriptForShell(controlPath, shellPath string) string {
 		"__vmsh_mcp_relay_stop=__vmsh_mcp_relay_stop__\n" +
 		"__vmsh_mcp_initial_umask=$(umask)\n" +
 		"umask 077\n" +
-		"rm -rf " + dir + "\n" +
-		"mkdir -m 700 " + dir + " || exit 126\n" +
+		"if [ -d " + dir + " ]; then chmod 700 " + dir + " || exit 126; else mkdir -m 700 " + dir + " || exit 126; fi\n" +
+		"rm -f \"$__vmsh_mcp_fifo\" || exit 126\n" +
 		"mkfifo \"$__vmsh_mcp_fifo\" || exit 126\n" +
 		"(exec 8<>\"$__vmsh_mcp_fifo\"; while IFS= read -r __vmsh_mcp_frame <&8; do [ \"$__vmsh_mcp_frame\" = \"$__vmsh_mcp_relay_stop\" ] && break; command printf '%s\\n' \"$__vmsh_mcp_frame\"; done) >&3 &\n" +
 		"__vmsh_mcp_relay=$!\n" +

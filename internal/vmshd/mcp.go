@@ -68,7 +68,7 @@ type mcpEndpoint struct {
 	contexts         map[string]*mcpGuestContext
 	stopping         map[string]struct{}
 	quarantined      map[string]struct{}
-	starting         int
+	starting         map[string]*mcpVMStart
 	openingContexts  int
 	artifactOps      int
 	artifactInFlight int64
@@ -77,28 +77,35 @@ type mcpEndpoint struct {
 	shutdownTimeout  time.Duration
 }
 
+type mcpVMStart struct {
+	id     string
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
 type mcpVM struct {
-	ID                     string `json:"id"`
-	Name                   string `json:"name,omitempty"`
-	Image                  string `json:"image"`
-	Status                 string `json:"status,omitempty"`
-	MemoryMB               uint64 `json:"memory_mb,omitempty"`
-	BalloonMB              uint64 `json:"balloon_mb,omitempty"`
-	BalloonActualMB        uint64 `json:"balloon_actual_mb,omitempty"`
-	BalloonStatus          string `json:"balloon_status,omitempty"`
-	AutomaticMemory        bool   `json:"automatic_memory,omitempty"`
-	BalloonPolicyInFlight  bool   `json:"balloon_policy_in_flight,omitempty"`
-	BalloonPolicyError     string `json:"balloon_policy_error,omitempty"`
-	BalloonPolicyLastError string `json:"balloon_policy_last_error,omitempty"`
-	BackendStatus          string `json:"backend_status,omitempty"`
-	Quarantined            bool   `json:"quarantined,omitempty"`
-	BackingBytes           uint64 `json:"backing_bytes,omitempty"`
-	BackingHighWaterBytes  uint64 `json:"backing_high_water_bytes,omitempty"`
-	BackingPhysicalBytes   uint64 `json:"backing_physical_bytes,omitempty"`
-	BackingReclaimError    string `json:"backing_reclaim_error,omitempty"`
-	Error                  string `json:"error,omitempty"`
-	ExitReason             string `json:"exit_reason,omitempty"`
-	ExitedAt               string `json:"exited_at,omitempty"`
+	ID                      string `json:"id"`
+	Name                    string `json:"name,omitempty"`
+	Image                   string `json:"image"`
+	Status                  string `json:"status,omitempty"`
+	MemoryMB                uint64 `json:"memory_mb,omitempty"`
+	BalloonMB               uint64 `json:"balloon_mb,omitempty"`
+	BalloonObservedTargetMB uint64 `json:"balloon_observed_target_mb,omitempty"`
+	BalloonActualMB         uint64 `json:"balloon_actual_mb,omitempty"`
+	BalloonStatus           string `json:"balloon_status,omitempty"`
+	AutomaticMemory         bool   `json:"automatic_memory,omitempty"`
+	BalloonPolicyInFlight   bool   `json:"balloon_policy_in_flight,omitempty"`
+	BalloonPolicyError      string `json:"balloon_policy_error,omitempty"`
+	BalloonPolicyLastError  string `json:"balloon_policy_last_error,omitempty"`
+	BackendStatus           string `json:"backend_status,omitempty"`
+	Quarantined             bool   `json:"quarantined,omitempty"`
+	BackingBytes            uint64 `json:"backing_bytes,omitempty"`
+	BackingHighWaterBytes   uint64 `json:"backing_high_water_bytes,omitempty"`
+	BackingPhysicalBytes    uint64 `json:"backing_physical_bytes,omitempty"`
+	BackingReclaimError     string `json:"backing_reclaim_error,omitempty"`
+	Error                   string `json:"error,omitempty"`
+	ExitReason              string `json:"exit_reason,omitempty"`
+	ExitedAt                string `json:"exited_at,omitempty"`
 }
 
 func newMCPManager(token string) *mcpManager {
@@ -157,17 +164,28 @@ func (m *mcpManager) Start(sessionID string) (MCPEndpointInfo, error) {
 		contexts:    make(map[string]*mcpGuestContext),
 		stopping:    make(map[string]struct{}),
 		quarantined: make(map[string]struct{}),
+		starting:    make(map[string]*mcpVMStart),
 	}
 	handler := http.MaxBytesHandler(endpoint.handler(), mcpMaxRequestBytes)
 	endpoint.server = &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: mcpRequestReadTimeout, IdleTimeout: 2 * time.Minute}
 	m.endpoints[sessionID] = endpoint
 	m.mu.Unlock()
 	go func() {
-		if err := endpoint.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			_ = endpoint.close()
-		}
+		m.handleEndpointServeExit(sessionID, endpoint, endpoint.server.Serve(listener))
 	}()
 	return endpoint.info(), nil
+}
+
+func (m *mcpManager) handleEndpointServeExit(sessionID string, endpoint *mcpEndpoint, serveErr error) {
+	if serveErr == nil || errors.Is(serveErr, http.ErrServerClosed) {
+		return
+	}
+	closeErr := endpoint.close()
+	m.mu.Lock()
+	if closeErr == nil && m.endpoints[sessionID] == endpoint {
+		delete(m.endpoints, sessionID)
+	}
+	m.mu.Unlock()
 }
 
 func (m *mcpManager) Status(sessionID string) (MCPEndpointInfo, bool) {
@@ -386,24 +404,6 @@ func (e *mcpEndpoint) createVM(ctx context.Context, _ *mcp.CallToolRequest, in m
 	if in.BootTimeoutSeconds == 0 && isMCPBuiltinBSDImage(image) {
 		in.BootTimeoutSeconds = mcpBSDDefaultBootTime.Seconds()
 	}
-	e.mu.Lock()
-	if e.closed {
-		e.mu.Unlock()
-		return nil, mcpCreateVMOutput{}, fmt.Errorf("MCP endpoint is stopped")
-	}
-	for _, vm := range e.vms {
-		if name != "" && vm.Name == name {
-			e.mu.Unlock()
-			return nil, mcpCreateVMOutput{}, fmt.Errorf("VM name %q is already in use", name)
-		}
-	}
-	e.starting++
-	e.mu.Unlock()
-	defer func() {
-		e.mu.Lock()
-		e.starting--
-		e.mu.Unlock()
-	}()
 	baseName := name
 	var err error
 	if baseName == "" {
@@ -415,36 +415,116 @@ func (e *mcpEndpoint) createVM(ctx context.Context, _ *mcp.CallToolRequest, in m
 		return nil, mcpCreateVMOutput{}, err
 	}
 	id := vmconfig.IsolatedVMID(baseName)
+	startCtx, startCancel := context.WithCancel(ctx)
+	start := &mcpVMStart{id: id, cancel: startCancel, done: make(chan struct{})}
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		startCancel()
+		return nil, mcpCreateVMOutput{}, fmt.Errorf("MCP endpoint is stopped")
+	}
+	for _, vm := range e.vms {
+		if name != "" && vm.Name == name {
+			e.mu.Unlock()
+			startCancel()
+			return nil, mcpCreateVMOutput{}, fmt.Errorf("VM name %q is already in use", name)
+		}
+	}
+	if e.starting == nil {
+		e.starting = make(map[string]*mcpVMStart)
+	}
+	if e.vms == nil {
+		e.vms = make(map[string]mcpVM)
+	}
+	e.starting[id] = start
+	e.vms[id] = mcpVM{ID: id, Name: baseName, Image: image, Status: "starting", BackendStatus: "starting"}
+	e.mu.Unlock()
+	backendStarted := false
+	defer func() {
+		startCancel()
+		e.mu.Lock()
+		if e.starting[id] == start {
+			delete(e.starting, id)
+		}
+		if !backendStarted {
+			delete(e.vms, id)
+			delete(e.stopping, id)
+			delete(e.quarantined, id)
+		}
+		close(start.done)
+		e.mu.Unlock()
+	}()
 	if !isMCPBuiltinImage(image) {
-		if _, err := e.control.GetImageContext(ctx, image); err != nil {
+		if _, err := e.control.GetImageContext(startCtx, image); err != nil {
 			if err := validateMCPAutoPullImage(image); err != nil {
 				return nil, mcpCreateVMOutput{}, err
 			}
-			if err := e.control.PullImageContext(ctx, image, client.PullImageRequest{Source: mcpDockerHubSource(image)}); err != nil {
+			if err := e.control.PullImageContext(startCtx, image, client.PullImageRequest{Source: mcpDockerHubSource(image)}); err != nil {
 				return nil, mcpCreateVMOutput{}, fmt.Errorf("pull image: %w", err)
 			}
 		}
 	}
-	state, err := e.control.StartInstanceStreamWithIDContext(ctx, id, client.StartInstanceRequest{
+	state, err := e.control.StartInstanceStreamWithIDContext(startCtx, id, client.StartInstanceRequest{
 		Image: image, MemoryMB: in.MemoryMB, CPUs: in.CPUs,
 		Network: vmconfig.IsolatedNetworkConfig(), TimeoutSeconds: in.BootTimeoutSeconds,
 	}, nil)
 	if err != nil {
 		return nil, mcpCreateVMOutput{}, fmt.Errorf("create VM: %w", err)
 	}
+	backendStarted = true
 	vm := mcpVM{ID: id, Name: baseName, Image: image, Status: state.Status, BackendStatus: state.Status, MemoryMB: state.MemoryMB, BalloonMB: state.BalloonMB, BalloonActualMB: state.BalloonActualMB, BalloonStatus: state.BalloonStatus}
 	e.applyBalloonPolicy(&vm)
 	e.mu.Lock()
-	if e.closed {
-		e.mu.Unlock()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = e.control.ShutdownInstanceWithIDContext(shutdownCtx, id)
-		return nil, mcpCreateVMOutput{}, fmt.Errorf("MCP endpoint stopped while the VM was starting")
-	}
 	e.vms[id] = vm
+	closed := e.closed
 	e.mu.Unlock()
+	if closed {
+		return nil, mcpCreateVMOutput{}, fmt.Errorf("MCP endpoint stopped while VM %q was starting; ownership was retained for shutdown recovery", id)
+	}
+	vm, err = e.waitForInitialBalloon(startCtx, vm)
+	if err != nil {
+		return nil, mcpCreateVMOutput{}, err
+	}
 	return nil, mcpCreateVMOutput{VM: vm}, nil
+}
+
+func (e *mcpEndpoint) waitForInitialBalloon(ctx context.Context, vm mcpVM) (mcpVM, error) {
+	if e.balloon == nil || !e.balloon.state(vm.ID).Automatic {
+		return vm, nil
+	}
+	wait := normalizeBalloonPolicyConfig(e.balloon.config).Convergence
+	waitCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		state, err := e.control.InstanceStatusOfContext(waitCtx, vm.ID)
+		if err != nil {
+			return vm, fmt.Errorf("wait for VM %q initial memory safety convergence: %w; the VM remains owned and can be inspected or stopped", vm.ID, err)
+		}
+		vm.Status, vm.BackendStatus = state.Status, state.Status
+		vm.MemoryMB, vm.BalloonMB, vm.BalloonActualMB, vm.BalloonStatus = state.MemoryMB, state.BalloonMB, state.BalloonActualMB, state.BalloonStatus
+		e.balloon.adjustmentReady(state, time.Now())
+		e.applyBalloonPolicy(&vm)
+		e.mu.Lock()
+		e.vms[vm.ID] = vm
+		closed := e.closed
+		e.mu.Unlock()
+		if closed {
+			return vm, fmt.Errorf("MCP endpoint stopped while VM %q was waiting for initial memory safety convergence; ownership was retained for shutdown recovery", vm.ID)
+		}
+		if vm.BalloonStatus == "converged" && vm.BalloonMB == vm.BalloonActualMB {
+			return vm, nil
+		}
+		if state.Status == "stopped" || state.Status == "crashed" {
+			return vm, fmt.Errorf("VM %q became %s before initial memory safety convergence: %s", vm.ID, state.Status, firstNonEmpty(state.ExitReason, state.Error, "no diagnostic available"))
+		}
+		select {
+		case <-waitCtx.Done():
+			return vm, fmt.Errorf("VM %q initial memory safety target did not converge within %s; target=%d MiB actual=%d MiB status=%s; the VM remains owned and can be inspected or stopped", vm.ID, wait, vm.BalloonMB, vm.BalloonActualMB, vm.BalloonStatus)
+		case <-ticker.C:
+		}
+	}
 }
 
 func validateMCPVMName(name string) error {
@@ -611,11 +691,21 @@ func (e *mcpEndpoint) applyBalloonPolicy(vm *mcpVM) {
 		return
 	}
 	policy := e.balloon.state(vm.ID)
+	vm.BalloonObservedTargetMB = vm.BalloonMB
 	vm.AutomaticMemory = policy.Automatic
 	vm.BalloonPolicyInFlight = policy.InFlight
 	vm.BalloonPolicyError = policy.DegradedReason
 	vm.BalloonPolicyLastError = policy.LastFailure
-	if policy.Automatic && vm.BackendStatus != "running" && vm.BackendStatus != "starting" && vm.BackendStatus != "stopping" {
+	if policy.Automatic && policy.InFlight {
+		vm.BalloonMB = policy.TargetMB
+		if vm.BalloonActualMB < vm.BalloonMB {
+			vm.BalloonStatus = "inflating"
+		} else if vm.BalloonActualMB > vm.BalloonMB {
+			vm.BalloonStatus = "deflating"
+		} else {
+			vm.BalloonStatus = "converged"
+		}
+	} else if policy.Automatic && vm.BackendStatus != "running" && vm.BackendStatus != "starting" && vm.BackendStatus != "stopping" {
 		vm.BalloonMB = policy.TargetMB
 		vm.BalloonActualMB = policy.ActualMB
 		vm.BalloonStatus = policy.Status
@@ -754,11 +844,10 @@ func mcpGuestUser(vm mcpVM, requested string) (string, error) {
 }
 
 func isMCPRootUser(user string) bool {
-	identity, group, hasGroup := strings.Cut(strings.ToLower(strings.TrimSpace(user)), ":")
-	if identity != "root" && identity != "0" {
-		return false
-	}
-	return !hasGroup || group == "root" || group == "wheel" || group == "0"
+	identity, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(user)), ":")
+	// Effective UID 0 remains fully privileged regardless of its primary GID.
+	// Group syntax is an execution preference, not a containment guarantee.
+	return identity == "root" || identity == "0"
 }
 
 func mcpGuestWorkDir(vm mcpVM, requested string) string {
@@ -798,6 +887,10 @@ func (e *mcpEndpoint) close() error {
 	e.closed = true
 	commands := make([]*mcpCommand, 0, len(e.commands))
 	contexts := make([]*mcpGuestContext, 0, len(e.contexts))
+	starts := make([]*mcpVMStart, 0, len(e.starting))
+	for _, start := range e.starting {
+		starts = append(starts, start)
+	}
 	if firstClose {
 		e.credentials = make(map[string]string)
 		for _, command := range e.commands {
@@ -810,16 +903,11 @@ func (e *mcpEndpoint) close() error {
 		e.artifacts = make(map[string]*mcpArtifact)
 		e.contexts = make(map[string]*mcpGuestContext)
 	}
-	ids := make([]string, 0, len(e.vms))
-	if e.stopping == nil {
-		e.stopping = make(map[string]struct{})
-	}
-	for id := range e.vms {
-		ids = append(ids, id)
-		e.stopping[id] = struct{}{}
-	}
 	e.mu.Unlock()
 	var errs []error
+	for _, start := range starts {
+		start.cancel()
+	}
 	if firstClose {
 		errs = append(errs, cancelAndWaitMCPWork(context.Background(), e.workCleanupTimeout(), commands, contexts))
 		for _, command := range commands {
@@ -832,6 +920,34 @@ func (e *mcpEndpoint) close() error {
 		// long-lived MCP session that is itself waiting on this cleanup.
 		errs = append(errs, e.server.Close())
 	}
+	if len(starts) != 0 {
+		deadline := time.NewTimer(e.workCleanupTimeout())
+		for _, start := range starts {
+			select {
+			case <-start.done:
+			case <-deadline.C:
+				errs = append(errs, fmt.Errorf("VM %q start did not stop before endpoint cleanup deadline; ownership was retained for retry", start.id))
+				goto startsDone
+			}
+		}
+		if !deadline.Stop() {
+			select {
+			case <-deadline.C:
+			default:
+			}
+		}
+	}
+startsDone:
+	e.mu.Lock()
+	ids := make([]string, 0, len(e.vms))
+	if e.stopping == nil {
+		e.stopping = make(map[string]struct{})
+	}
+	for id := range e.vms {
+		ids = append(ids, id)
+		e.stopping[id] = struct{}{}
+	}
+	e.mu.Unlock()
 	errs = append(errs, e.shutdownOwnedVMs(ids))
 	return errors.Join(errs...)
 }
