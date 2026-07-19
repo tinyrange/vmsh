@@ -166,9 +166,9 @@ func TestBalloonReleaseIsFairWithinUnusedCommitment(t *testing.T) {
 }
 
 func TestExplicitDuplicateNormalizationDoesNotChangeAutomaticOwner(t *testing.T) {
-	controller := newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 4096}})
-	automatic := client.StartInstanceRequest{ID: "shared", Image: "alpine"}
-	controller.applyStartRequest(&automatic, nil)
+	snapshot := memorySnapshot{TotalMB: 8192, AvailableMB: 4096}
+	controller := newBalloonController(fakeMemoryObserver{snapshot: snapshot})
+	controller.reserveAutomaticStart("shared", 4096, snapshot, time.Now())
 	explicit := client.StartInstanceRequest{ID: "shared", Image: "alpine", MemoryMB: 512}
 	controller.applyStartRequest(&explicit, nil)
 	if !controller.state("shared").Automatic || explicit.MemoryMB != 512 || explicit.BalloonMB != 0 {
