@@ -48,13 +48,16 @@ type balloonPolicyEntry struct {
 	requestedMB    uint64
 	requestedAt    time.Time
 	lastActualMB   uint64
+	initialRequest bool
 	degradedReason string
+	lastFailure    string
 }
 
 type balloonPolicyState struct {
 	Automatic      bool
 	InFlight       bool
 	DegradedReason string
+	LastFailure    string
 }
 
 type balloonPolicyConfig struct {
@@ -136,7 +139,7 @@ func (c *balloonController) applyStartRequest(req *client.StartInstanceRequest, 
 	}
 	req.BalloonMB = c.initialBalloonTarget(snapshot, current, req.ID, req.MemoryMB)
 	if req.BalloonMB != 0 {
-		c.markBalloonRequest(req.ID, req.BalloonMB, time.Now())
+		c.markInitialBalloonRequest(req.ID, req.BalloonMB, time.Now())
 	}
 }
 
@@ -215,7 +218,20 @@ func (c *balloonController) state(id string) balloonPolicyState {
 	c.mu.Lock()
 	entry := c.automatic[strings.TrimSpace(id)]
 	c.mu.Unlock()
-	return balloonPolicyState{Automatic: entry.automatic, InFlight: entry.inFlight, DegradedReason: entry.degradedReason}
+	return balloonPolicyState{Automatic: entry.automatic, InFlight: entry.inFlight, DegradedReason: entry.degradedReason, LastFailure: entry.lastFailure}
+}
+
+func (c *balloonController) markInitialBalloonRequest(id string, targetMB uint64, now time.Time) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = "default"
+	}
+	c.markBalloonRequest(id, targetMB, now)
+	c.mu.Lock()
+	entry := c.automatic[id]
+	entry.initialRequest = true
+	c.automatic[id] = entry
+	c.mu.Unlock()
 }
 
 func (c *balloonController) markBalloonRequest(id string, targetMB uint64, now time.Time) {
@@ -236,7 +252,7 @@ func (c *balloonController) adjustmentReady(state client.InstanceState, now time
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok := c.automatic[strings.TrimSpace(state.ID)]
-	if !ok || !entry.automatic || entry.degradedReason != "" {
+	if !ok || !entry.automatic {
 		return false
 	}
 	if state.BalloonStatus == "unsupported" {
@@ -247,6 +263,14 @@ func (c *balloonController) adjustmentReady(state client.InstanceState, now time
 	actual := state.BalloonActualMB
 	if state.BalloonStatus == "" {
 		actual = state.BalloonMB
+	}
+	if entry.degradedReason != "" {
+		if state.BalloonStatus == "driver_unavailable" || state.BalloonMB != actual {
+			return false
+		}
+		entry.lastFailure = entry.degradedReason
+		entry.degradedReason = ""
+		entry.inFlight = false
 	}
 	if !entry.inFlight && state.BalloonMB != actual {
 		entry.inFlight = true
@@ -277,6 +301,7 @@ func (c *balloonController) markBalloonFailure(id string, err error) {
 	c.mu.Lock()
 	entry := c.automatic[strings.TrimSpace(id)]
 	entry.degradedReason = err.Error()
+	entry.lastFailure = err.Error()
 	entry.inFlight = false
 	c.automatic[strings.TrimSpace(id)] = entry
 	c.mu.Unlock()
@@ -294,9 +319,24 @@ func (c *balloonController) reconcileLifecycle(states []client.InstanceState, no
 	defer c.mu.Unlock()
 	for id, entry := range c.automatic {
 		state, ok := present[id]
-		if ok && (state.Status == "running" || state.Status == "starting") {
+		if ok && (state.Status == "running" || state.Status == "starting" || state.Status == "stopping") {
 			if state.Status == "running" && !entry.seen {
 				entry.seen = true
+				if entry.inFlight && entry.initialRequest {
+					// Start requests are normalized before the backend creates the
+					// balloon device. The live device state is authoritative once the
+					// guest is running: a restored or freshly initialized device may
+					// legitimately begin at a different target.
+					entry.requestedMB = state.BalloonMB
+					entry.initialRequest = false
+					actual := state.BalloonActualMB
+					if state.BalloonStatus == "" {
+						actual = state.BalloonMB
+					}
+					if state.BalloonStatus != "driver_unavailable" && actual == state.BalloonMB {
+						entry.inFlight = false
+					}
+				}
 				if entry.inFlight {
 					entry.requestedAt = now
 				}

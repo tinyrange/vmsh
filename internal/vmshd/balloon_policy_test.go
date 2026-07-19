@@ -140,6 +140,45 @@ func TestRuntimePolicyAppliesDefaultMemoryAndInitialBalloon(t *testing.T) {
 	}
 }
 
+func TestAutomaticPolicyReconcilesInitialTargetWithLiveDevice(t *testing.T) {
+	controller := newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 0}})
+	controller.setAutomatic("new", true)
+	controller.markInitialBalloonRequest("new", 1024, time.Now().Add(-time.Minute))
+	state := client.InstanceState{ID: "new", Status: "running", MemoryMB: 4096, BalloonStatus: "converged"}
+	controller.reconcileLifecycle([]client.InstanceState{state}, time.Now())
+	if !controller.adjustmentReady(state, time.Now()) {
+		t.Fatal("converged live device remained blocked by the pre-boot target")
+	}
+	policy := controller.state("new")
+	if policy.InFlight || policy.DegradedReason != "" {
+		t.Fatalf("policy after live reconciliation = %+v", policy)
+	}
+}
+
+func TestAutomaticPolicyRecoversAfterLateConvergence(t *testing.T) {
+	controller := newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 0}})
+	controller.config.Convergence = time.Second
+	controller.setAutomatic("slow", true)
+	controller.markBalloonRequest("slow", 512, time.Now().Add(-2*time.Second))
+	inflight := client.InstanceState{ID: "slow", Status: "running", MemoryMB: 4096, BalloonMB: 512, BalloonActualMB: 128, BalloonStatus: "inflating"}
+	if controller.adjustmentReady(inflight, time.Now()) {
+		t.Fatal("unacknowledged target was reported ready")
+	}
+	if controller.state("slow").DegradedReason == "" {
+		t.Fatal("convergence failure was not exposed")
+	}
+	converged := inflight
+	converged.BalloonActualMB = converged.BalloonMB
+	converged.BalloonStatus = "converged"
+	if !controller.adjustmentReady(converged, time.Now()) {
+		t.Fatal("late convergence did not recover the policy")
+	}
+	policy := controller.state("slow")
+	if policy.DegradedReason != "" || policy.LastFailure == "" {
+		t.Fatalf("recovered policy did not retain failure history: %+v", policy)
+	}
+}
+
 func TestRuntimePolicyPreservesExplicitMemoryAndBalloon(t *testing.T) {
 	srv := NewServer("secret")
 	srv.balloon = newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 0}})

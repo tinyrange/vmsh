@@ -77,22 +77,27 @@ type mcpEndpoint struct {
 }
 
 type mcpVM struct {
-	ID                    string `json:"id"`
-	Name                  string `json:"name,omitempty"`
-	Image                 string `json:"image"`
-	Status                string `json:"status,omitempty"`
-	MemoryMB              uint64 `json:"memory_mb,omitempty"`
-	BalloonMB             uint64 `json:"balloon_mb,omitempty"`
-	BalloonActualMB       uint64 `json:"balloon_actual_mb,omitempty"`
-	BalloonStatus         string `json:"balloon_status,omitempty"`
-	AutomaticMemory       bool   `json:"automatic_memory,omitempty"`
-	BalloonPolicyError    string `json:"balloon_policy_error,omitempty"`
-	BackingBytes          uint64 `json:"backing_bytes,omitempty"`
-	BackingHighWaterBytes uint64 `json:"backing_high_water_bytes,omitempty"`
-	BackingReclaimError   string `json:"backing_reclaim_error,omitempty"`
-	Error                 string `json:"error,omitempty"`
-	ExitReason            string `json:"exit_reason,omitempty"`
-	ExitedAt              string `json:"exited_at,omitempty"`
+	ID                     string `json:"id"`
+	Name                   string `json:"name,omitempty"`
+	Image                  string `json:"image"`
+	Status                 string `json:"status,omitempty"`
+	MemoryMB               uint64 `json:"memory_mb,omitempty"`
+	BalloonMB              uint64 `json:"balloon_mb,omitempty"`
+	BalloonActualMB        uint64 `json:"balloon_actual_mb,omitempty"`
+	BalloonStatus          string `json:"balloon_status,omitempty"`
+	AutomaticMemory        bool   `json:"automatic_memory,omitempty"`
+	BalloonPolicyInFlight  bool   `json:"balloon_policy_in_flight,omitempty"`
+	BalloonPolicyError     string `json:"balloon_policy_error,omitempty"`
+	BalloonPolicyLastError string `json:"balloon_policy_last_error,omitempty"`
+	BackendStatus          string `json:"backend_status,omitempty"`
+	Quarantined            bool   `json:"quarantined,omitempty"`
+	BackingBytes           uint64 `json:"backing_bytes,omitempty"`
+	BackingHighWaterBytes  uint64 `json:"backing_high_water_bytes,omitempty"`
+	BackingPhysicalBytes   uint64 `json:"backing_physical_bytes,omitempty"`
+	BackingReclaimError    string `json:"backing_reclaim_error,omitempty"`
+	Error                  string `json:"error,omitempty"`
+	ExitReason             string `json:"exit_reason,omitempty"`
+	ExitedAt               string `json:"exited_at,omitempty"`
 }
 
 func newMCPManager(token string) *mcpManager {
@@ -405,7 +410,8 @@ func (e *mcpEndpoint) createVM(ctx context.Context, _ *mcp.CallToolRequest, in m
 	if err != nil {
 		return nil, mcpCreateVMOutput{}, fmt.Errorf("create VM: %w", err)
 	}
-	vm := mcpVM{ID: id, Name: baseName, Image: image, Status: state.Status, MemoryMB: state.MemoryMB, BalloonMB: state.BalloonMB, BalloonActualMB: state.BalloonActualMB, BalloonStatus: state.BalloonStatus}
+	vm := mcpVM{ID: id, Name: baseName, Image: image, Status: state.Status, BackendStatus: state.Status, MemoryMB: state.MemoryMB, BalloonMB: state.BalloonMB, BalloonActualMB: state.BalloonActualMB, BalloonStatus: state.BalloonStatus}
+	e.applyBalloonPolicy(&vm)
 	e.mu.Lock()
 	if e.closed {
 		e.mu.Unlock()
@@ -538,32 +544,34 @@ func (e *mcpEndpoint) listVMs(ctx context.Context, _ *mcp.CallToolRequest, _ mcp
 	e.mu.Lock()
 	vms := make([]mcpVM, 0, len(e.vms))
 	for _, vm := range e.vms {
-		if _, quarantined := e.quarantined[vm.ID]; quarantined {
-			vm.Status = "quarantined"
-		} else if vm.Status == "" {
+		_, quarantined := e.quarantined[vm.ID]
+		if vm.Status == "" {
 			vm.Status = "running"
 		}
 		if state, ok := observed[vm.ID]; ok {
 			vm.Status = state.Status
+			vm.BackendStatus = state.Status
 			vm.MemoryMB = state.MemoryMB
 			vm.BalloonMB = state.BalloonMB
 			vm.BalloonActualMB = state.BalloonActualMB
 			vm.BalloonStatus = state.BalloonStatus
 			vm.BackingBytes = state.BackingBytes
 			vm.BackingHighWaterBytes = state.BackingHighWaterBytes
+			vm.BackingPhysicalBytes = state.BackingPhysicalBytes
 			vm.BackingReclaimError = state.BackingReclaimError
 			vm.Error = state.Error
 			vm.ExitReason = state.ExitReason
 			vm.ExitedAt = state.ExitedAt
 		} else if observationErr == nil {
 			vm.Status = "absent"
+			vm.BackendStatus = "absent"
 			vm.ExitReason = "backend no longer owns the VM"
 		}
-		if e.balloon != nil {
-			policy := e.balloon.state(vm.ID)
-			vm.AutomaticMemory = policy.Automatic
-			vm.BalloonPolicyError = policy.DegradedReason
+		vm.Quarantined = quarantined
+		if quarantined {
+			vm.Status = "quarantined"
 		}
+		e.applyBalloonPolicy(&vm)
 		e.vms[vm.ID] = vm
 		vms = append(vms, vm)
 	}
@@ -574,6 +582,17 @@ func (e *mcpEndpoint) listVMs(ctx context.Context, _ *mcp.CallToolRequest, _ mcp
 		out.ObservationError = conciseCommandError(observationErr)
 	}
 	return nil, out, nil
+}
+
+func (e *mcpEndpoint) applyBalloonPolicy(vm *mcpVM) {
+	if e == nil || e.balloon == nil || vm == nil {
+		return
+	}
+	policy := e.balloon.state(vm.ID)
+	vm.AutomaticMemory = policy.Automatic
+	vm.BalloonPolicyInFlight = policy.InFlight
+	vm.BalloonPolicyError = policy.DegradedReason
+	vm.BalloonPolicyLastError = policy.LastFailure
 }
 
 type mcpStopVMInput struct {

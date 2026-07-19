@@ -584,15 +584,7 @@ func (c *mcpCommand) snapshot(stdoutOffset, stderrOffset int64, maxBytes int, in
 }
 
 func (c *mcpCommand) deliver(stdoutOffset, stderrOffset int64, maxBytes int, includeCombined bool) mcpCommandOutput {
-	out := c.snapshot(stdoutOffset, stderrOffset, maxBytes, includeCombined)
-	c.mu.Lock()
-	terminal := c.status != "running"
-	allDelivered := out.Stdout.NextOffset >= int64(len(c.stdout)) && out.Stderr.NextOffset >= int64(len(c.stderr))
-	c.mu.Unlock()
-	if terminal && allDelivered {
-		c.releasePayload()
-	}
-	return out
+	return c.snapshot(stdoutOffset, stderrOffset, maxBytes, includeCombined)
 }
 
 func appendCommandOutput(dst []byte, total int64, truncated bool, data []byte) ([]byte, int64, bool) {

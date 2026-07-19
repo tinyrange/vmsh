@@ -418,7 +418,7 @@ func TestMCPListReportsObservedMemoryAndBackingUsage(t *testing.T) {
 		}
 		writeJSON(w, http.StatusOK, []client.InstanceState{{
 			ID: "one", Status: "running", MemoryMB: 4096, BalloonMB: 768,
-			BackingBytes: 1024, BackingHighWaterBytes: 4096, BackingReclaimError: "disk refused reclaim",
+			BackingBytes: 1024, BackingHighWaterBytes: 4096, BackingPhysicalBytes: 2048, BackingReclaimError: "disk refused reclaim",
 		}})
 	}))
 	defer control.Close()
@@ -428,8 +428,59 @@ func TestMCPListReportsObservedMemoryAndBackingUsage(t *testing.T) {
 		t.Fatalf("list VMs = %#v, %v", listed, err)
 	}
 	vm := listed.VMs[0]
-	if vm.MemoryMB != 4096 || vm.BalloonMB != 768 || vm.BackingBytes != 1024 || vm.BackingHighWaterBytes != 4096 || vm.BackingReclaimError != "disk refused reclaim" {
+	if vm.MemoryMB != 4096 || vm.BalloonMB != 768 || vm.BackingBytes != 1024 || vm.BackingHighWaterBytes != 4096 || vm.BackingPhysicalBytes != 2048 || vm.BackingReclaimError != "disk refused reclaim" {
 		t.Fatalf("observed VM = %#v", vm)
+	}
+}
+
+func TestMCPListKeepsQuarantineVisibleAlongsideBackendState(t *testing.T) {
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, []client.InstanceState{{ID: "one", Status: "running", MemoryMB: 512}})
+	}))
+	defer control.Close()
+	endpoint := &mcpEndpoint{
+		control:     client.NewClient(control.URL, nil),
+		vms:         map[string]mcpVM{"one": {ID: "one", Image: "alpine"}},
+		quarantined: map[string]struct{}{"one": {}},
+	}
+	_, listed, err := endpoint.listVMs(t.Context(), nil, mcpListVMsInput{})
+	if err != nil || len(listed.VMs) != 1 {
+		t.Fatalf("list VMs = %#v, %v", listed, err)
+	}
+	vm := listed.VMs[0]
+	if vm.Status != "quarantined" || !vm.Quarantined || vm.BackendStatus != "running" {
+		t.Fatalf("quarantined VM = %#v", vm)
+	}
+}
+
+func TestMCPCreateReturnsAutomaticMemoryPolicyState(t *testing.T) {
+	balloon := newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 4096}})
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/image/alpine":
+			writeJSON(w, http.StatusOK, map[string]string{"name": "alpine"})
+		case "/vm/start":
+			var req client.StartInstanceRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode start request: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			balloon.setAutomatic(req.ID, true)
+			balloon.markBalloonRequest(req.ID, 128, time.Now())
+			writeMCPBootReady(t, w, r, client.InstanceState{ID: req.ID, Status: "running", Image: req.Image, MemoryMB: 4096, BalloonMB: 128, BalloonStatus: "inflating"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer control.Close()
+	endpoint := &mcpEndpoint{control: client.NewClient(control.URL, nil), balloon: balloon, vms: make(map[string]mcpVM)}
+	_, created, err := endpoint.createVM(t.Context(), nil, mcpCreateVMInput{Image: "alpine", Name: "automatic"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created.VM.AutomaticMemory || !created.VM.BalloonPolicyInFlight {
+		t.Fatalf("create response policy = %#v", created.VM)
 	}
 }
 
@@ -644,7 +695,7 @@ func TestMCPForgetReleasesCompletedCommandPayload(t *testing.T) {
 	}
 }
 
-func TestMCPFinalOutputDeliveryReleasesCompletedPayload(t *testing.T) {
+func TestMCPCompletedOutputCanBeReplayedUntilForgotten(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	command := &mcpCommand{
@@ -660,10 +711,17 @@ func TestMCPFinalOutputDeliveryReleasesCompletedPayload(t *testing.T) {
 	if last.Stdout.Text != "out" || last.Stderr.Text != "err" {
 		t.Fatalf("last page = %#v", last)
 	}
-	command.mu.Lock()
-	defer command.mu.Unlock()
-	if command.stdout != nil || command.stderr != nil || command.stdin != nil || len(command.request.Command) != 0 {
-		t.Fatal("fully delivered command retained payloads")
+	replayed := command.deliver(0, 0, 16, false)
+	if replayed.Stdout.Text != "stdout" || replayed.Stderr.Text != "stderr" || replayed.Stdout.Truncated || replayed.Stderr.Truncated {
+		t.Fatalf("replayed output = %#v", replayed)
+	}
+	oversized := command.deliver(1<<20, 1<<20, 16, false)
+	if oversized.Stdout.NextOffset != 6 || oversized.Stderr.NextOffset != 6 {
+		t.Fatalf("oversized cursor = %#v", oversized)
+	}
+	replayed = command.deliver(0, 0, 16, false)
+	if replayed.Stdout.Text != "stdout" || replayed.Stderr.Text != "stderr" {
+		t.Fatalf("output after oversized cursor = %#v", replayed)
 	}
 }
 
