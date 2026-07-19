@@ -3,6 +3,7 @@ package vmshd
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ const (
 	mcpMaxCommandStreamBytes = 4 << 20
 	mcpDefaultOutputChunk    = 1 << 20
 	mcpMaxOutputChunk        = 4 << 20
+	mcpMaxCombinedOutput     = 64 << 10
 	mcpDefaultWaitSeconds    = 20
 	mcpMaxWaitSeconds        = 30
 	mcpMaxTimeoutSeconds     = 24 * 60 * 60
@@ -51,20 +53,23 @@ type mcpOutputChunk struct {
 }
 
 type mcpCommandOutput struct {
-	CommandID    string          `json:"command_id"`
-	VMID         string          `json:"vm_id"`
-	ContextID    string          `json:"context_id,omitempty"`
-	Status       string          `json:"status"`
-	ExitCode     *int            `json:"exit_code,omitempty"`
-	Stdout       mcpOutputChunk  `json:"stdout"`
-	Stderr       mcpOutputChunk  `json:"stderr"`
-	AsyncStdout  *mcpOutputChunk `json:"async_stdout,omitempty"`
-	AsyncStderr  *mcpOutputChunk `json:"async_stderr,omitempty"`
-	Output       string          `json:"output,omitempty"`
-	OutputBase64 string          `json:"output_base64,omitempty"`
-	Error        string          `json:"error,omitempty"`
-	StartedAt    time.Time       `json:"started_at"`
-	FinishedAt   *time.Time      `json:"finished_at,omitempty"`
+	CommandID         string          `json:"command_id"`
+	VMID              string          `json:"vm_id"`
+	ContextID         string          `json:"context_id,omitempty"`
+	Status            string          `json:"status"`
+	ExitCode          *int            `json:"exit_code,omitempty"`
+	Stdout            mcpOutputChunk  `json:"stdout"`
+	Stderr            mcpOutputChunk  `json:"stderr"`
+	AsyncStdout       *mcpOutputChunk `json:"async_stdout,omitempty"`
+	AsyncStderr       *mcpOutputChunk `json:"async_stderr,omitempty"`
+	Output            string          `json:"output,omitempty"`
+	OutputBase64      string          `json:"output_base64,omitempty"`
+	Error             string          `json:"error,omitempty"`
+	ContainmentAction string          `json:"containment_action,omitempty"`
+	RecoveryImage     string          `json:"recovery_image,omitempty"`
+	ContainmentError  string          `json:"containment_error,omitempty"`
+	StartedAt         time.Time       `json:"started_at"`
+	FinishedAt        *time.Time      `json:"finished_at,omitempty"`
 }
 
 type mcpCommand struct {
@@ -98,6 +103,18 @@ type mcpCommand struct {
 	cancelRequested      bool
 	cancelOnce           sync.Once
 	terminateOverride    func()
+	containmentFallback  func() mcpContainmentResult
+	containmentDone      chan struct{}
+	containmentOnce      sync.Once
+	containmentAction    string
+	recoveryImage        string
+	containmentError     string
+}
+
+type mcpContainmentResult struct {
+	action        string
+	recoveryImage string
+	err           error
 }
 
 func (e *mcpEndpoint) runVM(ctx context.Context, _ *mcp.CallToolRequest, in mcpRunVMInput) (*mcp.CallToolResult, mcpCommandOutput, error) {
@@ -214,6 +231,13 @@ func (e *mcpEndpoint) cancelVMCommand(ctx context.Context, _ *mcp.CallToolReques
 	case <-ctx.Done():
 		return nil, mcpCommandOutput{}, ctx.Err()
 	}
+	if command.containmentDone != nil {
+		select {
+		case <-command.containmentDone:
+		case <-ctx.Done():
+			return nil, mcpCommandOutput{}, ctx.Err()
+		}
+	}
 	return nil, command.snapshot(in.StdoutOffset, in.StderrOffset, maxBytes, false), nil
 }
 
@@ -257,6 +281,10 @@ func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
 		request: client.RunRequest{Command: append([]string(nil), in.Command...), Env: append([]string(nil), in.Env...), WorkDir: workDir, User: user, TimeoutSeconds: in.TimeoutSeconds},
 		stdin:   stdin, inputs: make(chan client.ExecInput),
 	}
+	if isMCPRootUser(user) {
+		command.containmentDone = make(chan struct{})
+		command.containmentFallback = func() mcpContainmentResult { return e.containPrivilegedCancellation(id, commandID) }
+	}
 	if _, err := e.registerMCPCommand(command); err != nil {
 		cancel()
 		return nil, err
@@ -284,6 +312,10 @@ func (e *mcpEndpoint) registerMCPCommand(command *mcpCommand) (*mcpGuestContext,
 		default:
 		}
 		command.terminateOverride = guest.stop
+		if isMCPRootUser(guest.user) {
+			command.containmentDone = make(chan struct{})
+			command.containmentFallback = func() mcpContainmentResult { return e.containPrivilegedCancellation(command.vmID, command.id) }
+		}
 	}
 	if _, ok := e.vms[command.vmID]; !ok {
 		return nil, fmt.Errorf("VM %q is not owned by this MCP session", command.vmID)
@@ -326,6 +358,12 @@ func (c *mcpCommand) run(ctx context.Context, control *client.Client) {
 	}
 	go streamMCPCommandStdin(ctx, c.inputs, c.stdin)
 	err := control.RunInteractiveStreamInContext(ctx, c.vmID, c.request, c.inputs, onEvent)
+	c.mu.Lock()
+	timedOut := c.exitCode != nil && *c.exitCode == 124
+	c.mu.Unlock()
+	if timedOut && c.containmentFallback != nil {
+		c.applyContainmentFallback()
+	}
 	now := time.Now().UTC()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -413,6 +451,9 @@ func (c *mcpCommand) requestCancel() {
 }
 
 func (c *mcpCommand) terminate() {
+	if c.containmentFallback != nil {
+		defer c.applyContainmentFallback()
+	}
 	if c.terminateOverride != nil {
 		c.terminateOverride()
 		if !c.waitDone(3 * time.Second) {
@@ -433,6 +474,20 @@ func (c *mcpCommand) terminate() {
 		return
 	}
 	c.cancel()
+}
+
+func (c *mcpCommand) applyContainmentFallback() {
+	c.containmentOnce.Do(func() {
+		result := c.containmentFallback()
+		c.mu.Lock()
+		c.containmentAction = result.action
+		c.recoveryImage = result.recoveryImage
+		if result.err != nil {
+			c.containmentError = result.err.Error()
+		}
+		c.mu.Unlock()
+		close(c.containmentDone)
+	})
 }
 
 func (c *mcpCommand) sendInput(input client.ExecInput) bool {
@@ -462,7 +517,8 @@ func (c *mcpCommand) snapshot(stdoutOffset, stderrOffset int64, maxBytes int, in
 	stderr := commandOutputChunk(c.stderr, c.stderrTotal, c.stderrTruncated, stderrOffset, maxBytes)
 	out := mcpCommandOutput{
 		CommandID: c.id, VMID: c.vmID, ContextID: c.contextID, Status: c.status, ExitCode: cloneInt(c.exitCode), Stdout: stdout, Stderr: stderr,
-		Error: c.err, StartedAt: c.startedAt, FinishedAt: cloneTime(c.finishedAt),
+		Error: c.err, ContainmentAction: c.containmentAction, RecoveryImage: c.recoveryImage, ContainmentError: c.containmentError,
+		StartedAt: c.startedAt, FinishedAt: cloneTime(c.finishedAt),
 	}
 	if c.asyncStdoutTotal != 0 {
 		chunk := commandOutputChunk(c.asyncStdout, c.asyncStdoutTotal, c.asyncStdoutTruncated, 0, mcpMaxOutputChunk)
@@ -476,7 +532,10 @@ func (c *mcpCommand) snapshot(stdoutOffset, stderrOffset int64, maxBytes int, in
 		combined := make([]byte, 0, len(c.stdout)+len(c.stderr))
 		combined = append(combined, c.stdout...)
 		combined = append(combined, c.stderr...)
-		if utf8.Valid(combined) {
+		if len(combined) > mcpMaxCombinedOutput {
+			return out
+		}
+		if efficientTextOutput(combined) {
 			out.Output = string(combined)
 		} else if len(combined) > 0 {
 			out.OutputBase64 = base64.StdEncoding.EncodeToString(combined)
@@ -511,12 +570,23 @@ func commandOutputChunk(data []byte, total int64, truncated bool, offset int64, 
 	}
 	chunk := append([]byte(nil), data[offset:end]...)
 	out := mcpOutputChunk{Offset: offset, NextOffset: end, TotalBytes: total, Truncated: truncated}
-	if utf8.Valid(chunk) {
+	if efficientTextOutput(chunk) {
 		out.Text = string(chunk)
 	} else if len(chunk) > 0 {
 		out.Base64 = base64.StdEncoding.EncodeToString(chunk)
 	}
 	return out
+}
+
+func efficientTextOutput(data []byte) bool {
+	if !utf8.Valid(data) {
+		return false
+	}
+	encoded, err := json.Marshal(string(data))
+	if err != nil {
+		return false
+	}
+	return len(encoded) <= base64.StdEncoding.EncodedLen(len(data))+2
 }
 
 func mcpCommandStdin(text, encoded string) ([]byte, error) {

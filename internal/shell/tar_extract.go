@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -24,6 +25,7 @@ type hostTarExtractor struct {
 	exactDirectory bool
 	exactTarget    string
 	dirs           []hostTarDirMtime
+	regulars       map[string]string
 }
 
 type hostTarDirMtime struct {
@@ -245,9 +247,20 @@ func (e *hostTarExtractor) extract(name string, header *tar.Header, tr *tar.Read
 	case tar.TypeSymlink:
 		return e.writeSymlink(name, header.Linkname)
 	case tar.TypeLink:
-		return fmt.Errorf("tar hard link %q is not supported", header.Name)
+		return e.writeHardlink(name, header)
 	case tar.TypeReg, 0:
-		return e.writeRegular(name, perm, header.ModTime, tr)
+		if err := e.writeRegular(name, perm, header.ModTime, header, tr); err != nil {
+			return err
+		}
+		if e.regulars == nil {
+			e.regulars = make(map[string]string)
+		}
+		clean, err := cleanHostTarName(header.Name)
+		if err != nil {
+			return err
+		}
+		e.regulars[clean] = name
+		return nil
 	default:
 		return nil
 	}
@@ -281,7 +294,59 @@ func (e *hostTarExtractor) writeSymlink(name, target string) error {
 	return nil
 }
 
-func (e *hostTarExtractor) writeRegular(name string, perm os.FileMode, mtime time.Time, tr *tar.Reader) error {
+func (e *hostTarExtractor) writeHardlink(name string, header *tar.Header) error {
+	linkName, err := cleanHostTarName(header.Linkname)
+	if err != nil {
+		return fmt.Errorf("unsafe tar hard link target %q: %w", header.Linkname, err)
+	}
+	target, ok := e.regulars[linkName]
+	if !ok {
+		return fmt.Errorf("tar hard link %q targets unavailable regular file %q", header.Name, header.Linkname)
+	}
+	parent, base, err := openHostTarParent(e.root, name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = parent.Close() }()
+	if info, statErr := parent.Lstat(base); statErr == nil {
+		if info.IsDir() || !info.Mode().IsRegular() {
+			return fmt.Errorf("copy conflict at %s: refusing to overwrite non-regular file", name)
+		}
+	} else if !os.IsNotExist(statErr) {
+		return statErr
+	}
+	var temporary string
+	for range 100 {
+		var random [12]byte
+		if _, err := cryptorand.Read(random[:]); err != nil {
+			return err
+		}
+		temporary = ".vmsh-link-" + hex.EncodeToString(random[:])
+		temporaryPath := filepath.Join(filepath.Dir(name), temporary)
+		if err := e.root.Link(target, temporaryPath); err == nil {
+			break
+		} else if !os.IsExist(err) {
+			return fmt.Errorf("stage hard link %s to %s: %w", name, target, err)
+		}
+		temporary = ""
+	}
+	if temporary == "" {
+		return fmt.Errorf("could not allocate temporary hard link for %s", name)
+	}
+	published := false
+	defer func() {
+		if !published {
+			_ = parent.Remove(temporary)
+		}
+	}()
+	if err := parent.Rename(temporary, base); err != nil {
+		return fmt.Errorf("publish hard link %s to %s: %w", name, target, err)
+	}
+	published = true
+	return nil
+}
+
+func (e *hostTarExtractor) writeRegular(name string, perm os.FileMode, mtime time.Time, header *tar.Header, tr *tar.Reader) error {
 	parent, base, err := openHostTarParent(e.root, name)
 	if err != nil {
 		return err
@@ -314,7 +379,7 @@ func (e *hostTarExtractor) writeRegular(name string, perm os.FileMode, mtime tim
 			_ = parent.Remove(temporary)
 		}
 	}()
-	if _, err := io.Copy(file, tr); err != nil {
+	if err := copyHostTarRegular(file, header, tr); err != nil {
 		_ = file.Close()
 		return err
 	}
@@ -351,6 +416,72 @@ func (e *hostTarExtractor) writeRegular(name string, perm os.FileMode, mtime tim
 		}
 	}
 	return nil
+}
+
+type hostTarSparseExtent struct {
+	offset int64
+	length int64
+}
+
+func hostTarSparseMap(header *tar.Header) ([]hostTarSparseExtent, int64, bool, error) {
+	if header == nil || header.PAXRecords == nil {
+		return nil, 0, false, nil
+	}
+	encodedSize, present := header.PAXRecords["VMSH.sparse.size"]
+	if !present {
+		return nil, 0, false, nil
+	}
+	logicalSize, err := strconv.ParseInt(encodedSize, 10, 64)
+	if err != nil || logicalSize < 0 {
+		return nil, 0, false, fmt.Errorf("tar entry %q has invalid sparse size", header.Name)
+	}
+	count, err := strconv.Atoi(header.PAXRecords["VMSH.sparse.numblocks"])
+	if err != nil || count < 0 {
+		return nil, 0, false, fmt.Errorf("tar entry %q has invalid sparse extent count", header.Name)
+	}
+	var values []string
+	if encoded := header.PAXRecords["VMSH.sparse.map"]; encoded != "" {
+		values = strings.Split(encoded, ",")
+	}
+	if len(values) != count*2 {
+		return nil, 0, false, fmt.Errorf("tar entry %q has invalid sparse map", header.Name)
+	}
+	extents := make([]hostTarSparseExtent, 0, count)
+	var physicalSize, previousEnd int64
+	for i := 0; i < len(values); i += 2 {
+		offset, offsetErr := strconv.ParseInt(values[i], 10, 64)
+		length, lengthErr := strconv.ParseInt(values[i+1], 10, 64)
+		if offsetErr != nil || lengthErr != nil || offset < previousEnd || length < 0 || offset < 0 || offset > logicalSize-length || physicalSize > header.Size-length {
+			return nil, 0, false, fmt.Errorf("tar entry %q has invalid sparse map", header.Name)
+		}
+		physicalSize += length
+		previousEnd = offset + length
+		extents = append(extents, hostTarSparseExtent{offset: offset, length: length})
+	}
+	if physicalSize != header.Size {
+		return nil, 0, false, fmt.Errorf("tar entry %q has invalid sparse payload size", header.Name)
+	}
+	return extents, logicalSize, true, nil
+}
+
+func copyHostTarRegular(file *os.File, header *tar.Header, tr *tar.Reader) error {
+	extents, logicalSize, sparse, err := hostTarSparseMap(header)
+	if err != nil {
+		return err
+	}
+	if !sparse {
+		_, err = io.Copy(file, tr)
+		return err
+	}
+	for _, extent := range extents {
+		if _, err := file.Seek(extent.offset, io.SeekStart); err != nil {
+			return err
+		}
+		if _, err := io.CopyN(file, tr, extent.length); err != nil {
+			return err
+		}
+	}
+	return file.Truncate(logicalSize)
 }
 
 func createHostTarTemp(root *os.Root, perm os.FileMode) (*os.File, string, error) {

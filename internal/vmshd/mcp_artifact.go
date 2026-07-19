@@ -10,6 +10,7 @@ import (
 	"io"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,8 @@ const (
 	mcpMaxArtifacts          = 64
 	mcpMaxArtifactBytes      = 64 << 20
 	mcpMaxArtifactTotalBytes = 256 << 20
+	mcpMaxArtifactNameBytes  = 1024
+	mcpMaxArtifactOperations = 4
 	// Keep each base64-encoded control message below the guest vsock receive
 	// window. WriteFull can span the window, but a message larger than it can
 	// deadlock with the guest waiting for the remainder before decoding JSON.
@@ -42,7 +45,7 @@ type mcpArtifact struct {
 type mcpArtifactExportInput struct {
 	VMID string `json:"vm_id" jsonschema:"ID returned by vm_create"`
 	Path string `json:"path" jsonschema:"file or directory path inside the source guest"`
-	Name string `json:"name,omitempty" jsonschema:"optional artifact label"`
+	Name string `json:"name,omitempty" jsonschema:"optional artifact label capped at 1024 bytes"`
 	User string `json:"user,omitempty" jsonschema:"guest user used to read the source; built-in BSD guests currently support only root; defaults to 1000:1000 otherwise"`
 }
 
@@ -51,6 +54,11 @@ type mcpArtifactOutput struct {
 }
 
 func (e *mcpEndpoint) exportArtifact(ctx context.Context, _ *mcp.CallToolRequest, in mcpArtifactExportInput) (*mcp.CallToolResult, mcpArtifactOutput, error) {
+	reservation, err := e.beginArtifactOperation(mcpMaxArtifactBytes)
+	if err != nil {
+		return nil, mcpArtifactOutput{}, err
+	}
+	defer reservation.release()
 	vm, err := e.ownedVM(in.VMID)
 	if err != nil {
 		return nil, mcpArtifactOutput{}, err
@@ -58,6 +66,12 @@ func (e *mcpEndpoint) exportArtifact(ctx context.Context, _ *mcp.CallToolRequest
 	path := in.Path
 	if strings.TrimSpace(path) == "" {
 		return nil, mcpArtifactOutput{}, fmt.Errorf("path is required")
+	}
+	if len(path) > mcpMaxPathBytes {
+		return nil, mcpArtifactOutput{}, fmt.Errorf("path exceeds the %d-byte limit", mcpMaxPathBytes)
+	}
+	if len(strings.TrimSpace(in.Name)) > mcpMaxArtifactNameBytes {
+		return nil, mcpArtifactOutput{}, fmt.Errorf("artifact name exceeds the %d-byte limit", mcpMaxArtifactNameBytes)
 	}
 	user, err := mcpGuestUser(vm, in.User)
 	if err != nil {
@@ -67,7 +81,7 @@ func (e *mcpEndpoint) exportArtifact(ctx context.Context, _ *mcp.CallToolRequest
 	if err != nil {
 		return nil, mcpArtifactOutput{}, err
 	}
-	artifact, err := e.storeArtifact(in.Name, vm.ID, path, data)
+	artifact, err := reservation.storeArtifact(in.Name, vm.ID, path, data)
 	if err != nil {
 		return nil, mcpArtifactOutput{}, err
 	}
@@ -88,6 +102,11 @@ type mcpArtifactImportOutput struct {
 }
 
 func (e *mcpEndpoint) importArtifact(ctx context.Context, _ *mcp.CallToolRequest, in mcpArtifactImportInput) (*mcp.CallToolResult, mcpArtifactImportOutput, error) {
+	reservation, err := e.beginArtifactOperation(0)
+	if err != nil {
+		return nil, mcpArtifactImportOutput{}, err
+	}
+	defer reservation.release()
 	vm, err := e.ownedVM(in.VMID)
 	if err != nil {
 		return nil, mcpArtifactImportOutput{}, err
@@ -95,6 +114,9 @@ func (e *mcpEndpoint) importArtifact(ctx context.Context, _ *mcp.CallToolRequest
 	path := in.Path
 	if strings.TrimSpace(path) == "" {
 		return nil, mcpArtifactImportOutput{}, fmt.Errorf("path is required")
+	}
+	if len(path) > mcpMaxPathBytes {
+		return nil, mcpArtifactImportOutput{}, fmt.Errorf("path exceeds the %d-byte limit", mcpMaxPathBytes)
 	}
 	artifact, err := e.artifact(in.ArtifactID)
 	if err != nil {
@@ -126,6 +148,11 @@ type mcpCopyOutput struct {
 }
 
 func (e *mcpEndpoint) copyGuestPath(ctx context.Context, _ *mcp.CallToolRequest, in mcpCopyInput) (*mcp.CallToolResult, mcpCopyOutput, error) {
+	reservation, err := e.beginArtifactOperation(mcpMaxArtifactBytes)
+	if err != nil {
+		return nil, mcpCopyOutput{}, err
+	}
+	defer reservation.release()
 	sourceVM, err := e.ownedVM(in.SourceVM)
 	if err != nil {
 		return nil, mcpCopyOutput{}, err
@@ -138,6 +165,9 @@ func (e *mcpEndpoint) copyGuestPath(ctx context.Context, _ *mcp.CallToolRequest,
 	destinationPath := in.DestinationPath
 	if strings.TrimSpace(sourcePath) == "" || strings.TrimSpace(destinationPath) == "" {
 		return nil, mcpCopyOutput{}, fmt.Errorf("source_path and destination_path are required")
+	}
+	if len(sourcePath) > mcpMaxPathBytes || len(destinationPath) > mcpMaxPathBytes {
+		return nil, mcpCopyOutput{}, fmt.Errorf("source_path and destination_path are capped at %d bytes", mcpMaxPathBytes)
 	}
 	sourceUser, err := mcpGuestUser(sourceVM, in.SourceUser)
 	if err != nil {
@@ -330,6 +360,7 @@ func validateMCPArchive(data []byte) error {
 	tr := tar.NewReader(bytes.NewReader(data))
 	entries := 0
 	regularEntries := make(map[string]struct{})
+	var expanded int64
 	for {
 		header, err := tr.Next()
 		if err == io.EOF {
@@ -351,6 +382,17 @@ func validateMCPArchive(data []byte) error {
 		}
 		switch header.Typeflag {
 		case tar.TypeReg, byte(0):
+			logicalSize, err := mcpArchiveLogicalSize(header)
+			if err != nil {
+				return err
+			}
+			if logicalSize > mcpMaxArtifactBytes {
+				return fmt.Errorf("archive entry %q exceeds the %d MiB expanded file limit", header.Name, mcpMaxArtifactBytes>>20)
+			}
+			if logicalSize > mcpMaxArtifactBytes*4-expanded {
+				return fmt.Errorf("archive exceeds the %d MiB expanded size limit", (mcpMaxArtifactBytes*4)>>20)
+			}
+			expanded += logicalSize
 			regularEntries[name] = struct{}{}
 		case tar.TypeDir:
 		case tar.TypeLink:
@@ -378,6 +420,48 @@ func validateMCPArchive(data []byte) error {
 	}
 }
 
+func mcpArchiveLogicalSize(header *tar.Header) (int64, error) {
+	if header == nil || header.Size < 0 {
+		return 0, fmt.Errorf("archive entry has invalid size")
+	}
+	if header.PAXRecords == nil {
+		return header.Size, nil
+	}
+	encoded, sparse := header.PAXRecords["VMSH.sparse.size"]
+	if !sparse {
+		return header.Size, nil
+	}
+	logicalSize, err := strconv.ParseInt(encoded, 10, 64)
+	if err != nil || logicalSize < 0 {
+		return 0, fmt.Errorf("archive entry %q has an invalid sparse size", header.Name)
+	}
+	count, err := strconv.Atoi(header.PAXRecords["VMSH.sparse.numblocks"])
+	if err != nil || count < 0 {
+		return 0, fmt.Errorf("archive entry %q has an invalid sparse extent count", header.Name)
+	}
+	var values []string
+	if encodedMap := header.PAXRecords["VMSH.sparse.map"]; encodedMap != "" {
+		values = strings.Split(encodedMap, ",")
+	}
+	if len(values) != count*2 {
+		return 0, fmt.Errorf("archive entry %q has an invalid sparse map", header.Name)
+	}
+	var physical, previousEnd int64
+	for i := 0; i < len(values); i += 2 {
+		offset, offsetErr := strconv.ParseInt(values[i], 10, 64)
+		length, lengthErr := strconv.ParseInt(values[i+1], 10, 64)
+		if offsetErr != nil || lengthErr != nil || offset < previousEnd || length < 0 || offset < 0 || offset > logicalSize-length || physical > header.Size-length {
+			return 0, fmt.Errorf("archive entry %q has an invalid sparse map", header.Name)
+		}
+		physical += length
+		previousEnd = offset + length
+	}
+	if physical != header.Size {
+		return 0, fmt.Errorf("archive entry %q has an invalid sparse payload size", header.Name)
+	}
+	return logicalSize, nil
+}
+
 func tarEntryTypeName(typeflag byte) string {
 	switch typeflag {
 	case tar.TypeLink:
@@ -393,32 +477,81 @@ func tarEntryTypeName(typeflag byte) string {
 	}
 }
 
-func (e *mcpEndpoint) storeArtifact(name, sourceVM, source string, data []byte) (mcpArtifact, error) {
+type mcpArtifactReservation struct {
+	endpoint *mcpEndpoint
+	bytes    int64
+	released bool
+}
+
+func (e *mcpEndpoint) beginArtifactOperation(reserve int64) (*mcpArtifactReservation, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return nil, fmt.Errorf("MCP endpoint is stopped")
+	}
+	if e.artifactOps >= mcpMaxArtifactOperations {
+		return nil, fmt.Errorf("MCP artifact operation limit reached (%d)", mcpMaxArtifactOperations)
+	}
+	if reserve < 0 || e.artifactRetainedBytesLocked()+e.artifactInFlight+reserve > mcpMaxArtifactTotalBytes {
+		return nil, fmt.Errorf("MCP artifact memory limit reached (%d MiB)", mcpMaxArtifactTotalBytes>>20)
+	}
+	e.artifactOps++
+	e.artifactInFlight += reserve
+	return &mcpArtifactReservation{endpoint: e, bytes: reserve}, nil
+}
+
+func (r *mcpArtifactReservation) release() {
+	if r == nil || r.endpoint == nil {
+		return
+	}
+	r.endpoint.mu.Lock()
+	if !r.released {
+		r.endpoint.artifactOps--
+		r.endpoint.artifactInFlight -= r.bytes
+		r.released = true
+	}
+	r.endpoint.mu.Unlock()
+}
+
+func (e *mcpEndpoint) artifactRetainedBytesLocked() int64 {
+	var total int64
+	for _, artifact := range e.artifacts {
+		total += int64(len(artifact.data) + len(artifact.ID) + len(artifact.Name) + len(artifact.SHA256) + len(artifact.SourceVM) + len(artifact.Source))
+	}
+	return total
+}
+
+func (r *mcpArtifactReservation) storeArtifact(name, sourceVM, source string, data []byte) (mcpArtifact, error) {
 	if len(data) > mcpMaxArtifactBytes {
 		return mcpArtifact{}, fmt.Errorf("artifact exceeds the %d MiB MCP limit", mcpMaxArtifactBytes>>20)
+	}
+	name = strings.TrimSpace(name)
+	if len(name) > mcpMaxArtifactNameBytes {
+		return mcpArtifact{}, fmt.Errorf("artifact name exceeds the %d-byte limit", mcpMaxArtifactNameBytes)
 	}
 	id, err := randomMCPID("artifact")
 	if err != nil {
 		return mcpArtifact{}, err
 	}
 	digest := sha256.Sum256(data)
-	artifact := &mcpArtifact{ID: id, Name: strings.TrimSpace(name), Size: int64(len(data)), SHA256: hex.EncodeToString(digest[:]), CreatedAt: time.Now().UTC(), SourceVM: sourceVM, Source: source, data: append([]byte(nil), data...)}
+	artifact := &mcpArtifact{ID: id, Name: name, Size: int64(len(data)), SHA256: hex.EncodeToString(digest[:]), CreatedAt: time.Now().UTC(), SourceVM: sourceVM, Source: source, data: data}
+	e := r.endpoint
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.closed {
+	if e.closed || r.released {
 		return mcpArtifact{}, fmt.Errorf("MCP endpoint is stopped")
 	}
 	if len(e.artifacts) >= mcpMaxArtifacts {
 		return mcpArtifact{}, fmt.Errorf("MCP artifact limit reached (%d)", mcpMaxArtifacts)
 	}
-	total := len(data)
-	for _, existing := range e.artifacts {
-		total += len(existing.data)
-	}
-	if total > mcpMaxArtifactTotalBytes {
+	retained := e.artifactRetainedBytesLocked() + int64(len(data)+len(id)+len(name)+len(artifact.SHA256)+len(sourceVM)+len(source))
+	otherInFlight := e.artifactInFlight - r.bytes
+	if retained+otherInFlight > mcpMaxArtifactTotalBytes {
 		return mcpArtifact{}, fmt.Errorf("MCP artifact storage limit reached (%d MiB)", mcpMaxArtifactTotalBytes>>20)
 	}
 	e.artifacts[id] = artifact
+	e.artifactInFlight -= r.bytes
+	r.bytes = 0
 	return artifact.metadata(), nil
 }
 
@@ -426,11 +559,6 @@ func (e *mcpEndpoint) artifact(id string) (*mcpArtifact, error) {
 	id = strings.TrimSpace(id)
 	e.mu.Lock()
 	artifact := e.artifacts[id]
-	if artifact != nil {
-		copy := *artifact
-		copy.data = append([]byte(nil), artifact.data...)
-		artifact = &copy
-	}
 	e.mu.Unlock()
 	if artifact == nil {
 		return nil, fmt.Errorf("artifact %q is not owned by this MCP session", id)

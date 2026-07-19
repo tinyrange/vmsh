@@ -8482,6 +8482,83 @@ func TestExtractTarToHostRejectsHardlinks(t *testing.T) {
 	}
 }
 
+func TestExtractTarToHostPreservesSafeHardlinks(t *testing.T) {
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	entries := []tar.Header{
+		{Name: "tree", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: "tree/a", Typeflag: tar.TypeReg, Mode: 0o644, Size: 7},
+		{Name: "tree/b", Typeflag: tar.TypeLink, Linkname: "tree/a", Mode: 0o644},
+	}
+	for i := range entries {
+		if err := tw.WriteHeader(&entries[i]); err != nil {
+			t.Fatal(err)
+		}
+		if entries[i].Typeflag == tar.TypeReg {
+			_, _ = tw.Write([]byte("payload"))
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "copied")
+	if err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: dst}); err != nil {
+		t.Fatalf("extract hard-linked tree: %v", err)
+	}
+	a, err := os.Stat(filepath.Join(dst, "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.Stat(filepath.Join(dst, "b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(a, b) {
+		t.Fatal("copied aliases do not share an inode")
+	}
+}
+
+func TestExtractTarToHostReconstructsSparseFiles(t *testing.T) {
+	const logicalSize = int64(8 << 20)
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	header := &tar.Header{
+		Name: "sparse", Typeflag: tar.TypeReg, Mode: 0o644, Size: 1, Format: tar.FormatPAX,
+		PAXRecords: map[string]string{
+			"VMSH.sparse.size":      strconv.FormatInt(logicalSize, 10),
+			"VMSH.sparse.numblocks": "1",
+			"VMSH.sparse.map":       strconv.FormatInt(logicalSize-1, 10) + ",1",
+		},
+	}
+	if err := tw.WriteHeader(header); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = tw.Write([]byte{'Z'})
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "sparse")
+	if err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: dst}); err != nil {
+		t.Fatalf("extract sparse file: %v", err)
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != logicalSize {
+		t.Fatalf("logical size = %d, want %d", info.Size(), logicalSize)
+	}
+	file, err := os.Open(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	var tail [1]byte
+	if _, err := file.ReadAt(tail[:], logicalSize-1); err != nil || tail[0] != 'Z' {
+		t.Fatalf("sparse tail = %q, %v", tail, err)
+	}
+}
+
 func TestExtractTarToHostRejectsSymlinkDestination(t *testing.T) {
 	parent := t.TempDir()
 	dst := filepath.Join(parent, "dst")

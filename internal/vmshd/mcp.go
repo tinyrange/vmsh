@@ -64,23 +64,27 @@ type mcpEndpoint struct {
 	server    *http.Server
 	control   *client.Client
 
-	mu              sync.Mutex
-	credentials     map[string]string
-	vms             map[string]mcpVM
-	commands        map[string]*mcpCommand
-	artifacts       map[string]*mcpArtifact
-	contexts        map[string]*mcpGuestContext
-	stopping        map[string]struct{}
-	starting        int
-	openingContexts int
-	closed          bool
-	cleanupTimeout  time.Duration
+	mu               sync.Mutex
+	credentials      map[string]string
+	vms              map[string]mcpVM
+	commands         map[string]*mcpCommand
+	artifacts        map[string]*mcpArtifact
+	contexts         map[string]*mcpGuestContext
+	stopping         map[string]struct{}
+	quarantined      map[string]struct{}
+	starting         int
+	openingContexts  int
+	artifactOps      int
+	artifactInFlight int64
+	closed           bool
+	cleanupTimeout   time.Duration
 }
 
 type mcpVM struct {
-	ID    string `json:"id"`
-	Name  string `json:"name,omitempty"`
-	Image string `json:"image"`
+	ID     string `json:"id"`
+	Name   string `json:"name,omitempty"`
+	Image  string `json:"image"`
+	Status string `json:"status,omitempty"`
 }
 
 func newMCPManager(token string) *mcpManager {
@@ -131,6 +135,7 @@ func (m *mcpManager) Start(sessionID string) (MCPEndpointInfo, error) {
 		artifacts:   make(map[string]*mcpArtifact),
 		contexts:    make(map[string]*mcpGuestContext),
 		stopping:    make(map[string]struct{}),
+		quarantined: make(map[string]struct{}),
 	}
 	handler := http.MaxBytesHandler(endpoint.handler(), mcpMaxRequestBytes)
 	endpoint.server = &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: mcpRequestReadTimeout, IdleTimeout: 2 * time.Minute}
@@ -502,6 +507,11 @@ func (e *mcpEndpoint) listVMs(context.Context, *mcp.CallToolRequest, mcpListVMsI
 	e.mu.Lock()
 	vms := make([]mcpVM, 0, len(e.vms))
 	for _, vm := range e.vms {
+		if _, quarantined := e.quarantined[vm.ID]; quarantined {
+			vm.Status = "quarantined"
+		} else {
+			vm.Status = "running"
+		}
 		vms = append(vms, vm)
 	}
 	e.mu.Unlock()
@@ -524,13 +534,17 @@ func (e *mcpEndpoint) stopVM(ctx context.Context, _ *mcp.CallToolRequest, in mcp
 	cleanupErr := e.cancelVMWork(ctx, id)
 	if err := e.control.ShutdownInstanceWithIDContext(ctx, id); err != nil {
 		e.mu.Lock()
-		delete(e.stopping, id)
+		if e.quarantined == nil {
+			e.quarantined = make(map[string]struct{})
+		}
+		e.quarantined[id] = struct{}{}
 		e.mu.Unlock()
 		return nil, mcpStopVMOutput{}, errors.Join(cleanupErr, fmt.Errorf("stop VM: %w", err))
 	}
 	e.mu.Lock()
 	delete(e.vms, id)
 	delete(e.stopping, id)
+	delete(e.quarantined, id)
 	e.mu.Unlock()
 	if cleanupErr != nil {
 		return nil, mcpStopVMOutput{}, fmt.Errorf("VM %q stopped but MCP cleanup was incomplete: %w", id, cleanupErr)
@@ -606,6 +620,10 @@ func (e *mcpEndpoint) beginVMStop(id string) (string, error) {
 		return "", fmt.Errorf("VM %q is not owned by this MCP session", id)
 	}
 	if _, ok := e.stopping[id]; ok {
+		if _, quarantined := e.quarantined[id]; quarantined {
+			delete(e.quarantined, id)
+			return id, nil
+		}
 		return "", fmt.Errorf("VM %q is already stopping", id)
 	}
 	if e.stopping == nil {
@@ -639,6 +657,7 @@ func (e *mcpEndpoint) close() error {
 		ids = append(ids, id)
 	}
 	e.vms = make(map[string]mcpVM)
+	e.quarantined = make(map[string]struct{})
 	e.mu.Unlock()
 	var errs []error
 	errs = append(errs, cancelAndWaitMCPWork(context.Background(), e.workCleanupTimeout(), commands, contexts))
@@ -673,6 +692,80 @@ func (e *mcpEndpoint) cancelVMWork(ctx context.Context, vmID string) error {
 	}
 	e.mu.Unlock()
 	return cancelAndWaitMCPWork(ctx, e.workCleanupTimeout(), commands, contexts)
+}
+
+func (e *mcpEndpoint) containPrivilegedCancellation(vmID, commandID string) mcpContainmentResult {
+	e.mu.Lock()
+	if _, ok := e.vms[vmID]; !ok {
+		e.mu.Unlock()
+		return mcpContainmentResult{action: "VM was already stopped"}
+	}
+	if _, stopping := e.stopping[vmID]; stopping {
+		e.mu.Unlock()
+		return mcpContainmentResult{action: "VM stop was already in progress"}
+	}
+	e.stopping[vmID] = struct{}{}
+	var commands []*mcpCommand
+	for id, command := range e.commands {
+		if id != commandID && command.vmID == vmID {
+			commands = append(commands, command)
+		}
+	}
+	var contexts []*mcpGuestContext
+	for id, guest := range e.contexts {
+		if guest.vmID == vmID {
+			contexts = append(contexts, guest)
+			delete(e.contexts, id)
+		}
+	}
+	e.mu.Unlock()
+
+	for _, command := range commands {
+		command.requestCancel()
+	}
+	for _, guest := range contexts {
+		guest.stop()
+	}
+
+	recoveryID, idErr := randomMCPID("recovery")
+	recoveryImage := ""
+	var preserveErr error
+	if idErr != nil {
+		preserveErr = fmt.Errorf("allocate recovery image name: %w", idErr)
+	} else {
+		recoveryImage = "vmsh-mcp-" + strings.ReplaceAll(recoveryID, "_", "-")
+		preserveCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		flushErr := e.control.FlushInstanceContext(preserveCtx, vmID)
+		_, saveErr := e.control.SaveInstanceImageContext(preserveCtx, vmID, client.SaveImageRequest{Name: recoveryImage})
+		cancel()
+		if saveErr != nil {
+			recoveryImage = ""
+			preserveErr = errors.Join(flushErr, fmt.Errorf("preserve COW filesystem: %w", saveErr))
+		} else if flushErr != nil {
+			preserveErr = fmt.Errorf("recovery image was saved after flush failed: %w", flushErr)
+		}
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	stopErr := e.control.ShutdownInstanceWithIDContext(stopCtx, vmID)
+	stopCancel()
+	e.mu.Lock()
+	if stopErr == nil {
+		delete(e.vms, vmID)
+		delete(e.stopping, vmID)
+		delete(e.quarantined, vmID)
+	} else {
+		if e.quarantined == nil {
+			e.quarantined = make(map[string]struct{})
+		}
+		e.quarantined[vmID] = struct{}{}
+	}
+	e.mu.Unlock()
+	action := "VM stopped after privileged command cancellation"
+	if stopErr != nil {
+		action = "VM quarantined after privileged command cancellation; host stop failed"
+	}
+	return mcpContainmentResult{action: action, recoveryImage: recoveryImage, err: errors.Join(preserveErr, stopErr)}
 }
 
 func (e *mcpEndpoint) workCleanupTimeout() time.Duration {

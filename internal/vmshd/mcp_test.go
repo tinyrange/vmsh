@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -518,6 +519,201 @@ func TestMCPAsyncCommandSeparatesOutputAndCancels(t *testing.T) {
 	}
 }
 
+func TestMCPPrivilegedCancellationPreservesFilesystemThenStopsVM(t *testing.T) {
+	started := make(chan struct{})
+	var lifecycle []string
+	var lifecycleMu sync.Mutex
+	mux := http.NewServeMux()
+	commandHandler := websocket.Handler(func(ws *websocket.Conn) {
+		defer ws.Close()
+		var req client.RunRequest
+		if err := websocket.JSON.Receive(ws, &req); err != nil {
+			return
+		}
+		close(started)
+		for {
+			var input client.ExecInput
+			if err := websocket.JSON.Receive(ws, &input); err != nil {
+				return
+			}
+			if input.Kind == "signal" {
+				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 143})
+				return
+			}
+		}
+	})
+	mux.Handle("/vm/run", commandHandler)
+	mux.Handle("/vm/run/stream", commandHandler)
+	mux.HandleFunc("POST /vm/owned/flush", func(w http.ResponseWriter, _ *http.Request) {
+		lifecycleMu.Lock()
+		lifecycle = append(lifecycle, "flush")
+		lifecycleMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]string{"status": "flushed"})
+	})
+	mux.HandleFunc("POST /vm/owned/save", func(w http.ResponseWriter, r *http.Request) {
+		var req client.SaveImageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+			http.Error(w, "invalid recovery request", http.StatusBadRequest)
+			return
+		}
+		lifecycleMu.Lock()
+		lifecycle = append(lifecycle, "save")
+		lifecycleMu.Unlock()
+		writeJSON(w, http.StatusOK, client.ImageState{Name: req.Name, Status: "ready"})
+	})
+	mux.HandleFunc("POST /vm/shutdown", func(w http.ResponseWriter, _ *http.Request) {
+		lifecycleMu.Lock()
+		lifecycle = append(lifecycle, "stop")
+		lifecycleMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]bool{"stopped": true})
+	})
+	control := httptest.NewServer(mux)
+	defer control.Close()
+	endpoint := &mcpEndpoint{
+		control: client.NewClient(control.URL, nil), vms: map[string]mcpVM{"owned": {ID: "owned"}}, stopping: make(map[string]struct{}),
+		commands: make(map[string]*mcpCommand), artifacts: make(map[string]*mcpArtifact), contexts: make(map[string]*mcpGuestContext),
+	}
+	command, err := endpoint.startCommand(mcpRunVMInput{VMID: "owned", Command: []string{"sleep", "60"}, User: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("privileged command did not start")
+	}
+	_, result, err := endpoint.cancelVMCommand(t.Context(), nil, mcpCommandCancelInput{CommandID: command.id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RecoveryImage == "" || result.ContainmentAction == "" || result.ContainmentError != "" {
+		t.Fatalf("privileged cancellation result = %#v", result)
+	}
+	if _, err := endpoint.ownedVM("owned"); err == nil {
+		t.Fatal("privileged cancellation left the VM runnable")
+	}
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	if !slices.Equal(lifecycle, []string{"flush", "save", "stop"}) {
+		t.Fatalf("containment lifecycle = %#v", lifecycle)
+	}
+}
+
+func TestMCPPrivilegedContainmentFailuresAreExplicit(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		failSave     bool
+		failStop     bool
+		wantRecovery bool
+		wantRetained bool
+	}{
+		{name: "filesystem preservation fails", failSave: true},
+		{name: "host stop fails after preservation", failStop: true, wantRecovery: true, wantRetained: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("POST /vm/owned/flush", func(w http.ResponseWriter, _ *http.Request) {
+				writeJSON(w, http.StatusOK, map[string]string{"status": "flushed"})
+			})
+			mux.HandleFunc("POST /vm/owned/save", func(w http.ResponseWriter, r *http.Request) {
+				if tc.failSave {
+					http.Error(w, "save failed", http.StatusInternalServerError)
+					return
+				}
+				var req client.SaveImageRequest
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				writeJSON(w, http.StatusOK, client.ImageState{Name: req.Name, Status: "ready"})
+			})
+			mux.HandleFunc("POST /vm/shutdown", func(w http.ResponseWriter, _ *http.Request) {
+				if tc.failStop {
+					http.Error(w, "stop failed", http.StatusInternalServerError)
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]bool{"stopped": true})
+			})
+			control := httptest.NewServer(mux)
+			defer control.Close()
+			endpoint := &mcpEndpoint{
+				control: client.NewClient(control.URL, nil), vms: map[string]mcpVM{"owned": {ID: "owned"}}, stopping: make(map[string]struct{}),
+				commands: make(map[string]*mcpCommand), contexts: make(map[string]*mcpGuestContext),
+			}
+			result := endpoint.containPrivilegedCancellation("owned", "command")
+			if result.err == nil || result.action == "" || (result.recoveryImage != "") != tc.wantRecovery {
+				t.Fatalf("containment failure result = %#v", result)
+			}
+			endpoint.mu.Lock()
+			_, retained := endpoint.vms["owned"]
+			_, quarantined := endpoint.stopping["owned"]
+			endpoint.mu.Unlock()
+			if retained != tc.wantRetained || quarantined != tc.wantRetained {
+				t.Fatalf("retained/quarantined = %v/%v", retained, quarantined)
+			}
+		})
+	}
+}
+
+func TestMCPOutputUsesBinaryEncodingWhenJSONTextWouldExpand(t *testing.T) {
+	data := bytes.Repeat([]byte{0}, 1024)
+	chunk := commandOutputChunk(data, int64(len(data)), false, 0, len(data))
+	if chunk.Text != "" || chunk.Base64 == "" {
+		t.Fatalf("NUL-heavy output encoding = %#v", chunk)
+	}
+	plain := commandOutputChunk([]byte("ordinary text\n"), 14, false, 0, 14)
+	if plain.Text != "ordinary text\n" || plain.Base64 != "" {
+		t.Fatalf("plain output encoding = %#v", plain)
+	}
+}
+
+func TestMCPArtifactOperationsReserveSessionMemory(t *testing.T) {
+	endpoint := &mcpEndpoint{artifacts: make(map[string]*mcpArtifact)}
+	reservations := make([]*mcpArtifactReservation, 0, mcpMaxArtifactOperations)
+	for range mcpMaxArtifactOperations {
+		reservation, err := endpoint.beginArtifactOperation(mcpMaxArtifactBytes)
+		if err != nil {
+			t.Fatalf("reserve bounded artifact operation: %v", err)
+		}
+		reservations = append(reservations, reservation)
+	}
+	if _, err := endpoint.beginArtifactOperation(0); err == nil {
+		t.Fatal("artifact operation exceeded the session concurrency limit")
+	}
+	for _, reservation := range reservations {
+		reservation.release()
+	}
+	reservation, err := endpoint.beginArtifactOperation(mcpMaxArtifactBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reservation.release()
+	if _, err := reservation.storeArtifact(strings.Repeat("x", mcpMaxArtifactNameBytes+1), "vm", "/file", []byte("data")); err == nil {
+		t.Fatal("oversized retained artifact label was accepted")
+	}
+}
+
+func TestMCPArchiveRejectsOversizedSparseLogicalFile(t *testing.T) {
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	logicalSize := int64(mcpMaxArtifactBytes + 1)
+	header := &tar.Header{
+		Name: "sparse", Typeflag: tar.TypeReg, Mode: 0o644, Size: 1, Format: tar.FormatPAX,
+		PAXRecords: map[string]string{
+			"VMSH.sparse.size":      strconv.FormatInt(logicalSize, 10),
+			"VMSH.sparse.numblocks": "1",
+			"VMSH.sparse.map":       strconv.FormatInt(logicalSize-1, 10) + ",1",
+		},
+	}
+	if err := tw.WriteHeader(header); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = tw.Write([]byte{'x'})
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMCPArchive(archive.Bytes()); err == nil {
+		t.Fatal("oversized sparse logical file passed MCP archive validation")
+	}
+}
+
 func TestMCPCommandStreamsLargeStdinToEOF(t *testing.T) {
 	stdin := bytes.Repeat([]byte{0x00, 0xff, 0x7f, 0x80}, 256<<10)
 	received := make(chan []byte, 1)
@@ -601,10 +797,13 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 		if err := websocket.JSON.Receive(ws, &req); err != nil {
 			return
 		}
-		if len(req.Command) >= 3 && (strings.Contains(req.Command[2], `tail -c`) || strings.HasPrefix(req.Command[2], "rm -f ")) {
+		if len(req.Command) >= 3 && (strings.Contains(req.Command[2], `tail -c`) || strings.Contains(req.Command[2], `wc -c`) || strings.HasPrefix(req.Command[2], "rm -f ") || slices.Equal(req.Command[:2], []string{"/bin/rm", "-f"})) {
 			var input client.ExecInput
 			if err := websocket.JSON.Receive(ws, &input); err != nil || input.Kind != "stdin_close" {
 				return
+			}
+			if len(req.Command) >= 3 && strings.Contains(req.Command[2], `wc -c`) {
+				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte("0\n")})
 			}
 			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 0})
 			return
@@ -903,6 +1102,48 @@ func TestMCPContextCaptureKeepsBackgroundOutputWithItsOriginatingCommand(t *test
 	}
 }
 
+func TestMCPContextCaptureIgnoresPersistentUmaskAndBoundsFiles(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	tempDir := t.TempDir()
+	controlPath := filepath.Join(tempDir, "private", "control")
+	firstOut := filepath.Join(tempDir, "private", "first.stdout")
+	firstErr := filepath.Join(tempDir, "private", "first.stderr")
+	secondOut := filepath.Join(tempDir, "private", "second.stdout")
+	secondErr := filepath.Join(tempDir, "private", "second.stderr")
+	thirdOut := filepath.Join(tempDir, "private", "third.stdout")
+	thirdErr := filepath.Join(tempDir, "private", "third.stderr")
+	controlR, controlW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controlR.Close()
+	cmd := exec.Command("/bin/sh", "-c", mcpContextShellScriptForShell(controlPath, "/bin/sh"))
+	cmd.Stdin = strings.NewReader(
+		mcpContextCommandCaptureScript("marker_one", "umask 022", controlPath, firstOut, firstErr) +
+			mcpContextCommandCaptureScript("marker_two", "umask 777", controlPath, secondOut, secondErr) +
+			mcpContextCommandCaptureScript("marker_three", "dd if=/dev/zero bs=1048576 count=5 2>/dev/null || :", controlPath, thirdOut, thirdErr),
+	)
+	cmd.ExtraFiles = []*os.File{controlW}
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run bounded context captures: %v; output=%q", err, output)
+	}
+	_ = controlW.Close()
+	for _, name := range []string{firstOut, firstErr, secondOut, secondErr, thirdOut, thirdErr} {
+		info, err := os.Stat(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("capture %s mode = %#o", filepath.Base(name), info.Mode().Perm())
+		}
+		if info.Size() > mcpMaxCommandStreamBytes {
+			t.Fatalf("capture %s grew to %d bytes", filepath.Base(name), info.Size())
+		}
+	}
+}
+
 func TestMCPGuestWorkDirPreservesNonemptyBytes(t *testing.T) {
 	linuxVM := mcpVM{Image: "alpine"}
 	if got := mcpGuestWorkDir(linuxVM, " "); got != " " {
@@ -925,6 +1166,9 @@ func TestMCPContextPreservesOutputAccountingTimeoutBytesAndPrivateFraming(t *tes
 		var input client.ExecInput
 		if err := websocket.JSON.Receive(ws, &input); err != nil || input.Kind != "stdin_close" {
 			return
+		}
+		if len(req.Command) >= 3 && strings.Contains(req.Command[2], `wc -c`) {
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte("0\n")})
 		}
 		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 0})
 	}))
@@ -1054,6 +1298,9 @@ func TestMCPAsyncContextCommandsAllowSequentialLifecycleInterruption(t *testing.
 		var input client.ExecInput
 		if err := websocket.JSON.Receive(ws, &input); err != nil || input.Kind != "stdin_close" {
 			return
+		}
+		if len(req.Command) >= 3 && strings.Contains(req.Command[2], `wc -c`) {
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte("0\n")})
 		}
 		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 0})
 	}))
