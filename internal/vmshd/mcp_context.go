@@ -309,6 +309,14 @@ func (c *mcpCommand) runGuestContext(ctx context.Context, guest *mcpGuestContext
 	c.asyncStderrTotal = result.asyncStderrTotal
 	c.asyncStdoutTruncated = result.asyncStdoutTruncated
 	c.asyncStderrTruncated = result.asyncStderrTruncated
+	if runCtx.Err() != nil && c.cancellationUnverifiable && c.containmentError == "" {
+		c.markPrivilegedCancellationUnverifiableLocked()
+	}
+	if c.containmentError != "" {
+		c.status = "termination_unconfirmed"
+		c.exitCode = nil
+		return
+	}
 	if runCtx.Err() == context.DeadlineExceeded {
 		c.status = "timed_out"
 		code := 124

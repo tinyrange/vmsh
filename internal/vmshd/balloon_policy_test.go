@@ -1,7 +1,9 @@
 package vmshd
 
 import (
+	"errors"
 	"testing"
+	"time"
 
 	"j5.nz/cc/client"
 )
@@ -143,6 +145,19 @@ func TestRuntimePolicyPreservesExplicitMemoryAndBalloon(t *testing.T) {
 	}
 }
 
+func TestRuntimePolicyDoesNotClassifyExplicitMemoryAsAutomatic(t *testing.T) {
+	srv := NewServer("secret")
+	srv.balloon = newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 0}})
+	req := client.StartInstanceRequest{ID: "explicit-memory", MemoryMB: 2048}
+	srv.normalizeStartRequest(&req, nil)
+	if req.MemoryMB != 2048 || req.BalloonMB != 0 {
+		t.Fatalf("explicit request changed to %+v", req)
+	}
+	if srv.balloon.isAutomatic(req.ID) {
+		t.Fatal("explicit memory request was enrolled in automatic ballooning")
+	}
+}
+
 func TestRuntimePolicyReclaimsAndRestoresMemoryFromObservedHostPressure(t *testing.T) {
 	memory := fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 256}}
 	srv := NewServer("secret")
@@ -183,6 +198,57 @@ func TestRuntimePressureDoesNotOverrideExplicitBalloonTarget(t *testing.T) {
 	}
 	if called {
 		t.Fatal("host pressure policy changed an explicit balloon target")
+	}
+}
+
+func TestRuntimePressureContinuesAfterIndependentBalloonFailure(t *testing.T) {
+	srv := NewServer("secret")
+	srv.balloon = newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 0}})
+	srv.balloon.setAutomatic("a-failing", true)
+	srv.balloon.setAutomatic("b-healthy", true)
+	wantErr := errors.New("wedged balloon")
+	var healthyTarget uint64
+	runtime := fakeRuntimeView{
+		statuses: []client.InstanceState{
+			{ID: "a-failing", Status: "running", MemoryMB: 2048},
+			{ID: "b-healthy", Status: "running", MemoryMB: 2048},
+		},
+		balloon: func(id string, target uint64) error {
+			if id == "a-failing" {
+				return wantErr
+			}
+			healthyTarget = target
+			return nil
+		},
+	}
+	if err := srv.reconcileBalloonPressure(runtime); !errors.Is(err, wantErr) {
+		t.Fatalf("reconcile error = %v", err)
+	}
+	if healthyTarget == 0 {
+		t.Fatal("healthy VM was not adjusted after another balloon failed")
+	}
+}
+
+func TestBalloonPolicyPrunesStoppedAndFailedStartEntries(t *testing.T) {
+	srv := NewServer("secret")
+	srv.balloon = newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 4096}})
+	for _, id := range []string{"active", "stopped", "failed-start"} {
+		srv.balloon.setAutomatic(id, true)
+	}
+	srv.balloon.mu.Lock()
+	failed := srv.balloon.automatic["failed-start"]
+	failed.createdAt = time.Now().Add(-2 * time.Minute)
+	srv.balloon.automatic["failed-start"] = failed
+	srv.balloon.mu.Unlock()
+	runtime := fakeRuntimeView{statuses: []client.InstanceState{
+		{ID: "active", Status: "running", MemoryMB: 2048},
+		{ID: "stopped", Status: "stopped", MemoryMB: 2048},
+	}}
+	if err := srv.reconcileBalloonPressure(runtime); err != nil {
+		t.Fatal(err)
+	}
+	if !srv.balloon.isAutomatic("active") || srv.balloon.isAutomatic("stopped") || srv.balloon.isAutomatic("failed-start") {
+		t.Fatalf("policy lifecycle entries = %+v", srv.balloon.automatic)
 	}
 }
 

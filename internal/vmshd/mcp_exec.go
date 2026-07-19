@@ -79,30 +79,31 @@ type mcpCommand struct {
 	cancel    context.CancelFunc
 	done      chan struct{}
 
-	mu                   sync.Mutex
-	status               string
-	exitCode             *int
-	stdout               []byte
-	stderr               []byte
-	stdoutTotal          int64
-	stderrTotal          int64
-	stdoutTruncated      bool
-	stderrTruncated      bool
-	timedOut             bool
-	asyncStdout          []byte
-	asyncStderr          []byte
-	asyncStdoutTotal     int64
-	asyncStderrTotal     int64
-	asyncStdoutTruncated bool
-	asyncStderrTruncated bool
-	err                  string
-	startedAt            time.Time
-	finishedAt           *time.Time
-	cancelRequested      bool
-	cancelOnce           sync.Once
-	terminateOverride    func()
-	containmentAction    string
-	containmentError     string
+	mu                       sync.Mutex
+	status                   string
+	exitCode                 *int
+	stdout                   []byte
+	stderr                   []byte
+	stdoutTotal              int64
+	stderrTotal              int64
+	stdoutTruncated          bool
+	stderrTruncated          bool
+	timedOut                 bool
+	asyncStdout              []byte
+	asyncStderr              []byte
+	asyncStdoutTotal         int64
+	asyncStderrTotal         int64
+	asyncStdoutTruncated     bool
+	asyncStderrTruncated     bool
+	err                      string
+	startedAt                time.Time
+	finishedAt               *time.Time
+	cancelRequested          bool
+	cancelOnce               sync.Once
+	terminateOverride        func()
+	containmentAction        string
+	containmentError         string
+	cancellationUnverifiable bool
 }
 
 func (e *mcpEndpoint) runVM(ctx context.Context, _ *mcp.CallToolRequest, in mcpRunVMInput) (*mcp.CallToolResult, mcpCommandOutput, error) {
@@ -289,6 +290,7 @@ func (e *mcpEndpoint) startCommand(in mcpRunVMInput) (*mcpCommand, error) {
 		id: commandID, vmID: id, cancel: cancel, done: make(chan struct{}), status: "running", startedAt: time.Now().UTC(),
 		request: client.RunRequest{Command: append([]string(nil), in.Command...), Env: append([]string(nil), in.Env...), WorkDir: workDir, User: user, TimeoutSeconds: in.TimeoutSeconds},
 		stdin:   stdin, inputs: make(chan client.ExecInput),
+		cancellationUnverifiable: isMCPRootUser(user),
 	}
 	if _, err := e.registerMCPCommand(command); err != nil {
 		cancel()
@@ -317,6 +319,7 @@ func (e *mcpEndpoint) registerMCPCommand(command *mcpCommand) (*mcpGuestContext,
 		default:
 		}
 		command.terminateOverride = guest.stop
+		command.cancellationUnverifiable = isMCPRootUser(guest.user)
 	}
 	if _, ok := e.vms[command.vmID]; !ok {
 		return nil, fmt.Errorf("VM %q is not owned by this MCP session", command.vmID)
@@ -353,9 +356,13 @@ func (c *mcpCommand) run(ctx context.Context, control *client.Client) {
 	c.finishedAt = &now
 	c.stdin = nil
 	c.request = client.RunRequest{}
-	if c.cancelRequested || (ctx.Err() != nil && c.status == "running") {
+	if c.timedOut && c.cancellationUnverifiable && c.containmentError == "" {
+		c.markPrivilegedCancellationUnverifiableLocked()
+	}
+	if c.cancelRequested || (ctx.Err() != nil && c.status == "running") || (c.timedOut && c.containmentError != "") {
 		if c.containmentError != "" {
 			c.status = "termination_unconfirmed"
+			c.exitCode = nil
 			if err != nil && c.err == "" && !strings.Contains(err.Error(), "context canceled") {
 				c.err = conciseCommandError(err)
 			}
@@ -448,9 +455,18 @@ func (c *mcpCommand) requestCancel() {
 	c.mu.Lock()
 	if c.status == "running" {
 		c.cancelRequested = true
+		if c.cancellationUnverifiable && c.containmentError == "" {
+			c.markPrivilegedCancellationUnverifiableLocked()
+		}
 		c.cancelOnce.Do(func() { go c.terminate() })
 	}
 	c.mu.Unlock()
+}
+
+func (c *mcpCommand) markPrivilegedCancellationUnverifiableLocked() {
+	c.containmentAction = "VM retained after unconfirmed command cancellation"
+	c.containmentError = "a privileged guest command can move descendants outside its command cgroup; leader exit does not prove descendant termination, so the VM and filesystem were retained"
+	c.err = c.containmentError
 }
 
 func (c *mcpCommand) terminate() {

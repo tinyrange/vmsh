@@ -24,7 +24,6 @@ import (
 
 const (
 	mcpMinRAMMB           = 128
-	mcpDefaultRAMMB       = 512
 	mcpDefaultCPUs        = 1
 	mcpBSDDefaultBootTime = 60 * time.Second
 	mcpWorkCleanupTimeout = 3 * time.Second
@@ -76,10 +75,15 @@ type mcpEndpoint struct {
 }
 
 type mcpVM struct {
-	ID     string `json:"id"`
-	Name   string `json:"name,omitempty"`
-	Image  string `json:"image"`
-	Status string `json:"status,omitempty"`
+	ID                    string `json:"id"`
+	Name                  string `json:"name,omitempty"`
+	Image                 string `json:"image"`
+	Status                string `json:"status,omitempty"`
+	MemoryMB              uint64 `json:"memory_mb,omitempty"`
+	BalloonMB             uint64 `json:"balloon_mb,omitempty"`
+	BackingBytes          uint64 `json:"backing_bytes,omitempty"`
+	BackingHighWaterBytes uint64 `json:"backing_high_water_bytes,omitempty"`
+	BackingReclaimError   string `json:"backing_reclaim_error,omitempty"`
 }
 
 func newMCPManager(token string) *mcpManager {
@@ -302,7 +306,7 @@ func (e *mcpEndpoint) authorized(header string) bool {
 type mcpCreateVMInput struct {
 	Image              string  `json:"image" jsonschema:"guest image to boot, for example alpine or @freebsd"`
 	Name               string  `json:"name,omitempty" jsonschema:"optional human-readable name unique within this MCP session"`
-	MemoryMB           uint64  `json:"memory_mb,omitempty" jsonschema:"guest memory in MiB, minimum 128 and default 512; the host reports allocation failures"`
+	MemoryMB           uint64  `json:"memory_mb,omitempty" jsonschema:"guest memory in MiB, minimum 128 when specified; omitted selects host-observed automatic memory with dynamic pressure recovery"`
 	CPUs               int     `json:"cpus,omitempty" jsonschema:"virtual CPU count, default 1; CPU oversubscription is allowed"`
 	BootTimeoutSeconds float64 `json:"boot_timeout_seconds,omitempty" jsonschema:"bounded VM boot deadline; built-in BSD guests default to 60 seconds"`
 }
@@ -321,13 +325,10 @@ func (e *mcpEndpoint) createVM(ctx context.Context, _ *mcp.CallToolRequest, in m
 		return nil, mcpCreateVMOutput{}, fmt.Errorf("%q is a legacy recovery image, not an isolated guest image; inspect or delete it with the host vmsh image APIs", image)
 	}
 	image = canonicalMCPBuiltinImage(image)
-	if in.MemoryMB == 0 {
-		in.MemoryMB = mcpDefaultRAMMB
-	}
 	if in.CPUs == 0 {
 		in.CPUs = mcpDefaultCPUs
 	}
-	if in.MemoryMB < mcpMinRAMMB {
+	if in.MemoryMB != 0 && in.MemoryMB < mcpMinRAMMB {
 		return nil, mcpCreateVMOutput{}, fmt.Errorf("memory_mb must be at least %d MiB", mcpMinRAMMB)
 	}
 	if in.CPUs < 1 {
@@ -381,14 +382,14 @@ func (e *mcpEndpoint) createVM(ctx context.Context, _ *mcp.CallToolRequest, in m
 			}
 		}
 	}
-	_, err = e.control.StartInstanceStreamWithIDContext(ctx, id, client.StartInstanceRequest{
+	state, err := e.control.StartInstanceStreamWithIDContext(ctx, id, client.StartInstanceRequest{
 		Image: image, MemoryMB: in.MemoryMB, CPUs: in.CPUs,
 		Network: vmconfig.IsolatedNetworkConfig(), TimeoutSeconds: in.BootTimeoutSeconds,
 	}, nil)
 	if err != nil {
 		return nil, mcpCreateVMOutput{}, fmt.Errorf("create VM: %w", err)
 	}
-	vm := mcpVM{ID: id, Name: baseName, Image: image}
+	vm := mcpVM{ID: id, Name: baseName, Image: image, Status: state.Status, MemoryMB: state.MemoryMB, BalloonMB: state.BalloonMB}
 	e.mu.Lock()
 	if e.closed {
 		e.mu.Unlock()
@@ -508,10 +509,16 @@ func mcpDockerHubSource(image string) string {
 
 type mcpListVMsInput struct{}
 type mcpListVMsOutput struct {
-	VMs []mcpVM `json:"vms"`
+	VMs              []mcpVM `json:"vms"`
+	ObservationError string  `json:"observation_error,omitempty"`
 }
 
-func (e *mcpEndpoint) listVMs(context.Context, *mcp.CallToolRequest, mcpListVMsInput) (*mcp.CallToolResult, mcpListVMsOutput, error) {
+func (e *mcpEndpoint) listVMs(ctx context.Context, _ *mcp.CallToolRequest, _ mcpListVMsInput) (*mcp.CallToolResult, mcpListVMsOutput, error) {
+	states, observationErr := e.control.InstanceStatusesContext(ctx)
+	observed := make(map[string]client.InstanceState, len(states))
+	for _, state := range states {
+		observed[state.ID] = state
+	}
 	e.mu.Lock()
 	vms := make([]mcpVM, 0, len(e.vms))
 	for _, vm := range e.vms {
@@ -520,11 +527,23 @@ func (e *mcpEndpoint) listVMs(context.Context, *mcp.CallToolRequest, mcpListVMsI
 		} else {
 			vm.Status = "running"
 		}
+		if state, ok := observed[vm.ID]; ok {
+			vm.Status = state.Status
+			vm.MemoryMB = state.MemoryMB
+			vm.BalloonMB = state.BalloonMB
+			vm.BackingBytes = state.BackingBytes
+			vm.BackingHighWaterBytes = state.BackingHighWaterBytes
+			vm.BackingReclaimError = state.BackingReclaimError
+		}
 		vms = append(vms, vm)
 	}
 	e.mu.Unlock()
 	sort.Slice(vms, func(i, j int) bool { return vms[i].ID < vms[j].ID })
-	return nil, mcpListVMsOutput{VMs: vms}, nil
+	out := mcpListVMsOutput{VMs: vms}
+	if observationErr != nil {
+		out.ObservationError = conciseCommandError(observationErr)
+	}
+	return nil, out, nil
 }
 
 type mcpStopVMInput struct {

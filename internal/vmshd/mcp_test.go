@@ -324,7 +324,7 @@ func TestMCPEndpointIsScopedToOwnedIsolatedVMs(t *testing.T) {
 	}
 	bsdStart := starts[1]
 	mu.Unlock()
-	if bsdStart.Image != "@netbsd" || bsdStart.CPUs != 1 || bsdStart.TimeoutSeconds != mcpBSDDefaultBootTime.Seconds() {
+	if bsdStart.Image != "@netbsd" || bsdStart.MemoryMB != 0 || bsdStart.CPUs != 1 || bsdStart.TimeoutSeconds != mcpBSDDefaultBootTime.Seconds() {
 		t.Fatalf("built-in BSD start request = %#v", bsdStart)
 	}
 	bsdRun, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "vm_run", Arguments: map[string]any{
@@ -407,6 +407,29 @@ func TestMCPCreateVMCancelsBootStreamWithoutClaimingTheVM(t *testing.T) {
 	defer endpoint.mu.Unlock()
 	if len(endpoint.vms) != 0 || endpoint.starting != 0 {
 		t.Fatalf("canceled boot retained MCP ownership: vms=%v starting=%d", endpoint.vms, endpoint.starting)
+	}
+}
+
+func TestMCPListReportsObservedMemoryAndBackingUsage(t *testing.T) {
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/vm" {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, []client.InstanceState{{
+			ID: "one", Status: "running", MemoryMB: 4096, BalloonMB: 768,
+			BackingBytes: 1024, BackingHighWaterBytes: 4096, BackingReclaimError: "disk refused reclaim",
+		}})
+	}))
+	defer control.Close()
+	endpoint := &mcpEndpoint{control: client.NewClient(control.URL, nil), vms: map[string]mcpVM{"one": {ID: "one", Image: "alpine"}}}
+	_, listed, err := endpoint.listVMs(t.Context(), nil, mcpListVMsInput{})
+	if err != nil || listed.ObservationError != "" || len(listed.VMs) != 1 {
+		t.Fatalf("list VMs = %#v, %v", listed, err)
+	}
+	vm := listed.VMs[0]
+	if vm.MemoryMB != 4096 || vm.BalloonMB != 768 || vm.BackingBytes != 1024 || vm.BackingHighWaterBytes != 4096 || vm.BackingReclaimError != "disk refused reclaim" {
+		t.Fatalf("observed VM = %#v", vm)
 	}
 }
 
@@ -517,6 +540,15 @@ func TestMCPAsyncCommandSeparatesOutputAndCancels(t *testing.T) {
 	timeoutResult := timeoutCommand.snapshot(0, 0, 1024, false)
 	if timeoutResult.Status != "timed_out" || timeoutResult.ExitCode == nil || *timeoutResult.ExitCode != 124 {
 		t.Fatalf("structured timeout result = %#v", timeoutResult)
+	}
+	rootTimeout, err := endpoint.startCommand(mcpRunVMInput{VMID: "owned", Command: []string{"timeout"}, TimeoutSeconds: 1, User: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-rootTimeout.done
+	rootTimeoutResult := rootTimeout.snapshot(0, 0, 1024, false)
+	if rootTimeoutResult.Status != "termination_unconfirmed" || rootTimeoutResult.ExitCode != nil || rootTimeoutResult.ContainmentError == "" {
+		t.Fatalf("privileged timeout result = %#v", rootTimeoutResult)
 	}
 	paged := command.snapshot(1, 0, 2, false)
 	if paged.Stdout.Text != "ut" || paged.Stdout.NextOffset != 3 || paged.Stdout.TotalBytes != 4 || paged.Output != "" {
@@ -650,7 +682,7 @@ func TestMCPUnconfirmedTerminationIsNotReportedAsCanceled(t *testing.T) {
 	}
 }
 
-func TestMCPPrivilegedCancellationReapsCommandWithoutStoppingVM(t *testing.T) {
+func TestMCPPrivilegedCancellationDoesNotClaimDetachedDescendantsWereReaped(t *testing.T) {
 	started := make(chan struct{})
 	mux := http.NewServeMux()
 	commandHandler := websocket.Handler(func(ws *websocket.Conn) {
@@ -692,7 +724,7 @@ func TestMCPPrivilegedCancellationReapsCommandWithoutStoppingVM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Status != "canceled" || result.ContainmentAction != "" || result.ContainmentError != "" {
+	if result.Status != "termination_unconfirmed" || result.ExitCode != nil || result.ContainmentAction == "" || result.ContainmentError == "" {
 		t.Fatalf("privileged cancellation result = %#v", result)
 	}
 	if _, err := endpoint.ownedVM("owned"); err != nil {
@@ -1699,15 +1731,131 @@ func assertNoRunningMCPCommands(t *testing.T, endpoint *mcpEndpoint) {
 
 func structuredToolOutput[T any](t *testing.T, result *mcp.CallToolResult) T {
 	t.Helper()
-	encoded, err := json.Marshal(result.StructuredContent)
+	output, err := decodeStructuredToolOutput[T](result)
 	if err != nil {
-		t.Fatalf("encode structured tool output: %v", err)
-	}
-	var output T
-	if err := json.Unmarshal(encoded, &output); err != nil {
-		t.Fatalf("decode structured tool output: %v", err)
+		t.Fatal(err)
 	}
 	return output
+}
+
+func decodeStructuredToolOutput[T any](result *mcp.CallToolResult) (T, error) {
+	var output T
+	encoded, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		return output, fmt.Errorf("encode structured tool output: %w", err)
+	}
+	if err := json.Unmarshal(encoded, &output); err != nil {
+		return output, fmt.Errorf("decode structured tool output: %w", err)
+	}
+	return output, nil
+}
+
+func TestMCPKVMContextFanout(t *testing.T) {
+	endpoint, token := os.Getenv("VMSH_MCP_INTEGRATION_URL"), os.Getenv("VMSH_MCP_INTEGRATION_TOKEN")
+	if endpoint == "" || token == "" {
+		t.Skip("set VMSH_MCP_INTEGRATION_URL and VMSH_MCP_INTEGRATION_TOKEN for live KVM coverage")
+	}
+	mcpClient := mcp.NewClient(&mcp.Implementation{Name: "vmsh-context-fanout-test", Version: "1"}, nil)
+	session, err := mcpClient.Connect(t.Context(), &mcp.StreamableClientTransport{
+		Endpoint: endpoint, HTTPClient: &http.Client{Transport: mcpBearerTransport{token: token}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	created, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_create", Arguments: map[string]any{
+		"image": "alpine", "name": "context-fanout",
+	}})
+	if err != nil || created.IsError {
+		t.Fatalf("create VM = %#v, %v", created, err)
+	}
+	vm := structuredToolOutput[mcpCreateVMOutput](t, created).VM
+	defer func() {
+		_, _ = session.CallTool(context.Background(), &mcp.CallToolParams{Name: "vm_stop", Arguments: map[string]any{"vm_id": vm.ID}})
+	}()
+
+	const count = 32
+	contexts := make([]string, count)
+	errs := make(chan error, count)
+	var wg sync.WaitGroup
+	openedAt := time.Now()
+	for i := range count {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			opened, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_context_open", Arguments: map[string]any{"vm_id": vm.ID}})
+			if err != nil || opened.IsError {
+				errs <- fmt.Errorf("open context %d: result=%#v error=%v", i, opened, err)
+				return
+			}
+			info, err := decodeStructuredToolOutput[mcpContextInfo](opened)
+			if err != nil {
+				errs <- fmt.Errorf("decode context %d: %w", i, err)
+				return
+			}
+			contexts[i] = info.ContextID
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if t.Failed() {
+		return
+	}
+	openElapsed := time.Since(openedAt)
+	t.Logf("opened %d contexts in %s", count, openElapsed)
+	if openElapsed > 15*time.Second {
+		t.Fatalf("opening %d independent contexts took %s", count, openElapsed)
+	}
+
+	errs = make(chan error, count)
+	closedAt := time.Now()
+	for i := range count {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			closed, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_context_close", Arguments: map[string]any{"context_id": contexts[i]}})
+			if err != nil || closed.IsError {
+				errs <- fmt.Errorf("close context %d: result=%#v error=%v", i, closed, err)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	closeElapsed := time.Since(closedAt)
+	t.Logf("closed %d contexts in %s", count, closeElapsed)
+	if closeElapsed > 15*time.Second {
+		t.Fatalf("closing %d independent contexts took %s", count, closeElapsed)
+	}
+
+	escaped, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_exec_start", Arguments: map[string]any{
+		"vm_id": vm.ID, "user": "root", "command": []string{"sh", "-c", `echo $$ >/sys/fs/cgroup/cgroup.procs; setsid sh -c 'nohup sh -c '"'"'trap "" TERM HUP INT; sleep 300'"'"' </dev/null >/tmp/vmsh-escaped.log 2>&1 & echo $! >/tmp/vmsh-escaped.pid' </dev/null >/dev/null 2>&1; echo ready; sleep 300`},
+	}})
+	if err != nil || escaped.IsError {
+		t.Fatalf("start privileged escape = %#v, %v", escaped, err)
+	}
+	escapedCommand := structuredToolOutput[mcpCommandOutput](t, escaped)
+	_, _ = session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_exec_wait", Arguments: map[string]any{
+		"command_id": escapedCommand.CommandID, "wait_seconds": 1,
+	}})
+	canceled, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_exec_cancel", Arguments: map[string]any{
+		"command_id": escapedCommand.CommandID,
+	}})
+	if err != nil || canceled.IsError {
+		t.Fatalf("cancel privileged escape = %#v, %v", canceled, err)
+	}
+	canceledOutput := structuredToolOutput[mcpCommandOutput](t, canceled)
+	if canceledOutput.Status != "termination_unconfirmed" || canceledOutput.ExitCode != nil || canceledOutput.ContainmentError == "" {
+		t.Fatalf("privileged escape cancellation = %#v", canceledOutput)
+	}
+	_, _ = session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_run", Arguments: map[string]any{
+		"vm_id": vm.ID, "user": "root", "command": []string{"sh", "-c", `test ! -f /tmp/vmsh-escaped.pid || kill -KILL "$(cat /tmp/vmsh-escaped.pid)" 2>/dev/null || true`},
+	}})
 }
 
 func TestMCPArchiveRejectsUnsupportedEntriesBeforeImport(t *testing.T) {

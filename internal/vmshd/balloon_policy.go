@@ -2,6 +2,7 @@ package vmshd
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"slices"
 	"strings"
@@ -32,7 +33,13 @@ type balloonController struct {
 	memory    memoryObserver
 	config    balloonPolicyConfig
 	mu        sync.Mutex
-	automatic map[string]bool
+	automatic map[string]balloonPolicyEntry
+}
+
+type balloonPolicyEntry struct {
+	automatic bool
+	createdAt time.Time
+	seen      bool
 }
 
 type balloonPolicyConfig struct {
@@ -68,7 +75,7 @@ func newBalloonController(memory memoryObserver) *balloonController {
 			HysteresisMB:   defaultPolicyHysteresisMB,
 			MinUsableMB:    defaultMinimumGuestUsableMB,
 		},
-		automatic: make(map[string]bool),
+		automatic: make(map[string]balloonPolicyEntry),
 	}
 }
 
@@ -91,6 +98,11 @@ func (c *balloonController) applyStartRequest(req *client.StartInstanceRequest, 
 	if c == nil || c.memory == nil || req == nil {
 		return
 	}
+	automatic := req.MemoryMB == 0 && req.BalloonMB == 0
+	c.setAutomatic(req.ID, automatic)
+	if !automatic {
+		return
+	}
 	snapshot, err := c.memory.Snapshot()
 	if err != nil || snapshot.TotalMB == 0 {
 		return
@@ -98,12 +110,10 @@ func (c *balloonController) applyStartRequest(req *client.StartInstanceRequest, 
 	if req.MemoryMB == 0 {
 		req.MemoryMB = defaultGuestMemoryMB(snapshot.TotalMB)
 	}
-	if req.BalloonMB != 0 || req.MemoryMB == 0 {
-		c.setAutomatic(req.ID, false)
+	if req.MemoryMB == 0 {
 		return
 	}
 	req.BalloonMB = c.initialBalloonTarget(snapshot, current, req.ID, req.MemoryMB)
-	c.setAutomatic(req.ID, true)
 }
 
 func (c *balloonController) applyCreateRequest(req *client.CreateInstanceRequest, current []client.InstanceState) {
@@ -124,6 +134,11 @@ func (c *balloonController) applyRunRequest(req *client.RunRequest, current []cl
 	if c == nil || c.memory == nil || req == nil {
 		return
 	}
+	automatic := req.MemoryMB == 0 && req.BalloonMB == 0
+	c.setAutomatic(req.ID, automatic)
+	if !automatic {
+		return
+	}
 	snapshot, err := c.memory.Snapshot()
 	if err != nil || snapshot.TotalMB == 0 {
 		return
@@ -131,12 +146,10 @@ func (c *balloonController) applyRunRequest(req *client.RunRequest, current []cl
 	if req.MemoryMB == 0 {
 		req.MemoryMB = defaultGuestMemoryMB(snapshot.TotalMB)
 	}
-	if req.BalloonMB != 0 || req.MemoryMB == 0 {
-		c.setAutomatic(req.ID, false)
+	if req.MemoryMB == 0 {
 		return
 	}
 	req.BalloonMB = c.initialBalloonTarget(snapshot, current, req.ID, req.MemoryMB)
-	c.setAutomatic(req.ID, true)
 }
 
 func (c *balloonController) setAutomatic(id string, automatic bool) {
@@ -148,7 +161,7 @@ func (c *balloonController) setAutomatic(id string, automatic bool) {
 		id = "default"
 	}
 	c.mu.Lock()
-	c.automatic[id] = automatic
+	c.automatic[id] = balloonPolicyEntry{automatic: automatic, createdAt: time.Now()}
 	c.mu.Unlock()
 }
 
@@ -157,9 +170,35 @@ func (c *balloonController) isAutomatic(id string) bool {
 		return false
 	}
 	c.mu.Lock()
-	automatic := c.automatic[strings.TrimSpace(id)]
+	automatic := c.automatic[strings.TrimSpace(id)].automatic
 	c.mu.Unlock()
 	return automatic
+}
+
+func (c *balloonController) reconcileLifecycle(states []client.InstanceState, now time.Time) {
+	if c == nil {
+		return
+	}
+	present := make(map[string]client.InstanceState, len(states))
+	for _, state := range states {
+		present[strings.TrimSpace(state.ID)] = state
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for id, entry := range c.automatic {
+		state, ok := present[id]
+		if ok && state.Status == "running" {
+			entry.seen = true
+			c.automatic[id] = entry
+			continue
+		}
+		// A policy entry which reached the runtime can be removed as soon as
+		// the VM disappears. Entries for failed starts receive a short grace
+		// period so the monitor cannot race request normalization and startup.
+		if ok || entry.seen || now.Sub(entry.createdAt) >= time.Minute {
+			delete(c.automatic, id)
+		}
+	}
 }
 
 func (c *balloonController) initialBalloonTarget(snapshot memorySnapshot, current []client.InstanceState, id string, memoryMB uint64) uint64 {
@@ -340,6 +379,7 @@ func (s *Server) reconcileBalloonPressure(runtime balloonRuntime) error {
 		return err
 	}
 	states := runtime.InstanceStatuses()
+	s.balloon.reconcileLifecycle(states, time.Now())
 	vms := balloonVMsFromInstances(states)
 	vms = slices.DeleteFunc(vms, func(vm balloonVM) bool { return !s.balloon.isAutomatic(vm.ID) })
 	decisions := planBalloonTargets(snapshot, vms, s.balloon.config)
@@ -347,15 +387,16 @@ func (s *Server) reconcileBalloonPressure(runtime balloonRuntime) error {
 	for _, vm := range vms {
 		current[vm.ID] = vm.BalloonMB
 	}
+	var errs []error
 	for _, decision := range decisions {
 		if current[decision.ID] == decision.BalloonMB {
 			continue
 		}
 		if err := runtime.SetInstanceBalloon(decision.ID, decision.BalloonMB); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func min[T ~uint64](values ...T) T {
