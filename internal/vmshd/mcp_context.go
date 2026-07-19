@@ -17,9 +17,12 @@ import (
 )
 
 const (
-	mcpShellEventBuffer     = 256
-	mcpMaxContextCaptures   = 8
-	mcpContextCaptureBlocks = mcpMaxCommandStreamBytes / 512
+	mcpShellEventBuffer   = 256
+	mcpMaxContextCaptures = 8
+	// POSIX specifies 512-byte units for ulimit -f, but some supported shells
+	// expose the limit in 1 KiB units. Use the larger unit here so either
+	// interpretation keeps capture files at or below the intended limit.
+	mcpContextCaptureLimitUnits = mcpMaxCommandStreamBytes / 1024
 )
 
 type mcpGuestContext struct {
@@ -762,7 +765,7 @@ func mcpContextCommandCaptureScript(token, line, controlPath, stdoutPath, stderr
 	stdout := shellJoin([]string{stdoutPath})
 	stderr := shellJoin([]string{stderrPath})
 	return umaskVar + "=$(umask)\numask 077\n: >" + stdout + "\n: >" + stderr + "\nchmod 600 " + stdout + " " + stderr + "\numask \"$" + umaskVar + "\"\n" +
-		limitVar + "=$(ulimit -f)\nulimit -f " + strconv.Itoa(mcpContextCaptureBlocks) + " 2>/dev/null || :\n" + appliedLimitVar + "=$(ulimit -f)\n" +
+		limitVar + "=$(ulimit -f)\nulimit -f " + strconv.Itoa(mcpContextCaptureLimitUnits) + " 2>/dev/null || :\n" + appliedLimitVar + "=$(ulimit -f)\n" +
 		"/usr/bin/printf '\\036" + token + ":begin\\037\\n' >" + path + "\nif {\n" + line +
 		"\n} </dev/null >" + stdout + " 2>" + stderr + "; then\n" + statusVar + "=0\nelse\n" + statusVar + "=$?\nfi\n" +
 		"if [ \"$(ulimit -f)\" = \"$" + appliedLimitVar + "\" ]; then ulimit -f \"$" + limitVar + "\" 2>/dev/null || :; fi\n/usr/bin/printf '\\036" + token + ":%s\\037\\n' \"$" + statusVar + "\" >" + path + "\nunset " + statusVar + " " + umaskVar + " " + limitVar + " " + appliedLimitVar + "\n"
