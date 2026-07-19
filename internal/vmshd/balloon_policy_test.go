@@ -379,19 +379,25 @@ func TestRuntimePressureWaitsForGuestAcknowledgement(t *testing.T) {
 	srv.balloon.commitmentLimitMB = 4096
 	var mu sync.Mutex
 	var targets []uint64
+	adjusted := make(chan struct{}, 2)
 	runtime := fakeRuntimeView{
 		statuses: []client.InstanceState{{ID: "one", Status: "running", MemoryMB: 4096, BalloonStatus: "converged"}},
 		balloon: func(_ string, target uint64) error {
 			mu.Lock()
 			targets = append(targets, target)
 			mu.Unlock()
+			adjusted <- struct{}{}
 			return nil
 		},
 	}
 	if err := srv.reconcileBalloonPressure(runtime); err != nil {
 		t.Fatal(err)
 	}
-	requireEventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(targets) == 1 })
+	select {
+	case <-adjusted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("first balloon adjustment did not complete")
+	}
 	mu.Lock()
 	if len(targets) != 1 || targets[0] != 819 {
 		t.Fatalf("first targets = %v", targets)
@@ -413,7 +419,11 @@ func TestRuntimePressureWaitsForGuestAcknowledgement(t *testing.T) {
 	if err := srv.reconcileBalloonPressure(runtime); err != nil {
 		t.Fatal(err)
 	}
-	requireEventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(targets) == 2 })
+	select {
+	case <-adjusted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("second balloon adjustment did not complete")
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	if len(targets) != 2 || targets[1] != 1638 {
