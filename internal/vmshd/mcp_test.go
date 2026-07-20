@@ -1669,7 +1669,7 @@ func TestMCPRetiredCaptureSwitchesToBoundedDiscard(t *testing.T) {
 		"(sleep 0.05; head -c 100000 /dev/zero) >" + shellJoin([]string{outputPath + ".fifo"}) + " & __vmsh_mcp_writer=$!\n" +
 		"sleep 0.01\n" +
 		"__vmsh_mcp_capture_relay=$(cat " + shellJoin([]string{outputPath + ".relay"}) + ")\nkill -USR1 \"$__vmsh_mcp_capture_relay\"\nwait \"$__vmsh_mcp_writer\"\nwait \"$__vmsh_mcp_capture_relay\"\n" +
-		"stored=$(wc -c <" + shellJoin([]string{outputPath}) + "); discarded=$(cat " + shellJoin([]string{outputPath + ".overflow"}) + "); printf '%s %s\\n' \"$stored\" \"$discarded\"\n"
+		"stored=$(wc -c <" + shellJoin([]string{outputPath}) + "); discarded=$(cat " + shellJoin([]string{outputPath + ".overflow"}) + "); [ -n \"$discarded\" ] || discarded=0; printf '%s %s\\n' \"$stored\" \"$discarded\"\n"
 	cmd := exec.Command("/bin/sh", "-c", script)
 	var output, diagnostic bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &output, &diagnostic
@@ -1684,6 +1684,39 @@ func TestMCPRetiredCaptureSwitchesToBoundedDiscard(t *testing.T) {
 	discarded, _ := strconv.ParseInt(fields[1], 10, 64)
 	if stored+discarded != 100000 || stored > mcpContextCaptureMaxStoredBytes {
 		t.Fatalf("retired capture stored=%d discarded=%d", stored, discarded)
+	}
+}
+
+func TestMCPRetiredCaptureAccountsForUnlinkedSpool(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	outputPath := filepath.Join(dir, "capture")
+	controlPath := filepath.Join(dir, "accounting")
+	script := mcpContextCaptureRelayScript(outputPath, controlPath, "split-output") +
+		"(head -c 50000 /dev/zero; sleep 0.1; head -c 50000 /dev/zero) >" + shellJoin([]string{outputPath + ".fifo"}) + " & writer=$!\n" +
+		"sleep 0.02\nrelay=$(cat " + shellJoin([]string{outputPath + ".relay"}) + ")\n" +
+		"kill -USR1 \"$relay\"\n" +
+		"while [ ! -s " + shellJoin([]string{outputPath + ".retired"}) + " ]; do sleep 0.001; done\n" +
+		"rm -f " + shellJoin([]string{outputPath}) + "\n" +
+		"wait \"$writer\"\nwait \"$relay\"\n"
+	cmd := exec.Command("/bin/sh", "-c", script)
+	var diagnostic bytes.Buffer
+	cmd.Stderr = &diagnostic
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("retire and unlink capture: %v; diagnostic=%q", err, diagnostic.String())
+	}
+	if diagnostic.Len() != 0 {
+		t.Fatalf("relay injected diagnostic after retirement: %q", diagnostic.String())
+	}
+	accounting, err := os.ReadFile(controlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "\x1dvmsh-capture:split-output:100000\x1f\n"
+	if string(accounting) != want {
+		t.Fatalf("capture accounting = %q, want %q", accounting, want)
 	}
 }
 

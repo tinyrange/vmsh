@@ -1146,11 +1146,11 @@ func mcpContextCaptureRelayScript(outputPath, controlPath, account string) strin
 		": >" + output + "\n: >" + closed + "\n: >" + overflow + "\n: >" + retired + "\nmkfifo " + fifo + "\n" +
 		"chmod 600 " + output + " " + fifo + " " + closed + " " + overflow + " " + retired + "\n" +
 		"(trap '' PIPE; exec 7<" + fifo + "; exec 6>" + closed + "; exec 5>" + overflow + "; exec 4>" + retired + "; " + accountingOpen +
-		"__vmsh_mcp_capture_reader=; __vmsh_mcp_capture_retired=; trap '__vmsh_mcp_capture_retired=1; command printf 1 >&4; [ -z \"$__vmsh_mcp_capture_reader\" ] || kill \"$__vmsh_mcp_capture_reader\" 2>/dev/null || :' USR1; " +
-		"head -c " + strconv.Itoa(mcpContextCaptureMaxStoredBytes) + " <&7 >" + output + " & __vmsh_mcp_capture_reader=$!; " +
-		"wait \"$__vmsh_mcp_capture_reader\" 2>/dev/null || :; __vmsh_mcp_capture_overflow=$(wc -c <&7) || __vmsh_mcp_capture_overflow=0; " +
+		"__vmsh_mcp_capture_reader=; __vmsh_mcp_capture_retired=; trap '__vmsh_mcp_capture_retired=1; command printf 1 >&4' USR1; " +
+		"exec 3<" + output + "; head -c " + strconv.Itoa(mcpContextCaptureMaxStoredBytes) + " <&7 >" + output + " & __vmsh_mcp_capture_reader=$!; " +
+		"while kill -0 \"$__vmsh_mcp_capture_reader\" 2>/dev/null; do wait \"$__vmsh_mcp_capture_reader\" 2>/dev/null || :; done; __vmsh_mcp_capture_overflow=$(wc -c <&7) || __vmsh_mcp_capture_overflow=0; " +
 		"[ \"$__vmsh_mcp_capture_overflow\" -eq 0 ] || command printf '%s\\n' \"$__vmsh_mcp_capture_overflow\" >&5; " +
-		"__vmsh_mcp_capture_stored=$(wc -c <" + output + ") || __vmsh_mcp_capture_stored=0; " +
+		"__vmsh_mcp_capture_stored=$(wc -c <&3) || __vmsh_mcp_capture_stored=0; " +
 		accounting + "command printf 1 >&6) &\n" +
 		"command printf '%s\\n' \"$!\" >" + relay + "\nchmod 600 " + relay + "\n"
 }
