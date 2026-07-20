@@ -37,6 +37,8 @@ const (
 	mcpCompletedMetadataCount      = 1024
 	mcpMaxActiveCommandsPerVM      = 64
 	mcpMaxActiveCommandsPerSession = 256
+	mcpMaxContextsPerVM            = 64
+	mcpMaxContextsPerSession       = 256
 )
 
 type mcpRunVMInput struct {
@@ -348,6 +350,12 @@ func (e *mcpEndpoint) registerMCPCommand(command *mcpCommand) (*mcpGuestContext,
 		case <-guest.done:
 			return nil, fmt.Errorf("context %q is closed", command.contextID)
 		default:
+		}
+		guest.mu.Lock()
+		closing := guest.closing
+		guest.mu.Unlock()
+		if closing {
+			return nil, fmt.Errorf("context %q is closing", command.contextID)
 		}
 		command.terminateOverride = guest.stop
 		command.cancellationUnverifiable = isMCPRootUser(guest.user)

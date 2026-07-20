@@ -60,22 +60,23 @@ type mcpEndpoint struct {
 	control   *client.Client
 	balloon   *balloonController
 
-	mu               sync.Mutex
-	credentials      map[string]string
-	vms              map[string]mcpVM
-	commands         map[string]*mcpCommand
-	artifacts        map[string]*mcpArtifact
-	contexts         map[string]*mcpGuestContext
-	stopping         map[string]struct{}
-	quarantined      map[string]struct{}
-	starting         map[string]*mcpVMStart
-	openingContexts  int
-	artifactOps      int
-	artifactWork     map[*mcpArtifactReservation]struct{}
-	artifactInFlight int64
-	closed           bool
-	cleanupTimeout   time.Duration
-	shutdownTimeout  time.Duration
+	mu                  sync.Mutex
+	credentials         map[string]string
+	vms                 map[string]mcpVM
+	commands            map[string]*mcpCommand
+	artifacts           map[string]*mcpArtifact
+	contexts            map[string]*mcpGuestContext
+	stopping            map[string]struct{}
+	quarantined         map[string]struct{}
+	starting            map[string]*mcpVMStart
+	openingContexts     int
+	openingContextsByVM map[string]int
+	artifactOps         int
+	artifactWork        map[*mcpArtifactReservation]struct{}
+	artifactInFlight    int64
+	closed              bool
+	cleanupTimeout      time.Duration
+	shutdownTimeout     time.Duration
 }
 
 type mcpVMStart struct {

@@ -1603,6 +1603,9 @@ func TestMCPContextCaptureAtExactLimitIsComplete(t *testing.T) {
 		if err := cmd.Run(); err != nil {
 			t.Fatalf("read exact capture: %v; diagnostic=%q", err, diagnostic.String())
 		}
+		if diagnostic.Len() > 128 {
+			t.Fatalf("guest capture metadata expanded diagnostic to %d bytes", diagnostic.Len())
+		}
 		fields := strings.Fields(diagnostic.String())
 		if len(fields) != 4 {
 			t.Fatalf("capture diagnostic = %q", diagnostic.String())
@@ -1618,29 +1621,38 @@ func TestMCPContextCaptureAtExactLimitIsComplete(t *testing.T) {
 	if state := readState(); state != "capped" {
 		t.Fatalf("overflowing output state = %q, want capped", state)
 	}
+	if err := os.WriteFile(capture+".overflow", bytes.Repeat([]byte{'9'}, 1<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if state := readState(); state != "capped" {
+		t.Fatalf("large guest metadata state = %q, want capped", state)
+	}
 }
 
-func TestMCPRetiredCapturePublishesDiscardedByteCount(t *testing.T) {
+func TestMCPRetiredCaptureSwitchesToBoundedDiscard(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX shell")
 	}
 	dir := t.TempDir()
-	totalPath := filepath.Join(dir, "retired.total")
 	outputPath := filepath.Join(dir, "capture")
 	script := "__vmsh_mcp_relay_stop=stop\n" +
-		mcpContextRetiredCounterScript(totalPath, "__vmsh_mcp_counter") +
-		mcpContextCaptureRelayScript(outputPath, totalPath+".fifo") +
+		mcpContextCaptureRelayScript(outputPath) +
 		"(sleep 0.05; head -c 100000 /dev/zero) >" + shellJoin([]string{outputPath + ".fifo"}) + " & __vmsh_mcp_writer=$!\n" +
-		"sleep 0.01\ncommand printf '0\\n' >" + shellJoin([]string{outputPath + ".observed"}) + "\ncommand printf 1 >" + shellJoin([]string{outputPath + ".retired"}) + "\n" +
+		"sleep 0.01\n" +
 		"__vmsh_mcp_capture_relay=$(cat " + shellJoin([]string{outputPath + ".relay"}) + ")\nkill -USR1 \"$__vmsh_mcp_capture_relay\"\nwait \"$__vmsh_mcp_writer\"\nwait \"$__vmsh_mcp_capture_relay\"\n" +
-		"__vmsh_mcp_tries=0\nwhile [ \"$(cat " + shellJoin([]string{totalPath}) + ")\" = 0 ] && [ \"$__vmsh_mcp_tries\" -lt 100 ]; do sleep 0.01; __vmsh_mcp_tries=$((__vmsh_mcp_tries + 1)); done\n" +
-		"cat " + shellJoin([]string{totalPath}) + "\ncommand printf '%s\\n' \"$__vmsh_mcp_relay_stop\" >" + shellJoin([]string{totalPath + ".fifo"}) + "\nwait \"$__vmsh_mcp_counter\"\n"
+		"stored=$(wc -c <" + shellJoin([]string{outputPath}) + "); discarded=$(cat " + shellJoin([]string{outputPath + ".overflow"}) + "); printf '%s %s\\n' \"$stored\" \"$discarded\"\n"
 	output, err := exec.Command("/bin/sh", "-c", script).CombinedOutput()
 	if err != nil {
-		t.Fatalf("retired capture accounting: %v; output=%q", err, output)
+		t.Fatalf("retired capture discard: %v; output=%q", err, output)
 	}
-	if got := strings.TrimSpace(string(output)); got != "100000" {
-		t.Fatalf("retired capture total = %q, want 100000", got)
+	fields := strings.Fields(string(output))
+	if len(fields) != 2 {
+		t.Fatalf("retired capture result = %q", output)
+	}
+	stored, _ := strconv.ParseInt(fields[0], 10, 64)
+	discarded, _ := strconv.ParseInt(fields[1], 10, 64)
+	if stored+discarded != 100000 || stored > mcpContextCaptureMaxStoredBytes {
+		t.Fatalf("retired capture stored=%d discarded=%d", stored, discarded)
 	}
 }
 
@@ -2146,21 +2158,34 @@ func TestMCPCommandStartIsRejectedOnceVMStopBegins(t *testing.T) {
 	assertNoRunningMCPCommands(t, endpoint)
 }
 
-func TestMCPContextAdmissionPrunesClosedContextsWithoutArbitraryCeiling(t *testing.T) {
+func TestMCPContextCommandAdmissionRejectsClosingContext(t *testing.T) {
+	guest := &mcpGuestContext{id: "closing", vmID: "one", closing: true, done: make(chan struct{})}
+	endpoint := &mcpEndpoint{
+		vms: map[string]mcpVM{"one": {ID: "one"}}, contexts: map[string]*mcpGuestContext{guest.id: guest}, commands: make(map[string]*mcpCommand),
+	}
+	command := &mcpCommand{id: "command", contextID: guest.id, done: make(chan struct{})}
+	if _, err := endpoint.registerMCPCommand(command); err == nil {
+		t.Fatal("async command was admitted into a closing context")
+	}
+	if _, err := endpoint.runnableGuestContext(guest.id); err == nil {
+		t.Fatal("synchronous command was admitted into a closing context")
+	}
+}
+
+func TestMCPContextAdmissionIsBoundedAndPrunesClosedContexts(t *testing.T) {
 	endpoint := &mcpEndpoint{contexts: make(map[string]*mcpGuestContext)}
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < mcpMaxContextsPerVM; i++ {
 		id := fmt.Sprintf("context-%d", i)
-		endpoint.contexts[id] = &mcpGuestContext{id: id, done: make(chan struct{})}
+		endpoint.contexts[id] = &mcpGuestContext{id: id, vmID: "one", done: make(chan struct{})}
 	}
-	if err := endpoint.reserveGuestContext(); err != nil {
-		t.Fatalf("arbitrary context count prevented admission: %v", err)
+	if err := endpoint.reserveGuestContext("one"); err == nil {
+		t.Fatal("per-VM context ceiling did not reject admission")
 	}
-	endpoint.releaseGuestContextReservation()
 	close(endpoint.contexts["context-0"].done)
-	if err := endpoint.reserveGuestContext(); err != nil {
+	if err := endpoint.reserveGuestContext("one"); err != nil {
 		t.Fatalf("reserve after a closed context became prunable: %v", err)
 	}
-	endpoint.releaseGuestContextReservation()
+	endpoint.releaseGuestContextReservation("one")
 	if _, ok := endpoint.contexts["context-0"]; ok {
 		t.Fatal("closed context was not pruned during admission")
 	}
