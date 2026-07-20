@@ -60,27 +60,33 @@ type mcpEndpoint struct {
 	control   *client.Client
 	balloon   *balloonController
 
-	mu                  sync.Mutex
-	credentials         map[string]string
-	vms                 map[string]mcpVM
-	commands            map[string]*mcpCommand
-	artifacts           map[string]*mcpArtifact
-	contexts            map[string]*mcpGuestContext
-	stopping            map[string]struct{}
-	quarantined         map[string]struct{}
-	starting            map[string]*mcpVMStart
-	openingContexts     int
-	openingContextsByVM map[string]int
-	artifactOps         int
-	artifactWork        map[*mcpArtifactReservation]struct{}
-	artifactInFlight    int64
-	closed              bool
-	cleanupTimeout      time.Duration
-	shutdownTimeout     time.Duration
+	mu               sync.Mutex
+	credentials      map[string]string
+	vms              map[string]mcpVM
+	commands         map[string]*mcpCommand
+	artifacts        map[string]*mcpArtifact
+	contexts         map[string]*mcpGuestContext
+	stopping         map[string]struct{}
+	quarantined      map[string]struct{}
+	starting         map[string]*mcpVMStart
+	openingContexts  map[string]*mcpContextOpening
+	artifactOps      int
+	artifactWork     map[*mcpArtifactReservation]struct{}
+	artifactInFlight int64
+	closed           bool
+	cleanupTimeout   time.Duration
+	shutdownTimeout  time.Duration
 }
 
 type mcpVMStart struct {
 	id     string
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+type mcpContextOpening struct {
+	id     string
+	vmID   string
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -157,21 +163,22 @@ func (m *mcpManager) Start(sessionID string) (MCPEndpointInfo, error) {
 		return MCPEndpointInfo{}, fmt.Errorf("listen for MCP: %w", err)
 	}
 	endpoint := &mcpEndpoint{
-		sessionID:    sessionID,
-		url:          "http://" + listener.Addr().String() + "/mcp",
-		createdAt:    time.Now().UTC(),
-		listener:     listener,
-		control:      control,
-		balloon:      m.balloon,
-		credentials:  make(map[string]string),
-		vms:          make(map[string]mcpVM),
-		commands:     make(map[string]*mcpCommand),
-		artifacts:    make(map[string]*mcpArtifact),
-		artifactWork: make(map[*mcpArtifactReservation]struct{}),
-		contexts:     make(map[string]*mcpGuestContext),
-		stopping:     make(map[string]struct{}),
-		quarantined:  make(map[string]struct{}),
-		starting:     make(map[string]*mcpVMStart),
+		sessionID:       sessionID,
+		url:             "http://" + listener.Addr().String() + "/mcp",
+		createdAt:       time.Now().UTC(),
+		listener:        listener,
+		control:         control,
+		balloon:         m.balloon,
+		credentials:     make(map[string]string),
+		vms:             make(map[string]mcpVM),
+		commands:        make(map[string]*mcpCommand),
+		artifacts:       make(map[string]*mcpArtifact),
+		artifactWork:    make(map[*mcpArtifactReservation]struct{}),
+		contexts:        make(map[string]*mcpGuestContext),
+		stopping:        make(map[string]struct{}),
+		quarantined:     make(map[string]struct{}),
+		starting:        make(map[string]*mcpVMStart),
+		openingContexts: make(map[string]*mcpContextOpening),
 	}
 	handler := http.MaxBytesHandler(endpoint.handler(), mcpMaxRequestBytes)
 	endpoint.server = &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: mcpRequestReadTimeout, IdleTimeout: 2 * time.Minute}
@@ -899,6 +906,7 @@ func (e *mcpEndpoint) close() error {
 	e.closed = true
 	commands := make([]*mcpCommand, 0, len(e.commands))
 	contexts := make([]*mcpGuestContext, 0, len(e.contexts))
+	openings := make([]*mcpContextOpening, 0, len(e.openingContexts))
 	starts := make([]*mcpVMStart, 0, len(e.starting))
 	artifactWork := make([]*mcpArtifactReservation, 0, len(e.artifactWork))
 	for _, start := range e.starting {
@@ -913,6 +921,9 @@ func (e *mcpEndpoint) close() error {
 	for _, guest := range e.contexts {
 		contexts = append(contexts, guest)
 	}
+	for _, opening := range e.openingContexts {
+		openings = append(openings, opening)
+	}
 	if firstClose {
 		e.credentials = make(map[string]string)
 		e.artifacts = make(map[string]*mcpArtifact)
@@ -925,8 +936,12 @@ func (e *mcpEndpoint) close() error {
 	for _, operation := range artifactWork {
 		operation.cancel()
 	}
+	for _, opening := range openings {
+		opening.cancel()
+	}
 	cleanupErr := cancelAndWaitMCPWork(context.Background(), e.workCleanupTimeout(), commands, contexts)
 	errs = append(errs, cleanupErr)
+	errs = append(errs, waitMCPContextOpenings(context.Background(), e.workCleanupTimeout(), openings))
 	e.mu.Lock()
 	for _, command := range commands {
 		select {
@@ -1072,8 +1087,18 @@ func (e *mcpEndpoint) cancelVMWork(ctx context.Context, vmID string) error {
 			contexts = append(contexts, guest)
 		}
 	}
+	openings := make([]*mcpContextOpening, 0)
+	for _, opening := range e.openingContexts {
+		if opening.vmID == vmID {
+			openings = append(openings, opening)
+		}
+	}
 	e.mu.Unlock()
+	for _, opening := range openings {
+		opening.cancel()
+	}
 	err := cancelAndWaitMCPWork(ctx, e.workCleanupTimeout(), commands, contexts)
+	err = errors.Join(err, waitMCPContextOpenings(ctx, e.workCleanupTimeout(), openings))
 	e.mu.Lock()
 	for _, guest := range contexts {
 		select {
@@ -1086,6 +1111,22 @@ func (e *mcpEndpoint) cancelVMWork(ctx context.Context, vmID string) error {
 	}
 	e.mu.Unlock()
 	return err
+}
+
+func waitMCPContextOpenings(ctx context.Context, timeout time.Duration, openings []*mcpContextOpening) error {
+	if len(openings) == 0 {
+		return nil
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for _, opening := range openings {
+		select {
+		case <-opening.done:
+		case <-waitCtx.Done():
+			return fmt.Errorf("context %q opening for VM %q did not stop before cleanup deadline: %w", opening.id, opening.vmID, waitCtx.Err())
+		}
+	}
+	return nil
 }
 
 func (e *mcpEndpoint) workCleanupTimeout() time.Duration {

@@ -35,20 +35,34 @@ type mcpGuestContext struct {
 	done        chan struct{}
 	control     *client.Client
 
-	runMu    sync.Mutex
-	stopOnce sync.Once
-	mu       sync.Mutex
-	err      string
-	closing  bool
-	carry    []byte
-	captures []mcpContextCapture
+	runMu                sync.Mutex
+	stopOnce             sync.Once
+	mu                   sync.Mutex
+	err                  string
+	closing              bool
+	carry                []byte
+	captures             []mcpContextCapture
+	accountingCarry      []byte
+	captureAccounts      map[string]*mcpCaptureAccount
+	pendingRetiredStdout int64
+	pendingRetiredStderr int64
 }
 
 type mcpContextCapture struct {
-	stdoutPath   string
-	stderrPath   string
-	stdoutOffset int64
-	stderrOffset int64
+	stdoutPath    string
+	stderrPath    string
+	stdoutAccount string
+	stderrAccount string
+	stdoutOffset  int64
+	stderrOffset  int64
+}
+
+type mcpCaptureAccount struct {
+	stream  string
+	offset  int64
+	total   int64
+	known   bool
+	retired bool
 }
 
 func (c mcpContextCapture) paths() []string {
@@ -94,19 +108,21 @@ func (e *mcpEndpoint) openGuestContext(ctx context.Context, _ *mcp.CallToolReque
 		return nil, mcpContextInfo{}, err
 	}
 	workDir := mcpGuestWorkDir(vm, in.WorkDir)
-	if err := e.reserveGuestContext(vm.ID); err != nil {
-		return nil, mcpContextInfo{}, err
-	}
-	reserved := true
-	defer func() {
-		if reserved {
-			e.releaseGuestContextReservation(vm.ID)
-		}
-	}()
 	id, err := randomMCPID("context")
 	if err != nil {
 		return nil, mcpContextInfo{}, err
 	}
+	openingCtx, openingCancel := context.WithCancel(ctx)
+	opening := &mcpContextOpening{id: id, vmID: vm.ID, cancel: openingCancel, done: make(chan struct{})}
+	if err := e.reserveGuestContext(opening); err != nil {
+		openingCancel()
+		return nil, mcpContextInfo{}, err
+	}
+	defer func() {
+		openingCancel()
+		e.releaseGuestContextReservation(opening)
+		close(opening.done)
+	}()
 	streamCtx, cancel := context.WithCancel(context.Background())
 	// Built-in Linux guests mount both /tmp and /var/tmp as tmpfs. Keep capture
 	// files under /var/lib, which belongs to the recoverable imageFS root, and
@@ -115,34 +131,38 @@ func (e *mcpEndpoint) openGuestContext(ctx context.Context, _ *mcp.CallToolReque
 	guest := &mcpGuestContext{
 		id: id, vmID: vm.ID, user: user, workDir: workDir, env: append([]string(nil), in.Env...), captureDir: captureDir, controlPath: captureDir + "/control",
 		inputs: make(chan client.ExecInput, 16), events: make(chan client.ExecEvent, mcpShellEventBuffer), cancel: cancel, done: make(chan struct{}), control: e.control,
+		captureAccounts: make(map[string]*mcpCaptureAccount),
 	}
-	if err := guest.prepareCaptureDir(ctx); err != nil {
+	if err := guest.prepareCaptureDir(openingCtx); err != nil {
 		cancel()
 		return nil, mcpContextInfo{}, fmt.Errorf("prepare guest context storage: %w", err)
 	}
 	e.mu.Lock()
-	e.openingContexts--
-	e.openingContextsByVM[vm.ID]--
-	if e.openingContextsByVM[vm.ID] == 0 {
-		delete(e.openingContextsByVM, vm.ID)
-	}
-	reserved = false
 	if e.closed {
 		e.mu.Unlock()
 		cancel()
 		return nil, mcpContextInfo{}, fmt.Errorf("MCP endpoint is stopped")
 	}
+	if _, stopping := e.stopping[vm.ID]; stopping {
+		e.mu.Unlock()
+		cancel()
+		return nil, mcpContextInfo{}, fmt.Errorf("VM %q is stopping", vm.ID)
+	}
+	if _, owned := e.vms[vm.ID]; !owned || e.openingContexts[id] != opening {
+		e.mu.Unlock()
+		cancel()
+		return nil, mcpContextInfo{}, fmt.Errorf("VM %q is no longer available for context %q", vm.ID, id)
+	}
+	delete(e.openingContexts, id)
 	e.contexts[id] = guest
 	e.mu.Unlock()
 	go guest.serve(streamCtx, e.control)
-	probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
+	probeCtx, probeCancel := context.WithTimeout(openingCtx, 10*time.Second)
 	defer probeCancel()
 	if _, err := guest.runLine(probeCtx, ":"); err != nil {
+		guest.markClosing()
 		guest.stop()
-		e.mu.Lock()
-		delete(e.contexts, id)
-		e.mu.Unlock()
-		return nil, mcpContextInfo{}, fmt.Errorf("open guest context: %w", err)
+		return nil, mcpContextInfo{}, fmt.Errorf("open guest context %q: %w; termination ownership is retained until the context exits or VM %q is stopped", id, err, vm.ID)
 	}
 	return nil, guest.info(), nil
 }
@@ -166,11 +186,17 @@ func (g *mcpGuestContext) prepareCaptureDir(ctx context.Context) error {
 	return err
 }
 
-func (e *mcpEndpoint) reserveGuestContext(vmID string) error {
+func (e *mcpEndpoint) reserveGuestContext(opening *mcpContextOpening) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
 		return fmt.Errorf("MCP endpoint is stopped")
+	}
+	if _, stopping := e.stopping[opening.vmID]; stopping {
+		return fmt.Errorf("VM %q is stopping", opening.vmID)
+	}
+	if _, owned := e.vms[opening.vmID]; !owned {
+		return fmt.Errorf("VM %q is not owned by this MCP session", opening.vmID)
 	}
 	for id, guest := range e.contexts {
 		select {
@@ -179,33 +205,35 @@ func (e *mcpEndpoint) reserveGuestContext(vmID string) error {
 		default:
 		}
 	}
-	activeSession := len(e.contexts) + e.openingContexts
-	activeVM := e.openingContextsByVM[vmID]
+	activeSession := len(e.contexts) + len(e.openingContexts)
+	activeVM := 0
+	for _, active := range e.openingContexts {
+		if active.vmID == opening.vmID {
+			activeVM++
+		}
+	}
 	for _, guest := range e.contexts {
-		if guest.vmID == vmID {
+		if guest.vmID == opening.vmID {
 			activeVM++
 		}
 	}
 	if activeVM >= mcpMaxContextsPerVM {
-		return fmt.Errorf("VM %q has %d persistent contexts; close an existing context before opening another", vmID, activeVM)
+		return fmt.Errorf("VM %q has %d persistent contexts; close an existing context before opening another", opening.vmID, activeVM)
 	}
 	if activeSession >= mcpMaxContextsPerSession {
 		return fmt.Errorf("MCP session has %d persistent contexts; close an existing context before opening another", activeSession)
 	}
-	if e.openingContextsByVM == nil {
-		e.openingContextsByVM = make(map[string]int)
+	if e.openingContexts == nil {
+		e.openingContexts = make(map[string]*mcpContextOpening)
 	}
-	e.openingContexts++
-	e.openingContextsByVM[vmID]++
+	e.openingContexts[opening.id] = opening
 	return nil
 }
 
-func (e *mcpEndpoint) releaseGuestContextReservation(vmID string) {
+func (e *mcpEndpoint) releaseGuestContextReservation(opening *mcpContextOpening) {
 	e.mu.Lock()
-	e.openingContexts--
-	e.openingContextsByVM[vmID]--
-	if e.openingContextsByVM[vmID] == 0 {
-		delete(e.openingContextsByVM, vmID)
+	if e.openingContexts[opening.id] == opening {
+		delete(e.openingContexts, opening.id)
 	}
 	e.mu.Unlock()
 }
@@ -500,19 +528,23 @@ func (g *mcpGuestContext) runLine(ctx context.Context, line string) (mcpContextR
 	}
 	marker := []byte("\x1e" + token + ":")
 	beginMarker := []byte("\x1e" + token + ":begin\x1f")
+	stdoutAccount, err := randomMCPID("capture")
+	if err != nil {
+		return mcpContextResult{}, err
+	}
+	stderrAccount, err := randomMCPID("capture")
+	if err != nil {
+		return mcpContextResult{}, err
+	}
 	capture := mcpContextCapture{
-		stdoutPath: g.captureDir + "/" + token + ".stdout",
-		stderrPath: g.captureDir + "/" + token + ".stderr",
+		stdoutPath: g.captureDir + "/" + token + ".stdout", stdoutAccount: stdoutAccount,
+		stderrPath: g.captureDir + "/" + token + ".stderr", stderrAccount: stderrAccount,
 	}
-	if err := g.collectContextCaptures(ctx, &result); err != nil {
-		return result, err
-	}
-	script := mcpContextCommandCaptureScript(token, line, g.controlPath, capture.stdoutPath, capture.stderrPath)
 	g.mu.Lock()
 	initial := append([]byte(nil), g.carry...)
 	g.carry = nil
 	g.mu.Unlock()
-	scan := append([]byte(nil), initial...)
+	scan := g.filterCaptureAccounting(initial)
 	// Anything already delivered before this command is submitted belongs to
 	// the persistent context, not to the new command. Drain it explicitly so a
 	// background writer cannot be charged to the next command.
@@ -524,7 +556,7 @@ func (g *mcpGuestContext) runLine(ctx context.Context, line string) (mcpContextR
 			case "stdout", "stderr", "output":
 				result.appendOutputEvent(event, data, true)
 			case "control":
-				scan = append(scan, data...)
+				scan = append(scan, g.filterCaptureAccounting(data)...)
 			case "error":
 				return result, fmt.Errorf("guest context: %s", firstNonEmpty(event.Error, event.Output, "shell failed"))
 			case "exit":
@@ -535,6 +567,12 @@ func (g *mcpGuestContext) runLine(ctx context.Context, line string) (mcpContextR
 		}
 	}
 drained:
+	g.applyPendingRetiredCounts(&result)
+	if err := g.collectContextCaptures(ctx, &result); err != nil {
+		return result, err
+	}
+	g.registerCaptureAccounts(capture)
+	script := mcpContextCommandCaptureScript(token, line, g.controlPath, capture)
 	select {
 	case g.inputs <- client.ExecInput{Kind: "stdin", Data: []byte(script)}:
 	case <-g.done:
@@ -617,7 +655,7 @@ drained:
 			case "stdout", "stderr", "output":
 				result.appendOutputEvent(event, data, false)
 			case "control":
-				scan = append(scan, data...)
+				scan = append(scan, g.filterCaptureAccounting(data)...)
 			case "error":
 				return result, fmt.Errorf("guest context: %s", firstNonEmpty(event.Error, event.Output, "shell failed"))
 			case "exit":
@@ -671,6 +709,22 @@ func (g *mcpGuestContext) collectContextCaptures(ctx context.Context, result *mc
 		}
 		stdoutDelta := max(int64(0), stdoutSize-captures[i].stdoutOffset)
 		stderrDelta := max(int64(0), stderrSize-captures[i].stderrOffset)
+		if total, known := g.updateCaptureAccount(captures[i].stdoutAccount, stdoutSize); stdoutClosed {
+			if known {
+				stdoutDelta += max(int64(0), total-stdoutSize)
+				stdoutSize = total
+			} else {
+				stdoutClosed = false
+			}
+		}
+		if total, known := g.updateCaptureAccount(captures[i].stderrAccount, stderrSize); stderrClosed {
+			if known {
+				stderrDelta += max(int64(0), total-stderrSize)
+				stderrSize = total
+			} else {
+				stderrClosed = false
+			}
+		}
 		result.asyncStdout, result.asyncStdoutTotal, result.asyncStdoutTruncated = appendCapturedOutput(result.asyncStdout, result.asyncStdoutTotal, result.asyncStdoutTruncated, stdout, stdoutDelta)
 		result.asyncStderr, result.asyncStderrTotal, result.asyncStderrTruncated = appendCapturedOutput(result.asyncStderr, result.asyncStderrTotal, result.asyncStderrTruncated, stderr, stderrDelta)
 		result.asyncStdoutTruncated = result.asyncStdoutTruncated || stdoutCapped
@@ -679,9 +733,11 @@ func (g *mcpGuestContext) collectContextCaptures(ctx context.Context, result *mc
 		captures[i].stderrOffset = stderrSize
 		if stdoutClosed {
 			captures[i].stdoutPath = ""
+			g.removeCaptureAccount(captures[i].stdoutAccount)
 		}
 		if stderrClosed {
 			captures[i].stderrPath = ""
+			g.removeCaptureAccount(captures[i].stderrAccount)
 		}
 		g.removeContextCaptures([]mcpContextCapture{{stdoutPath: emptyUnless(stdoutClosed, stdoutPath), stderrPath: emptyUnless(stderrClosed, stderrPath)}})
 	}
@@ -708,17 +764,36 @@ func (g *mcpGuestContext) collectCurrentCapture(ctx context.Context, result *mcp
 	if err != nil {
 		return err
 	}
-	result.stdout, result.stdoutTotal, result.stdoutTruncated = appendCapturedOutput(result.stdout, result.stdoutTotal, result.stdoutTruncated, stdout, stdoutSize)
-	result.stderr, result.stderrTotal, result.stderrTruncated = appendCapturedOutput(result.stderr, result.stderrTotal, result.stderrTruncated, stderr, stderrSize)
+	stdoutObserved, stderrObserved := stdoutSize, stderrSize
+	if total, known := g.updateCaptureAccount(capture.stdoutAccount, stdoutSize); stdoutClosed {
+		if known {
+			stdoutObserved = total
+			stdoutSize = total
+		} else {
+			stdoutClosed = false
+		}
+	}
+	if total, known := g.updateCaptureAccount(capture.stderrAccount, stderrSize); stderrClosed {
+		if known {
+			stderrObserved = total
+			stderrSize = total
+		} else {
+			stderrClosed = false
+		}
+	}
+	result.stdout, result.stdoutTotal, result.stdoutTruncated = appendCapturedOutput(result.stdout, result.stdoutTotal, result.stdoutTruncated, stdout, stdoutObserved)
+	result.stderr, result.stderrTotal, result.stderrTruncated = appendCapturedOutput(result.stderr, result.stderrTotal, result.stderrTruncated, stderr, stderrObserved)
 	result.stdoutTruncated = result.stdoutTruncated || stdoutCapped
 	result.stderrTruncated = result.stderrTruncated || stderrCapped
 	capture.stdoutOffset = stdoutSize
 	capture.stderrOffset = stderrSize
 	if stdoutClosed {
 		capture.stdoutPath = ""
+		g.removeCaptureAccount(capture.stdoutAccount)
 	}
 	if stderrClosed {
 		capture.stderrPath = ""
+		g.removeCaptureAccount(capture.stderrAccount)
 	}
 	g.removeContextCaptures([]mcpContextCapture{{stdoutPath: emptyUnless(stdoutClosed, stdoutPath), stderrPath: emptyUnless(stderrClosed, stderrPath)}})
 	return nil
@@ -738,6 +813,141 @@ func appendCapturedOutput(dst []byte, total int64, truncated bool, data []byte, 
 		truncated = true
 	}
 	return dst, total, truncated
+}
+
+const mcpCaptureAccountingPrefix = "\x1dvmsh-capture:"
+
+func (g *mcpGuestContext) registerCaptureAccounts(capture mcpContextCapture) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.captureAccounts == nil {
+		g.captureAccounts = make(map[string]*mcpCaptureAccount)
+	}
+	g.captureAccounts[capture.stdoutAccount] = &mcpCaptureAccount{stream: "stdout"}
+	g.captureAccounts[capture.stderrAccount] = &mcpCaptureAccount{stream: "stderr"}
+}
+
+func (g *mcpGuestContext) updateCaptureAccount(account string, offset int64) (int64, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	state := g.captureAccounts[account]
+	if state == nil {
+		return 0, false
+	}
+	state.offset = offset
+	return state.total, state.known
+}
+
+func (g *mcpGuestContext) removeCaptureAccount(account string) {
+	g.mu.Lock()
+	delete(g.captureAccounts, account)
+	g.mu.Unlock()
+}
+
+func (g *mcpGuestContext) retireCaptureAccounts(captures []mcpContextCapture) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, capture := range captures {
+		accounts := []struct {
+			key    string
+			offset int64
+		}{{capture.stdoutAccount, capture.stdoutOffset}, {capture.stderrAccount, capture.stderrOffset}}
+		for _, account := range accounts {
+			state := g.captureAccounts[account.key]
+			if state == nil {
+				continue
+			}
+			state.offset = account.offset
+			state.retired = true
+			if state.known {
+				g.finishRetiredCaptureLocked(account.key, state)
+			}
+		}
+	}
+}
+
+func (g *mcpGuestContext) finishRetiredCaptureLocked(account string, state *mcpCaptureAccount) {
+	delta := max(int64(0), state.total-state.offset)
+	if state.stream == "stderr" {
+		g.pendingRetiredStderr += delta
+	} else {
+		g.pendingRetiredStdout += delta
+	}
+	delete(g.captureAccounts, account)
+}
+
+func (g *mcpGuestContext) applyPendingRetiredCounts(result *mcpContextResult) {
+	g.mu.Lock()
+	stdout, stderr := g.pendingRetiredStdout, g.pendingRetiredStderr
+	g.pendingRetiredStdout, g.pendingRetiredStderr = 0, 0
+	g.mu.Unlock()
+	if stdout != 0 {
+		result.asyncStdoutTotal += stdout
+		result.asyncStdoutTruncated = true
+	}
+	if stderr != 0 {
+		result.asyncStderrTotal += stderr
+		result.asyncStderrTruncated = true
+	}
+}
+
+// filterCaptureAccounting removes bounded, capability-tagged accounting
+// frames from the private persistent-shell control stream.
+func (g *mcpGuestContext) filterCaptureAccounting(data []byte) []byte {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	buf := append(g.accountingCarry, data...)
+	g.accountingCarry = nil
+	var output []byte
+	prefix := []byte(mcpCaptureAccountingPrefix)
+	for len(buf) != 0 {
+		start := bytes.Index(buf, prefix)
+		if start < 0 {
+			keep := 0
+			maxKeep := len(prefix) - 1
+			if len(buf) < maxKeep {
+				maxKeep = len(buf)
+			}
+			for n := maxKeep; n > 0; n-- {
+				if bytes.Equal(buf[len(buf)-n:], prefix[:n]) {
+					keep = n
+					break
+				}
+			}
+			output = append(output, buf[:len(buf)-keep]...)
+			g.accountingCarry = append(g.accountingCarry, buf[len(buf)-keep:]...)
+			break
+		}
+		output = append(output, buf[:start]...)
+		end := bytes.IndexByte(buf[start+len(prefix):], '\x1f')
+		if end < 0 {
+			if len(buf)-start > 256 {
+				output = append(output, buf[start])
+				buf = buf[start+1:]
+				continue
+			}
+			g.accountingCarry = append(g.accountingCarry, buf[start:]...)
+			break
+		}
+		end += start + len(prefix)
+		payload := string(buf[start+len(prefix) : end])
+		account, totalText, ok := strings.Cut(payload, ":")
+		total, parseErr := strconv.ParseInt(totalText, 10, 64)
+		state := g.captureAccounts[account]
+		if !ok || parseErr != nil || total < 0 || state == nil {
+			output = append(output, buf[start:end+1]...)
+		} else {
+			state.total, state.known = total, true
+			if state.retired {
+				g.finishRetiredCaptureLocked(account, state)
+			}
+		}
+		buf = buf[end+1:]
+		if len(buf) != 0 && buf[0] == '\n' {
+			buf = buf[1:]
+		}
+	}
+	return output
 }
 
 func (g *mcpGuestContext) readContextCapture(ctx context.Context, capturePath string, offset int64, limit int) ([]byte, int64, bool, bool, error) {
@@ -838,6 +1048,7 @@ func (g *mcpGuestContext) retireContextCaptures(captures []mcpContextCapture) er
 	if _, err := g.control.RunEventsInContext(ctx, g.vmID, client.RunRequest{Command: args, WorkDir: "/", User: g.user}); err != nil {
 		return fmt.Errorf("retire context output: %w", err)
 	}
+	g.retireCaptureAccounts(captures)
 	g.removeContextCaptures(captures)
 	return nil
 }
@@ -904,32 +1115,43 @@ func mcpContextCommandScript(token, line, controlPath string) string {
 	return "/usr/bin/printf '\\036" + token + ":begin\\037\\n' >" + path + "\nif {\n" + line + "\n} </dev/null; then\n" + statusVar + "=0\nelse\n" + statusVar + "=$?\nfi\n/usr/bin/printf '\\036" + token + ":%s\\037\\n' \"$" + statusVar + "\" >" + path + "\nunset " + statusVar + "\n"
 }
 
-func mcpContextCommandCaptureScript(token, line, controlPath, stdoutPath, stderrPath string) string {
+func mcpContextCommandCaptureScript(token, line, controlPath string, capture mcpContextCapture) string {
 	statusVar := "__vmsh_mcp_status_" + strings.TrimPrefix(token, "marker_")
 	umaskVar := "__vmsh_mcp_umask_" + strings.TrimPrefix(token, "marker_")
 	path := shellJoin([]string{controlPath})
-	stdout := shellJoin([]string{stdoutPath + ".fifo"})
-	stderr := shellJoin([]string{stderrPath + ".fifo"})
-	return umaskVar + "=$(umask)\numask 077\n" + mcpContextCaptureRelayScript(stdoutPath) + mcpContextCaptureRelayScript(stderrPath) + "umask \"$" + umaskVar + "\"\n" +
+	stdout := shellJoin([]string{capture.stdoutPath + ".fifo"})
+	stderr := shellJoin([]string{capture.stderrPath + ".fifo"})
+	return umaskVar + "=$(umask)\numask 077\n" +
+		mcpContextCaptureRelayScript(capture.stdoutPath, controlPath, capture.stdoutAccount) +
+		mcpContextCaptureRelayScript(capture.stderrPath, controlPath, capture.stderrAccount) + "umask \"$" + umaskVar + "\"\n" +
 		"/usr/bin/printf '\\036" + token + ":begin\\037\\n' >" + path + "\nif {\n" + line +
 		"\n} </dev/null >" + stdout + " 2>" + stderr + "; then\n" + statusVar + "=0\nelse\n" + statusVar + "=$?\nfi\n" +
 		"/usr/bin/printf '\\036" + token + ":%s\\037\\n' \"$" + statusVar + "\" >" + path + "\nunset " + statusVar + " " + umaskVar + "\n"
 }
 
-func mcpContextCaptureRelayScript(outputPath string) string {
+func mcpContextCaptureRelayScript(outputPath, controlPath, account string) string {
 	output := shellJoin([]string{outputPath})
 	fifo := shellJoin([]string{outputPath + ".fifo"})
 	closed := shellJoin([]string{outputPath + ".closed"})
 	overflow := shellJoin([]string{outputPath + ".overflow"})
 	relay := shellJoin([]string{outputPath + ".relay"})
 	retired := shellJoin([]string{outputPath + ".retired"})
+	accounting := ""
+	accountingOpen := ""
+	if controlPath != "" && account != "" {
+		accountingOpen = "exec 8>" + shellJoin([]string{controlPath}) + "; "
+		accounting = "command printf '\\035vmsh-capture:%s:%s\\037\\n' " + shellJoin([]string{account}) + " \"$((__vmsh_mcp_capture_stored + __vmsh_mcp_capture_overflow))\" >&8; "
+	}
 	return "rm -f " + output + " " + fifo + " " + closed + " " + overflow + " " + relay + " " + retired + "\n" +
 		": >" + output + "\n: >" + closed + "\n: >" + overflow + "\n: >" + retired + "\nmkfifo " + fifo + "\n" +
 		"chmod 600 " + output + " " + fifo + " " + closed + " " + overflow + " " + retired + "\n" +
-		"(exec 7<" + fifo + "; exec 6>" + closed + "; exec 5>" + overflow + "; exec 4>" + retired + "; " +
+		"(trap '' PIPE; exec 7<" + fifo + "; exec 6>" + closed + "; exec 5>" + overflow + "; exec 4>" + retired + "; " + accountingOpen +
 		"__vmsh_mcp_capture_reader=; __vmsh_mcp_capture_retired=; trap '__vmsh_mcp_capture_retired=1; command printf 1 >&4; [ -z \"$__vmsh_mcp_capture_reader\" ] || kill \"$__vmsh_mcp_capture_reader\" 2>/dev/null || :' USR1; " +
 		"head -c " + strconv.Itoa(mcpContextCaptureMaxStoredBytes) + " <&7 >" + output + " & __vmsh_mcp_capture_reader=$!; " +
-		"wait \"$__vmsh_mcp_capture_reader\" 2>/dev/null || :; wc -c <&7 >&5; command printf 1 >&6) &\n" +
+		"wait \"$__vmsh_mcp_capture_reader\" 2>/dev/null || :; __vmsh_mcp_capture_overflow=$(wc -c <&7) || __vmsh_mcp_capture_overflow=0; " +
+		"[ \"$__vmsh_mcp_capture_overflow\" -eq 0 ] || command printf '%s\\n' \"$__vmsh_mcp_capture_overflow\" >&5; " +
+		"__vmsh_mcp_capture_stored=$(wc -c <" + output + ") || __vmsh_mcp_capture_stored=0; " +
+		accounting + "command printf 1 >&6) &\n" +
 		"command printf '%s\\n' \"$!\" >" + relay + "\nchmod 600 " + relay + "\n"
 }
 

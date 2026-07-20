@@ -1490,8 +1490,8 @@ func TestMCPContextCaptureKeepsBackgroundOutputWithItsOriginatingCommand(t *test
 	defer controlR.Close()
 	cmd := exec.Command("/bin/sh", "-c", mcpContextShellScriptForShell(controlPath, "/bin/sh"))
 	cmd.Stdin = strings.NewReader(
-		mcpContextCommandCaptureScript("marker_first", "(sleep 0.1; printf late) & printf first", controlPath, firstOut, firstErr) +
-			mcpContextCommandCaptureScript("marker_second", "sleep 0.2; printf second", controlPath, secondOut, secondErr),
+		mcpContextCommandCaptureScript("marker_first", "(sleep 0.1; printf late) & printf first", controlPath, mcpContextCapture{stdoutPath: firstOut, stderrPath: firstErr, stdoutAccount: "first-out", stderrAccount: "first-err"}) +
+			mcpContextCommandCaptureScript("marker_second", "sleep 0.2; printf second", controlPath, mcpContextCapture{stdoutPath: secondOut, stderrPath: secondErr, stdoutAccount: "second-out", stderrAccount: "second-err"}),
 	)
 	cmd.ExtraFiles = []*os.File{controlW}
 	var stdout, stderr bytes.Buffer
@@ -1523,6 +1523,35 @@ func TestMCPContextCaptureKeepsBackgroundOutputWithItsOriginatingCommand(t *test
 				return -1
 			}(), err)
 		}
+		overflow, err := os.ReadFile(capture + ".overflow")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(overflow) != 0 {
+			t.Fatalf("non-overflowing capture %s recorded overflow %q", capture, overflow)
+		}
+	}
+}
+
+func TestMCPContextCaptureAccountingSurvivesFragmentationAndRetirement(t *testing.T) {
+	guest := &mcpGuestContext{captureAccounts: make(map[string]*mcpCaptureAccount)}
+	capture := mcpContextCapture{stdoutAccount: "private-token", stdoutOffset: 5}
+	guest.captureAccounts[capture.stdoutAccount] = &mcpCaptureAccount{stream: "stdout", offset: capture.stdoutOffset, retired: true}
+	frame := []byte("ordinary\x1dvmsh-capture:private-token:100000\x1f\nafter")
+	var ordinary []byte
+	for _, part := range [][]byte{frame[:11], frame[11:33], frame[33:49], frame[49:]} {
+		ordinary = append(ordinary, guest.filterCaptureAccounting(part)...)
+	}
+	if got, want := string(ordinary), "ordinaryafter"; got != want {
+		t.Fatalf("ordinary control bytes = %q, want %q", got, want)
+	}
+	var result mcpContextResult
+	guest.applyPendingRetiredCounts(&result)
+	if result.asyncStdoutTotal != 99995 || !result.asyncStdoutTruncated {
+		t.Fatalf("retired accounting total=%d truncated=%t", result.asyncStdoutTotal, result.asyncStdoutTruncated)
+	}
+	if len(guest.captureAccounts) != 0 {
+		t.Fatal("completed retired accounting remained live")
 	}
 }
 
@@ -1543,7 +1572,7 @@ func TestMCPContextCaptureRelayBoundsStoredOutputAndKeepsByteCount(t *testing.T)
 	cmd.Stdin = strings.NewReader(mcpContextCommandCaptureScript(
 		"marker_bounded",
 		fmt.Sprintf("head -c %d /dev/zero", mcpContextCaptureMaxStoredBytes+8192),
-		controlPath, stdoutPath, stderrPath,
+		controlPath, mcpContextCapture{stdoutPath: stdoutPath, stderrPath: stderrPath, stdoutAccount: "bounded-out", stderrAccount: "bounded-err"},
 	))
 	cmd.ExtraFiles = []*os.File{controlW}
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -1636,7 +1665,7 @@ func TestMCPRetiredCaptureSwitchesToBoundedDiscard(t *testing.T) {
 	dir := t.TempDir()
 	outputPath := filepath.Join(dir, "capture")
 	script := "__vmsh_mcp_relay_stop=stop\n" +
-		mcpContextCaptureRelayScript(outputPath) +
+		mcpContextCaptureRelayScript(outputPath, "", "") +
 		"(sleep 0.05; head -c 100000 /dev/zero) >" + shellJoin([]string{outputPath + ".fifo"}) + " & __vmsh_mcp_writer=$!\n" +
 		"sleep 0.01\n" +
 		"__vmsh_mcp_capture_relay=$(cat " + shellJoin([]string{outputPath + ".relay"}) + ")\nkill -USR1 \"$__vmsh_mcp_capture_relay\"\nwait \"$__vmsh_mcp_writer\"\nwait \"$__vmsh_mcp_capture_relay\"\n" +
@@ -1763,9 +1792,9 @@ func TestMCPContextCaptureDoesNotAlterUserResourceLimitsOrInitialUmask(t *testin
 	defer controlR.Close()
 	cmd := exec.Command("/bin/sh", "-c", "umask 022; "+mcpContextShellScriptForShell(controlPath, "/bin/sh"))
 	cmd.Stdin = strings.NewReader(
-		mcpContextCommandCaptureScript("marker_one", "umask; ulimit -f", controlPath, firstOut, firstErr) +
-			mcpContextCommandCaptureScript("marker_two", "umask 777", controlPath, secondOut, secondErr) +
-			mcpContextCommandCaptureScript("marker_three", "ulimit -f; dd if=/dev/zero of="+shellJoin([]string{userFile})+" bs=1048576 count=5 2>/dev/null", controlPath, thirdOut, thirdErr),
+		mcpContextCommandCaptureScript("marker_one", "umask; ulimit -f", controlPath, mcpContextCapture{stdoutPath: firstOut, stderrPath: firstErr, stdoutAccount: "one-out", stderrAccount: "one-err"}) +
+			mcpContextCommandCaptureScript("marker_two", "umask 777", controlPath, mcpContextCapture{stdoutPath: secondOut, stderrPath: secondErr, stdoutAccount: "two-out", stderrAccount: "two-err"}) +
+			mcpContextCommandCaptureScript("marker_three", "ulimit -f; dd if=/dev/zero of="+shellJoin([]string{userFile})+" bs=1048576 count=5 2>/dev/null", controlPath, mcpContextCapture{stdoutPath: thirdOut, stderrPath: thirdErr, stdoutAccount: "three-out", stderrAccount: "three-err"}),
 	)
 	cmd.ExtraFiles = []*os.File{controlW}
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -2175,21 +2204,60 @@ func TestMCPContextCommandAdmissionRejectsClosingContext(t *testing.T) {
 }
 
 func TestMCPContextAdmissionIsBoundedAndPrunesClosedContexts(t *testing.T) {
-	endpoint := &mcpEndpoint{contexts: make(map[string]*mcpGuestContext)}
+	endpoint := &mcpEndpoint{vms: map[string]mcpVM{"one": {ID: "one"}}, contexts: make(map[string]*mcpGuestContext), stopping: make(map[string]struct{})}
 	for i := 0; i < mcpMaxContextsPerVM; i++ {
 		id := fmt.Sprintf("context-%d", i)
 		endpoint.contexts[id] = &mcpGuestContext{id: id, vmID: "one", done: make(chan struct{})}
 	}
-	if err := endpoint.reserveGuestContext("one"); err == nil {
+	opening := &mcpContextOpening{id: "opening", vmID: "one"}
+	if err := endpoint.reserveGuestContext(opening); err == nil {
 		t.Fatal("per-VM context ceiling did not reject admission")
 	}
 	close(endpoint.contexts["context-0"].done)
-	if err := endpoint.reserveGuestContext("one"); err != nil {
+	if err := endpoint.reserveGuestContext(opening); err != nil {
 		t.Fatalf("reserve after a closed context became prunable: %v", err)
 	}
-	endpoint.releaseGuestContextReservation("one")
+	endpoint.releaseGuestContextReservation(opening)
 	if _, ok := endpoint.contexts["context-0"]; ok {
 		t.Fatal("closed context was not pruned during admission")
+	}
+}
+
+func TestMCPVMStopOwnsInFlightContextOpening(t *testing.T) {
+	endpoint := &mcpEndpoint{
+		vms: map[string]mcpVM{"one": {ID: "one"}}, contexts: make(map[string]*mcpGuestContext),
+		commands: make(map[string]*mcpCommand), stopping: make(map[string]struct{}), openingContexts: make(map[string]*mcpContextOpening),
+	}
+	openingCtx, cancel := context.WithCancel(t.Context())
+	opening := &mcpContextOpening{id: "opening", vmID: "one", cancel: cancel, done: make(chan struct{})}
+	if err := endpoint.reserveGuestContext(opening); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		<-openingCtx.Done()
+		endpoint.releaseGuestContextReservation(opening)
+		close(opening.done)
+	}()
+	if _, err := endpoint.beginVMStop("one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := endpoint.cancelVMWork(t.Context(), "one"); err != nil {
+		t.Fatalf("cancel VM work: %v", err)
+	}
+	select {
+	case <-opening.done:
+	default:
+		t.Fatal("VM stop returned before its context opening exited")
+	}
+	endpoint.mu.Lock()
+	remaining := len(endpoint.openingContexts)
+	endpoint.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("VM stop retained %d completed context openings", remaining)
+	}
+	rejected := &mcpContextOpening{id: "late", vmID: "one"}
+	if err := endpoint.reserveGuestContext(rejected); err == nil {
+		t.Fatal("context opening was admitted after VM stop began")
 	}
 }
 
