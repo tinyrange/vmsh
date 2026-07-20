@@ -1557,6 +1557,34 @@ func TestMCPContextCaptureAccountingSurvivesFragmentationAndRetirement(t *testin
 	}
 }
 
+func TestMCPContextEmptyRetiredCaptureIsNotTruncated(t *testing.T) {
+	guest := &mcpGuestContext{captureAccounts: map[string]*mcpCaptureAccount{
+		"stdout": {stream: "stdout", known: true, retired: true},
+		"stderr": {stream: "stderr", known: true, retired: true},
+	}}
+	var result mcpContextResult
+	guest.applyPendingRetiredCounts(&result)
+	if result.asyncStdoutTotal != 0 || result.asyncStdoutTruncated || result.asyncStderrTotal != 0 || result.asyncStderrTruncated {
+		t.Fatalf("empty retired capture reported loss: %+v", result)
+	}
+}
+
+func TestMCPContextCaptureRelayReadinessSurvivesEventFragmentation(t *testing.T) {
+	guest := &mcpGuestContext{relayReady: make(chan struct{})}
+	for _, part := range [][]byte{
+		[]byte("unrelated output\nvmsh-capture-"),
+		[]byte("relay-"),
+		[]byte("ready\n"),
+	} {
+		guest.observeCaptureRelayOutput(part)
+	}
+	select {
+	case <-guest.relayReady:
+	default:
+		t.Fatal("fragmented relay readiness was not recognized")
+	}
+}
+
 func TestMCPContextCaptureRelayBoundsStoredOutputAndKeepsByteCount(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX shell")
@@ -2609,6 +2637,13 @@ func TestMCPKVMCaptureRetirementDoesNotAccumulateGuestProcesses(t *testing.T) {
 		}})
 		if err != nil || result.IsError {
 			t.Fatalf("run capture %d = %s, %v", i, toolResultDiagnostic(result), err)
+		}
+		output := structuredToolOutput[mcpContextRunOutput](t, result)
+		if want := fmt.Sprintf("command-%d", i); output.Stdout != want || output.StdoutTotalBytes != int64(len(want)) {
+			t.Fatalf("capture %d foreground attribution = %#v, want %q", i, output, want)
+		}
+		if output.StdoutTruncated || output.StderrTruncated || output.AsyncStdoutTruncated || output.AsyncStderrTruncated {
+			t.Fatalf("capture %d reported nonexistent output loss: %#v", i, output)
 		}
 	}
 	after := processCount()

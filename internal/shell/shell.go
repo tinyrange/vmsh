@@ -6499,7 +6499,7 @@ func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer, startF
 				continue
 			}
 			completed = &record
-			p.inputs <- client.ExecInput{Kind: "stdin", Data: []byte("command printf '%s' " + shellQuote(string(barrier.marker)) + "\n")}
+			p.inputs <- client.ExecInput{Kind: "stdin", Data: []byte("command printf '%s' " + shellQuote(string(barrier.marker)) + " >/dev/tty\n")}
 		case "stdout", "output":
 			barrier.write(stdout, execEventBytes(event))
 		case "stderr":

@@ -683,6 +683,13 @@ func TestVMIntegrationInteractiveUIRoutesCommandsAcrossVMs(t *testing.T) {
 	position = enterUI(t, driver, session)
 	waitUILine(t, ctx, driver, "VMSH_UI_LINUX_STATE=linux", session)
 	waitUIPromptAfter(t, ctx, driver, position, session)
+	typeUI(t, driver, "exec >/tmp/vmsh-ui-session.log", session)
+	position = enterUI(t, driver, session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+	typeUI(t, driver, "exec >/dev/tty; printf 'VMSH_UI_LINUX_REDIRECT_RECOVERED=1\\n'", session)
+	position = enterUI(t, driver, session)
+	waitUILine(t, ctx, driver, "VMSH_UI_LINUX_REDIRECT_RECOVERED=1", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
 
 	driver.SetDelay(0)
 	position = session.Snapshot().BytesRead
