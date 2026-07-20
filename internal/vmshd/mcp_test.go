@@ -1314,6 +1314,7 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 	endpoint := &mcpEndpoint{
 		control: client.NewClient(control.URL, nil), vms: map[string]mcpVM{"one": {ID: "one"}, "two": {ID: "two"}},
 		commands: make(map[string]*mcpCommand), artifacts: make(map[string]*mcpArtifact), contexts: make(map[string]*mcpGuestContext),
+		disableCaptureRelay: true,
 	}
 
 	_, exported, err := endpoint.exportArtifact(context.Background(), nil, mcpArtifactExportInput{VMID: "one", Path: "/project "})
@@ -1397,6 +1398,7 @@ func TestMCPContextOpenReportsInvalidWorkdirWithoutWaitingForShellProbe(t *testi
 	endpoint := &mcpEndpoint{
 		control: client.NewClient(control.URL, nil), vms: map[string]mcpVM{"one": {ID: "one"}},
 		commands: make(map[string]*mcpCommand), artifacts: make(map[string]*mcpArtifact), contexts: make(map[string]*mcpGuestContext),
+		disableCaptureRelay: true,
 	}
 	started := time.Now()
 	_, _, err := endpoint.openGuestContext(t.Context(), nil, mcpContextOpenInput{VMID: "one", WorkDir: "/root", User: "1000:1000"})
@@ -1941,6 +1943,7 @@ func TestMCPContextPreservesOutputAccountingTimeoutBytesAndPrivateFraming(t *tes
 	endpoint := &mcpEndpoint{
 		control: client.NewClient(control.URL, nil), vms: map[string]mcpVM{"one": {ID: "one", Image: "alpine"}},
 		commands: make(map[string]*mcpCommand), contexts: make(map[string]*mcpGuestContext), stopping: make(map[string]struct{}),
+		disableCaptureRelay: true,
 	}
 	_, opened, err := endpoint.openGuestContext(t.Context(), nil, mcpContextOpenInput{VMID: "one"})
 	if err != nil {
@@ -2062,6 +2065,7 @@ func TestMCPAsyncContextCommandsAllowSequentialLifecycleInterruption(t *testing.
 	endpoint := &mcpEndpoint{
 		control: client.NewClient(control.URL, nil), credentials: map[string]string{"test": "token"}, vms: map[string]mcpVM{"one": {ID: "one"}},
 		commands: make(map[string]*mcpCommand), artifacts: make(map[string]*mcpArtifact), contexts: make(map[string]*mcpGuestContext),
+		disableCaptureRelay: true,
 	}
 	_, opened, err := endpoint.openGuestContext(t.Context(), nil, mcpContextOpenInput{VMID: "one"})
 	if err != nil {
@@ -2546,6 +2550,71 @@ func TestMCPKVMContextFanout(t *testing.T) {
 	_, _ = session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_run", Arguments: map[string]any{
 		"vm_id": vm.ID, "user": "root", "command": []string{"sh", "-c", `test ! -f /tmp/vmsh-escaped.pid || kill -KILL "$(cat /tmp/vmsh-escaped.pid)" 2>/dev/null || true`},
 	}})
+}
+
+func TestMCPKVMCaptureRetirementDoesNotAccumulateGuestProcesses(t *testing.T) {
+	endpoint, token := os.Getenv("VMSH_MCP_INTEGRATION_URL"), os.Getenv("VMSH_MCP_INTEGRATION_TOKEN")
+	if endpoint == "" || token == "" {
+		t.Skip("set VMSH_MCP_INTEGRATION_URL and VMSH_MCP_INTEGRATION_TOKEN for live KVM coverage")
+	}
+	image := os.Getenv("VMSH_MCP_INTEGRATION_IMAGE")
+	if image == "" {
+		image = "alpine"
+	}
+	mcpClient := mcp.NewClient(&mcp.Implementation{Name: "vmsh-capture-retirement-test", Version: "1"}, nil)
+	session, err := mcpClient.Connect(t.Context(), &mcp.StreamableClientTransport{
+		Endpoint: endpoint, HTTPClient: &http.Client{Transport: mcpBearerTransport{token: token}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	created, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_create", Arguments: map[string]any{
+		"image": image, "name": "capture-retirement", "memory_mb": 512, "boot_timeout_seconds": 90,
+	}})
+	if err != nil || created.IsError {
+		t.Fatalf("create VM = %s, %v", toolResultDiagnostic(created), err)
+	}
+	vm := structuredToolOutput[mcpCreateVMOutput](t, created).VM
+	defer func() {
+		_, _ = session.CallTool(context.Background(), &mcp.CallToolParams{Name: "vm_stop", Arguments: map[string]any{"vm_id": vm.ID}})
+	}()
+	processCount := func() int {
+		result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_run", Arguments: map[string]any{
+			"vm_id": vm.ID, "user": "root", "command": []string{"sh", "-c", "ps | wc -l"},
+		}})
+		if err != nil || result.IsError {
+			t.Fatalf("count guest processes = %s, %v", toolResultDiagnostic(result), err)
+		}
+		output := structuredToolOutput[mcpCommandOutput](t, result)
+		count, err := strconv.Atoi(strings.TrimSpace(output.Stdout.Text))
+		if err != nil {
+			t.Fatalf("parse guest process count %q: %v", output.Stdout.Text, err)
+		}
+		return count
+	}
+	baseline := processCount()
+	opened, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_context_open", Arguments: map[string]any{"vm_id": vm.ID}})
+	if err != nil || opened.IsError {
+		t.Fatalf("open context = %s, %v", toolResultDiagnostic(opened), err)
+	}
+	contextID := structuredToolOutput[mcpContextInfo](t, opened).ContextID
+	defer func() {
+		_, _ = session.CallTool(context.Background(), &mcp.CallToolParams{Name: "vm_context_close", Arguments: map[string]any{"context_id": contextID}})
+	}()
+	const writers = 12
+	for i := range writers {
+		result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_context_run", Arguments: map[string]any{
+			"context_id": contextID, "command_line": fmt.Sprintf("sleep 300 & printf command-%d", i),
+		}})
+		if err != nil || result.IsError {
+			t.Fatalf("run capture %d = %s, %v", i, toolResultDiagnostic(result), err)
+		}
+	}
+	after := processCount()
+	if growth := after - baseline; growth > writers+2 {
+		t.Fatalf("%d inherited writers grew the guest process table by %d; retired captures retained per-stream processes", writers, growth)
+	}
 }
 
 func TestMCPKVMAutomaticHeadroomAndContextCaptureRecovery(t *testing.T) {

@@ -22,24 +22,31 @@ const (
 )
 
 type mcpGuestContext struct {
-	id          string
-	vmID        string
-	user        string
-	workDir     string
-	env         []string
-	controlPath string
-	captureDir  string
-	inputs      chan client.ExecInput
-	events      chan client.ExecEvent
-	cancel      context.CancelFunc
-	done        chan struct{}
-	control     *client.Client
+	id                  string
+	vmID                string
+	user                string
+	workDir             string
+	env                 []string
+	controlPath         string
+	captureDir          string
+	captureControlPath  string
+	captureRelayCommand []string
+	inputs              chan client.ExecInput
+	events              chan client.ExecEvent
+	cancel              context.CancelFunc
+	relayCancel         context.CancelFunc
+	done                chan struct{}
+	control             *client.Client
+	relayReady          chan struct{}
+	relayDone           chan struct{}
+	relayReadyOnce      sync.Once
 
 	runMu                sync.Mutex
 	stopOnce             sync.Once
 	mu                   sync.Mutex
 	err                  string
 	closing              bool
+	relayStopping        bool
 	carry                []byte
 	captures             []mcpContextCapture
 	accountingCarry      []byte
@@ -66,12 +73,12 @@ type mcpCaptureAccount struct {
 }
 
 func (c mcpContextCapture) paths() []string {
-	paths := make([]string, 0, 10)
+	paths := make([]string, 0, 14)
 	for _, output := range []string{c.stdoutPath, c.stderrPath} {
 		if output == "" {
 			continue
 		}
-		paths = append(paths, output, output+".fifo", output+".closed", output+".overflow", output+".relay", output+".retired")
+		paths = append(paths, output, output+".fifo", output+".closed", output+".overflow", output+".relay", output+".retired", output+".registered")
 	}
 	return paths
 }
@@ -124,33 +131,58 @@ func (e *mcpEndpoint) openGuestContext(ctx context.Context, _ *mcp.CallToolReque
 		close(opening.done)
 	}()
 	streamCtx, cancel := context.WithCancel(context.Background())
+	relayCtx, relayCancel := context.WithCancel(context.Background())
 	// Built-in Linux guests mount both /tmp and /var/tmp as tmpfs. Keep capture
 	// files under /var/lib, which belongs to the recoverable imageFS root, and
 	// prepare the private leaf as root for the requested execution identity.
 	captureDir := "/var/lib/vmsh-mcp/" + id
 	guest := &mcpGuestContext{
 		id: id, vmID: vm.ID, user: user, workDir: workDir, env: append([]string(nil), in.Env...), captureDir: captureDir, controlPath: captureDir + "/control",
-		inputs: make(chan client.ExecInput, 16), events: make(chan client.ExecEvent, mcpShellEventBuffer), cancel: cancel, done: make(chan struct{}), control: e.control,
+		inputs: make(chan client.ExecInput, 16), events: make(chan client.ExecEvent, mcpShellEventBuffer), cancel: cancel, relayCancel: relayCancel, done: make(chan struct{}), control: e.control,
 		captureAccounts: make(map[string]*mcpCaptureAccount),
+	}
+	if !e.disableCaptureRelay {
+		guest.captureControlPath = captureDir + "/capture-control"
+		guest.captureRelayCommand = mcpCaptureRelayCommand(vm, guest.captureControlPath, guest.controlPath)
+		guest.relayReady = make(chan struct{})
+		guest.relayDone = make(chan struct{})
 	}
 	if err := guest.prepareCaptureDir(openingCtx); err != nil {
 		cancel()
+		relayCancel()
 		return nil, mcpContextInfo{}, fmt.Errorf("prepare guest context storage: %w", err)
+	}
+	if guest.captureControlPath != "" {
+		go guest.serveCaptureRelay(relayCtx)
+		select {
+		case <-guest.relayReady:
+		case <-guest.relayDone:
+			cancel()
+			relayCancel()
+			return nil, mcpContextInfo{}, fmt.Errorf("start guest context capture relay: %s", guest.relayError())
+		case <-openingCtx.Done():
+			cancel()
+			relayCancel()
+			return nil, mcpContextInfo{}, fmt.Errorf("start guest context capture relay: %w", openingCtx.Err())
+		}
 	}
 	e.mu.Lock()
 	if e.closed {
 		e.mu.Unlock()
 		cancel()
+		relayCancel()
 		return nil, mcpContextInfo{}, fmt.Errorf("MCP endpoint is stopped")
 	}
 	if _, stopping := e.stopping[vm.ID]; stopping {
 		e.mu.Unlock()
 		cancel()
+		relayCancel()
 		return nil, mcpContextInfo{}, fmt.Errorf("VM %q is stopping", vm.ID)
 	}
 	if _, owned := e.vms[vm.ID]; !owned || e.openingContexts[id] != opening {
 		e.mu.Unlock()
 		cancel()
+		relayCancel()
 		return nil, mcpContextInfo{}, fmt.Errorf("VM %q is no longer available for context %q", vm.ID, id)
 	}
 	delete(e.openingContexts, id)
@@ -171,7 +203,7 @@ func (g *mcpGuestContext) prepareCaptureDir(ctx context.Context) error {
 	script := `umask 077; base=$1; leaf=$2; owner=$3; mkdir -p "$base" || exit; chmod 711 "$base" || exit; rm -rf "$leaf" || exit; mkdir "$leaf" || exit; chown "$owner" "$leaf" || exit; chmod 700 "$leaf"`
 	var diagnostic string
 	err := g.control.ExecStreamInContext(ctx, g.vmID, client.ExecRequest{
-		Command: []string{"/bin/sh", "-c", script, "sh", pathpkg.Dir(g.captureDir), g.captureDir, g.user}, WorkDir: "/", User: "root",
+		Command: []string{"/bin/sh", "-c", script, "sh", pathpkg.Dir(g.captureDir), g.captureDir, mcpCaptureOwner(g.user)}, WorkDir: "/", User: "root",
 	}, nil, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stderr", "error":
@@ -184,6 +216,13 @@ func (g *mcpGuestContext) prepareCaptureDir(ctx context.Context) error {
 		return nil
 	})
 	return err
+}
+
+func mcpCaptureOwner(user string) string {
+	if isMCPRootUser(user) {
+		return "0:0"
+	}
+	return user
 }
 
 func (e *mcpEndpoint) reserveGuestContext(opening *mcpContextOpening) error {
@@ -504,6 +543,18 @@ func (g *mcpGuestContext) serve(ctx context.Context, control *client.Client) {
 			return ctx.Err()
 		}
 	})
+	if g.relayDone != nil {
+		g.requestCaptureRelayStop()
+		select {
+		case <-g.relayDone:
+		case <-time.After(2 * time.Second):
+			g.relayCancel()
+			select {
+			case <-g.relayDone:
+			case <-time.After(time.Second):
+			}
+		}
+	}
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	_, _ = control.RunEventsInContext(cleanupCtx, g.vmID, client.RunRequest{
 		Command: []string{"/bin/sh", "-c", `rm -rf "$1"`, "sh", g.captureDir},
@@ -516,6 +567,60 @@ func (g *mcpGuestContext) serve(ctx context.Context, control *client.Client) {
 	}
 	g.mu.Unlock()
 	close(g.done)
+}
+
+func (g *mcpGuestContext) requestCaptureRelayStop() {
+	g.mu.Lock()
+	g.relayStopping = true
+	g.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_, _ = g.control.RunEventsInContext(ctx, g.vmID, client.RunRequest{
+		Command: []string{"/bin/sh", "-c", `printf 'stop\n' >"$1"`, "sh", g.captureControlPath}, WorkDir: "/", User: g.user,
+	})
+}
+
+func (g *mcpGuestContext) serveCaptureRelay(ctx context.Context) {
+	defer close(g.relayDone)
+	err := g.control.RunInteractiveStreamInContext(ctx, g.vmID, client.RunRequest{
+		Command: append([]string(nil), g.captureRelayCommand...), WorkDir: "/", User: "root",
+	}, nil, func(event client.ExecEvent) error {
+		if event.Kind == "stdout" || event.Kind == "output" && event.Stream != "stderr" {
+			if strings.Contains(string(contextEventData(event)), "vmsh-capture-relay-ready") {
+				g.relayReadyOnce.Do(func() { close(g.relayReady) })
+			}
+		}
+		return nil
+	})
+	g.mu.Lock()
+	expected := g.relayStopping
+	if ctx.Err() == nil && !expected {
+		g.err = "capture relay stopped: " + conciseCommandError(err)
+	}
+	g.mu.Unlock()
+	if ctx.Err() == nil && !expected {
+		g.stop()
+	}
+}
+
+func (g *mcpGuestContext) relayError() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return firstNonEmpty(g.err, "capture relay exited before becoming ready")
+}
+
+func mcpCaptureRelayCommand(vm mcpVM, captureControlPath, shellControlPath string) []string {
+	args := []string{captureControlPath, shellControlPath, strconv.Itoa(mcpContextCaptureMaxStoredBytes)}
+	switch canonicalMCPBuiltinImage(vm.Image) {
+	case "@freebsd":
+		return append([]string{"/sbin/cc-freebsd-init", "--ccx3-capture-relay"}, args...)
+	case "@netbsd":
+		return append([]string{"/sbin/cc-netbsd-init", "--ccx3-capture-relay"}, args...)
+	case "@openbsd":
+		return append([]string{"/sbin/cc-openbsd-init", "--ccx3-capture-relay"}, args...)
+	default:
+		return append([]string{"/bin/sh", "-c", `helper=/proc/1/exe; [ ! -x /var/tmp/.ccx3-snapshot-stage2 ] || helper=/var/tmp/.ccx3-snapshot-stage2; [ ! -x /etc/ccx3/stage2 ] || helper=/etc/ccx3/stage2; exec "$helper" --ccx3-capture-relay "$@"`, "sh"}, args...)
+	}
 }
 
 func (g *mcpGuestContext) runLine(ctx context.Context, line string) (mcpContextResult, error) {
@@ -573,6 +678,9 @@ drained:
 	}
 	g.registerCaptureAccounts(capture)
 	script := mcpContextCommandCaptureScript(token, line, g.controlPath, capture)
+	if g.captureControlPath != "" {
+		script = mcpContextCommandCaptureServiceScript(token, line, g.controlPath, g.captureControlPath, capture)
+	}
 	select {
 	case g.inputs <- client.ExecInput{Kind: "stdin", Data: []byte(script)}:
 	case <-g.done:
@@ -992,7 +1100,7 @@ func (g *mcpGuestContext) readContextCapture(ctx context.Context, capturePath st
 	}
 	fields := strings.Fields(string(diagnostic))
 	if len(fields) != 4 {
-		return nil, 0, false, false, fmt.Errorf("read context output returned invalid size and writer state")
+		return nil, 0, false, false, fmt.Errorf("read context output returned invalid size and writer state: %q", boundedDiagnostic(diagnostic, 512))
 	}
 	size, err := strconv.ParseInt(fields[0], 10, 64)
 	if err != nil || size < 0 {
@@ -1007,8 +1115,15 @@ func (g *mcpGuestContext) readContextCapture(ctx context.Context, capturePath st
 	return output, observed, fields[1] == "closed", capped, nil
 }
 
+func boundedDiagnostic(data []byte, limit int) string {
+	if len(data) <= limit {
+		return string(data)
+	}
+	return string(data[:limit]) + "…"
+}
+
 func mcpContextCaptureReadScript() string {
-	return `if [ ! -f "$1" ]; then printf '0 closed 0 uncapped\n' >&2; exit; fi; size=$(wc -c <"$1") || exit; count=$((size - $2)); [ "$count" -lt 0 ] && count=0; [ "$count" -gt "$3" ] && count=$3; if [ "$count" -gt 0 ]; then tail -c "+$(( $2 + 1 ))" "$1" | head -c "$count"; fi; writer=open; [ -s "$1.closed" ] && writer=closed; capstate=uncapped; [ -s "$1.overflow" ] && capstate=capped; [ -s "$1.retired" ] && capstate=capped; printf '%s %s 0 %s\n' "$size" "$writer" "$capstate" >&2`
+	return `if [ ! -f "$1" ]; then printf '0 closed 0 uncapped\n' >&2; exit; fi; size=$(wc -c <"$1") || exit; count=$((size - $2)); [ "$count" -lt 0 ] && count=0; [ "$count" -gt "$3" ] && count=$3; if [ "$count" -gt 0 ]; then if head -c 0 </dev/null >/dev/null 2>&1; then tail -c "+$(( $2 + 1 ))" "$1" | head -c "$count"; else dd if="$1" bs=1 skip="$2" count="$count" 2>/dev/null; fi; fi; writer=open; [ -s "$1.closed" ] && writer=closed; capstate=uncapped; [ -s "$1.overflow" ] && capstate=capped; [ -s "$1.retired" ] && capstate=capped; printf '%s %s 0 %s\n' "$size" "$writer" "$capstate" >&2`
 }
 
 func (g *mcpGuestContext) removeContextCaptures(captures []mcpContextCapture) {
@@ -1031,6 +1146,9 @@ func (g *mcpGuestContext) retireContextCaptures(captures []mcpContextCapture) er
 	if len(captures) == 0 || g.control == nil {
 		return nil
 	}
+	if g.captureControlPath != "" {
+		return g.retireServiceCaptures(captures)
+	}
 	args := []string{"/bin/sh", "-c", `for output do if [ -s "$output.relay" ]; then relay=$(cat "$output.relay"); kill -USR1 "$relay" 2>/dev/null || exit; while [ ! -s "$output.retired" ] && kill -0 "$relay" 2>/dev/null; do sleep 0.01; done; [ -s "$output.retired" ] || [ -s "$output.closed" ] || exit 1; elif [ ! -s "$output.closed" ]; then exit 1; fi; done`, "sh"}
 	for _, capture := range captures {
 		if capture.stdoutPath != "" {
@@ -1041,6 +1159,29 @@ func (g *mcpGuestContext) retireContextCaptures(captures []mcpContextCapture) er
 		}
 	}
 	if len(args) == 4 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := g.control.RunEventsInContext(ctx, g.vmID, client.RunRequest{Command: args, WorkDir: "/", User: g.user}); err != nil {
+		return fmt.Errorf("retire context output: %w", err)
+	}
+	g.retireCaptureAccounts(captures)
+	g.removeContextCaptures(captures)
+	return nil
+}
+
+func (g *mcpGuestContext) retireServiceCaptures(captures []mcpContextCapture) error {
+	args := []string{"/bin/sh", "-c", `control=$1; shift; while [ "$#" -ge 2 ]; do account=$1; output=$2; shift 2; if [ ! -s "$output.closed" ]; then printf 'retire\t%s\n' "$account" >"$control" || exit; while [ ! -s "$output.retired" ] && [ ! -s "$output.closed" ]; do sleep 0.01; done; fi; done`, "sh", g.captureControlPath}
+	for _, capture := range captures {
+		if capture.stdoutPath != "" {
+			args = append(args, capture.stdoutAccount, capture.stdoutPath)
+		}
+		if capture.stderrPath != "" {
+			args = append(args, capture.stderrAccount, capture.stderrPath)
+		}
+	}
+	if len(args) == 5 {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1127,6 +1268,39 @@ func mcpContextCommandCaptureScript(token, line, controlPath string, capture mcp
 		"/usr/bin/printf '\\036" + token + ":begin\\037\\n' >" + path + "\nif {\n" + line +
 		"\n} </dev/null >" + stdout + " 2>" + stderr + "; then\n" + statusVar + "=0\nelse\n" + statusVar + "=$?\nfi\n" +
 		"/usr/bin/printf '\\036" + token + ":%s\\037\\n' \"$" + statusVar + "\" >" + path + "\nunset " + statusVar + " " + umaskVar + "\n"
+}
+
+func mcpContextCommandCaptureServiceScript(token, line, controlPath, captureControlPath string, capture mcpContextCapture) string {
+	statusVar := "__vmsh_mcp_status_" + strings.TrimPrefix(token, "marker_")
+	umaskVar := "__vmsh_mcp_umask_" + strings.TrimPrefix(token, "marker_")
+	path := shellJoin([]string{controlPath})
+	stdout := shellJoin([]string{capture.stdoutPath + ".fifo"})
+	stderr := shellJoin([]string{capture.stderrPath + ".fifo"})
+	finish := "command printf 'finish\\t%s\\n' " + shellJoin([]string{capture.stdoutAccount}) + " >" + shellJoin([]string{captureControlPath}) + "\n" +
+		"command printf 'finish\\t%s\\n' " + shellJoin([]string{capture.stderrAccount}) + " >" + shellJoin([]string{captureControlPath}) + "\n"
+	return umaskVar + "=$(umask)\numask 077\n" +
+		mcpContextCaptureServiceRegisterScript(capture.stdoutPath, captureControlPath, capture.stdoutAccount) +
+		mcpContextCaptureServiceRegisterScript(capture.stderrPath, captureControlPath, capture.stderrAccount) + "umask \"$" + umaskVar + "\"\n" +
+		"/usr/bin/printf '\\036" + token + ":begin\\037\\n' >" + path + "\nif {\n" + line +
+		"\n} </dev/null >" + stdout + " 2>" + stderr + "; then\n" + statusVar + "=0\nelse\n" + statusVar + "=$?\nfi\n" + finish +
+		"/usr/bin/printf '\\036" + token + ":%s\\037\\n' \"$" + statusVar + "\" >" + path + "\nunset " + statusVar + " " + umaskVar + "\n"
+}
+
+func mcpContextCaptureServiceRegisterScript(outputPath, captureControlPath, account string) string {
+	output := shellJoin([]string{outputPath})
+	fifo := shellJoin([]string{outputPath + ".fifo"})
+	closed := shellJoin([]string{outputPath + ".closed"})
+	overflow := shellJoin([]string{outputPath + ".overflow"})
+	retired := shellJoin([]string{outputPath + ".retired"})
+	registered := shellJoin([]string{outputPath + ".registered"})
+	control := shellJoin([]string{captureControlPath})
+	accountArg := shellJoin([]string{account})
+	return "rm -f " + output + " " + fifo + " " + closed + " " + overflow + " " + retired + " " + registered + "\n" +
+		": >" + output + "\n: >" + closed + "\n: >" + overflow + "\n: >" + retired + "\n: >" + registered + "\nmkfifo " + fifo + "\n" +
+		"chmod 600 " + output + " " + fifo + " " + closed + " " + overflow + " " + retired + " " + registered + "\n" +
+		"command printf 'register\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' " + accountArg + " " + output + " " + fifo + " " + closed + " " + overflow + " " + retired + " " + registered + " >" + control + "\n" +
+		"while [ ! -s " + registered + " ]; do sleep 0.01; done\n" +
+		"[ \"$(cat " + registered + ")\" = ok ] || { cat " + registered + " >&2; exit 126; }\n"
 }
 
 func mcpContextCaptureRelayScript(outputPath, controlPath, account string) string {
