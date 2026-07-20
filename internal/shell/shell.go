@@ -8076,7 +8076,10 @@ const (
 	// Increment when restored guest memory is incompatible with the current
 	// runtime contract. Version 2 changes the Linux virtio-fs root mount tag so
 	// standard tools such as BusyBox df recognize the mounted root filesystem.
-	startupSnapshotFormatVersion = 2
+	// Version 3 requires guest-init to stream the private control descriptor used
+	// by the persistent interactive shell; older snapshots visibly run the shell
+	// but discard its ready and completion records.
+	startupSnapshotFormatVersion = 3
 )
 
 func (s *shellState) applyStartupSnapshotDefaults(req *client.StartInstanceRequest) {
@@ -8117,6 +8120,10 @@ func startupSnapshotCompatible(req client.StartInstanceRequest) bool {
 }
 
 func startupSnapshotRoot(rootCache string, req client.StartInstanceRequest) (string, error) {
+	return startupSnapshotRootForVersion(rootCache, req, startupSnapshotFormatVersion)
+}
+
+func startupSnapshotRootForVersion(rootCache string, req client.StartInstanceRequest, version int) (string, error) {
 	keyReq := req
 	keyReq.ID = ""
 	keyReq.TimeoutSeconds = 0
@@ -8128,7 +8135,7 @@ func startupSnapshotRoot(rootCache string, req client.StartInstanceRequest) (str
 	data, err := json.Marshal(struct {
 		Version int                         `json:"version"`
 		Request client.StartInstanceRequest `json:"request"`
-	}{Version: startupSnapshotFormatVersion, Request: keyReq})
+	}{Version: version, Request: keyReq})
 	if err != nil {
 		return "", err
 	}

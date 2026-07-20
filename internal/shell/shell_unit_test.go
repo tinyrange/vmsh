@@ -1818,6 +1818,29 @@ func TestStartVMRestoresNewestStartupSnapshotForCompatibleAlpine(t *testing.T) {
 	}
 }
 
+func TestStartVMIgnoresSnapshotWithoutPersistentControlProtocol(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	sh := newUnitShell(t, api)
+	baseReq := startupSnapshotTestRequest(t, sh)
+	legacyRoot, err := startupSnapshotRootForVersion(sh.rootCache, baseReq, 2)
+	if err != nil {
+		t.Fatalf("legacy snapshot root: %v", err)
+	}
+	legacySnapshot := filepath.Join(legacyRoot, "snapshot-legacy-control")
+	writeStartupSnapshotManifest(t, legacySnapshot, time.Unix(10, 0))
+
+	if err := sh.startVM("work", commandContext{Image: "alpine", MemoryMB: 512, CPUs: 1}, io.Discard); err != nil {
+		t.Fatalf("start VM: %v", err)
+	}
+	req := api.starts[0].req
+	if req.RestoreSnapshot != "" {
+		t.Fatalf("restore snapshot = %q, want legacy control-protocol snapshot ignored", req.RestoreSnapshot)
+	}
+	if req.SnapshotDir == legacyRoot {
+		t.Fatalf("snapshot dir reused legacy control-protocol root %q", legacyRoot)
+	}
+}
+
 func TestStartVMRestoresPersistedStartupSnapshotAfterDaemonRestart(t *testing.T) {
 	api := newRecordingShellAPI("alpine")
 	sh := newUnitShell(t, api)
