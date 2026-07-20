@@ -1641,13 +1641,15 @@ func TestMCPRetiredCaptureSwitchesToBoundedDiscard(t *testing.T) {
 		"sleep 0.01\n" +
 		"__vmsh_mcp_capture_relay=$(cat " + shellJoin([]string{outputPath + ".relay"}) + ")\nkill -USR1 \"$__vmsh_mcp_capture_relay\"\nwait \"$__vmsh_mcp_writer\"\nwait \"$__vmsh_mcp_capture_relay\"\n" +
 		"stored=$(wc -c <" + shellJoin([]string{outputPath}) + "); discarded=$(cat " + shellJoin([]string{outputPath + ".overflow"}) + "); printf '%s %s\\n' \"$stored\" \"$discarded\"\n"
-	output, err := exec.Command("/bin/sh", "-c", script).CombinedOutput()
-	if err != nil {
-		t.Fatalf("retired capture discard: %v; output=%q", err, output)
+	cmd := exec.Command("/bin/sh", "-c", script)
+	var output, diagnostic bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &output, &diagnostic
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("retired capture discard: %v; output=%q diagnostic=%q", err, output.String(), diagnostic.String())
 	}
-	fields := strings.Fields(string(output))
+	fields := strings.Fields(output.String())
 	if len(fields) != 2 {
-		t.Fatalf("retired capture result = %q", output)
+		t.Fatalf("retired capture result = %q", output.String())
 	}
 	stored, _ := strconv.ParseInt(fields[0], 10, 64)
 	discarded, _ := strconv.ParseInt(fields[1], 10, 64)
