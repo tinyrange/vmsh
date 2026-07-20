@@ -430,13 +430,22 @@ func TestRuntimePressureWaitsForGuestAcknowledgement(t *testing.T) {
 	mu.Unlock()
 	runtime.statuses[0].BalloonActualMB = firstTarget
 	runtime.statuses[0].BalloonStatus = "converged"
-	if err := srv.reconcileBalloonPressure(runtime); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-adjusted:
-	case <-time.After(10 * time.Second):
-		t.Fatal("second balloon adjustment did not complete")
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	retry := time.NewTicker(time.Millisecond)
+	defer retry.Stop()
+secondAdjustment:
+	for {
+		if err := srv.reconcileBalloonPressure(runtime); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-adjusted:
+			break secondAdjustment
+		case <-deadline.C:
+			t.Fatal("second balloon adjustment did not complete")
+		case <-retry.C:
+		}
 	}
 	mu.Lock()
 	defer mu.Unlock()
