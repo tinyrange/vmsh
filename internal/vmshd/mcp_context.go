@@ -1140,7 +1140,7 @@ func mcpContextCaptureRelayScript(outputPath, controlPath, account string) strin
 	accountingOpen := ""
 	if controlPath != "" && account != "" {
 		accountingOpen = "exec 8>" + shellJoin([]string{controlPath}) + "; "
-		accounting = "command printf '\\035vmsh-capture:%s:%s\\037\\n' " + shellJoin([]string{account}) + " \"$((__vmsh_mcp_capture_stored + __vmsh_mcp_capture_overflow))\" >&8; "
+		accounting = "command printf '\\035vmsh-capture:%s:%s\\037\\n' " + shellJoin([]string{account}) + " \"$((__vmsh_mcp_capture_stored + __vmsh_mcp_capture_overflow))\" >&8 2>/dev/null || :; "
 	}
 	return "rm -f " + output + " " + fifo + " " + closed + " " + overflow + " " + relay + " " + retired + "\n" +
 		": >" + output + "\n: >" + closed + "\n: >" + overflow + "\n: >" + retired + "\nmkfifo " + fifo + "\n" +
