@@ -207,6 +207,23 @@ func (c *balloonController) applyRunRequest(req *client.RunRequest, current []cl
 	if strings.TrimSpace(req.Image) == "" {
 		return nil
 	}
+	// The interactive shell deliberately keeps Image populated while executing
+	// ordinary commands (and alternate-image commands) in the selected VM. A
+	// live matching ID means cc will route this as execution, not creation; its
+	// zero resource fields must leave the existing VM policy untouched.
+	id := strings.TrimSpace(req.ID)
+	if id == "" {
+		id = "default"
+	}
+	for _, state := range current {
+		stateID := strings.TrimSpace(state.ID)
+		if stateID == "" {
+			stateID = "default"
+		}
+		if stateID == id && (state.Status == "running" || state.Status == "starting") {
+			return nil
+		}
+	}
 	start := client.StartInstanceRequest{ID: req.ID, Image: req.Image, MemoryMB: req.MemoryMB, BalloonMB: req.BalloonMB}
 	if err := c.applyStartRequest(&start, current); err != nil {
 		return err

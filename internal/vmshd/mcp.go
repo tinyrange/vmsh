@@ -85,28 +85,32 @@ type mcpVMStart struct {
 }
 
 type mcpVM struct {
-	ID                      string `json:"id"`
-	Name                    string `json:"name,omitempty"`
-	Image                   string `json:"image"`
-	Status                  string `json:"status,omitempty"`
-	MemoryMB                uint64 `json:"memory_mb,omitempty"`
-	BalloonMB               uint64 `json:"balloon_mb,omitempty"`
-	BalloonObservedTargetMB uint64 `json:"balloon_observed_target_mb,omitempty"`
-	BalloonActualMB         uint64 `json:"balloon_actual_mb,omitempty"`
-	BalloonStatus           string `json:"balloon_status,omitempty"`
-	AutomaticMemory         bool   `json:"automatic_memory,omitempty"`
-	BalloonPolicyInFlight   bool   `json:"balloon_policy_in_flight,omitempty"`
-	BalloonPolicyError      string `json:"balloon_policy_error,omitempty"`
-	BalloonPolicyLastError  string `json:"balloon_policy_last_error,omitempty"`
-	BackendStatus           string `json:"backend_status,omitempty"`
-	Quarantined             bool   `json:"quarantined,omitempty"`
-	BackingBytes            uint64 `json:"backing_bytes,omitempty"`
-	BackingHighWaterBytes   uint64 `json:"backing_high_water_bytes,omitempty"`
-	BackingPhysicalBytes    uint64 `json:"backing_physical_bytes,omitempty"`
-	BackingReclaimError     string `json:"backing_reclaim_error,omitempty"`
-	Error                   string `json:"error,omitempty"`
-	ExitReason              string `json:"exit_reason,omitempty"`
-	ExitedAt                string `json:"exited_at,omitempty"`
+	ID                            string `json:"id"`
+	Name                          string `json:"name,omitempty"`
+	Image                         string `json:"image"`
+	Status                        string `json:"status,omitempty"`
+	MemoryMB                      uint64 `json:"memory_mb,omitempty"`
+	BalloonMB                     uint64 `json:"balloon_mb,omitempty"`
+	BalloonObservedTargetMB       uint64 `json:"balloon_observed_target_mb,omitempty"`
+	BalloonActualMB               uint64 `json:"balloon_actual_mb,omitempty"`
+	BalloonStatus                 string `json:"balloon_status,omitempty"`
+	AutomaticMemory               bool   `json:"automatic_memory,omitempty"`
+	BalloonPolicyInFlight         bool   `json:"balloon_policy_in_flight,omitempty"`
+	BalloonPolicyError            string `json:"balloon_policy_error,omitempty"`
+	BalloonPolicyLastError        string `json:"balloon_policy_last_error,omitempty"`
+	BackendStatus                 string `json:"backend_status,omitempty"`
+	Quarantined                   bool   `json:"quarantined,omitempty"`
+	BackingBytes                  uint64 `json:"backing_bytes,omitempty"`
+	BackingHighWaterBytes         uint64 `json:"backing_high_water_bytes,omitempty"`
+	BackingDataBytes              uint64 `json:"backing_data_bytes,omitempty"`
+	BackingDataHighWaterBytes     uint64 `json:"backing_data_high_water_bytes,omitempty"`
+	BackingMetadataBytes          uint64 `json:"backing_metadata_bytes,omitempty"`
+	BackingMetadataHighWaterBytes uint64 `json:"backing_metadata_high_water_bytes,omitempty"`
+	BackingPhysicalBytes          uint64 `json:"backing_physical_bytes,omitempty"`
+	BackingReclaimError           string `json:"backing_reclaim_error,omitempty"`
+	Error                         string `json:"error,omitempty"`
+	ExitReason                    string `json:"exit_reason,omitempty"`
+	ExitedAt                      string `json:"exited_at,omitempty"`
 }
 
 func newMCPManager(token string) *mcpManager {
@@ -635,8 +639,9 @@ func mcpDockerHubSource(image string) string {
 
 type mcpListVMsInput struct{}
 type mcpListVMsOutput struct {
-	VMs              []mcpVM `json:"vms"`
-	ObservationError string  `json:"observation_error,omitempty"`
+	VMs                   []mcpVM `json:"vms"`
+	ImplementationVersion string  `json:"implementation_version"`
+	ObservationError      string  `json:"observation_error,omitempty"`
 }
 
 func (e *mcpEndpoint) listVMs(ctx context.Context, _ *mcp.CallToolRequest, _ mcpListVMsInput) (*mcp.CallToolResult, mcpListVMsOutput, error) {
@@ -661,6 +666,10 @@ func (e *mcpEndpoint) listVMs(ctx context.Context, _ *mcp.CallToolRequest, _ mcp
 			vm.BalloonStatus = state.BalloonStatus
 			vm.BackingBytes = state.BackingBytes
 			vm.BackingHighWaterBytes = state.BackingHighWaterBytes
+			vm.BackingDataBytes = state.BackingDataBytes
+			vm.BackingDataHighWaterBytes = state.BackingDataHighWaterBytes
+			vm.BackingMetadataBytes = state.BackingMetadataBytes
+			vm.BackingMetadataHighWaterBytes = state.BackingMetadataHighWaterBytes
 			vm.BackingPhysicalBytes = state.BackingPhysicalBytes
 			vm.BackingReclaimError = state.BackingReclaimError
 			vm.Error = state.Error
@@ -681,7 +690,7 @@ func (e *mcpEndpoint) listVMs(ctx context.Context, _ *mcp.CallToolRequest, _ mcp
 	}
 	e.mu.Unlock()
 	sort.Slice(vms, func(i, j int) bool { return vms[i].ID < vms[j].ID })
-	out := mcpListVMsOutput{VMs: vms}
+	out := mcpListVMsOutput{VMs: vms, ImplementationVersion: mcpImplementationVersion()}
 	if observationErr != nil {
 		out.ObservationError = conciseCommandError(observationErr)
 	}

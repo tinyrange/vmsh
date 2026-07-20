@@ -345,10 +345,24 @@ func TestExistingInstanceRunDoesNotMutateMemoryPolicy(t *testing.T) {
 	srv := NewServer("secret")
 	srv.balloon = newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 0}})
 	srv.balloon.setAutomatic("explicit", false)
-	req := client.RunRequest{ID: "explicit", Command: []string{"true"}}
-	srv.normalizeRunRequest(&req, fakeRuntimeView{statuses: []client.InstanceState{{ID: "explicit", Status: "running", MemoryMB: 2048}}})
+	req := client.RunRequest{ID: "explicit", Image: "alpine", Command: []string{"true"}}
+	if err := srv.normalizeRunRequest(&req, fakeRuntimeView{statuses: []client.InstanceState{{ID: "explicit", Status: "running", MemoryMB: 2048}}}); err != nil {
+		t.Fatalf("normalize existing interactive command: %v", err)
+	}
 	if req.MemoryMB != 0 || req.BalloonMB != 0 || srv.balloon.isAutomatic("explicit") {
 		t.Fatalf("existing run mutated resources or policy: request=%+v policy=%+v", req, srv.balloon.state("explicit"))
+	}
+}
+
+func TestExistingInstanceAlternateImageRunDoesNotBecomeAStart(t *testing.T) {
+	srv := NewServer("secret")
+	srv.balloon = newBalloonController(fakeMemoryObserver{snapshot: memorySnapshot{TotalMB: 8192, AvailableMB: 4096}})
+	req := client.RunRequest{ID: "selected", Image: "ubuntu", Command: []string{"true"}}
+	if err := srv.normalizeRunRequest(&req, fakeRuntimeView{statuses: []client.InstanceState{{ID: "selected", Status: "running", Image: "alpine", MemoryMB: 2048}}}); err != nil {
+		t.Fatalf("normalize alternate-image command: %v", err)
+	}
+	if req.PolicyToken != 0 || req.MemoryMB != 0 || req.BalloonMB != 0 {
+		t.Fatalf("alternate-image command was normalized as a start: %+v", req)
 	}
 }
 

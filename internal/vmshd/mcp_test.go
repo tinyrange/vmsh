@@ -425,17 +425,18 @@ func TestMCPListReportsObservedMemoryAndBackingUsage(t *testing.T) {
 		}
 		writeJSON(w, http.StatusOK, []client.InstanceState{{
 			ID: "one", Status: "running", MemoryMB: 4096, BalloonMB: 768,
-			BackingBytes: 1024, BackingHighWaterBytes: 4096, BackingPhysicalBytes: 2048, BackingReclaimError: "disk refused reclaim",
+			BackingBytes: 1024, BackingHighWaterBytes: 4096, BackingDataBytes: 700, BackingDataHighWaterBytes: 3000,
+			BackingMetadataBytes: 324, BackingMetadataHighWaterBytes: 2000, BackingPhysicalBytes: 2048, BackingReclaimError: "disk refused reclaim",
 		}})
 	}))
 	defer control.Close()
 	endpoint := &mcpEndpoint{control: client.NewClient(control.URL, nil), vms: map[string]mcpVM{"one": {ID: "one", Image: "alpine"}}}
 	_, listed, err := endpoint.listVMs(t.Context(), nil, mcpListVMsInput{})
-	if err != nil || listed.ObservationError != "" || len(listed.VMs) != 1 {
+	if err != nil || listed.ObservationError != "" || listed.ImplementationVersion != mcpImplementationVersion() || len(listed.VMs) != 1 {
 		t.Fatalf("list VMs = %#v, %v", listed, err)
 	}
 	vm := listed.VMs[0]
-	if vm.MemoryMB != 4096 || vm.BalloonMB != 768 || vm.BackingBytes != 1024 || vm.BackingHighWaterBytes != 4096 || vm.BackingPhysicalBytes != 2048 || vm.BackingReclaimError != "disk refused reclaim" {
+	if vm.MemoryMB != 4096 || vm.BalloonMB != 768 || vm.BackingBytes != 1024 || vm.BackingHighWaterBytes != 4096 || vm.BackingDataBytes != 700 || vm.BackingDataHighWaterBytes != 3000 || vm.BackingMetadataBytes != 324 || vm.BackingMetadataHighWaterBytes != 2000 || vm.BackingPhysicalBytes != 2048 || vm.BackingReclaimError != "disk refused reclaim" {
 		t.Fatalf("observed VM = %#v", vm)
 	}
 }
@@ -1216,7 +1217,7 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 				return
 			}
 			if len(req.Command) >= 3 && strings.Contains(req.Command[2], `wc -c`) {
-				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte("0\n")})
+				_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte("0 closed 0 uncapped\n")})
 			}
 			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 0})
 			return
@@ -1513,6 +1514,67 @@ func TestMCPContextCaptureKeepsBackgroundOutputWithItsOriginatingCommand(t *test
 	if string(first) != "firstlate" || string(second) != "second" {
 		t.Fatalf("capture provenance first=%q second=%q", first, second)
 	}
+	for _, capture := range []string{firstOut, firstErr, secondOut, secondErr} {
+		if info, err := os.Stat(capture + ".closed"); err != nil || info.Size() == 0 {
+			t.Fatalf("portable relay did not close %s: size=%v err=%v", capture, func() int64 {
+				if info != nil {
+					return info.Size()
+				}
+				return -1
+			}(), err)
+		}
+	}
+}
+
+func TestMCPContextCaptureRelayBoundsStoredOutputAndKeepsByteCount(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	controlPath := filepath.Join(dir, "control")
+	stdoutPath := filepath.Join(dir, "bounded.stdout")
+	stderrPath := filepath.Join(dir, "bounded.stderr")
+	controlR, controlW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controlR.Close()
+	cmd := exec.Command("/bin/sh", "-c", mcpContextShellScriptForShell(controlPath, "/bin/sh"))
+	cmd.Stdin = strings.NewReader(mcpContextCommandCaptureScript(
+		"marker_bounded",
+		fmt.Sprintf("head -c %d /dev/zero", mcpContextCaptureMaxStoredBytes+8192),
+		controlPath, stdoutPath, stderrPath,
+	))
+	cmd.ExtraFiles = []*os.File{controlW}
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run bounded relay: %v output=%q", err, output)
+	}
+	_ = controlW.Close()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if info, err := os.Stat(stdoutPath + ".closed"); err == nil && info.Size() != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("capture relay did not report closure")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	info, err := os.Stat(stdoutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != int64(mcpContextCaptureMaxStoredBytes) {
+		t.Fatalf("stored capture bytes = %d, want %d", info.Size(), mcpContextCaptureMaxStoredBytes)
+	}
+	overflowData, err := os.ReadFile(stdoutPath + ".overflow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	overflow, err := strconv.ParseInt(strings.TrimSpace(string(overflowData)), 10, 64)
+	if err != nil || overflow != 8192 {
+		t.Fatalf("capture overflow = %q (%d, %v)", overflowData, overflow, err)
+	}
 }
 
 func TestMCPContextCaptureCursorDoesNotReadPastSizeSnapshot(t *testing.T) {
@@ -1583,17 +1645,18 @@ func TestMCPContextCaptureCursorDoesNotReadPastSizeSnapshot(t *testing.T) {
 	}
 }
 
-func TestMCPContextKeepsEveryCaptureWithAnOpenWriterObservable(t *testing.T) {
+func TestMCPContextRetiresOldCaptureObservationWithoutLosingRecentOutput(t *testing.T) {
 	captures := []mcpContextCapture{{stdoutPath: "closed-cleared"}}
 	captures[0].stdoutPath = ""
 	for i := 0; i < 12; i++ {
 		captures = retainObservableContextCaptures(captures, mcpContextCapture{stdoutPath: fmt.Sprintf("capture-%d", i)})
 	}
-	if len(captures) != 12 {
-		t.Fatalf("observable captures = %d, want all 12 live writers", len(captures))
+	kept, retired := limitObservableContextCaptures(captures)
+	if len(kept) != mcpContextCaptureRetention || len(retired) != 4 {
+		t.Fatalf("capture lifecycle kept=%d retired=%d", len(kept), len(retired))
 	}
-	for i, capture := range captures {
-		if capture.stdoutPath != fmt.Sprintf("capture-%d", i) {
+	for i, capture := range kept {
+		if capture.stdoutPath != fmt.Sprintf("capture-%d", i+4) {
 			t.Fatalf("capture %d = %+v", i, capture)
 		}
 	}
@@ -1678,7 +1741,7 @@ func TestMCPContextPreservesOutputAccountingTimeoutBytesAndPrivateFraming(t *tes
 			return
 		}
 		if len(req.Command) >= 3 && strings.Contains(req.Command[2], `wc -c`) {
-			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte("0\n")})
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte("0 closed 0 uncapped\n")})
 		}
 		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 0})
 	}))
@@ -1810,7 +1873,7 @@ func TestMCPAsyncContextCommandsAllowSequentialLifecycleInterruption(t *testing.
 			return
 		}
 		if len(req.Command) >= 3 && strings.Contains(req.Command[2], `wc -c`) {
-			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte("0\n")})
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte("0 closed 0 uncapped\n")})
 		}
 		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 0})
 	}))
