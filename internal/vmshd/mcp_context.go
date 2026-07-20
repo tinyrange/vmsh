@@ -35,12 +35,16 @@ type mcpGuestContext struct {
 	done        chan struct{}
 	control     *client.Client
 
-	runMu    sync.Mutex
-	stopOnce sync.Once
-	mu       sync.Mutex
-	err      string
-	carry    []byte
-	captures []mcpContextCapture
+	runMu              sync.Mutex
+	stopOnce           sync.Once
+	mu                 sync.Mutex
+	err                string
+	closing            bool
+	carry              []byte
+	captures           []mcpContextCapture
+	retiredStdoutSeen  int64
+	retiredStderrSeen  int64
+	hasRetiredCaptures bool
 }
 
 type mcpContextCapture struct {
@@ -56,7 +60,7 @@ func (c mcpContextCapture) paths() []string {
 		if output == "" {
 			continue
 		}
-		paths = append(paths, output, output+".fifo", output+".closed", output+".overflow", output+".relay", output+".retired")
+		paths = append(paths, output, output+".fifo", output+".closed", output+".overflow", output+".relay", output+".retired", output+".observed")
 	}
 	return paths
 }
@@ -408,11 +412,15 @@ func (e *mcpEndpoint) closeGuestContext(ctx context.Context, _ *mcp.CallToolRequ
 			commands = append(commands, command)
 		}
 	}
-	delete(e.contexts, guest.id)
 	e.mu.Unlock()
 	if err := cancelAndWaitMCPWork(ctx, e.workCleanupTimeout(), commands, []*mcpGuestContext{guest}); err != nil {
 		return nil, mcpContextCloseOutput{}, fmt.Errorf("close guest context: %w", err)
 	}
+	e.mu.Lock()
+	if e.contexts[guest.id] == guest {
+		delete(e.contexts, guest.id)
+	}
+	e.mu.Unlock()
 	return nil, mcpContextCloseOutput{Closed: true}, nil
 }
 
@@ -617,6 +625,9 @@ func limitObservableContextCaptures(captures []mcpContextCapture) ([]mcpContextC
 }
 
 func (g *mcpGuestContext) collectContextCaptures(ctx context.Context, result *mcpContextResult) error {
+	if err := g.collectRetiredCaptureCounts(ctx, result); err != nil {
+		return err
+	}
 	g.mu.Lock()
 	captures := append([]mcpContextCapture(nil), g.captures...)
 	g.mu.Unlock()
@@ -758,7 +769,62 @@ func (g *mcpGuestContext) readContextCapture(ctx context.Context, capturePath st
 }
 
 func mcpContextCaptureReadScript() string {
-	return `if [ ! -f "$1" ]; then printf '0 closed 0 uncapped\n' >&2; exit; fi; size=$(wc -c <"$1") || exit; count=$((size - $2)); [ "$count" -lt 0 ] && count=0; [ "$count" -gt "$3" ] && count=$3; if [ "$count" -gt 0 ]; then tail -c "+$(( $2 + 1 ))" "$1" | head -c "$count"; fi; writer=open; [ -s "$1.closed" ] && writer=closed; overflow=0; [ -s "$1.overflow" ] && overflow=$(cat "$1.overflow"); capstate=uncapped; if [ "$size" -ge ` + strconv.Itoa(mcpContextCaptureMaxStoredBytes) + ` ] || [ "$overflow" -gt 0 ] || [ -s "$1.retired" ]; then capstate=capped; fi; printf '%s %s %s %s\n' "$size" "$writer" "$overflow" "$capstate" >&2`
+	return `if [ ! -f "$1" ]; then printf '0 closed 0 uncapped\n' >&2; exit; fi; size=$(wc -c <"$1") || exit; count=$((size - $2)); [ "$count" -lt 0 ] && count=0; [ "$count" -gt "$3" ] && count=$3; if [ "$count" -gt 0 ]; then tail -c "+$(( $2 + 1 ))" "$1" | head -c "$count"; fi; writer=open; [ -s "$1.closed" ] && writer=closed; overflow=0; [ -s "$1.overflow" ] && overflow=$(cat "$1.overflow"); capstate=uncapped; if [ "$overflow" -gt 0 ] || [ -s "$1.retired" ]; then capstate=capped; fi; printf '%s %s %s %s\n' "$size" "$writer" "$overflow" "$capstate" >&2`
+}
+
+func (g *mcpGuestContext) collectRetiredCaptureCounts(ctx context.Context, result *mcpContextResult) error {
+	if g.control == nil {
+		return fmt.Errorf("guest context control client is unavailable")
+	}
+	g.mu.Lock()
+	hasRetired := g.hasRetiredCaptures
+	g.mu.Unlock()
+	if !hasRetired {
+		return nil
+	}
+	stdoutCount, stderrCount := mcpContextRetiredCountPaths(g.captureDir)
+	var output []byte
+	err := g.control.ExecStreamInContext(ctx, g.vmID, client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", `for count do if [ -f "$count" ]; then cat "$count"; else printf '0\n'; fi; done`, "sh", stdoutCount, stderrCount},
+		WorkDir: "/", User: g.user,
+	}, nil, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "stdout", "output":
+			if event.Stream != "stderr" {
+				output = append(output, contextEventData(event)...)
+			}
+		case "error":
+			return fmt.Errorf("%s", firstNonEmpty(event.Error, event.Output, "command failed"))
+		case "exit":
+			if event.ExitCode != 0 {
+				return fmt.Errorf("read retired context counts exited with status %d", event.ExitCode)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("read retired context counts: %w", err)
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) != 2 {
+		return fmt.Errorf("read retired context counts returned invalid totals")
+	}
+	stdoutTotal, stdoutErr := strconv.ParseInt(fields[0], 10, 64)
+	stderrTotal, stderrErr := strconv.ParseInt(fields[1], 10, 64)
+	if stdoutErr != nil || stderrErr != nil || stdoutTotal < 0 || stderrTotal < 0 {
+		return fmt.Errorf("read retired context counts returned invalid totals")
+	}
+	g.mu.Lock()
+	stdoutDelta := max(int64(0), stdoutTotal-g.retiredStdoutSeen)
+	stderrDelta := max(int64(0), stderrTotal-g.retiredStderrSeen)
+	g.retiredStdoutSeen = max(g.retiredStdoutSeen, stdoutTotal)
+	g.retiredStderrSeen = max(g.retiredStderrSeen, stderrTotal)
+	g.mu.Unlock()
+	result.asyncStdoutTotal += stdoutDelta
+	result.asyncStderrTotal += stderrDelta
+	result.asyncStdoutTruncated = result.asyncStdoutTruncated || stdoutDelta != 0
+	result.asyncStderrTruncated = result.asyncStderrTruncated || stderrDelta != 0
+	return nil
 }
 
 func (g *mcpGuestContext) removeContextCaptures(captures []mcpContextCapture) {
@@ -781,21 +847,23 @@ func (g *mcpGuestContext) retireContextCaptures(captures []mcpContextCapture) {
 	if len(captures) == 0 || g.control == nil {
 		return
 	}
-	paths := make([]string, 0, len(captures)*2)
+	g.mu.Lock()
+	g.hasRetiredCaptures = true
+	g.mu.Unlock()
+	args := []string{"/bin/sh", "-c", `while [ "$#" -ge 2 ]; do output=$1; observed=$2; shift 2; command printf '%s\n' "$observed" >"$output.observed"; command printf 1 >"$output.retired"; if [ -s "$output.relay" ]; then kill -USR1 "$(cat "$output.relay")" 2>/dev/null || :; fi; done`, "sh"}
 	for _, capture := range captures {
 		if capture.stdoutPath != "" {
-			paths = append(paths, capture.stdoutPath)
+			args = append(args, capture.stdoutPath, strconv.FormatInt(capture.stdoutOffset, 10))
 		}
 		if capture.stderrPath != "" {
-			paths = append(paths, capture.stderrPath)
+			args = append(args, capture.stderrPath, strconv.FormatInt(capture.stderrOffset, 10))
 		}
 	}
-	if len(paths) == 0 {
+	if len(args) == 4 {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	args := append([]string{"/bin/sh", "-c", `for output do if [ -s "$output.relay" ]; then kill -USR1 "$(cat "$output.relay")" 2>/dev/null || :; fi; done`, "sh"}, paths...)
 	_, _ = g.control.RunEventsInContext(ctx, g.vmID, client.RunRequest{Command: args, WorkDir: "/", User: g.user})
 	g.removeContextCaptures(captures)
 }
@@ -832,11 +900,15 @@ func mcpContextShellScriptForShell(controlPath, shellPath string) string {
 	path := shellJoin([]string{controlPath})
 	dir := shellJoin([]string{pathpkg.Dir(controlPath)})
 	shell := shellJoin([]string{shellPath})
+	stdoutCount, stderrCount := mcpContextRetiredCountPaths(pathpkg.Dir(controlPath))
+	stdoutCounter := mcpContextRetiredCounterScript(stdoutCount, "__vmsh_mcp_stdout_counter")
+	stderrCounter := mcpContextRetiredCounterScript(stderrCount, "__vmsh_mcp_stderr_counter")
 	return "__vmsh_mcp_fifo=" + path + "\n" +
 		"__vmsh_mcp_relay_stop=__vmsh_mcp_relay_stop__\n" +
 		"__vmsh_mcp_initial_umask=$(umask)\n" +
 		"umask 077\n" +
 		"if [ -d " + dir + " ]; then chmod 700 " + dir + " || exit 126; else mkdir -m 700 " + dir + " || exit 126; fi\n" +
+		stdoutCounter + stderrCounter +
 		"rm -f \"$__vmsh_mcp_fifo\" || exit 126\n" +
 		"mkfifo \"$__vmsh_mcp_fifo\" || exit 126\n" +
 		"(exec 8<>\"$__vmsh_mcp_fifo\"; while IFS= read -r __vmsh_mcp_frame <&8; do [ \"$__vmsh_mcp_frame\" = \"$__vmsh_mcp_relay_stop\" ] && break; command printf '%s\\n' \"$__vmsh_mcp_frame\"; done) >&3 &\n" +
@@ -845,7 +917,7 @@ func mcpContextShellScriptForShell(controlPath, shellPath string) string {
 		// an internal script-reader descriptor. The user may freely close or
 		// replace this harmless placeholder without affecting the relay.
 		"exec 3</dev/null\n" +
-		"__vmsh_mcp_cleanup() { (command printf '%s\\n' \"$__vmsh_mcp_relay_stop\" >\"$__vmsh_mcp_fifo\") & __vmsh_mcp_stop_writer=$!; wait \"$__vmsh_mcp_relay\" 2>/dev/null; kill \"$__vmsh_mcp_stop_writer\" 2>/dev/null; wait \"$__vmsh_mcp_stop_writer\" 2>/dev/null; rm -f \"$__vmsh_mcp_fifo\"; }\n" +
+		"__vmsh_mcp_cleanup() { (command printf '%s\\n' \"$__vmsh_mcp_relay_stop\" >\"$__vmsh_mcp_fifo\") & __vmsh_mcp_stop_writer=$!; wait \"$__vmsh_mcp_relay\" 2>/dev/null; kill \"$__vmsh_mcp_stop_writer\" 2>/dev/null; wait \"$__vmsh_mcp_stop_writer\" 2>/dev/null; (command printf '%s\\n' \"$__vmsh_mcp_relay_stop\" >" + shellJoin([]string{stdoutCount + ".fifo"}) + ") & __vmsh_mcp_stdout_stop_writer=$!; (command printf '%s\\n' \"$__vmsh_mcp_relay_stop\" >" + shellJoin([]string{stderrCount + ".fifo"}) + ") & __vmsh_mcp_stderr_stop_writer=$!; wait \"$__vmsh_mcp_stdout_counter\" \"$__vmsh_mcp_stderr_counter\" 2>/dev/null; kill \"$__vmsh_mcp_stdout_stop_writer\" \"$__vmsh_mcp_stderr_stop_writer\" 2>/dev/null; wait \"$__vmsh_mcp_stdout_stop_writer\" \"$__vmsh_mcp_stderr_stop_writer\" 2>/dev/null; rm -f \"$__vmsh_mcp_fifo\"; }\n" +
 		"trap '__vmsh_mcp_cleanup; exit 143' HUP INT TERM\n" +
 		"umask \"$__vmsh_mcp_initial_umask\"\n" +
 		"unset __vmsh_mcp_initial_umask\n" +
@@ -868,44 +940,68 @@ func mcpContextCommandCaptureScript(token, line, controlPath, stdoutPath, stderr
 	path := shellJoin([]string{controlPath})
 	stdout := shellJoin([]string{stdoutPath + ".fifo"})
 	stderr := shellJoin([]string{stderrPath + ".fifo"})
-	return umaskVar + "=$(umask)\numask 077\n" + mcpContextCaptureRelayScript(stdoutPath) + mcpContextCaptureRelayScript(stderrPath) + "umask \"$" + umaskVar + "\"\n" +
+	stdoutCount, stderrCount := mcpContextRetiredCountPaths(pathpkg.Dir(controlPath))
+	return umaskVar + "=$(umask)\numask 077\n" + mcpContextCaptureRelayScript(stdoutPath, stdoutCount+".fifo") + mcpContextCaptureRelayScript(stderrPath, stderrCount+".fifo") + "umask \"$" + umaskVar + "\"\n" +
 		"/usr/bin/printf '\\036" + token + ":begin\\037\\n' >" + path + "\nif {\n" + line +
 		"\n} </dev/null >" + stdout + " 2>" + stderr + "; then\n" + statusVar + "=0\nelse\n" + statusVar + "=$?\nfi\n" +
 		"/usr/bin/printf '\\036" + token + ":%s\\037\\n' \"$" + statusVar + "\" >" + path + "\nunset " + statusVar + " " + umaskVar + "\n"
 }
 
-func mcpContextCaptureRelayScript(outputPath string) string {
+func mcpContextCaptureRelayScript(outputPath, retiredCountFIFO string) string {
 	output := shellJoin([]string{outputPath})
 	fifo := shellJoin([]string{outputPath + ".fifo"})
 	closed := shellJoin([]string{outputPath + ".closed"})
 	overflow := shellJoin([]string{outputPath + ".overflow"})
 	relay := shellJoin([]string{outputPath + ".relay"})
 	retired := shellJoin([]string{outputPath + ".retired"})
-	return "rm -f " + output + " " + fifo + " " + closed + " " + overflow + " " + relay + " " + retired + "\n" +
-		": >" + output + "\n: >" + closed + "\n: >" + overflow + "\n: >" + retired + "\nmkfifo " + fifo + "\n" +
-		"chmod 600 " + output + " " + fifo + " " + closed + " " + overflow + " " + retired + "\n" +
-		"(exec 7<" + fifo + "; exec 6>" + closed + "; exec 5>" + overflow + "; exec 4>" + retired + "; " +
-		"__vmsh_mcp_capture_reader=; trap 'command printf 1 >&4; [ -z \"$__vmsh_mcp_capture_reader\" ] || kill \"$__vmsh_mcp_capture_reader\" 2>/dev/null || :' USR1; " +
+	observed := shellJoin([]string{outputPath + ".observed"})
+	countFIFO := shellJoin([]string{retiredCountFIFO})
+	return "rm -f " + output + " " + fifo + " " + closed + " " + overflow + " " + relay + " " + retired + " " + observed + "\n" +
+		": >" + output + "\n: >" + closed + "\n: >" + overflow + "\n: >" + retired + "\n: >" + observed + "\nmkfifo " + fifo + "\n" +
+		"chmod 600 " + output + " " + fifo + " " + closed + " " + overflow + " " + retired + " " + observed + "\n" +
+		"(exec 9<" + observed + "; exec 8<" + output + "; exec 7<" + fifo + "; exec 6>" + closed + "; exec 5>" + overflow + "; exec 4>" + retired + "; exec 3<>" + countFIFO + "; " +
+		"__vmsh_mcp_capture_reader=; __vmsh_mcp_capture_retired=; trap '__vmsh_mcp_capture_retired=1; command printf 1 >&4; [ -z \"$__vmsh_mcp_capture_reader\" ] || kill \"$__vmsh_mcp_capture_reader\" 2>/dev/null || :' USR1; " +
 		"head -c " + strconv.Itoa(mcpContextCaptureMaxStoredBytes) + " <&7 >" + output + " & __vmsh_mcp_capture_reader=$!; " +
-		"wait \"$__vmsh_mcp_capture_reader\" 2>/dev/null || :; wc -c <&7 >&5; command printf 1 >&6) &\n" +
+		"wait \"$__vmsh_mcp_capture_reader\" 2>/dev/null || :; __vmsh_mcp_capture_overflow=$(wc -c <&7); command printf '%s' \"$__vmsh_mcp_capture_overflow\" >&5; if [ -n \"$__vmsh_mcp_capture_retired\" ]; then __vmsh_mcp_capture_stored=$(wc -c <&8); __vmsh_mcp_capture_observed=$(cat <&9); __vmsh_mcp_capture_delta=$((__vmsh_mcp_capture_stored + __vmsh_mcp_capture_overflow - __vmsh_mcp_capture_observed)); [ \"$__vmsh_mcp_capture_delta\" -lt 0 ] && __vmsh_mcp_capture_delta=0; command printf '%s\\n' \"$__vmsh_mcp_capture_delta\" >&3; fi; command printf 1 >&6) &\n" +
 		"command printf '%s\\n' \"$!\" >" + relay + "\nchmod 600 " + relay + "\n"
+}
+
+func mcpContextRetiredCountPaths(captureDir string) (string, string) {
+	return captureDir + "/retired.stdout.total", captureDir + "/retired.stderr.total"
+}
+
+func mcpContextRetiredCounterScript(totalPath, pidVar string) string {
+	total := shellJoin([]string{totalPath})
+	fifo := shellJoin([]string{totalPath + ".fifo"})
+	tmp := shellJoin([]string{totalPath + ".next"})
+	return "rm -f " + total + " " + fifo + " " + tmp + "\ncommand printf '0\\n' >" + total + "\nmkfifo " + fifo + "\nchmod 600 " + total + " " + fifo + "\n" +
+		"(exec 9<>" + fifo + "; __vmsh_mcp_retired_total=0; while IFS= read -r __vmsh_mcp_retired_delta <&9; do [ \"$__vmsh_mcp_retired_delta\" = \"$__vmsh_mcp_relay_stop\" ] && break; __vmsh_mcp_retired_total=$((__vmsh_mcp_retired_total + __vmsh_mcp_retired_delta)); command printf '%s\\n' \"$__vmsh_mcp_retired_total\" >" + tmp + "; mv -f " + tmp + " " + total + "; done) &\n" + pidVar + "=$!\n"
 }
 
 func (g *mcpGuestContext) info() mcpContextInfo {
 	g.mu.Lock()
 	err := g.err
+	closing := g.closing
 	g.mu.Unlock()
 	status := "running"
 	select {
 	case <-g.done:
 		status = "closed"
 	default:
+		if closing {
+			status = "closing"
+		}
 	}
 	return mcpContextInfo{ContextID: g.id, VMID: g.vmID, Status: status, User: g.user, WorkDir: g.workDir, Error: err}
 }
 
 func (g *mcpGuestContext) stop() {
-	g.stopOnce.Do(g.cancel)
+	g.stopOnce.Do(func() {
+		g.mu.Lock()
+		g.closing = true
+		g.mu.Unlock()
+		g.cancel()
+	})
 }
 
 func (g *mcpGuestContext) stopAndWait(timeout time.Duration) bool {

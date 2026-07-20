@@ -906,17 +906,15 @@ func (e *mcpEndpoint) close() error {
 	for operation := range e.artifactWork {
 		artifactWork = append(artifactWork, operation)
 	}
+	for _, command := range e.commands {
+		commands = append(commands, command)
+	}
+	for _, guest := range e.contexts {
+		contexts = append(contexts, guest)
+	}
 	if firstClose {
 		e.credentials = make(map[string]string)
-		for _, command := range e.commands {
-			commands = append(commands, command)
-		}
-		for _, guest := range e.contexts {
-			contexts = append(contexts, guest)
-		}
-		e.commands = make(map[string]*mcpCommand)
 		e.artifacts = make(map[string]*mcpArtifact)
-		e.contexts = make(map[string]*mcpGuestContext)
 	}
 	e.mu.Unlock()
 	var errs []error
@@ -926,12 +924,29 @@ func (e *mcpEndpoint) close() error {
 	for _, operation := range artifactWork {
 		operation.cancel()
 	}
-	if firstClose {
-		errs = append(errs, cancelAndWaitMCPWork(context.Background(), e.workCleanupTimeout(), commands, contexts))
-		for _, command := range commands {
-			command.releasePayload()
+	cleanupErr := cancelAndWaitMCPWork(context.Background(), e.workCleanupTimeout(), commands, contexts)
+	errs = append(errs, cleanupErr)
+	e.mu.Lock()
+	for _, command := range commands {
+		select {
+		case <-command.done:
+			if e.commands[command.id] == command {
+				command.releasePayload()
+				delete(e.commands, command.id)
+			}
+		default:
 		}
 	}
+	for _, guest := range contexts {
+		select {
+		case <-guest.done:
+			if e.contexts[guest.id] == guest {
+				delete(e.contexts, guest.id)
+			}
+		default:
+		}
+	}
+	e.mu.Unlock()
 	if firstClose && e.server != nil {
 		// Stop accepting and terminate active MCP transports before cleaning up
 		// their VMs. Graceful HTTP shutdown can otherwise wait indefinitely for a
@@ -1051,14 +1066,25 @@ func (e *mcpEndpoint) cancelVMWork(ctx context.Context, vmID string) error {
 		}
 	}
 	contexts := make([]*mcpGuestContext, 0)
-	for id, guest := range e.contexts {
+	for _, guest := range e.contexts {
 		if guest.vmID == vmID {
 			contexts = append(contexts, guest)
-			delete(e.contexts, id)
 		}
 	}
 	e.mu.Unlock()
-	return cancelAndWaitMCPWork(ctx, e.workCleanupTimeout(), commands, contexts)
+	err := cancelAndWaitMCPWork(ctx, e.workCleanupTimeout(), commands, contexts)
+	e.mu.Lock()
+	for _, guest := range contexts {
+		select {
+		case <-guest.done:
+			if e.contexts[guest.id] == guest {
+				delete(e.contexts, guest.id)
+			}
+		default:
+		}
+	}
+	e.mu.Unlock()
+	return err
 }
 
 func (e *mcpEndpoint) workCleanupTimeout() time.Duration {

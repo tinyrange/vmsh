@@ -1577,6 +1577,73 @@ func TestMCPContextCaptureRelayBoundsStoredOutputAndKeepsByteCount(t *testing.T)
 	}
 }
 
+func TestMCPContextCaptureAtExactLimitIsComplete(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	capture := filepath.Join(dir, "exact")
+	if err := os.WriteFile(capture, make([]byte, mcpContextCaptureMaxStoredBytes), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{".closed", ".overflow", ".retired"} {
+		data := []byte(nil)
+		if suffix == ".closed" {
+			data = []byte("1")
+		}
+		if err := os.WriteFile(capture+suffix, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readState := func() string {
+		t.Helper()
+		cmd := exec.Command("/bin/sh", "-c", mcpContextCaptureReadScript(), "sh", capture, "0", "0")
+		var diagnostic bytes.Buffer
+		cmd.Stderr = &diagnostic
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("read exact capture: %v; diagnostic=%q", err, diagnostic.String())
+		}
+		fields := strings.Fields(diagnostic.String())
+		if len(fields) != 4 {
+			t.Fatalf("capture diagnostic = %q", diagnostic.String())
+		}
+		return fields[3]
+	}
+	if state := readState(); state != "uncapped" {
+		t.Fatalf("exact retained output state = %q, want uncapped", state)
+	}
+	if err := os.WriteFile(capture+".overflow", []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if state := readState(); state != "capped" {
+		t.Fatalf("overflowing output state = %q, want capped", state)
+	}
+}
+
+func TestMCPRetiredCapturePublishesDiscardedByteCount(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	totalPath := filepath.Join(dir, "retired.total")
+	outputPath := filepath.Join(dir, "capture")
+	script := "__vmsh_mcp_relay_stop=stop\n" +
+		mcpContextRetiredCounterScript(totalPath, "__vmsh_mcp_counter") +
+		mcpContextCaptureRelayScript(outputPath, totalPath+".fifo") +
+		"(sleep 0.05; head -c 100000 /dev/zero) >" + shellJoin([]string{outputPath + ".fifo"}) + " & __vmsh_mcp_writer=$!\n" +
+		"sleep 0.01\ncommand printf '0\\n' >" + shellJoin([]string{outputPath + ".observed"}) + "\ncommand printf 1 >" + shellJoin([]string{outputPath + ".retired"}) + "\n" +
+		"__vmsh_mcp_capture_relay=$(cat " + shellJoin([]string{outputPath + ".relay"}) + ")\nkill -USR1 \"$__vmsh_mcp_capture_relay\"\nwait \"$__vmsh_mcp_writer\"\nwait \"$__vmsh_mcp_capture_relay\"\n" +
+		"__vmsh_mcp_tries=0\nwhile [ \"$(cat " + shellJoin([]string{totalPath}) + ")\" = 0 ] && [ \"$__vmsh_mcp_tries\" -lt 100 ]; do sleep 0.01; __vmsh_mcp_tries=$((__vmsh_mcp_tries + 1)); done\n" +
+		"cat " + shellJoin([]string{totalPath}) + "\ncommand printf '%s\\n' \"$__vmsh_mcp_relay_stop\" >" + shellJoin([]string{totalPath + ".fifo"}) + "\nwait \"$__vmsh_mcp_counter\"\n"
+	output, err := exec.Command("/bin/sh", "-c", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("retired capture accounting: %v; output=%q", err, output)
+	}
+	if got := strings.TrimSpace(string(output)); got != "100000" {
+		t.Fatalf("retired capture total = %q, want 100000", got)
+	}
+}
+
 func TestMCPContextCaptureCursorDoesNotReadPastSizeSnapshot(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX shell")
@@ -2110,6 +2177,17 @@ func TestMCPLifecycleReportsIncompleteCleanup(t *testing.T) {
 		if err == nil || closed.Closed {
 			t.Fatalf("wedged context close = %#v, %v", closed, err)
 		}
+		if endpoint.contexts[guest.id] != guest || guest.info().Status != "closing" {
+			t.Fatalf("failed close lost recovery handle: contexts=%#v status=%q", endpoint.contexts, guest.info().Status)
+		}
+		close(guest.done)
+		_, closed, err = endpoint.closeGuestContext(t.Context(), nil, mcpContextStatusInput{ContextID: guest.id})
+		if err != nil || !closed.Closed {
+			t.Fatalf("retry context close = %#v, %v", closed, err)
+		}
+		if endpoint.contexts[guest.id] != nil {
+			t.Fatal("completed close retained context recovery handle")
+		}
 	})
 
 	t.Run("VM stop", func(t *testing.T) {
@@ -2133,6 +2211,9 @@ func TestMCPLifecycleReportsIncompleteCleanup(t *testing.T) {
 		case <-shutdownCalled:
 		default:
 			t.Fatal("VM shutdown was skipped after cleanup timed out")
+		}
+		if endpoint.contexts[guest.id] != nil {
+			t.Fatal("terminal VM teardown retained context recovery handle")
 		}
 	})
 }
