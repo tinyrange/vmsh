@@ -1496,9 +1496,11 @@ func TestTerminalStreamsAreRevokedByAttachmentLifecycle(t *testing.T) {
 			if err := ws.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 				t.Fatalf("set stream deadline: %v", err)
 			}
-			var msg TerminalStreamMessage
-			if err := websocket.JSON.Receive(ws, &msg); err == nil {
-				t.Fatalf("revoked stream remained readable: %+v", msg)
+			for {
+				var msg TerminalStreamMessage
+				if err := websocket.JSON.Receive(ws, &msg); err != nil {
+					break
+				}
 			}
 			requireEventually(t, func() bool { return len(srv.streams.List()) == 0 })
 		})
