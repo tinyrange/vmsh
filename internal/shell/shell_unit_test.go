@@ -1526,17 +1526,18 @@ func TestPersistentShellCommandAllowedRejectsLeadingDashCommand(t *testing.T) {
 
 func TestPersistentGuestShellStartsForwardingBeforeCommand(t *testing.T) {
 	inputs := make(chan client.ExecInput, 1)
-	events := make(chan client.ExecEvent, 1)
+	events := make(chan client.ExecEvent, 3)
 	session := &persistentGuestShell{
 		inputs: inputs,
 		events: events,
 		done:   make(chan error, 1),
 	}
+	var stdout bytes.Buffer
 	started := make(chan struct{})
 	stop := make(chan struct{})
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- session.run("cat", io.Discard, io.Discard, func() (func(), error) {
+		errCh <- session.run("cat", &stdout, io.Discard, func() (func(), error) {
 			close(started)
 			return func() { close(stop) }, nil
 		})
@@ -1556,7 +1557,35 @@ func TestPersistentGuestShellStartsForwardingBeforeCommand(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("persistent shell command was not sent")
 	}
+
+	// The control pipe and PTY are relayed independently. A fast shell can
+	// report completion before the PTY reader delivers output that was written
+	// first, which must not make the next prompt race ahead of that output.
 	events <- client.ExecEvent{Kind: "control", Output: "done\t0\t/home/cc\n"}
+	var marker []byte
+	select {
+	case input := <-inputs:
+		start := bytes.Index(input.Data, []byte(persistentOutputBarrierPrefix))
+		if start < 0 {
+			t.Fatalf("persistent shell command has no output barrier: %q", input.Data)
+		}
+		end := bytes.Index(input.Data[start+len(persistentOutputBarrierPrefix):], []byte(persistentOutputBarrierSuffix))
+		if end < 0 {
+			t.Fatalf("persistent shell command has incomplete output barrier: %q", input.Data)
+		}
+		end += start + len(persistentOutputBarrierPrefix) + len(persistentOutputBarrierSuffix)
+		marker = append([]byte(nil), input.Data[start:end]...)
+	case <-time.After(2 * time.Second):
+		t.Fatal("persistent shell output barrier was not requested after completion")
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("persistent command finished before prior PTY output arrived: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	split := len(marker) / 2
+	events <- client.ExecEvent{Kind: "stdout", Data: append([]byte("command output\n"), marker[:split]...)}
+	events <- client.ExecEvent{Kind: "stdout", Data: marker[split:]}
 	select {
 	case err := <-errCh:
 		if err != nil {
@@ -1564,6 +1593,9 @@ func TestPersistentGuestShellStartsForwardingBeforeCommand(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("persistent command did not finish")
+	}
+	if got, want := stdout.String(), "command output\r\n"; got != want {
+		t.Fatalf("persistent command output = %q, want %q", got, want)
 	}
 	select {
 	case <-stop:

@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -52,6 +53,8 @@ const defaultCCVMGuestMemoryMB = 512
 const maxEmbeddedHostInitPreludeBytes = 64 * 1024
 const maxBackgroundJobLogBytes = 1024 * 1024
 const ubuntuCloudRootFSBaseURL = "https://cloud-images.ubuntu.com/releases/noble/release"
+const persistentOutputBarrierPrefix = "__VMSH_OUTPUT_BARRIER_"
+const persistentOutputBarrierSuffix = "__"
 const (
 	colorReset   = "\x1b[0m"
 	colorGreen   = "\x1b[32m"
@@ -6343,6 +6346,7 @@ func shareMountKey(shares []client.ShareMount) string {
 
 func guestPersistentCommand() []string {
 	return []string{"sh", "-lc", guestShellPrelude() + strings.Join([]string{
+		"trap ':' INT QUIT",
 		"stty -echo 2>/dev/null || true",
 		colorPrelude("ls --color=always -C -w ${COLUMNS:-80}", "ls -G -C", false),
 		"__vmsh_control_fd=3",
@@ -6467,6 +6471,10 @@ func parsePersistentReady(text string) (string, bool) {
 func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer, startForwarding func() (func(), error)) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	barrier, err := newPersistentOutputBarrier()
+	if err != nil {
+		return err
+	}
 	stopForwarding := func() {}
 	if startForwarding != nil {
 		stop, err := startForwarding()
@@ -6479,6 +6487,7 @@ func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer, startF
 	}
 	defer stopForwarding()
 	p.inputs <- client.ExecInput{Kind: "stdin", Data: []byte("__vmsh_run " + shellQuote(line) + "\n")}
+	var completed *persistentHostControlRecord
 	for event := range p.events {
 		switch event.Kind {
 		case "control":
@@ -6489,25 +6498,80 @@ func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer, startF
 			if record.kind != "done" {
 				continue
 			}
-			p.lastCWD = record.cwd
-			if record.code != 0 {
-				return persistentShellExit{code: record.code}
-			}
-			return nil
+			completed = &record
+			p.inputs <- client.ExecInput{Kind: "stdin", Data: []byte("command printf '%s' " + shellQuote(string(barrier.marker)) + "\n")}
 		case "stdout", "output":
-			writeTTYExecEventOutput(stdout, event)
+			barrier.write(stdout, execEventBytes(event))
 		case "stderr":
 			writeTTYExecEventOutput(stderr, event)
 		case "exit":
+			barrier.flush(stdout)
 			return errPersistentGuestShellExited
 		case "error":
+			barrier.flush(stdout)
 			if event.Error != "" {
 				return fmt.Errorf("%s", event.Error)
 			}
 			return fmt.Errorf("persistent guest shell failed")
 		}
+		if completed != nil && barrier.reached {
+			p.lastCWD = completed.cwd
+			if completed.code != 0 {
+				return persistentShellExit{code: completed.code}
+			}
+			return nil
+		}
 	}
+	barrier.flush(stdout)
 	return errPersistentGuestShellClosed
+}
+
+type persistentOutputBarrier struct {
+	marker  []byte
+	pending []byte
+	reached bool
+}
+
+func newPersistentOutputBarrier() (*persistentOutputBarrier, error) {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return nil, fmt.Errorf("create persistent output barrier: %w", err)
+	}
+	marker := persistentOutputBarrierPrefix + hex.EncodeToString(token[:]) + persistentOutputBarrierSuffix
+	return &persistentOutputBarrier{marker: []byte(marker)}, nil
+}
+
+func (b *persistentOutputBarrier) write(w io.Writer, data []byte) {
+	if b == nil || len(data) == 0 {
+		return
+	}
+	out := make([]byte, 0, len(data))
+	for _, value := range data {
+		if b.reached {
+			out = append(out, value)
+			continue
+		}
+		b.pending = append(b.pending, value)
+		for len(b.pending) > 0 && !bytes.HasPrefix(b.marker, b.pending) {
+			out = append(out, b.pending[0])
+			b.pending = b.pending[1:]
+		}
+		if bytes.Equal(b.pending, b.marker) {
+			b.pending = nil
+			b.reached = true
+		}
+	}
+	if len(out) > 0 {
+		_, _ = w.Write(normalizeTTYNewlines(out))
+	}
+}
+
+func (b *persistentOutputBarrier) flush(w io.Writer) {
+	if b == nil || len(b.pending) == 0 {
+		return
+	}
+	_, _ = w.Write(normalizeTTYNewlines(b.pending))
+	b.pending = nil
 }
 
 func persistentGuestShellEnded(err error) bool {
