@@ -21,6 +21,8 @@ const (
 	mcpContextCaptureMaxStoredBytes = mcpMaxCommandStreamBytes
 )
 
+const mcpPrivilegedTerminationUnconfirmed = "guest descendant termination cannot be confirmed for a privileged command"
+
 type mcpGuestContext struct {
 	id                  string
 	vmID                string
@@ -36,6 +38,7 @@ type mcpGuestContext struct {
 	cancel              context.CancelFunc
 	relayCancel         context.CancelFunc
 	done                chan struct{}
+	cleanupDone         chan struct{}
 	control             *client.Client
 	relayReady          chan struct{}
 	relayDone           chan struct{}
@@ -134,7 +137,7 @@ func (e *mcpEndpoint) openGuestContext(ctx context.Context, _ *mcp.CallToolReque
 	captureDir := "/var/lib/vmsh-mcp/" + id
 	guest := &mcpGuestContext{
 		id: id, vmID: vm.ID, user: user, workDir: workDir, env: append([]string(nil), in.Env...), captureDir: captureDir, controlPath: captureDir + "/control",
-		inputs: make(chan client.ExecInput, 16), events: make(chan client.ExecEvent, mcpShellEventBuffer), cancel: cancel, relayCancel: relayCancel, done: make(chan struct{}), control: e.control,
+		inputs: make(chan client.ExecInput, 16), events: make(chan client.ExecEvent, mcpShellEventBuffer), cancel: cancel, relayCancel: relayCancel, done: make(chan struct{}), cleanupDone: make(chan struct{}), control: e.control,
 		captureAccounts: make(map[string]*mcpCaptureAccount),
 	}
 	if !e.disableCaptureRelay {
@@ -306,7 +309,7 @@ type mcpContextRunOutput struct {
 	VMID                  string `json:"vm_id"`
 	ContextStatus         string `json:"context_status"`
 	CommandStatus         string `json:"command_status"`
-	ExitCode              int    `json:"exit_code"`
+	ExitCode              *int   `json:"exit_code,omitempty"`
 	Stdout                string `json:"stdout,omitempty"`
 	StdoutBase64          string `json:"stdout_base64,omitempty"`
 	StdoutTotalBytes      int64  `json:"stdout_total_bytes"`
@@ -324,6 +327,7 @@ type mcpContextRunOutput struct {
 	AsyncStderrTotalBytes int64  `json:"async_stderr_total_bytes"`
 	AsyncStderrTruncated  bool   `json:"async_stderr_truncated,omitempty"`
 	Error                 string `json:"error,omitempty"`
+	ContainmentError      string `json:"containment_error,omitempty"`
 }
 
 func (e *mcpEndpoint) runGuestContext(ctx context.Context, _ *mcp.CallToolRequest, in mcpContextRunInput) (*mcp.CallToolResult, mcpContextRunOutput, error) {
@@ -346,6 +350,7 @@ func (e *mcpEndpoint) runGuestContext(ctx context.Context, _ *mcp.CallToolReques
 	applyContextResult(&out, result)
 	if err != nil {
 		if runCtx.Err() != nil {
+			out.Error = interruptedContextDiagnostic(err, runCtx.Err())
 			closed := guest.stopAndWait(3 * time.Second)
 			status := "canceled"
 			exitCode := 130
@@ -355,19 +360,32 @@ func (e *mcpEndpoint) runGuestContext(ctx context.Context, _ *mcp.CallToolReques
 			}
 			out.ContextStatus = "closed"
 			if !closed {
+				status = "termination_unconfirmed"
 				out.ContextStatus = "closing"
-				out.Error = "persistent context termination was not confirmed; VM retained with its filesystem intact and the command may still be running"
+				out.ContainmentError = "persistent context did not close after cancellation"
+			} else if isMCPRootUser(guest.user) {
+				status = "termination_unconfirmed"
+				out.ContainmentError = mcpPrivilegedTerminationUnconfirmed
 			}
 			out.CommandStatus = status
-			out.ExitCode = exitCode
+			if status != "termination_unconfirmed" {
+				out.ExitCode = &exitCode
+			}
 			return nil, out, nil
 		}
 		return nil, mcpContextRunOutput{}, err
 	}
 	out.ContextStatus = "running"
 	out.CommandStatus = "exited"
-	out.ExitCode = result.exitCode
+	out.ExitCode = &result.exitCode
 	return nil, out, nil
+}
+
+func interruptedContextDiagnostic(err, cause error) string {
+	if err == nil || cause == nil || err == cause {
+		return ""
+	}
+	return conciseCommandError(err)
 }
 
 func applyContextResult(out *mcpContextRunOutput, result mcpContextResult) {
@@ -460,6 +478,9 @@ func (c *mcpCommand) runGuestContext(ctx context.Context, guest *mcpGuestContext
 	c.asyncStderrTotal = result.asyncStderrTotal
 	c.asyncStdoutTruncated = result.asyncStdoutTruncated
 	c.asyncStderrTruncated = result.asyncStderrTruncated
+	if diagnostic := interruptedContextDiagnostic(err, runCtx.Err()); diagnostic != "" {
+		c.err = diagnostic
+	}
 	if runCtx.Err() != nil && c.cancellationUnverifiable && c.containmentError == "" {
 		c.markPrivilegedCancellationUnverifiableLocked()
 	}
@@ -572,18 +593,19 @@ func (g *mcpGuestContext) serve(ctx context.Context, control *client.Client) {
 			}
 		}
 	}
-	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	_, _ = control.RunEventsInContext(cleanupCtx, g.vmID, client.RunRequest{
-		Command: []string{"/bin/sh", "-c", `rm -rf "$1"`, "sh", g.captureDir},
-		WorkDir: "/", User: "root",
-	})
-	cleanupCancel()
 	g.mu.Lock()
 	if err != nil && ctx.Err() == nil {
 		g.err = conciseCommandError(err)
 	}
 	g.mu.Unlock()
 	close(g.done)
+	// Wake the active command before removing its capture files. The command
+	// owns runMu and gets one final bounded read; teardown then removes the
+	// private directory before lifecycle completion is reported.
+	g.runMu.Lock()
+	g.removeCaptureDir()
+	g.runMu.Unlock()
+	close(g.cleanupDone)
 }
 
 func (g *mcpGuestContext) requestCaptureRelayStop() {
@@ -755,28 +777,8 @@ drained:
 					g.mu.Lock()
 					g.carry = append(g.carry[:0], scan[carryStart:]...)
 					g.mu.Unlock()
-					if err := g.collectCurrentCapture(ctx, &result, &capture); err != nil {
+					if err := g.finishCommandCapture(ctx, &result, &capture, true); err != nil {
 						return result, err
-					}
-					g.mu.Lock()
-					// A pathname with an inherited writer remains observable while it is
-					// among the recent captures. Older relays are explicitly switched to
-					// discard mode before unlinking, so retirement cannot create a growing
-					// hidden inode or back-pressure the guest writer.
-					g.captures = retainObservableContextCaptures(g.captures, capture)
-					var retired []mcpContextCapture
-					g.captures, retired = limitObservableContextCaptures(g.captures)
-					g.mu.Unlock()
-					if len(retired) != 0 {
-						// Retiring observation must not terminate or back-pressure a guest
-						// descendant. The relay keeps the FIFO open and switches to a byte
-						// counter/discard path before the bounded spool is unlinked.
-						if err := g.retireContextCaptures(retired); err != nil {
-							g.mu.Lock()
-							g.captures = append(append([]mcpContextCapture(nil), retired...), g.captures...)
-							g.mu.Unlock()
-							return result, err
-						}
 					}
 					result.exitCode = code
 					return result, nil
@@ -803,11 +805,49 @@ drained:
 				return result, fmt.Errorf("guest context shell exited with status %d", event.ExitCode)
 			}
 		case <-g.done:
-			return result, g.closedError()
+			return g.finishInterruptedCapture(result, &capture, g.closedError())
 		case <-ctx.Done():
-			return result, ctx.Err()
+			return g.finishInterruptedCapture(result, &capture, ctx.Err())
 		}
 	}
+}
+
+func (g *mcpGuestContext) finishInterruptedCapture(result mcpContextResult, capture *mcpContextCapture, cause error) (mcpContextResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := g.finishCommandCapture(ctx, &result, capture, false); err != nil {
+		return result, fmt.Errorf("%w; preserve partial context output: %v", cause, err)
+	}
+	return result, cause
+}
+
+func (g *mcpGuestContext) finishCommandCapture(ctx context.Context, result *mcpContextResult, capture *mcpContextCapture, retain bool) error {
+	if err := g.collectCurrentCapture(ctx, result, capture); err != nil {
+		return err
+	}
+	if !retain {
+		g.removeCaptureAccount(capture.stdoutAccount)
+		g.removeCaptureAccount(capture.stderrAccount)
+		return nil
+	}
+	g.mu.Lock()
+	// A pathname with an inherited writer remains observable while it is among
+	// the recent captures. Older relays switch to counting/discard before their
+	// bounded spool is unlinked, so retirement cannot back-pressure the guest.
+	g.captures = retainObservableContextCaptures(g.captures, *capture)
+	var retired []mcpContextCapture
+	g.captures, retired = limitObservableContextCaptures(g.captures)
+	g.mu.Unlock()
+	if len(retired) == 0 {
+		return nil
+	}
+	if err := g.retireContextCaptures(retired); err != nil {
+		g.mu.Lock()
+		g.captures = append(append([]mcpContextCapture(nil), retired...), g.captures...)
+		g.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 func retainObservableContextCaptures(existing []mcpContextCapture, next mcpContextCapture) []mcpContextCapture {
@@ -1408,11 +1448,18 @@ func (g *mcpGuestContext) stopAndWait(timeout time.Duration) bool {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
-	case <-g.done:
+	case <-g.completion():
 		return true
 	case <-timer.C:
 		return false
 	}
+}
+
+func (g *mcpGuestContext) completion() <-chan struct{} {
+	if g.cleanupDone != nil {
+		return g.cleanupDone
+	}
+	return g.done
 }
 
 func (g *mcpGuestContext) closedError() error {

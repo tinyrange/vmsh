@@ -62,23 +62,22 @@ type mcpOutputChunk struct {
 }
 
 type mcpCommandOutput struct {
-	CommandID         string          `json:"command_id"`
-	VMID              string          `json:"vm_id"`
-	ContextID         string          `json:"context_id,omitempty"`
-	Status            string          `json:"status"`
-	ExitCode          *int            `json:"exit_code,omitempty"`
-	Stdout            mcpOutputChunk  `json:"stdout"`
-	Stderr            mcpOutputChunk  `json:"stderr"`
-	AsyncStdout       *mcpOutputChunk `json:"async_stdout,omitempty"`
-	AsyncStderr       *mcpOutputChunk `json:"async_stderr,omitempty"`
-	Output            string          `json:"output,omitempty"`
-	OutputBase64      string          `json:"output_base64,omitempty"`
-	Error             string          `json:"error,omitempty"`
-	ContainmentAction string          `json:"containment_action,omitempty"`
-	ContainmentError  string          `json:"containment_error,omitempty"`
-	StartedAt         time.Time       `json:"started_at"`
-	FinishedAt        *time.Time      `json:"finished_at,omitempty"`
-	OutputExpired     bool            `json:"output_expired,omitempty"`
+	CommandID        string          `json:"command_id"`
+	VMID             string          `json:"vm_id"`
+	ContextID        string          `json:"context_id,omitempty"`
+	Status           string          `json:"status"`
+	ExitCode         *int            `json:"exit_code,omitempty"`
+	Stdout           mcpOutputChunk  `json:"stdout"`
+	Stderr           mcpOutputChunk  `json:"stderr"`
+	AsyncStdout      *mcpOutputChunk `json:"async_stdout,omitempty"`
+	AsyncStderr      *mcpOutputChunk `json:"async_stderr,omitempty"`
+	Output           string          `json:"output,omitempty"`
+	OutputBase64     string          `json:"output_base64,omitempty"`
+	Error            string          `json:"error,omitempty"`
+	ContainmentError string          `json:"containment_error,omitempty"`
+	StartedAt        time.Time       `json:"started_at"`
+	FinishedAt       *time.Time      `json:"finished_at,omitempty"`
+	OutputExpired    bool            `json:"output_expired,omitempty"`
 }
 
 type mcpCommand struct {
@@ -113,7 +112,6 @@ type mcpCommand struct {
 	cancelRequested          bool
 	cancelOnce               sync.Once
 	terminateOverride        func()
-	containmentAction        string
 	containmentError         string
 	cancellationUnverifiable bool
 	outputExpired            bool
@@ -595,22 +593,20 @@ func (c *mcpCommand) requestCancel() {
 }
 
 func (c *mcpCommand) markPrivilegedCancellationUnverifiableLocked() {
-	c.containmentAction = "VM retained after unconfirmed command cancellation"
-	c.containmentError = "a privileged guest command can move descendants outside its command cgroup; leader exit does not prove descendant termination, so the VM and filesystem were retained"
-	c.err = c.containmentError
+	c.containmentError = mcpPrivilegedTerminationUnconfirmed
 }
 
 func (c *mcpCommand) terminate() {
 	if c.terminateOverride != nil {
 		c.terminateOverride()
 		if !c.waitDone(3 * time.Second) {
-			c.markTerminationUnconfirmed("persistent context did not close after cancellation; VM was retained with its filesystem intact")
+			c.markTerminationUnconfirmed("persistent context did not close after cancellation")
 			c.cancel()
 		}
 		return
 	}
 	if !c.sendInput(client.ExecInput{Kind: "signal", Signal: "TERM"}, 500*time.Millisecond) {
-		c.markTerminationUnconfirmed("guest command stream did not accept TERM; VM was retained with its filesystem intact and the command may still be running")
+		c.markTerminationUnconfirmed("guest command stream did not accept TERM; the command may still be running")
 		c.cancel()
 		return
 	}
@@ -618,14 +614,14 @@ func (c *mcpCommand) terminate() {
 		return
 	}
 	if !c.sendInput(client.ExecInput{Kind: "signal", Signal: "KILL"}, 500*time.Millisecond) {
-		c.markTerminationUnconfirmed("guest command stream did not accept KILL; VM was retained with its filesystem intact and the command may still be running")
+		c.markTerminationUnconfirmed("guest command stream did not accept KILL; the command may still be running")
 		c.cancel()
 		return
 	}
 	if c.waitDone(2500 * time.Millisecond) {
 		return
 	}
-	c.markTerminationUnconfirmed("guest did not confirm command termination after TERM and KILL; VM was retained with its filesystem intact and the command may still be running")
+	c.markTerminationUnconfirmed("guest did not confirm command termination after TERM and KILL; the command may still be running")
 	c.cancel()
 }
 
@@ -635,9 +631,7 @@ func (c *mcpCommand) markTerminationUnconfirmed(message string) {
 		c.mu.Unlock()
 		return
 	}
-	c.containmentAction = "VM retained after unconfirmed command cancellation"
 	c.containmentError = message
-	c.err = message
 	c.mu.Unlock()
 }
 
@@ -707,7 +701,7 @@ func (c *mcpCommand) snapshotLocked(stdoutOffset, stderrOffset, asyncStdoutOffse
 	stderr := commandOutputChunk(c.stderr, c.stderrTotal, c.stderrTruncated, stderrOffset, maxBytes)
 	out := mcpCommandOutput{
 		CommandID: c.id, VMID: c.vmID, ContextID: c.contextID, Status: c.status, ExitCode: cloneInt(c.exitCode), Stdout: stdout, Stderr: stderr,
-		Error: c.err, ContainmentAction: c.containmentAction, ContainmentError: c.containmentError,
+		Error: c.err, ContainmentError: c.containmentError,
 		StartedAt: c.startedAt, FinishedAt: cloneTime(c.finishedAt), OutputExpired: c.outputExpired,
 	}
 	if c.asyncStdoutTotal != 0 {

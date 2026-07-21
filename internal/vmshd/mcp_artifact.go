@@ -303,7 +303,10 @@ func (e *mcpEndpoint) extractGuestArchive(ctx context.Context, vmID, path string
 	var stderr []byte
 	err := e.control.ExecStreamInContext(opCtx, vmID, client.ExecRequest{
 		Kind: "fs_extract", Path: path, Directory: directory, User: user,
-		ArchiveLimits: &client.ArchiveLimits{MaxEntries: 100000, MaxFileBytes: mcpMaxArtifactBytes, MaxExpandedBytes: mcpMaxArtifactBytes * 4, TimeoutSeconds: mcpArtifactTimeout.Seconds()},
+		// Let the guest derive its entry allowance from the destination
+		// filesystem. A fixed MCP-only count made successfully exported
+		// artifacts impossible to import despite available guest capacity.
+		ArchiveLimits: &client.ArchiveLimits{MaxFileBytes: mcpMaxArtifactBytes, MaxExpandedBytes: mcpMaxArtifactBytes * 4, TimeoutSeconds: mcpArtifactTimeout.Seconds()},
 	}, inputs, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stderr":

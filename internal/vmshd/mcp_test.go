@@ -427,6 +427,7 @@ func TestMCPListReportsObservedMemoryAndBackingUsage(t *testing.T) {
 			ID: "one", Status: "running", MemoryMB: 4096, BalloonMB: 768,
 			BackingBytes: 1024, BackingHighWaterBytes: 4096, BackingDataBytes: 700, BackingDataHighWaterBytes: 3000,
 			BackingMetadataBytes: 324, BackingMetadataHighWaterBytes: 2000, BackingPhysicalBytes: 2048, BackingReclaimError: "disk refused reclaim",
+			BackingUsageStale: true, BackingActiveMutations: 3,
 		}})
 	}))
 	defer control.Close()
@@ -436,7 +437,7 @@ func TestMCPListReportsObservedMemoryAndBackingUsage(t *testing.T) {
 		t.Fatalf("list VMs = %#v, %v", listed, err)
 	}
 	vm := listed.VMs[0]
-	if vm.MemoryMB != 4096 || vm.BalloonMB != 768 || vm.BackingBytes != 1024 || vm.BackingHighWaterBytes != 4096 || vm.BackingDataBytes != 700 || vm.BackingDataHighWaterBytes != 3000 || vm.BackingMetadataBytes != 324 || vm.BackingMetadataHighWaterBytes != 2000 || vm.BackingPhysicalBytes != 2048 || vm.BackingReclaimError != "disk refused reclaim" {
+	if vm.MemoryMB != 4096 || vm.BalloonMB != 768 || vm.BackingBytes != 1024 || vm.BackingHighWaterBytes != 4096 || vm.BackingDataBytes != 700 || vm.BackingDataHighWaterBytes != 3000 || vm.BackingMetadataBytes != 324 || vm.BackingMetadataHighWaterBytes != 2000 || vm.BackingPhysicalBytes != 2048 || vm.BackingReclaimError != "disk refused reclaim" || !vm.BackingUsageStale || vm.BackingActiveMutations != 3 {
 		t.Fatalf("observed VM = %#v", vm)
 	}
 }
@@ -1004,7 +1005,7 @@ func TestMCPPrivilegedCancellationDoesNotClaimDetachedDescendantsWereReaped(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Status != "termination_unconfirmed" || result.ExitCode != nil || result.ContainmentAction == "" || result.ContainmentError == "" {
+	if result.Status != "termination_unconfirmed" || result.ExitCode != nil || result.Error != "" || result.ContainmentError == "" {
 		t.Fatalf("privileged cancellation result = %#v", result)
 	}
 	if _, err := endpoint.ownedVM("owned"); err != nil {
@@ -1028,7 +1029,7 @@ func TestMCPCommandCancellationReportsUnresponsiveControlStream(t *testing.T) {
 		t.Fatal("cancellation blocked forever on an unresponsive guest control stream")
 	}
 	result := command.snapshot(0, 0, 0, 0, 1024, false)
-	if result.ContainmentAction == "" || result.ContainmentError == "" {
+	if result.Error != "" || result.ContainmentError == "" {
 		t.Fatalf("unconfirmed cancellation result = %#v", result)
 	}
 }
@@ -1201,6 +1202,7 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 	archive := testMCPArchive(t, "payload.bin", bytes.Repeat([]byte{0x00, 0xff, 't', 'a', 'r'}, 20<<10))
 	var extracted []byte
 	var largestInput int
+	var extractMaxEntries uint64
 	var shellExported bool
 	var lateContextOutputSent bool
 	var archivedPath, extractedPath, contextWorkDir string
@@ -1252,6 +1254,9 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 			return
 		case "fs_extract":
 			extractedPath = req.Path
+			if req.ArchiveLimits != nil {
+				extractMaxEntries = req.ArchiveLimits.MaxEntries
+			}
 			for {
 				var input client.ExecInput
 				if err := websocket.JSON.Receive(ws, &input); err != nil {
@@ -1336,6 +1341,9 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 	if largestInput > mcpArtifactInputChunk {
 		t.Fatalf("largest artifact input = %d, want at most %d", largestInput, mcpArtifactInputChunk)
 	}
+	if extractMaxEntries != 0 {
+		t.Fatalf("artifact import imposed fixed entry limit %d instead of using destination capacity", extractMaxEntries)
+	}
 
 	_, opened, err := endpoint.openGuestContext(context.Background(), nil, mcpContextOpenInput{VMID: "one", WorkDir: "/tmp/work "})
 	if err != nil {
@@ -1352,7 +1360,7 @@ func TestMCPArtifactsAndPersistentContextStayInsideOwnedVMs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read context state: %v", err)
 	}
-	if result.Stdout != "42" || result.Stderr != "problem" || result.AsyncStdout != "late-from-previous\n" || result.ExitCode != 0 || result.CommandStatus != "exited" || result.ContextStatus != "running" {
+	if result.Stdout != "42" || result.Stderr != "problem" || result.AsyncStdout != "late-from-previous\n" || result.ExitCode == nil || *result.ExitCode != 0 || result.CommandStatus != "exited" || result.ContextStatus != "running" {
 		t.Fatalf("context result = %#v", result)
 	}
 	_, asyncResult, err := endpoint.startGuestContextCommand(context.Background(), nil, mcpContextRunInput{
@@ -2009,7 +2017,7 @@ func TestMCPContextPreservesOutputAccountingTimeoutBytesAndPrivateFraming(t *tes
 	if err != nil {
 		t.Fatalf("run after closing fd 3: %v", err)
 	}
-	if fdClosed.CommandStatus != "exited" || fdClosed.ContextStatus != "running" || fdClosed.ExitCode != 0 || fdClosed.Stdout != "fd3-closed\n" {
+	if fdClosed.CommandStatus != "exited" || fdClosed.ContextStatus != "running" || fdClosed.ExitCode == nil || *fdClosed.ExitCode != 0 || fdClosed.Stdout != "fd3-closed\n" {
 		t.Fatalf("fd-3-safe context result = %#v", fdClosed)
 	}
 	_, timedStart, err := endpoint.startGuestContextCommand(t.Context(), nil, mcpContextRunInput{
@@ -2030,6 +2038,76 @@ func TestMCPContextPreservesOutputAccountingTimeoutBytesAndPrivateFraming(t *tes
 	timed := timedCommand.snapshot(0, 0, 0, 0, mcpDefaultOutputChunk, false)
 	if timed.Status != "timed_out" || timed.ExitCode == nil || *timed.ExitCode != 124 || timed.Stdout.Text != "before-timeout\n" || timed.Stdout.TotalBytes != int64(len("before-timeout\n")) {
 		t.Fatalf("timed context output = %#v", timed)
+	}
+	_, rootContext, err := endpoint.openGuestContext(t.Context(), nil, mcpContextOpenInput{VMID: "one", User: "root"})
+	if err != nil {
+		t.Fatalf("open privileged context: %v", err)
+	}
+	_, rootTimed, err := endpoint.runGuestContext(t.Context(), nil, mcpContextRunInput{
+		ContextID: rootContext.ContextID, CommandLine: "echo before-timeout; sleep 20", TimeoutSeconds: 0.05,
+	})
+	if err != nil {
+		t.Fatalf("run privileged timed context command: %v", err)
+	}
+	if rootTimed.CommandStatus != "termination_unconfirmed" || rootTimed.ExitCode != nil || rootTimed.ContainmentError != mcpPrivilegedTerminationUnconfirmed || rootTimed.Stdout != "before-timeout\n" {
+		t.Fatalf("privileged timed context output = %#v", rootTimed)
+	}
+}
+
+func TestMCPContextInterruptedCommandCollectsCurrentCapture(t *testing.T) {
+	controlMux := http.NewServeMux()
+	controlMux.Handle("/vm/run", websocket.Handler(func(ws *websocket.Conn) {
+		defer ws.Close()
+		var req client.ExecRequest
+		if err := websocket.JSON.Receive(ws, &req); err != nil {
+			return
+		}
+		var input client.ExecInput
+		if err := websocket.JSON.Receive(ws, &input); err != nil || input.Kind != "stdin_close" {
+			return
+		}
+		path := ""
+		if len(req.Command) > 4 {
+			path = req.Command[4]
+		}
+		if strings.HasSuffix(path, ".stdout") {
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stdout", Data: []byte("before\n")})
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte("7 open 0 uncapped\n")})
+		} else {
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "stderr", Data: []byte("0 open 0 uncapped\n")})
+		}
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "exit", ExitCode: 0})
+	}))
+	control := httptest.NewServer(controlMux)
+	defer control.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	guest := &mcpGuestContext{
+		vmID: "one", user: "root", captureDir: "/var/lib/vmsh-mcp/test", captureControlPath: "/capture-control",
+		inputs: make(chan client.ExecInput, 1), events: make(chan client.ExecEvent, 1), done: make(chan struct{}),
+		control: client.NewClient(control.URL, nil), captureAccounts: make(map[string]*mcpCaptureAccount),
+	}
+	type outcome struct {
+		result mcpContextResult
+		err    error
+	}
+	finished := make(chan outcome, 1)
+	go func() {
+		result, err := guest.runLine(ctx, "sleep 60")
+		finished <- outcome{result: result, err: err}
+	}()
+	select {
+	case <-guest.inputs:
+		cancel()
+	case <-time.After(time.Second):
+		t.Fatal("context command was not submitted")
+	}
+	select {
+	case got := <-finished:
+		if !errors.Is(got.err, context.Canceled) || string(got.result.stdout) != "before\n" || got.result.stdoutTotal != 7 {
+			t.Fatalf("interrupted capture result = %#v, %v", got.result, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupted context command did not finalize its capture")
 	}
 }
 
@@ -2621,7 +2699,6 @@ func TestMCPKVMCaptureRetirementDoesNotAccumulateGuestProcesses(t *testing.T) {
 		}
 		return count
 	}
-	baseline := processCount()
 	opened, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_context_open", Arguments: map[string]any{"vm_id": vm.ID}})
 	if err != nil || opened.IsError {
 		t.Fatalf("open context = %s, %v", toolResultDiagnostic(opened), err)
@@ -2630,6 +2707,7 @@ func TestMCPKVMCaptureRetirementDoesNotAccumulateGuestProcesses(t *testing.T) {
 	defer func() {
 		_, _ = session.CallTool(context.Background(), &mcp.CallToolParams{Name: "vm_context_close", Arguments: map[string]any{"context_id": contextID}})
 	}()
+	baseline := processCount()
 	const writers = 12
 	for i := range writers {
 		result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_context_run", Arguments: map[string]any{
@@ -2649,6 +2727,23 @@ func TestMCPKVMCaptureRetirementDoesNotAccumulateGuestProcesses(t *testing.T) {
 	after := processCount()
 	if growth := after - baseline; growth > writers+2 {
 		t.Fatalf("%d inherited writers grew the guest process table by %d; retired captures retained per-stream processes", writers, growth)
+	}
+	timedResult, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_context_run", Arguments: map[string]any{
+		"context_id": contextID, "command_line": "printf before-timeout; sleep 300", "timeout_seconds": 2,
+	}})
+	if err != nil || timedResult.IsError {
+		t.Fatalf("run timed context capture = %s, %v", toolResultDiagnostic(timedResult), err)
+	}
+	timed := structuredToolOutput[mcpContextRunOutput](t, timedResult)
+	if timed.Stdout != "before-timeout" || timed.StdoutTotalBytes != int64(len("before-timeout")) {
+		t.Fatalf("timed context lost produced output: %#v", timed)
+	}
+	if canonicalMCPBuiltinImage(image) == "@freebsd" {
+		if timed.CommandStatus != "termination_unconfirmed" || timed.ExitCode != nil || timed.ContainmentError != mcpPrivilegedTerminationUnconfirmed {
+			t.Fatalf("FreeBSD timeout containment = %#v", timed)
+		}
+	} else if timed.CommandStatus != "timed_out" || timed.ExitCode == nil || *timed.ExitCode != 124 {
+		t.Fatalf("Linux timeout result = %#v", timed)
 	}
 }
 
@@ -2735,7 +2830,7 @@ func TestMCPKVMAutomaticHeadroomAndContextCaptureRecovery(t *testing.T) {
 		t.Fatalf("produce context output = %#v, %v", produced, err)
 	}
 	output := structuredToolOutput[mcpContextRunOutput](t, produced)
-	if output.CommandStatus != "exited" || output.ExitCode != 0 || output.StdoutTotalBytes != 32<<20 || !output.StdoutTruncated {
+	if output.CommandStatus != "exited" || output.ExitCode == nil || *output.ExitCode != 0 || output.StdoutTotalBytes != 32<<20 || !output.StdoutTruncated {
 		t.Fatalf("bulk context output = %#v", output)
 	}
 	checked, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_run", Arguments: map[string]any{

@@ -116,9 +116,33 @@ type mcpVM struct {
 	BackingMetadataHighWaterBytes uint64 `json:"backing_metadata_high_water_bytes,omitempty"`
 	BackingPhysicalBytes          uint64 `json:"backing_physical_bytes,omitempty"`
 	BackingReclaimError           string `json:"backing_reclaim_error,omitempty"`
+	BackingUsageStale             bool   `json:"backing_usage_stale,omitempty"`
+	BackingActiveMutations        uint64 `json:"backing_active_mutations,omitempty"`
 	Error                         string `json:"error,omitempty"`
 	ExitReason                    string `json:"exit_reason,omitempty"`
 	ExitedAt                      string `json:"exited_at,omitempty"`
+}
+
+func (vm *mcpVM) observe(state client.InstanceState) {
+	vm.Status = state.Status
+	vm.BackendStatus = state.Status
+	vm.MemoryMB = state.MemoryMB
+	vm.BalloonMB = state.BalloonMB
+	vm.BalloonActualMB = state.BalloonActualMB
+	vm.BalloonStatus = state.BalloonStatus
+	vm.BackingBytes = state.BackingBytes
+	vm.BackingHighWaterBytes = state.BackingHighWaterBytes
+	vm.BackingDataBytes = state.BackingDataBytes
+	vm.BackingDataHighWaterBytes = state.BackingDataHighWaterBytes
+	vm.BackingMetadataBytes = state.BackingMetadataBytes
+	vm.BackingMetadataHighWaterBytes = state.BackingMetadataHighWaterBytes
+	vm.BackingPhysicalBytes = state.BackingPhysicalBytes
+	vm.BackingReclaimError = state.BackingReclaimError
+	vm.BackingUsageStale = state.BackingUsageStale
+	vm.BackingActiveMutations = state.BackingActiveMutations
+	vm.Error = state.Error
+	vm.ExitReason = state.ExitReason
+	vm.ExitedAt = state.ExitedAt
 }
 
 func newMCPManager(token string) *mcpManager {
@@ -487,7 +511,8 @@ func (e *mcpEndpoint) createVM(ctx context.Context, _ *mcp.CallToolRequest, in m
 		return nil, mcpCreateVMOutput{}, fmt.Errorf("create VM: %w", err)
 	}
 	backendStarted = true
-	vm := mcpVM{ID: id, Name: baseName, Image: image, Status: state.Status, BackendStatus: state.Status, MemoryMB: state.MemoryMB, BalloonMB: state.BalloonMB, BalloonActualMB: state.BalloonActualMB, BalloonStatus: state.BalloonStatus}
+	vm := mcpVM{ID: id, Name: baseName, Image: image}
+	vm.observe(state)
 	e.applyBalloonPolicy(&vm)
 	e.mu.Lock()
 	e.vms[id] = vm
@@ -517,8 +542,7 @@ func (e *mcpEndpoint) waitForInitialBalloon(ctx context.Context, vm mcpVM) (mcpV
 		if err != nil {
 			return vm, fmt.Errorf("wait for VM %q initial memory safety convergence: %w; the VM remains owned and can be inspected or stopped", vm.ID, err)
 		}
-		vm.Status, vm.BackendStatus = state.Status, state.Status
-		vm.MemoryMB, vm.BalloonMB, vm.BalloonActualMB, vm.BalloonStatus = state.MemoryMB, state.BalloonMB, state.BalloonActualMB, state.BalloonStatus
+		vm.observe(state)
 		e.balloon.adjustmentReady(state, time.Now())
 		e.applyBalloonPolicy(&vm)
 		e.mu.Lock()
@@ -667,23 +691,7 @@ func (e *mcpEndpoint) listVMs(ctx context.Context, _ *mcp.CallToolRequest, _ mcp
 			vm.Status = "running"
 		}
 		if state, ok := observed[vm.ID]; ok {
-			vm.Status = state.Status
-			vm.BackendStatus = state.Status
-			vm.MemoryMB = state.MemoryMB
-			vm.BalloonMB = state.BalloonMB
-			vm.BalloonActualMB = state.BalloonActualMB
-			vm.BalloonStatus = state.BalloonStatus
-			vm.BackingBytes = state.BackingBytes
-			vm.BackingHighWaterBytes = state.BackingHighWaterBytes
-			vm.BackingDataBytes = state.BackingDataBytes
-			vm.BackingDataHighWaterBytes = state.BackingDataHighWaterBytes
-			vm.BackingMetadataBytes = state.BackingMetadataBytes
-			vm.BackingMetadataHighWaterBytes = state.BackingMetadataHighWaterBytes
-			vm.BackingPhysicalBytes = state.BackingPhysicalBytes
-			vm.BackingReclaimError = state.BackingReclaimError
-			vm.Error = state.Error
-			vm.ExitReason = state.ExitReason
-			vm.ExitedAt = state.ExitedAt
+			vm.observe(state)
 		} else if observationErr == nil {
 			vm.Status = "absent"
 			vm.BackendStatus = "absent"
@@ -956,7 +964,7 @@ func (e *mcpEndpoint) close() error {
 	}
 	for _, guest := range contexts {
 		select {
-		case <-guest.done:
+		case <-guest.completion():
 			if e.contexts[guest.id] == guest {
 				delete(e.contexts, guest.id)
 			}
@@ -1103,7 +1111,7 @@ func (e *mcpEndpoint) cancelVMWork(ctx context.Context, vmID string) error {
 	e.mu.Lock()
 	for _, guest := range contexts {
 		select {
-		case <-guest.done:
+		case <-guest.completion():
 			if e.contexts[guest.id] == guest {
 				delete(e.contexts, guest.id)
 			}
