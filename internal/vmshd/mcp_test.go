@@ -2341,9 +2341,32 @@ func TestMCPContextCommandAdmissionRejectsClosingContext(t *testing.T) {
 	if _, err := endpoint.registerMCPCommand(command); err == nil {
 		t.Fatal("async command was admitted into a closing context")
 	}
-	if _, err := endpoint.runnableGuestContext(guest.id); err == nil {
+	if _, err := endpoint.reserveRunnableGuestContext(guest.id); err == nil {
 		t.Fatal("synchronous command was admitted into a closing context")
 	}
+}
+
+func TestMCPContextRejectsConcurrentCommands(t *testing.T) {
+	guest := &mcpGuestContext{id: "context", vmID: "one", done: make(chan struct{})}
+	endpoint := &mcpEndpoint{
+		vms: map[string]mcpVM{"one": {ID: "one"}}, contexts: map[string]*mcpGuestContext{guest.id: guest}, commands: make(map[string]*mcpCommand),
+	}
+	active := &mcpCommand{id: "active", contextID: guest.id, done: make(chan struct{})}
+	if _, err := endpoint.registerMCPCommand(active); err != nil {
+		t.Fatalf("reserve first context command: %v", err)
+	}
+	concurrent := &mcpCommand{id: "concurrent", contextID: guest.id, done: make(chan struct{})}
+	if _, err := endpoint.registerMCPCommand(concurrent); err == nil {
+		t.Fatal("second asynchronous command was admitted into an active context")
+	}
+	if _, err := endpoint.reserveRunnableGuestContext(guest.id); err == nil {
+		t.Fatal("synchronous command was admitted into an active context")
+	}
+	guest.releaseCommand()
+	if reserved, err := endpoint.reserveRunnableGuestContext(guest.id); err != nil || reserved != guest {
+		t.Fatalf("context did not become runnable after command completion: %v", err)
+	}
+	guest.releaseCommand()
 }
 
 func TestMCPContextAdmissionIsBoundedAndPrunesClosedContexts(t *testing.T) {
@@ -2744,6 +2767,113 @@ func TestMCPKVMCaptureRetirementDoesNotAccumulateGuestProcesses(t *testing.T) {
 		}
 	} else if timed.CommandStatus != "timed_out" || timed.ExitCode == nil || *timed.ExitCode != 124 {
 		t.Fatalf("Linux timeout result = %#v", timed)
+	}
+}
+
+func TestMCPKVMLargeDirectoryAndContextCommandAdmission(t *testing.T) {
+	endpoint, token := os.Getenv("VMSH_MCP_INTEGRATION_URL"), os.Getenv("VMSH_MCP_INTEGRATION_TOKEN")
+	if endpoint == "" || token == "" {
+		t.Skip("set VMSH_MCP_INTEGRATION_URL and VMSH_MCP_INTEGRATION_TOKEN for live KVM coverage")
+	}
+	mcpClient := mcp.NewClient(&mcp.Implementation{Name: "vmsh-release-readiness-test", Version: "1"}, nil)
+	session, err := mcpClient.Connect(t.Context(), &mcp.StreamableClientTransport{
+		Endpoint: endpoint, HTTPClient: &http.Client{Transport: mcpBearerTransport{token: token}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	created, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_create", Arguments: map[string]any{
+		"image": "alpine", "name": "release-readiness", "memory_mb": 512, "boot_timeout_seconds": 90,
+	}})
+	if err != nil || created.IsError {
+		t.Fatalf("create VM = %s, %v", toolResultDiagnostic(created), err)
+	}
+	vm := structuredToolOutput[mcpCreateVMOutput](t, created).VM
+	defer func() {
+		_, _ = session.CallTool(context.Background(), &mcp.CallToolParams{Name: "vm_stop", Arguments: map[string]any{"vm_id": vm.ID}})
+	}()
+
+	createdAt := time.Now()
+	populated, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_run", Arguments: map[string]any{
+		"vm_id": vm.ID, "command": []string{"sh", "-c", `mkdir -p many; i=0; while [ "$i" -lt 30000 ]; do : >"many/entry-$i"; i=$((i+1)); done`},
+		"workdir": "/home/cc", "timeout_seconds": 120,
+	}})
+	if err != nil || populated.IsError {
+		t.Fatalf("populate large directory = %s, %v", toolResultDiagnostic(populated), err)
+	}
+	populateElapsed := time.Since(createdAt)
+	if output := structuredToolOutput[mcpCommandOutput](t, populated); output.Status != "exited" || output.ExitCode == nil || *output.ExitCode != 0 {
+		t.Fatalf("populate large directory = %#v", output)
+	}
+	t.Logf("created 30,000 files in %s", populateElapsed)
+	if populateElapsed > 90*time.Second {
+		t.Fatalf("creating 30,000 files took %s", populateElapsed)
+	}
+
+	for name, script := range map[string]string{
+		"find": `test "$(find many -maxdepth 1 -type f | wc -l)" -eq 30000`,
+		"ls":   `ls -1 many >/dev/null`,
+	} {
+		started := time.Now()
+		result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_run", Arguments: map[string]any{
+			"vm_id": vm.ID, "command": []string{"sh", "-c", script}, "workdir": "/home/cc", "timeout_seconds": 30,
+		}})
+		if err != nil || result.IsError {
+			t.Fatalf("%s large directory = %s, %v", name, toolResultDiagnostic(result), err)
+		}
+		elapsed := time.Since(started)
+		if output := structuredToolOutput[mcpCommandOutput](t, result); output.Status != "exited" || output.ExitCode == nil || *output.ExitCode != 0 {
+			t.Fatalf("%s large directory = %#v", name, output)
+		}
+		if elapsed > 15*time.Second {
+			t.Fatalf("%s of 30,000 files took %s", name, elapsed)
+		}
+		t.Logf("%s of 30,000 files completed in %s", name, elapsed)
+	}
+
+	opened, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_context_open", Arguments: map[string]any{"vm_id": vm.ID}})
+	if err != nil || opened.IsError {
+		t.Fatalf("open context = %s, %v", toolResultDiagnostic(opened), err)
+	}
+	contextID := structuredToolOutput[mcpContextInfo](t, opened).ContextID
+	defer func() {
+		_, _ = session.CallTool(context.Background(), &mcp.CallToolParams{Name: "vm_context_close", Arguments: map[string]any{"context_id": contextID}})
+	}()
+	first, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_context_exec_start", Arguments: map[string]any{
+		"context_id": contextID, "command_line": "sleep 3; printf first-done",
+	}})
+	if err != nil || first.IsError {
+		t.Fatalf("start first context command = %s, %v", toolResultDiagnostic(first), err)
+	}
+	firstCommand := structuredToolOutput[mcpCommandOutput](t, first)
+	rejectedAt := time.Now()
+	concurrent, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_context_run", Arguments: map[string]any{
+		"context_id": contextID, "command_line": "printf second-ran", "timeout_seconds": 0.2,
+	}})
+	if err != nil || !concurrent.IsError {
+		t.Fatalf("concurrent context command was not rejected = %s, %v", toolResultDiagnostic(concurrent), err)
+	}
+	if elapsed := time.Since(rejectedAt); elapsed > time.Second {
+		t.Fatalf("concurrent context rejection took %s", elapsed)
+	}
+	waited, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_exec_wait", Arguments: map[string]any{
+		"command_id": firstCommand.CommandID, "wait_seconds": 10,
+	}})
+	if err != nil || waited.IsError {
+		t.Fatalf("wait for first context command = %s, %v", toolResultDiagnostic(waited), err)
+	}
+	if output := structuredToolOutput[mcpCommandOutput](t, waited); output.Status != "exited" || output.Stdout.Text != "first-done" {
+		t.Fatalf("first context command = %#v", output)
+	}
+	healthy, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "vm_context_run", Arguments: map[string]any{
+		"context_id": contextID, "command_line": "printf healthy", "timeout_seconds": 2,
+	}})
+	if err != nil || healthy.IsError {
+		t.Fatalf("run after concurrent rejection = %s, %v", toolResultDiagnostic(healthy), err)
+	}
+	if output := structuredToolOutput[mcpContextRunOutput](t, healthy); output.CommandStatus != "exited" || output.Stdout != "healthy" {
+		t.Fatalf("context after concurrent rejection = %#v", output)
 	}
 }
 

@@ -382,6 +382,11 @@ func (e *mcpEndpoint) registerMCPCommand(command *mcpCommand) (*mcpGuestContext,
 	if activeSession >= mcpMaxActiveCommandsPerSession {
 		return nil, fmt.Errorf("MCP session has %d active commands; wait for or cancel existing commands before starting another", activeSession)
 	}
+	if guest != nil {
+		if err := guest.reserveCommand(); err != nil {
+			return nil, err
+		}
+	}
 	e.commands[command.id] = command
 	return guest, nil
 }

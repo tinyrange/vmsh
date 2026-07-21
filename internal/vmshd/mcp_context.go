@@ -49,6 +49,7 @@ type mcpGuestContext struct {
 	stopOnce             sync.Once
 	mu                   sync.Mutex
 	err                  string
+	commandActive        bool
 	closing              bool
 	relayStopping        bool
 	carry                []byte
@@ -331,10 +332,11 @@ type mcpContextRunOutput struct {
 }
 
 func (e *mcpEndpoint) runGuestContext(ctx context.Context, _ *mcp.CallToolRequest, in mcpContextRunInput) (*mcp.CallToolResult, mcpContextRunOutput, error) {
-	guest, err := e.runnableGuestContext(in.ContextID)
+	guest, err := e.reserveRunnableGuestContext(in.ContextID)
 	if err != nil {
 		return nil, mcpContextRunOutput{}, err
 	}
+	defer guest.releaseCommand()
 	line, err := validateGuestContextCommand(in)
 	if err != nil {
 		return nil, mcpContextRunOutput{}, err
@@ -450,6 +452,7 @@ func (e *mcpEndpoint) startGuestContextCommand(_ context.Context, _ *mcp.CallToo
 }
 
 func (c *mcpCommand) runGuestContext(ctx context.Context, guest *mcpGuestContext, line string, timeoutSeconds float64) {
+	defer guest.releaseCommand()
 	runCtx := ctx
 	var timeoutCancel context.CancelFunc
 	if timeoutSeconds > 0 {
@@ -1479,7 +1482,7 @@ func (e *mcpEndpoint) guestContext(id string) (*mcpGuestContext, error) {
 	return guest, nil
 }
 
-func (e *mcpEndpoint) runnableGuestContext(id string) (*mcpGuestContext, error) {
+func (e *mcpEndpoint) reserveRunnableGuestContext(id string) (*mcpGuestContext, error) {
 	id = strings.TrimSpace(id)
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -1492,13 +1495,29 @@ func (e *mcpEndpoint) runnableGuestContext(id string) (*mcpGuestContext, error) 
 		return nil, fmt.Errorf("context %q is closed", id)
 	default:
 	}
-	guest.mu.Lock()
-	closing := guest.closing
-	guest.mu.Unlock()
-	if closing {
-		return nil, fmt.Errorf("context %q is closing", id)
+	if err := guest.reserveCommand(); err != nil {
+		return nil, err
 	}
 	return guest, nil
+}
+
+func (g *mcpGuestContext) reserveCommand() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closing {
+		return fmt.Errorf("context %q is closing", g.id)
+	}
+	if g.commandActive {
+		return fmt.Errorf("context %q already has an active command; wait for or cancel it before starting another", g.id)
+	}
+	g.commandActive = true
+	return nil
+}
+
+func (g *mcpGuestContext) releaseCommand() {
+	g.mu.Lock()
+	g.commandActive = false
+	g.mu.Unlock()
 }
 
 func shellJoin(command []string) string {
