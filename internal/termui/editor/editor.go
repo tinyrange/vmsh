@@ -235,6 +235,7 @@ func (e *Editor) readPreparedLine(ctx context.Context, prompt string) (string, e
 				continue
 			}
 			menu = completionMenu{}
+			e.refresh(&st, "")
 		}
 		switch ev.key {
 		case keyRune:
@@ -580,14 +581,14 @@ func (e *Editor) refresh(s *lineState, suffix string) {
 	end := canonicalDisplayPosition(rendered, s.width)
 	terminal.WriteString(e.out, "\r")
 	actualEnd := displayPosition(rendered, s.width)
-	if end.row > actualEnd.row {
-		fmt.Fprintf(e.out, "\x1b[%dB", end.row-actualEnd.row)
+	for row := actualEnd.row; row < end.row; row++ {
+		terminal.WriteString(e.out, "\r\n")
 	}
 	cursor := canonicalDisplayPosition(normalizeDisplayNewlines(s.prompt+before), s.width)
 	renderedHeight := end.row + 1
 	currentRow := end.row
 	if len(below) > 0 {
-		terminal.WriteString(e.out, "\x1b[B")
+		terminal.WriteString(e.out, "\r\n")
 		currentRow++
 		for idx, displayLine := range below {
 			displayLine = normalizeDisplayNewlines(displayLine)
@@ -597,7 +598,7 @@ func (e *Editor) refresh(s *lineState, suffix string) {
 			renderedHeight += pos.row + 1
 			terminal.WriteString(e.out, "\r")
 			if idx+1 < len(below) {
-				terminal.WriteString(e.out, "\x1b[B")
+				terminal.WriteString(e.out, "\r\n")
 				currentRow++
 			}
 		}
@@ -788,7 +789,7 @@ func (e *Editor) verticalCompletionMenuSuffix(menu *completionMenu, st *lineStat
 		b.WriteByte(' ')
 		b.WriteString(truncateCells(menu.filtered[idx], itemWidth-1))
 	}
-	if end < len(menu.filtered) {
+	if end < len(menu.filtered) && 1+limit < e.completionRowBudget(st) {
 		b.WriteString("\n ...")
 	}
 	return b.String()
@@ -816,10 +817,36 @@ func (e *Editor) completionRows(menu *completionMenu, st *lineState) int {
 	if len(menu.filtered) == 0 {
 		return 0
 	}
-	if len(menu.filtered) > 5 {
-		return 5
+	limit := len(menu.filtered)
+	if limit > 5 {
+		limit = 5
 	}
-	return len(menu.filtered)
+	available := e.completionRowBudget(st) - 1
+	if available < 1 {
+		available = 1
+	}
+	if len(menu.filtered) > available && available > 1 {
+		available--
+	}
+	if limit > available {
+		limit = available
+	}
+	return limit
+}
+
+func (e *Editor) completionRowBudget(st *lineState) int {
+	height := st.heightOrDefault()
+	width := st.width
+	if width <= 0 {
+		width = 80
+	}
+	input := normalizeDisplayNewlines(st.prompt + string(st.buf))
+	inputRows := canonicalDisplayPosition(input, width).row + 1
+	budget := height - inputRows
+	if budget < 2 {
+		return 2
+	}
+	return budget
 }
 
 func (e *Editor) completionPageSize(menu *completionMenu, st *lineState) int {

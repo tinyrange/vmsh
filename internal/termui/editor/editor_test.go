@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"os"
@@ -623,6 +624,47 @@ func TestRefreshRendersCompletionBelowInputAndPreservesOutput(t *testing.T) {
 		if line != "" {
 			t.Fatalf("completion content remained on row %d: %q", row+2, line)
 		}
+	}
+}
+
+func TestRefreshReservesCompletionRowsAtTerminalBottom(t *testing.T) {
+	const (
+		width  = 40
+		height = 6
+	)
+	emulator := ptyterm.NewEmulator(ptyterm.Size{Cols: width, Rows: height}, 20)
+	for i := 0; i < height-1; i++ {
+		_, _ = fmt.Fprintf(emulator, "output-%d\r\n", i)
+	}
+	caps := terminal.Capabilities{Mode: terminal.ModeDynamicInteractive, Width: width, Height: height}
+	ed := New(Options{Reader: eofReader{}, Writer: emulator, Capabilities: &caps})
+	st := &lineState{prompt: "> ", buf: []rune("a"), cursor: 1, width: width, height: height}
+	menu := completionMenu{
+		active: true,
+		items: []string{
+			"alpha", "alpine", "archive", "awk", "basename", "bash", "cat", "chmod",
+		},
+	}
+	menu.filtered = append([]string(nil), menu.items...)
+
+	ed.refresh(st, ed.completionMenuSuffix(&menu, st))
+	snapshot := emulator.Snapshot()
+	if snapshot.Lines[snapshot.Cursor.Y] != "> a" {
+		t.Fatalf("input was not moved above reserved rows: cursor=%+v lines=%q", snapshot.Cursor, snapshot.Lines)
+	}
+	var selectedRow = -1
+	for row, cells := range snapshot.Cells {
+		for _, cell := range cells {
+			if cell.Attr.Inverse {
+				selectedRow = row
+			}
+		}
+	}
+	if selectedRow <= snapshot.Cursor.Y {
+		t.Fatalf("selected completion row = %d, input row = %d; lines=%q", selectedRow, snapshot.Cursor.Y, snapshot.Lines)
+	}
+	if len(snapshot.History) == 0 {
+		t.Fatalf("completion did not scroll to reserve rows: lines=%q", snapshot.Lines)
 	}
 }
 

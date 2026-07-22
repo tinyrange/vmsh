@@ -514,9 +514,6 @@ func (c *vmshCompleter) shouldCompleteCommand(prefix string, tokenStart int, isF
 	if strings.Contains(token, "/") || strings.HasPrefix(token, "~") || token == "." || token == ".." {
 		return false
 	}
-	if token == "" {
-		return false
-	}
 	if isFirstToken {
 		return !strings.HasPrefix(prefix, "@")
 	}

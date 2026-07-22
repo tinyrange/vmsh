@@ -548,7 +548,6 @@ func TestVMIntegrationInteractiveUIDrivesKeyboardAndRoutesCommands(t *testing.T)
 	position = enterUI(t, driver, session)
 	waitUILine(t, ctx, driver, "VMSH_UI_TAB=1", session)
 	waitUIPromptAfter(t, ctx, driver, position, session)
-	typeUI(t, driver, "@", session)
 	keyUI(t, driver, ptyterm.KeyTab, session)
 	completionSnapshot, err := driver.Wait(ctx, func(snapshot ptyterm.Snapshot) bool {
 		for _, row := range snapshot.Cells {
@@ -573,6 +572,13 @@ func TestVMIntegrationInteractiveUIDrivesKeyboardAndRoutesCommands(t *testing.T)
 	position = session.Snapshot().BytesRead
 	inputUI(t, driver, ptyterm.Ctrl('c'), session)
 	waitUIPromptAfter(t, ctx, driver, position, session)
+	for row, cells := range session.Snapshot().Cells {
+		for _, cell := range cells {
+			if cell.Attr.Inverse {
+				t.Fatalf("completion selection remained after cancellation on row %d; %s", row, uiSnapshotSummary(session.Snapshot()))
+			}
+		}
+	}
 
 	typeUI(t, driver, "pwd", session)
 	position = enterUI(t, driver, session)
