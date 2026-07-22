@@ -339,7 +339,7 @@ func (e *hostTarExtractor) writeHardlink(name string, header *tar.Header) error 
 			_ = parent.Remove(temporary)
 		}
 	}()
-	if err := parent.Rename(temporary, base); err != nil {
+	if err := replaceHostRootFile(parent, temporary, base); err != nil {
 		return fmt.Errorf("publish hard link %s to %s: %w", name, target, err)
 	}
 	published = true
@@ -398,15 +398,12 @@ func (e *hostTarExtractor) writeRegular(name string, perm os.FileMode, mtime tim
 		if !current.Mode().IsRegular() || !os.SameFile(existing, current) {
 			return fmt.Errorf("copy destination %s changed while extracting", name)
 		}
-		if err := parent.Remove(base); err != nil {
-			return err
-		}
 	} else if _, err := parent.Lstat(base); err == nil {
 		return fmt.Errorf("copy destination %s appeared while extracting", name)
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	if err := parent.Rename(temporary, base); err != nil {
+	if err := replaceHostRootFile(parent, temporary, base); err != nil {
 		return err
 	}
 	published = true
