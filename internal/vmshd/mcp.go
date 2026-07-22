@@ -73,6 +73,8 @@ type mcpEndpoint struct {
 	artifactOps         int
 	artifactWork        map[*mcpArtifactReservation]struct{}
 	artifactInFlight    int64
+	hostChallenges      map[string]*mcpHostChallenge
+	hostReadGrants      map[string]*mcpHostReadGrant
 	closed              bool
 	cleanupTimeout      time.Duration
 	shutdownTimeout     time.Duration
@@ -199,6 +201,8 @@ func (m *mcpManager) Start(sessionID string) (MCPEndpointInfo, error) {
 		commands:        make(map[string]*mcpCommand),
 		artifacts:       make(map[string]*mcpArtifact),
 		artifactWork:    make(map[*mcpArtifactReservation]struct{}),
+		hostChallenges:  make(map[string]*mcpHostChallenge),
+		hostReadGrants:  make(map[string]*mcpHostReadGrant),
 		contexts:        make(map[string]*mcpGuestContext),
 		stopping:        make(map[string]struct{}),
 		quarantined:     make(map[string]struct{}),
@@ -331,7 +335,7 @@ func (e *mcpEndpoint) info() MCPEndpointInfo {
 }
 
 func (e *mcpEndpoint) handler() http.Handler {
-	server := mcp.NewServer(&mcp.Implementation{Name: "vmsh", Version: mcpImplementationVersion()}, nil)
+	server := mcp.NewServer(&mcp.Implementation{Name: "vmsh", Version: mcpImplementationVersion()}, &mcp.ServerOptions{Instructions: mcpServerInstructions})
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_create", Description: "Create a regular vmsh isolated VM with internet access but no host access, filesystem shares, or port forwards."}, e.createVM)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_list", Description: "List VMs created through this MCP session."}, e.listVMs)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_run", Description: "Run any command inside a VM created through this MCP session and wait for it to finish."}, e.runVM)
@@ -345,6 +349,13 @@ func (e *mcpEndpoint) handler() http.Handler {
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_artifact_list", Description: "List metadata for artifacts owned by this MCP session."}, e.listArtifacts)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_artifact_delete", Description: "Delete an artifact owned by this MCP session."}, e.deleteArtifact)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_copy", Description: "Copy a file or directory directly between two MCP-owned isolated VMs."}, e.copyGuestPath)
+	mcp.AddTool(server, &mcp.Tool{Name: "vm_host_read_challenge", Description: "Request a filesystem challenge in a host directory. Completing the challenge grants read-only access only to direct entries named by the response file."}, e.createHostReadChallenge)
+	mcp.AddTool(server, &mcp.Tool{Name: "vm_host_read_claim", Description: "Verify a host read challenge response and mint session-scoped read grants."}, e.claimHostReadChallenge)
+	mcp.AddTool(server, &mcp.Tool{Name: "vm_copy_from_host", Description: "Stream a file or directory covered by a host read grant into an MCP-owned VM."}, e.copyHostPathToVM)
+	mcp.AddTool(server, &mcp.Tool{Name: "vm_host_write_challenge", Description: "Request a nonce placeholder challenge for one host output file. The parent path must not traverse symlinks."}, e.createHostWriteChallenge)
+	mcp.AddTool(server, &mcp.Tool{Name: "vm_copy_to_host", Description: "Verify a write-challenge placeholder, stage one guest file beside it, and atomically replace only that placeholder."}, e.copyVMFileToHost)
+	mcp.AddTool(server, &mcp.Tool{Name: "vm_host_grant_list", Description: "List active host read grants and pending filesystem challenges for this MCP session."}, e.listHostGrants)
+	mcp.AddTool(server, &mcp.Tool{Name: "vm_host_grant_revoke", Description: "Revoke an active host read grant or pending filesystem challenge."}, e.revokeHostGrant)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_context_open", Description: "Open a persistent shell context in an MCP-owned VM; cwd, exports, functions, and aliases survive across calls."}, e.openGuestContext)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_context_run", Description: "Run a short command line synchronously in a persistent guest context. Use vm_context_exec_start for long-running or cancelable work."}, e.runGuestContext)
 	mcp.AddTool(server, &mcp.Tool{Name: "vm_context_exec_start", Description: "Start a persistent-context command and return immediately; use vm_exec_status/wait, while vm_context_close or vm_stop can interrupt it."}, e.startGuestContextCommand)
@@ -364,6 +375,8 @@ func (e *mcpEndpoint) handler() http.Handler {
 		mcpHandler.ServeHTTP(w, r)
 	})
 }
+
+const mcpServerInstructions = `Host filesystem access uses agent-completed challenges and never follows symlinks. To read a host file, request vm_host_read_challenge for its parent, create the returned response_path containing {"paths":["direct-name"]}, claim it, then use vm_copy_from_host. To read a directory's direct files, request the challenge inside that directory and name "."; every subdirectory needs its own challenge. To write one guest file to the host, request vm_host_write_challenge, create its path with the returned nonce as the exact contents, then call vm_copy_to_host. Grants and challenges are session-scoped and revocable.`
 
 func mcpImplementationVersion() string {
 	build := version.Current()
@@ -936,6 +949,8 @@ func (e *mcpEndpoint) close() error {
 	if firstClose {
 		e.credentials = make(map[string]string)
 		e.artifacts = make(map[string]*mcpArtifact)
+		e.hostChallenges = make(map[string]*mcpHostChallenge)
+		e.hostReadGrants = make(map[string]*mcpHostReadGrant)
 	}
 	e.mu.Unlock()
 	var errs []error

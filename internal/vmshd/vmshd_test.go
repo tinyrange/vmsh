@@ -286,8 +286,8 @@ func TestAuthenticateRejectsUnsupportedFrontendMutation(t *testing.T) {
 	}))
 	req := httptest.NewRequest(http.MethodPost, "/vmsh/frontends", nil)
 	req.Header.Set("Authorization", "Bearer secret")
-	req.Header.Set("X-VMSH-Frontend-Protocol", "2")
-	req.Header.Set("X-VMSH-Frontend-Min-Protocol", "2")
+	req.Header.Set(vmshdprotocol.HeaderProtocol, fmt.Sprint(vmshdprotocol.Current+1))
+	req.Header.Set(vmshdprotocol.HeaderMinProtocol, fmt.Sprint(vmshdprotocol.Current+1))
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusUpgradeRequired {
@@ -306,8 +306,8 @@ func TestAuthenticateRejectsUnsupportedTerminalWebSocketUpgrade(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer secret")
 	req.Header.Set("Connection", "keep-alive, Upgrade")
 	req.Header.Set("Upgrade", "websocket")
-	req.Header.Set(vmshdprotocol.HeaderProtocol, "2")
-	req.Header.Set(vmshdprotocol.HeaderMinProtocol, "2")
+	req.Header.Set(vmshdprotocol.HeaderProtocol, fmt.Sprint(vmshdprotocol.Current+1))
+	req.Header.Set(vmshdprotocol.HeaderMinProtocol, fmt.Sprint(vmshdprotocol.Current+1))
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
 
@@ -332,8 +332,8 @@ func TestAuthenticateKeepsReadOnlyGetAvailableToUnsupportedFrontend(t *testing.T
 	}))
 	req := httptest.NewRequest(http.MethodGet, "/vmsh/status", nil)
 	req.Header.Set("Authorization", "Bearer secret")
-	req.Header.Set(vmshdprotocol.HeaderProtocol, "2")
-	req.Header.Set(vmshdprotocol.HeaderMinProtocol, "2")
+	req.Header.Set(vmshdprotocol.HeaderProtocol, fmt.Sprint(vmshdprotocol.Current+1))
+	req.Header.Set(vmshdprotocol.HeaderMinProtocol, fmt.Sprint(vmshdprotocol.Current+1))
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
 
@@ -368,7 +368,7 @@ func TestProtocolEndpointReportsCompatibility(t *testing.T) {
 	srv.RegisterHandlers(mux, fakeRuntimeView{})
 	handler := srv.Authenticate(mux)
 
-	req := httptest.NewRequest(http.MethodGet, "/vmsh/protocol?frontend_protocol=1&frontend_min_protocol=1", nil)
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/vmsh/protocol?frontend_protocol=%d&frontend_min_protocol=%d", vmshdprotocol.Current, vmshdprotocol.Minimum), nil)
 	req.Header.Set("Authorization", "Bearer secret")
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, req)
@@ -396,7 +396,7 @@ func TestProtocolEndpointReportsCompatibility(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&info); err != nil {
 		t.Fatalf("decode protocol: %v", err)
 	}
-	if info.Kind != Kind || info.Protocol.Name != "vmshd.frontend" || info.Protocol.Current != 1 || info.Protocol.Minimum != 1 {
+	if info.Kind != Kind || info.Protocol.Name != vmshdprotocol.Name || info.Protocol.Current != vmshdprotocol.Current || info.Protocol.Minimum != vmshdprotocol.Minimum {
 		t.Fatalf("protocol info = %+v", info)
 	}
 	if !info.Compatibility.Compatible || info.Compatibility.Action != "reuse" || info.Compatibility.Reason != "compatible" {
@@ -413,7 +413,8 @@ func TestProtocolEndpointRefusesUnsupportedFrontendRange(t *testing.T) {
 	srv.RegisterHandlers(mux, fakeRuntimeView{})
 	handler := srv.Authenticate(mux)
 
-	req := httptest.NewRequest(http.MethodGet, "/vmsh/protocol?frontend_protocol=2&frontend_min_protocol=2", nil)
+	unsupported := vmshdprotocol.Current + 1
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/vmsh/protocol?frontend_protocol=%d&frontend_min_protocol=%d", unsupported, unsupported), nil)
 	req.Header.Set("Authorization", "Bearer secret")
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, req)

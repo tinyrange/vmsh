@@ -221,8 +221,9 @@ func TestMCPEndpointIsScopedToOwnedIsolatedVMs(t *testing.T) {
 	slices.Sort(names)
 	wantNames := []string{
 		"vm_artifact_delete", "vm_artifact_export", "vm_artifact_import", "vm_artifact_list",
-		"vm_context_close", "vm_context_exec_start", "vm_context_open", "vm_context_run", "vm_context_status", "vm_copy",
-		"vm_create", "vm_exec_cancel", "vm_exec_forget", "vm_exec_start", "vm_exec_status", "vm_exec_wait", "vm_list", "vm_run", "vm_stop",
+		"vm_context_close", "vm_context_exec_start", "vm_context_open", "vm_context_run", "vm_context_status", "vm_copy", "vm_copy_from_host", "vm_copy_to_host",
+		"vm_create", "vm_exec_cancel", "vm_exec_forget", "vm_exec_start", "vm_exec_status", "vm_exec_wait",
+		"vm_host_grant_list", "vm_host_grant_revoke", "vm_host_read_challenge", "vm_host_read_claim", "vm_host_write_challenge", "vm_list", "vm_run", "vm_stop",
 	}
 	if !slices.Equal(names, wantNames) {
 		t.Fatalf("tools = %v, want %v", names, wantNames)

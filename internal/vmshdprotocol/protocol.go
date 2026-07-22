@@ -11,8 +11,8 @@ import (
 
 const (
 	Name    = "vmshd.frontend"
-	Current = 1
-	Minimum = 1
+	Current = 2
+	Minimum = 2
 
 	HeaderProtocol    = "X-VMSH-Frontend-Protocol"
 	HeaderMinProtocol = "X-VMSH-Frontend-Min-Protocol"
@@ -73,7 +73,7 @@ func NewInfo(kind string, startedAt time.Time, executable DaemonExecutable, fron
 			Name:          Name,
 			Current:       Current,
 			Minimum:       Minimum,
-			SchemaVersion: "0.1.0",
+			SchemaVersion: "0.2.0",
 		},
 		Daemon: DaemonRuntime{
 			Version:    build.Version,
