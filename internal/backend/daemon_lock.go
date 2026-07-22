@@ -11,6 +11,12 @@ import (
 
 var ErrDaemonLockTimeout = errors.New("timed out waiting for daemon state lock")
 
+// daemonStateProcessWriteMu prevents writers in this process from racing for
+// the non-blocking file lock. The file lock still provides cross-process
+// exclusion; serializing locally avoids unfair polling starving one of many
+// concurrent writers until its external-contention deadline expires.
+var daemonStateProcessWriteMu sync.Mutex
+
 type daemonFileLock struct {
 	file   *os.File
 	unlock func() error
@@ -64,6 +70,9 @@ func (l *daemonFileLock) Release() error {
 }
 
 func withDaemonStateWriteLock(path string, fn func() error) error {
+	daemonStateProcessWriteMu.Lock()
+	defer daemonStateProcessWriteMu.Unlock()
+
 	lock, err := acquireDaemonFileLock(path+".lock", 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("lock daemon state %s: %w", path, err)

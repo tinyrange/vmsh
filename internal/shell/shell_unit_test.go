@@ -1465,6 +1465,56 @@ func TestPersistentShellPreludesPrefixEvalArgument(t *testing.T) {
 	}
 }
 
+func TestCodexMCPLaunchKeepsCredentialOutOfArguments(t *testing.T) {
+	const token = "child-secret-token"
+	args, env := codexMCPLaunch("http://127.0.0.1:4321/mcp", token, []string{"--model", "gpt-5"})
+	if strings.Contains(strings.Join(args, "\x00"), token) {
+		t.Fatal("MCP credential leaked into Codex arguments")
+	}
+	if !slices.Equal(args[len(args)-2:], []string{"--model", "gpt-5"}) {
+		t.Fatalf("Codex user arguments = %q", args)
+	}
+	if !slices.Equal(env, []string{mcpCodexTokenEnv + "=" + token}) {
+		t.Fatalf("Codex MCP environment = %q", env)
+	}
+	joined := strings.Join(args, "\n")
+	if !strings.Contains(joined, `mcp_servers.vmsh.url="http://127.0.0.1:4321/mcp"`) ||
+		!strings.Contains(joined, `mcp_servers.vmsh.bearer_token_env_var="VMSH_MCP_TOKEN"`) {
+		t.Fatalf("Codex MCP arguments = %q", args)
+	}
+	if !slices.Contains(args, `mcp_servers.vmsh.default_tools_approval_mode="approve"`) {
+		t.Fatalf("Codex MCP tools are not configured for approval: %q", args)
+	}
+	if !slices.Contains(args, "mcp_servers.vmsh.tool_timeout_sec=86400") {
+		t.Fatalf("Codex MCP tools do not allow long-running guest work: %q", args)
+	}
+}
+
+func TestHostProgramPreservesTerminalThroughRecorder(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host PTYs are unavailable on Windows")
+	}
+	master, slave, err := pty.Open()
+	if err != nil {
+		t.Fatalf("open outer PTY: %v", err)
+	}
+	defer master.Close()
+	defer slave.Close()
+	recorder, err := newAsciinemaRecorder("", filepath.Join(t.TempDir(), "session.raw.jsonl"), 80, 24)
+	if err != nil {
+		t.Fatalf("create recorder: %v", err)
+	}
+	defer recorder.Close()
+	output := newRecordingTerminalWriter(slave, recorder)
+	sh := newUnitShell(t, newRecordingShellAPI())
+	if err := sh.runHostProgram([]string{"sh", "-c", "test -t 0 && test -t 1 && test -t 2"}, nil, output, output); err != nil {
+		t.Fatalf("run terminal-aware host program: %v", err)
+	}
+	if sh.lastCode != 0 {
+		t.Fatalf("terminal-aware host program exit code = %d, want 0", sh.lastCode)
+	}
+}
+
 func TestPersistentShellCommandAllowedRejectsLeadingDashCommand(t *testing.T) {
 	if persistentShellCommandAllowed("-la") {
 		t.Fatal("leading-dash command should not use persistent shell")
@@ -1476,17 +1526,18 @@ func TestPersistentShellCommandAllowedRejectsLeadingDashCommand(t *testing.T) {
 
 func TestPersistentGuestShellStartsForwardingBeforeCommand(t *testing.T) {
 	inputs := make(chan client.ExecInput, 1)
-	events := make(chan client.ExecEvent, 1)
+	events := make(chan client.ExecEvent, 3)
 	session := &persistentGuestShell{
 		inputs: inputs,
 		events: events,
-		done:   make(chan error, 1),
+		done:   make(chan struct{}),
 	}
+	var stdout bytes.Buffer
 	started := make(chan struct{})
 	stop := make(chan struct{})
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- session.run("cat", io.Discard, io.Discard, func() (func(), error) {
+		errCh <- session.run("cat", &stdout, io.Discard, func() (func(), error) {
 			close(started)
 			return func() { close(stop) }, nil
 		})
@@ -1498,15 +1549,38 @@ func TestPersistentGuestShellStartsForwardingBeforeCommand(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("stdin forwarding did not start")
 	}
+	var marker []byte
 	select {
 	case input := <-inputs:
 		if got := string(input.Data); !strings.Contains(got, "__vmsh_run") || !strings.Contains(got, "cat") {
 			t.Fatalf("persistent shell command input = %q", got)
 		}
+		start := bytes.Index(input.Data, []byte(persistentOutputBarrierPrefix))
+		if start < 0 {
+			t.Fatalf("persistent shell command has no output barrier: %q", input.Data)
+		}
+		end := bytes.Index(input.Data[start+len(persistentOutputBarrierPrefix):], []byte(persistentOutputBarrierSuffix))
+		if end < 0 {
+			t.Fatalf("persistent shell command has incomplete output barrier: %q", input.Data)
+		}
+		end += start + len(persistentOutputBarrierPrefix) + len(persistentOutputBarrierSuffix)
+		marker = append([]byte(nil), input.Data[start:end]...)
 	case <-time.After(2 * time.Second):
 		t.Fatal("persistent shell command was not sent")
 	}
+
+	// The control pipe and PTY are relayed independently. A fast shell can
+	// report completion before the PTY reader delivers output that was written
+	// first, which must not make the next prompt race ahead of that output.
 	events <- client.ExecEvent{Kind: "control", Output: "done\t0\t/home/cc\n"}
+	select {
+	case err := <-errCh:
+		t.Fatalf("persistent command finished before prior PTY output arrived: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	split := len(marker) / 2
+	events <- client.ExecEvent{Kind: "stdout", Data: append([]byte("command output\n"), marker[:split]...)}
+	events <- client.ExecEvent{Kind: "stdout", Data: marker[split:]}
 	select {
 	case err := <-errCh:
 		if err != nil {
@@ -1514,6 +1588,9 @@ func TestPersistentGuestShellStartsForwardingBeforeCommand(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("persistent command did not finish")
+	}
+	if got, want := stdout.String(), "command output\r\n"; got != want {
+		t.Fatalf("persistent command output = %q, want %q", got, want)
 	}
 	select {
 	case <-stop:
@@ -1768,6 +1845,29 @@ func TestStartVMRestoresNewestStartupSnapshotForCompatibleAlpine(t *testing.T) {
 	}
 }
 
+func TestStartVMIgnoresSnapshotWithoutPersistentControlProtocol(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	sh := newUnitShell(t, api)
+	baseReq := startupSnapshotTestRequest(t, sh)
+	legacyRoot, err := startupSnapshotRootForVersion(sh.rootCache, baseReq, 2)
+	if err != nil {
+		t.Fatalf("legacy snapshot root: %v", err)
+	}
+	legacySnapshot := filepath.Join(legacyRoot, "snapshot-legacy-control")
+	writeStartupSnapshotManifest(t, legacySnapshot, time.Unix(10, 0))
+
+	if err := sh.startVM("work", commandContext{Image: "alpine", MemoryMB: 512, CPUs: 1}, io.Discard); err != nil {
+		t.Fatalf("start VM: %v", err)
+	}
+	req := api.starts[0].req
+	if req.RestoreSnapshot != "" {
+		t.Fatalf("restore snapshot = %q, want legacy control-protocol snapshot ignored", req.RestoreSnapshot)
+	}
+	if req.SnapshotDir == legacyRoot {
+		t.Fatalf("snapshot dir reused legacy control-protocol root %q", legacyRoot)
+	}
+}
+
 func TestStartVMRestoresPersistedStartupSnapshotAfterDaemonRestart(t *testing.T) {
 	api := newRecordingShellAPI("alpine")
 	sh := newUnitShell(t, api)
@@ -1853,7 +1953,94 @@ func TestStartVMFallsBackWhenStartupSnapshotRestoreFails(t *testing.T) {
 		t.Fatalf("fallback request = %+v", api.starts[1].req)
 	}
 	if _, err := os.Stat(snapshot); !os.IsNotExist(err) {
-		t.Fatalf("snapshot dir after fallback stat error = %v, want not exist", err)
+		t.Fatalf("snapshot remained eligible for restore after fallback: %v", err)
+	}
+	quarantined := filepath.Join(root, "failed", filepath.Base(snapshot))
+	if _, err := os.Stat(filepath.Join(quarantined, "manifest.json")); err != nil {
+		t.Fatalf("failed snapshot was not retained at %q: %v", quarantined, err)
+	}
+	if latest := latestStartupSnapshot(root); latest != "" {
+		t.Fatalf("quarantined snapshot remained discoverable as %q", latest)
+	}
+}
+
+func TestStartVMRetainsSnapshotWhenRestoreAndColdFallbackFail(t *testing.T) {
+	api := newRecordingShellAPI("alpine")
+	sh := newUnitShell(t, api)
+	root, err := startupSnapshotRoot(sh.rootCache, startupSnapshotTestRequest(t, sh))
+	if err != nil {
+		t.Fatalf("snapshot root: %v", err)
+	}
+	snapshot := filepath.Join(root, "snapshot-failing")
+	writeStartupSnapshotManifest(t, snapshot, time.Unix(10, 0))
+	api.startStream = func(ctx context.Context, id string, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
+		api.starts = append(api.starts, recordedStart{id: id, req: req})
+		return client.InstanceState{}, errors.New("start failed")
+	}
+
+	if err := sh.startVM("work", commandContext{Image: "alpine", MemoryMB: 512, CPUs: 1}, io.Discard); err == nil {
+		t.Fatal("restore and cold fallback failure returned nil")
+	}
+	if len(api.starts) != 2 {
+		t.Fatalf("starts = %d, want restore attempt and cold fallback", len(api.starts))
+	}
+	quarantined := filepath.Join(root, "failed", filepath.Base(snapshot))
+	if _, err := os.Stat(filepath.Join(quarantined, "manifest.json")); err != nil {
+		t.Fatalf("snapshot was not retained after both starts failed: %v", err)
+	}
+}
+
+func TestInitialMemoryConvergenceWaitsOnlyWhenBackendReportsPendingTarget(t *testing.T) {
+	api := newRecordingShellAPI()
+	statusCalls := 0
+	api.instanceStatus = func(ctx context.Context, id string) (client.InstanceState, error) {
+		statusCalls++
+		return client.InstanceState{
+			ID: id, Status: "running", MemoryMB: 4096,
+			BalloonMB: 3072, BalloonActualMB: 3072, BalloonStatus: "converged",
+		}, nil
+	}
+	sh := newUnitShell(t, api)
+	pending := client.InstanceState{
+		ID: "work", Status: "running", MemoryMB: 4096,
+		BalloonMB: 3072, BalloonActualMB: 0, BalloonStatus: "driver_unavailable",
+	}
+
+	state, err := sh.waitForInitialMemoryConvergence(t.Context(), "work", true, pending, nil)
+	if err != nil {
+		t.Fatalf("wait for convergence: %v", err)
+	}
+	if statusCalls != 1 || !initialMemoryConverged(state) {
+		t.Fatalf("convergence result = %#v after %d status calls", state, statusCalls)
+	}
+
+	statusCalls = 0
+	if _, err := sh.waitForInitialMemoryConvergence(t.Context(), "fixed", false, pending, nil); err != nil {
+		t.Fatalf("explicit-memory VM was rejected: %v", err)
+	}
+	if statusCalls != 0 {
+		t.Fatalf("explicit-memory VM made %d convergence status calls", statusCalls)
+	}
+}
+
+func TestInitialMemoryConvergenceFailureRetainsRunningVM(t *testing.T) {
+	api := newRecordingShellAPI()
+	wantErr := errors.New("status unavailable")
+	api.instanceStatus = func(ctx context.Context, id string) (client.InstanceState, error) {
+		return client.InstanceState{}, wantErr
+	}
+	sh := newUnitShell(t, api)
+	pending := client.InstanceState{
+		ID: "work", Status: "running", MemoryMB: 4096,
+		BalloonMB: 3072, BalloonStatus: "driver_unavailable",
+	}
+
+	_, err := sh.waitForInitialMemoryConvergence(t.Context(), "work", true, pending, nil)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("convergence error = %v, want backend status error", err)
+	}
+	if len(api.deleted) != 0 {
+		t.Fatalf("convergence failure deleted resources: %v", api.deleted)
 	}
 }
 
@@ -5003,11 +5190,50 @@ func TestStopPTYForwardingDoesNotWaitForeverForBlockedProducer(t *testing.T) {
 func TestPersistentGuestShellCloseIsIdempotent(t *testing.T) {
 	session := &persistentGuestShell{
 		inputs: make(chan client.ExecInput, 1),
-		done:   make(chan error),
+		done:   make(chan struct{}),
 	}
 	close(session.done)
 	session.close()
 	session.close()
+}
+
+func TestGuestCommandStopsWhenOutputConsumerFails(t *testing.T) {
+	wantErr := errors.New("output consumer closed")
+	api := newRecordingShellAPI()
+	api.runStream = func(ctx context.Context, id string, req client.RunRequest, onEvent func(client.ExecEvent) error) error {
+		return onEvent(client.ExecEvent{Kind: "stdout", Data: []byte("unconsumed output")})
+	}
+	sh := newUnitShell(t, api)
+
+	err := sh.streamGuestRunWithInputContext(t.Context(), "work", client.RunRequest{}, nil, &failAfterWriter{err: wantErr}, io.Discard)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("stream error = %v, want output consumer error", err)
+	}
+}
+
+func TestGuestSessionCloseRetainsUnconfirmedRecoveryHandle(t *testing.T) {
+	session := &persistentGuestShell{
+		key:       "work\x00alpine\x001000:1000\x00",
+		inputs:    make(chan client.ExecInput, 1),
+		done:      make(chan struct{}),
+		closeWait: time.Millisecond,
+	}
+	sh := newUnitShell(t, newRecordingShellAPI())
+	sh.context = commandContext{Mode: modeVM, VMID: "work", Image: "alpine"}
+	sh.guestShell = session
+
+	sh.closeGuestSession()
+	if sh.guestShell != session {
+		t.Fatal("unconfirmed persistent session recovery handle was discarded")
+	}
+	if !session.closing.Load() {
+		t.Fatal("unconfirmed persistent session was not marked closing")
+	}
+	close(session.done)
+	sh.closeGuestSession()
+	if sh.guestShell != nil {
+		t.Fatal("completed persistent session was not released")
+	}
 }
 
 func TestStreamHostPTYStdinControlCCallsInterruptHook(t *testing.T) {
@@ -5312,6 +5538,33 @@ func TestPersistentHostShellCanReadForwardedInput(t *testing.T) {
 	}
 	if string(data) != "from-stdin" {
 		t.Fatalf("forwarded input wrote %q", string(data))
+	}
+}
+
+func TestPersistentHostShellControlSurvivesUserDescriptorChanges(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("persistent host shell requires a Unix PTY")
+	}
+	session, err := startPersistentHostShell(t.TempDir(), nil, 80, 24, "", nil, nil)
+	if err != nil {
+		t.Fatalf("start persistent host shell: %v", err)
+	}
+	t.Cleanup(session.close)
+
+	var first bytes.Buffer
+	if err := session.run("VMSH_RELAY_STATE=retained; exec 3>&-; printf first", &first, io.Discard, nil); err != nil {
+		t.Fatalf("run command after closing descriptor 3: %v", err)
+	}
+	if first.String() != "first" {
+		t.Fatalf("first command output = %q", first.String())
+	}
+
+	var second bytes.Buffer
+	if err := session.run(`printf '%s' "$VMSH_RELAY_STATE"`, &second, io.Discard, nil); err != nil {
+		t.Fatalf("run following command: %v", err)
+	}
+	if second.String() != "retained" {
+		t.Fatalf("following command output = %q", second.String())
 	}
 }
 
@@ -6807,9 +7060,9 @@ func TestStoppedVMRunErrorLeavesContext(t *testing.T) {
 		key:    "work\x00ubuntu\x00\x00",
 		inputs: make(chan client.ExecInput, 1),
 		events: make(chan client.ExecEvent),
-		done:   make(chan error, 1),
+		done:   make(chan struct{}),
 	}
-	sh.guestShell.done <- nil
+	close(sh.guestShell.done)
 
 	handled, err := sh.handleStoppedVMRunError(sh.context, errors.New("backend stream closed"))
 	if !handled {
@@ -8257,6 +8510,26 @@ func TestStreamTarToHostPreservesProducerAndExtractionErrors(t *testing.T) {
 	}
 }
 
+func TestHostCopyPublicationFailurePreservesDestination(t *testing.T) {
+	dir := t.TempDir()
+	destination := filepath.Join(dir, "destination")
+	if err := os.WriteFile(destination, []byte("retained"), 0o600); err != nil {
+		t.Fatalf("write destination: %v", err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("open destination root: %v", err)
+	}
+	defer root.Close()
+
+	if err := replaceHostRootFile(root, "missing-stage", filepath.Base(destination)); err == nil {
+		t.Fatal("publishing a missing staged file succeeded")
+	}
+	if got := readTestFile(t, destination); got != "retained" {
+		t.Fatalf("destination after failed publication = %q", got)
+	}
+}
+
 func TestStreamTarToHostStopsProducerWhenExtractionFails(t *testing.T) {
 	dst := t.TempDir()
 	producerStopped := false
@@ -8429,6 +8702,83 @@ func TestExtractTarToHostRejectsHardlinks(t *testing.T) {
 
 	if err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: t.TempDir()}); err == nil {
 		t.Fatal("extract hardlink succeeded")
+	}
+}
+
+func TestExtractTarToHostPreservesSafeHardlinks(t *testing.T) {
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	entries := []tar.Header{
+		{Name: "tree", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: "tree/a", Typeflag: tar.TypeReg, Mode: 0o644, Size: 7},
+		{Name: "tree/b", Typeflag: tar.TypeLink, Linkname: "tree/a", Mode: 0o644},
+	}
+	for i := range entries {
+		if err := tw.WriteHeader(&entries[i]); err != nil {
+			t.Fatal(err)
+		}
+		if entries[i].Typeflag == tar.TypeReg {
+			_, _ = tw.Write([]byte("payload"))
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "copied")
+	if err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: dst}); err != nil {
+		t.Fatalf("extract hard-linked tree: %v", err)
+	}
+	a, err := os.Stat(filepath.Join(dst, "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.Stat(filepath.Join(dst, "b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(a, b) {
+		t.Fatal("copied aliases do not share an inode")
+	}
+}
+
+func TestExtractTarToHostReconstructsSparseFiles(t *testing.T) {
+	const logicalSize = int64(8 << 20)
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	header := &tar.Header{
+		Name: "sparse", Typeflag: tar.TypeReg, Mode: 0o644, Size: 1, Format: tar.FormatPAX,
+		PAXRecords: map[string]string{
+			"VMSH.sparse.size":      strconv.FormatInt(logicalSize, 10),
+			"VMSH.sparse.numblocks": "1",
+			"VMSH.sparse.map":       strconv.FormatInt(logicalSize-1, 10) + ",1",
+		},
+	}
+	if err := tw.WriteHeader(header); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = tw.Write([]byte{'Z'})
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "sparse")
+	if err := extractTarToHost(bytes.NewReader(archive.Bytes()), copyTargetPath{path: dst}); err != nil {
+		t.Fatalf("extract sparse file: %v", err)
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != logicalSize {
+		t.Fatalf("logical size = %d, want %d", info.Size(), logicalSize)
+	}
+	file, err := os.Open(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	var tail [1]byte
+	if _, err := file.ReadAt(tail[:], logicalSize-1); err != nil || tail[0] != 'Z' {
+		t.Fatalf("sparse tail = %q, %v", tail, err)
 	}
 }
 
@@ -9027,6 +9377,7 @@ type recordingShellAPI struct {
 	pullStream            func(context.Context, string, client.PullImageRequest, func(client.ProgressEvent) error) error
 	startStream           func(context.Context, string, client.StartInstanceRequest, func(client.BootEvent) error) (client.InstanceState, error)
 	execStream            func(context.Context, string, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+	instanceStatus        func(context.Context, string) (client.InstanceState, error)
 	instanceStatusesErr   error
 }
 
@@ -9131,6 +9482,13 @@ func (a *recordingShellAPI) ShutdownInstanceWithID(id string) error {
 }
 
 func (a *recordingShellAPI) InstanceStatusOf(id string) (client.InstanceState, error) {
+	return a.InstanceStatusOfContext(context.Background(), id)
+}
+
+func (a *recordingShellAPI) InstanceStatusOfContext(ctx context.Context, id string) (client.InstanceState, error) {
+	if a.instanceStatus != nil {
+		return a.instanceStatus(ctx, id)
+	}
 	if state, ok := a.instances[id]; ok {
 		return state, nil
 	}

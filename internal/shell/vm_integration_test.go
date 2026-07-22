@@ -683,6 +683,13 @@ func TestVMIntegrationInteractiveUIRoutesCommandsAcrossVMs(t *testing.T) {
 	position = enterUI(t, driver, session)
 	waitUILine(t, ctx, driver, "VMSH_UI_LINUX_STATE=linux", session)
 	waitUIPromptAfter(t, ctx, driver, position, session)
+	typeUI(t, driver, "exec >/tmp/vmsh-ui-session.log", session)
+	position = enterUI(t, driver, session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+	typeUI(t, driver, "exec >/dev/tty; printf 'VMSH_UI_LINUX_REDIRECT_RECOVERED=1\\n'", session)
+	position = enterUI(t, driver, session)
+	waitUILine(t, ctx, driver, "VMSH_UI_LINUX_REDIRECT_RECOVERED=1", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
 
 	driver.SetDelay(0)
 	position = session.Snapshot().BytesRead
@@ -1005,6 +1012,90 @@ func TestVMIntegrationPersistentTTYGuestShellState(t *testing.T) {
 
 	if err := sh.stopVM("tty"); err != nil {
 		t.Fatalf("stop tty VM: %v", err)
+	}
+}
+
+func TestVMIntegrationPersistentTTYCommandLatency(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("persistent TTY shell test requires a Unix PTY")
+	}
+	requireLongVMIntegrationTest(t)
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+
+	stdout, stderr, err := sh.runTestScript("@tty-latency --from " + env.image + " --memory 768 --cpus 1 --no-network\n")
+	if err != nil {
+		t.Fatalf("select VM context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	t.Cleanup(func() { _ = sh.stopVM("tty-latency") })
+
+	const commandCount = 40
+	durations := make([]time.Duration, 0, commandCount)
+	var total time.Duration
+	for range commandCount {
+		started := time.Now()
+		if out, err := sh.evalOnTestPTY(":"); err != nil {
+			t.Fatalf("run latency command: %v\noutput:\n%s", err, out)
+		}
+		elapsed := time.Since(started)
+		durations = append(durations, elapsed)
+		total += elapsed
+	}
+	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+	median := durations[len(durations)/2]
+	p95 := durations[(len(durations)*95-1)/100]
+	average := total / commandCount
+	t.Logf("persistent interactive command latency: average=%s median=%s p95=%s max=%s", average, median, p95, durations[len(durations)-1])
+	if p95 >= 100*time.Millisecond {
+		t.Fatalf("persistent interactive p95 latency = %s, want less than 100ms", p95)
+	}
+}
+
+func TestVMIntegrationAutomaticMemoryConvergesBeforeContextSelectionReturns(t *testing.T) {
+	requireLongVMIntegrationTest(t)
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+
+	stdout, stderr, err := sh.runTestScript("@automatic-memory --from " + env.image + " --cpus 1 --no-network\n")
+	if err != nil {
+		t.Fatalf("select automatic-memory VM context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	t.Cleanup(func() { _ = sh.stopVM("automatic-memory") })
+	state, err := env.api.InstanceStatusOf("automatic-memory")
+	if err != nil {
+		t.Fatalf("read automatic-memory VM status: %v", err)
+	}
+	if state.BalloonStatus != "" && state.BalloonStatus != "unsupported" && !initialMemoryConverged(state) {
+		t.Fatalf("context selection returned before automatic memory converged: %#v", state)
+	}
+}
+
+func TestVMIntegrationPersistentTTYControlSurvivesUserDescriptorChanges(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("persistent TTY shell test requires a Unix PTY")
+	}
+	requireLongVMIntegrationTest(t)
+	env := newVMIntegrationTestEnv(t)
+	sh := env.newShell(t)
+
+	stdout, stderr, err := sh.runTestScript("@tty-control --from " + env.image + " --memory 768 --cpus 1 --no-network\n")
+	if err != nil {
+		t.Fatalf("select VM context: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+
+	out, err := sh.evalOnTestPTY("VMSH_RELAY_STATE=retained; exec 3>&-; printf first")
+	if err != nil {
+		t.Fatalf("close descriptor 3 in persistent command: %v\noutput:\n%s", err, out)
+	}
+	requireOutputLine(t, out, "first")
+
+	out, err = sh.evalOnTestPTY(`printf '%s\n' "$VMSH_RELAY_STATE"`)
+	if err != nil {
+		t.Fatalf("run command after descriptor change: %v\noutput:\n%s", err, out)
+	}
+	requireOutputLine(t, out, "retained")
+	if err := sh.stopVM("tty-control"); err != nil {
+		t.Fatalf("stop tty-control VM: %v", err)
 	}
 }
 

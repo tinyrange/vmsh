@@ -520,7 +520,7 @@ func TestConnectCCVMWithOptionsReusesAuthenticatedDaemon(t *testing.T) {
 	}))
 	mux.HandleFunc("/vmsh/protocol", requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"kind":"vmshd","protocol":{"name":"vmshd.frontend","current":1,"minimum":1},"daemon":{"version":"test","platform":"test/test","executable":{"mode":"stable-daemon-copy"}},"compatibility":{"compatible":true,"action":"reuse","reason":"compatible"}}`))
+		w.Write([]byte(`{"kind":"vmshd","protocol":{"name":"vmshd.frontend","current":2,"minimum":2},"daemon":{"version":"test","platform":"test/test","executable":{"mode":"stable-daemon-copy"}},"compatibility":{"compatible":true,"action":"reuse","reason":"compatible"}}`))
 	}))
 	srv := &http.Server{Handler: mux}
 	go func() {
@@ -798,7 +798,7 @@ func TestConcurrentConnectsPublishOneSharedDaemon(t *testing.T) {
 	}
 }
 
-func TestConnectCCVMWithOptionsStartsPrivateDaemonForIncompatibleVMSHD(t *testing.T) {
+func TestConnectCCVMWithOptionsStartsPrivateDaemonForOlderVMSHDProtocol(t *testing.T) {
 	oldLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen old: %v", err)
@@ -817,6 +817,14 @@ func TestConnectCCVMWithOptionsStartsPrivateDaemonForIncompatibleVMSHD(t *testin
 	}))
 	oldMux.HandleFunc("/vm/start", requireBearer(oldToken, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	oldMux.HandleFunc("/vmsh/status", requireBearer(oldToken, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"kind":"vmshd","status":"ok"}`))
+	}))
+	oldMux.HandleFunc("/vmsh/protocol", requireBearer(oldToken, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"kind":"vmshd","protocol":{"name":"vmshd.frontend","current":1,"minimum":1},"daemon":{"version":"old","platform":"test/test","executable":{"mode":"stable-daemon-copy"}},"compatibility":{"compatible":true,"action":"reuse","reason":"compatible"}}`))
 	}))
 	oldSrv := &http.Server{Handler: oldMux}
 	go func() {
@@ -851,7 +859,7 @@ func TestConnectCCVMWithOptionsStartsPrivateDaemonForIncompatibleVMSHD(t *testin
 	}))
 	newMux.HandleFunc("/vmsh/protocol", requireBearer(newToken, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"kind":"vmshd","protocol":{"name":"vmshd.frontend","current":1,"minimum":1},"daemon":{"version":"test","platform":"test/test","executable":{"mode":"stable-daemon-copy"}},"compatibility":{"compatible":true,"action":"reuse","reason":"compatible"}}`))
+		w.Write([]byte(`{"kind":"vmshd","protocol":{"name":"vmshd.frontend","current":2,"minimum":2},"daemon":{"version":"test","platform":"test/test","executable":{"mode":"stable-daemon-copy"}},"compatibility":{"compatible":true,"action":"reuse","reason":"compatible"}}`))
 	}))
 	newSrv := &http.Server{Handler: newMux}
 	go func() {
@@ -1002,7 +1010,7 @@ func TestConnectCCVMWithOptionsStartsPrivateDaemonForUnauthenticatedVMSHDState(t
 	}))
 	newMux.HandleFunc("/vmsh/protocol", requireBearer(newToken, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"kind":"vmshd","protocol":{"name":"vmshd.frontend","current":1,"minimum":1},"daemon":{"version":"test","platform":"test/test","executable":{"mode":"stable-daemon-copy"}},"compatibility":{"compatible":true,"action":"reuse","reason":"compatible"}}`))
+		w.Write([]byte(`{"kind":"vmshd","protocol":{"name":"vmshd.frontend","current":2,"minimum":2},"daemon":{"version":"test","platform":"test/test","executable":{"mode":"stable-daemon-copy"}},"compatibility":{"compatible":true,"action":"reuse","reason":"compatible"}}`))
 	}))
 	newSrv := &http.Server{Handler: newMux}
 	go func() {
@@ -1271,7 +1279,7 @@ func startCompatibleVMSHDTestServer(t *testing.T, token string) string {
 	}))
 	mux.HandleFunc("/vmsh/protocol", requireBearer(token, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"kind":"vmshd","protocol":{"name":"vmshd.frontend","current":1,"minimum":1},"daemon":{"version":"test","platform":"test/test","executable":{"mode":"stable-daemon-copy"}},"compatibility":{"compatible":true,"action":"reuse","reason":"compatible"}}`))
+		_, _ = w.Write([]byte(`{"kind":"vmshd","protocol":{"name":"vmshd.frontend","current":2,"minimum":2},"daemon":{"version":"test","platform":"test/test","executable":{"mode":"stable-daemon-copy"}},"compatibility":{"compatible":true,"action":"reuse","reason":"compatible"}}`))
 	}))
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)

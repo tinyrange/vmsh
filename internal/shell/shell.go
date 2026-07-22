@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -34,6 +35,7 @@ import (
 	"github.com/tinyrange/vmsh/internal/terminal"
 	"github.com/tinyrange/vmsh/internal/termui/editor"
 	"github.com/tinyrange/vmsh/internal/version"
+	"github.com/tinyrange/vmsh/internal/vmconfig"
 	"github.com/tinyrange/vmsh/internal/vmshd"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
@@ -41,7 +43,7 @@ import (
 )
 
 const guestHostMount = "/host"
-const isolatedVMSuffix = "-isolated"
+const isolatedVMSuffix = vmconfig.IsolatedVMSuffix
 const defaultGuestUser = "1000:1000"
 const defaultVMSHBootTimeoutSeconds = 60
 const defaultBuiltInBSDBootTimeoutSeconds = 180
@@ -51,6 +53,8 @@ const defaultCCVMGuestMemoryMB = 512
 const maxEmbeddedHostInitPreludeBytes = 64 * 1024
 const maxBackgroundJobLogBytes = 1024 * 1024
 const ubuntuCloudRootFSBaseURL = "https://cloud-images.ubuntu.com/releases/noble/release"
+const persistentOutputBarrierPrefix = "__VMSH_OUTPUT_BARRIER_"
+const persistentOutputBarrierSuffix = "__"
 const (
 	colorReset   = "\x1b[0m"
 	colorGreen   = "\x1b[32m"
@@ -144,6 +148,10 @@ type instanceStartContextAPI interface {
 	StartInstanceStreamWithIDContext(context.Context, string, client.StartInstanceRequest, func(client.BootEvent) error) (client.InstanceState, error)
 }
 
+type instanceStatusContextAPI interface {
+	InstanceStatusOfContext(context.Context, string) (client.InstanceState, error)
+}
+
 type execStreamContextAPI interface {
 	ExecStreamInContext(context.Context, string, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 }
@@ -196,28 +204,38 @@ type hostShellInit struct {
 type persistentHostShell struct {
 	mu          sync.Mutex
 	outputMu    sync.Mutex
+	doneMu      sync.Mutex
+	controlOnce sync.Once
 	cmd         *exec.Cmd
 	tty         *os.File
 	stdin       io.WriteCloser
 	stdout      *bufio.Reader
 	control     *bufio.Reader
 	controlFile *os.File
+	cleanupFIFO func()
 	output      io.Writer
+	barrier     *persistentOutputBarrier
+	barrierDone chan struct{}
 	seq         uint64
 	lastCWD     string
 	pending     string
-	done        chan error
+	done        chan struct{}
+	doneErr     error
 }
 
 type persistentGuestShell struct {
 	mu        sync.Mutex
+	doneMu    sync.Mutex
 	closeOnce sync.Once
 	ended     atomic.Bool
+	closing   atomic.Bool
 	key       string
 	inputs    chan client.ExecInput
 	events    chan client.ExecEvent
-	done      chan error
+	done      chan struct{}
+	doneErr   error
 	lastCWD   string
+	closeWait time.Duration
 }
 
 type vmshCompleter struct {
@@ -381,7 +399,7 @@ func (c *vmshCompleter) shellSSHSessionContext(name string) (commandContext, boo
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@agent", "@alias", "@connect", "@copy", "@detach", "@exec", "@help", "@host", "@install", "@jobs", "@mux", "@permissions", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux", "@trust", "@version"}
+	words := []string{"@agent", "@alias", "@connect", "@copy", "@detach", "@exec", "@help", "@host", "@install", "@jobs", "@mcp", "@mux", "@permissions", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux", "@trust", "@version"}
 	if c.shell != nil {
 		for _, name := range c.shell.sshSessionNames() {
 			words = append(words, "@"+name)
@@ -3388,6 +3406,11 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("usage: @sessions")
 		}
 		return s.printSessions(stdout)
+	case "mcp":
+		if len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @mcp [status|stop|codex [-- args]]")
+		}
+		return s.runMCP(at.Command, stdout, stderr)
 	case "detach":
 		if at.Command != "" || len(at.Options.OptionFields) != 0 {
 			return fmt.Errorf("usage: @detach")
@@ -3637,6 +3660,196 @@ func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 		return nil
 	}
 	interrupts := newCommandInterruptEscalator(line, stderr, func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+	}, func() {
+		_ = cmd.Process.Kill()
+	})
+	stopInterrupts, interrupted := s.startInterruptWatcher(interrupts.Interrupt)
+	err := cmd.Wait()
+	stopInterrupts()
+	if interrupted.Load() {
+		s.lastCode = 130
+		return nil
+	}
+	s.lastCode = exitCode(err)
+	if err != nil && s.lastCode < 0 {
+		return err
+	}
+	return nil
+}
+
+const mcpCodexTokenEnv = "VMSH_MCP_TOKEN"
+
+func (s *shellState) runMCP(command string, stdout, stderr io.Writer) error {
+	if s.vmshd == nil || s.vmshd.client == nil || strings.TrimSpace(s.vmshd.sessionID) == "" {
+		return fmt.Errorf("@mcp requires a vmshd session")
+	}
+	fields, err := splitShellFields(command)
+	if err != nil {
+		return err
+	}
+	sessionID := s.vmshd.sessionID
+	if len(fields) == 0 {
+		info, err := s.vmshd.client.StartMCP(sessionID)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(stdout, "MCP endpoint ready at %s (%d VMs, server %s)\n", info.URL, info.VMs, firstNonEmpty(info.Version, "unknown"))
+		return err
+	}
+	switch fields[0] {
+	case "status":
+		if len(fields) != 1 {
+			return fmt.Errorf("usage: @mcp status")
+		}
+		info, err := s.vmshd.client.MCPStatus(sessionID)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(stdout, "MCP endpoint running at %s (%d VMs, server %s)\n", info.URL, info.VMs, firstNonEmpty(info.Version, "unknown"))
+		return err
+	case "stop":
+		if len(fields) != 1 {
+			return fmt.Errorf("usage: @mcp stop")
+		}
+		if err := s.vmshd.client.StopMCP(sessionID); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintln(stdout, "MCP endpoint stopped")
+		return err
+	case "codex":
+		args := fields[1:]
+		if len(args) > 0 && args[0] == "--" {
+			args = args[1:]
+		}
+		info, err := s.vmshd.client.StartMCP(sessionID)
+		if err != nil {
+			return err
+		}
+		credential, err := s.vmshd.client.MintMCPCredential(sessionID)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = s.vmshd.client.RevokeMCPCredential(sessionID, credential.ID) }()
+		argv, env := codexMCPLaunch(info.URL, credential.Token, args)
+		return s.runHostProgram(argv, env, stdout, stderr)
+	default:
+		return fmt.Errorf("usage: @mcp [status|stop|codex [-- args]]")
+	}
+}
+
+func codexMCPLaunch(endpointURL, token string, userArgs []string) ([]string, []string) {
+	argv := []string{
+		"codex",
+		"-c", "mcp_servers.vmsh.url=" + strconv.Quote(endpointURL),
+		"-c", "mcp_servers.vmsh.bearer_token_env_var=" + strconv.Quote(mcpCodexTokenEnv),
+		"-c", "mcp_servers.vmsh.required=true",
+		"-c", "mcp_servers.vmsh.default_tools_approval_mode=\"approve\"",
+		"-c", "mcp_servers.vmsh.tool_timeout_sec=86400",
+	}
+	argv = append(argv, userArgs...)
+	return argv, []string{mcpCodexTokenEnv + "=" + token}
+}
+
+func (s *shellState) runHostProgram(argv, extraEnv []string, stdout, stderr io.Writer) error {
+	if len(argv) == 0 || strings.TrimSpace(argv[0]) == "" {
+		return fmt.Errorf("host program is required")
+	}
+	tty, cols, rows := terminalRequestSize(stdout)
+	termEnv := []string(nil)
+	if tty {
+		termEnv = terminalEnv(cols, rows)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Dir = s.hostCWD
+	cmd.Stdin = os.Stdin
+	cmd.Env = mergedEnv(hostCommandEnv(s.env, termEnv), extraEnv)
+	if tty && runtime.GOOS != "windows" {
+		return s.runHostProgramPTY(cmd, cols, rows, stdout, stderr, argv)
+	}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	// os/exec replaces non-file writers with pipes. On platforms where vmsh's
+	// PTY support is unavailable, preserve terminal identity through wrappers
+	// such as the session recorder even though their output cannot be observed.
+	if tty {
+		if file, ok := terminalWriterFile(stdout); ok {
+			cmd.Stdout = file
+		}
+		if file, ok := terminalWriterFile(stderr); ok {
+			cmd.Stderr = file
+		}
+	}
+	return s.waitHostProgram(cmd, argv, stderr)
+}
+
+func (s *shellState) runHostProgramPTY(cmd *exec.Cmd, cols, rows int, stdout, stderr io.Writer, argv []string) error {
+	winsize, err := hostPTYWinsize(cols, rows)
+	if err != nil {
+		return err
+	}
+	// pty.StartWithSize only installs the slave for nil streams. In particular,
+	// stdin must be replaced so the child can make the slave its controlling TTY.
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	tty, err := pty.StartWithSize(cmd, winsize)
+	if err != nil {
+		return err
+	}
+	outputDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(stdout, tty)
+		close(outputDone)
+	}()
+	session := &persistentHostShell{tty: tty}
+	display := strings.Join(argv, " ")
+	interrupts := newCommandInterruptEscalator(display, stderr, nil, func() {
+		_ = cmd.Process.Kill()
+	})
+	stopForwarding, interrupted, err := s.startHostPTYForwarding(true, session, stdout, stderr, func(name string) bool {
+		switch name {
+		case "INT":
+			interrupts.Interrupt()
+		case "QUIT":
+			return interrupts.Force()
+		}
+		return false
+	})
+	if err != nil {
+		_ = tty.Close()
+		<-outputDone
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return err
+	}
+	err = cmd.Wait()
+	stopForwarding()
+	_ = tty.Close()
+	<-outputDone
+	if interrupted.Load() && err != nil && exitCode(err) < 0 {
+		s.lastCode = 130
+		return nil
+	}
+	s.lastCode = exitCode(err)
+	if err != nil && s.lastCode < 0 {
+		return err
+	}
+	return nil
+}
+
+func (s *shellState) waitHostProgram(cmd *exec.Cmd, argv []string, stderr io.Writer) error {
+	if cmd.Process == nil {
+		if err := cmd.Start(); err != nil {
+			s.lastCode = exitCode(err)
+			if s.lastCode < 0 {
+				return err
+			}
+			return nil
+		}
+	}
+	display := strings.Join(argv, " ")
+	interrupts := newCommandInterruptEscalator(display, stderr, func() {
 		_ = cmd.Process.Signal(os.Interrupt)
 	}, func() {
 		_ = cmd.Process.Kill()
@@ -4492,8 +4705,7 @@ func (s *shellState) runGuestCopyExtractCommand(ctx commandContext, archiveGuest
 		"    echo \"copy conflict at $dst: cannot overwrite directory with non-directory\" >&2",
 		"    exit 1",
 		"  fi",
-		"  rm -f -- \"$dst\"",
-		"  mv -- \"$src\" \"$dst\"",
+		"  mv -f -- \"$src\" \"$dst\"",
 		"fi",
 	}, "\n")
 	return s.runGuestFSRequest(ctx, client.ExecRequest{
@@ -5190,7 +5402,7 @@ func backendVMID(ctx commandContext) string {
 func backendVMIDFor(id string, isolated bool) string {
 	id = normalizedVMID(id)
 	if isolated {
-		return id + isolatedVMSuffix
+		return vmconfig.IsolatedVMID(id)
 	}
 	return id
 }
@@ -5259,26 +5471,29 @@ func (s *shellState) hostPersistentShell(env []string, cols, rows int, stdout, s
 }
 
 func startPersistentHostShell(cwd string, env []string, cols, rows int, prelude string, startupOutput io.Writer, startForwarding func(*persistentHostShell) (func(), error)) (*persistentHostShell, error) {
-	script := prelude + persistentHostShellScript()
+	controlRead, controlPath, cleanupControl, err := openPersistentHostControl()
+	if err != nil {
+		return nil, err
+	}
+	cleanupOnError := true
+	defer func() {
+		if cleanupOnError {
+			_ = controlRead.Close()
+			cleanupControl()
+		}
+	}()
+	script := prelude + persistentHostShellScript(controlPath)
 	cmd := exec.Command(hostShell(), "-ic", script)
 	cmd.Dir = cwd
 	if env != nil {
 		cmd.Env = env
 	}
-	controlRead, controlWrite, err := os.Pipe()
-	if err != nil {
-		return nil, err
-	}
-	defer controlWrite.Close()
-	cmd.ExtraFiles = []*os.File{controlWrite}
 	winsize, err := hostPTYWinsize(cols, rows)
 	if err != nil {
-		_ = controlRead.Close()
 		return nil, err
 	}
 	tty, err := pty.StartWithSize(cmd, winsize)
 	if err != nil {
-		_ = controlRead.Close()
 		return nil, err
 	}
 	session := &persistentHostShell{
@@ -5288,12 +5503,18 @@ func startPersistentHostShell(cwd string, env []string, cols, rows int, prelude 
 		stdout:      bufio.NewReader(tty),
 		control:     bufio.NewReader(controlRead),
 		controlFile: controlRead,
+		cleanupFIFO: cleanupControl,
 		lastCWD:     cwd,
-		done:        make(chan error, 1),
+		done:        make(chan struct{}),
 	}
 	go func() {
-		session.done <- cmd.Wait()
+		session.doneMu.Lock()
+		session.doneErr = cmd.Wait()
+		session.doneMu.Unlock()
+		session.closeControl()
+		close(session.done)
 	}()
+	cleanupOnError = false
 	go session.forwardPTYOutput()
 	stopForwarding := func() {}
 	if startupOutput != nil {
@@ -5318,30 +5539,57 @@ func startPersistentHostShell(cwd string, env []string, cols, rows int, prelude 
 	return session, nil
 }
 
-func persistentHostShellScript() string {
+func persistentHostShellScript(controlPath string) string {
 	lines := []string{
-		"set -m 2>/dev/null || true",
 		"stty -echo 2>/dev/null || true",
 	}
 	if filepath.Base(hostShell()) == "bash" {
 		lines = append(lines, bashHostShellOptionsPrelude())
 	}
 	lines = append(lines, []string{
-		"__vmsh_control_fd=3",
+		"set -m 2>/dev/null || true",
+		"__vmsh_control_fifo=" + shellQuote(controlPath),
 		"__vmsh_report() {",
-		"  printf '%s\\t%s\\t%s\\n' \"$1\" \"$2\" \"$PWD\" >&$__vmsh_control_fd",
+		"  printf '%s\\t%s\\t%s\\n' \"$1\" \"$2\" \"$PWD\" >\"$__vmsh_control_fifo\"",
 		"}",
 		"__vmsh_run() {",
 		"  stty echo 2>/dev/null || true",
 		"  eval \" $1\"",
 		"  __vmsh_status=$?",
 		"  stty -echo 2>/dev/null || true",
+		"  command printf '%s' \"$2\" >/dev/tty",
 		"  __vmsh_report done \"$__vmsh_status\"",
 		"}",
 		"__vmsh_report ready 0",
 		"while IFS= read -r __vmsh_line; do eval \"$__vmsh_line\"; done",
 	}...)
 	return strings.Join(lines, "\n")
+}
+
+// persistentGuestControlRelayScript isolates completion framing from the shell that
+// evaluates user input. The relay keeps the real control descriptor while fd 3
+// in the user-visible shell is deliberately harmless and disposable.
+func persistentGuestControlRelayScript() []string {
+	lines := []string{
+		"__vmsh_control_dir=$(mktemp -d \"${TMPDIR:-/tmp}/vmsh-shell.XXXXXX\") || exit 126",
+		"__vmsh_control_fifo=$__vmsh_control_dir/control",
+		"mkfifo \"$__vmsh_control_fifo\" || exit 126",
+		// Launch from a short-lived helper shell so the relay never enters the
+		// interactive shell's job table. Bash otherwise prints its PID even with
+		// monitor mode disabled; zsh can report it later during shell shutdown.
+		"__vmsh_control_relay=$( (trap '' INT QUIT; exec 8<>\"$__vmsh_control_fifo\"; while IFS= read -r __vmsh_frame <&8; do [ \"$__vmsh_frame\" = __vmsh_relay_stop__ ] && break; printf '%s\\n' \"$__vmsh_frame\" >&3 || break; done) </dev/null >/dev/null 2>&1 & printf '%s' \"$!\" )",
+	}
+	return append(lines,
+		"exec 3</dev/null",
+		"__vmsh_report() {",
+		"  printf '%s\\t%s\\t%s\\n' \"$1\" \"$2\" \"$PWD\" >\"$__vmsh_control_fifo\"",
+		"}",
+		"__vmsh_cleanup() {",
+		"  kill \"$__vmsh_control_relay\" 2>/dev/null || true",
+		"  wait \"$__vmsh_control_relay\" 2>/dev/null || true",
+		"  rm -rf \"$__vmsh_control_dir\"",
+		"}",
+	)
 }
 
 func (p *persistentHostShell) waitReady() error {
@@ -5396,7 +5644,16 @@ func (p *persistentHostShell) forwardPTYOutput() {
 			p.outputMu.Lock()
 			output := p.output
 			if output != nil {
-				writePTYOutput(output, buf[:n])
+				if p.barrier != nil {
+					reached := p.barrier.reached
+					p.barrier.writePTY(output, buf[:n])
+					if !reached && p.barrier.reached && p.barrierDone != nil {
+						close(p.barrierDone)
+						p.barrierDone = nil
+					}
+				} else {
+					writePTYOutput(output, buf[:n])
+				}
 			}
 			p.outputMu.Unlock()
 		}
@@ -5421,17 +5678,27 @@ func writePTYOutput(output io.Writer, data []byte) {
 func (p *persistentHostShell) setOutput(output io.Writer) {
 	p.outputMu.Lock()
 	p.output = output
+	p.barrier = nil
+	p.barrierDone = nil
 	p.outputMu.Unlock()
 }
 
-func (p *persistentHostShell) clearOutputSoon() {
-	time.Sleep(20 * time.Millisecond)
-	p.setOutput(nil)
+func (p *persistentHostShell) setCommandOutput(output io.Writer, barrier *persistentOutputBarrier, done chan struct{}) {
+	p.outputMu.Lock()
+	p.output = output
+	p.barrier = barrier
+	p.barrierDone = done
+	p.outputMu.Unlock()
 }
 
 func (p *persistentHostShell) run(line string, stdout, stderr io.Writer, startForwarding func() (func(), error)) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	barrier, err := newPersistentOutputBarrier()
+	if err != nil {
+		return err
+	}
+	barrierDone := make(chan struct{})
 	stopForwarding := func() {}
 	if startForwarding != nil {
 		stop, err := startForwarding()
@@ -5442,12 +5709,12 @@ func (p *persistentHostShell) run(line string, stdout, stderr io.Writer, startFo
 			stopForwarding = stop
 		}
 	}
-	p.setOutput(stdout)
+	p.setCommandOutput(stdout, barrier, barrierDone)
 	defer func() {
-		p.clearOutputSoon()
+		p.setOutput(nil)
 		stopForwarding()
 	}()
-	if _, err := fmt.Fprintln(p.stdin, "__vmsh_run "+shellQuote(line)); err != nil {
+	if _, err := fmt.Fprintln(p.stdin, "__vmsh_run "+shellQuote(line)+" "+shellQuote(string(barrier.marker))); err != nil {
 		return err
 	}
 	for {
@@ -5457,6 +5724,16 @@ func (p *persistentHostShell) run(line string, stdout, stderr io.Writer, startFo
 		}
 		if record.kind != "done" {
 			continue
+		}
+		select {
+		case <-barrierDone:
+		case <-p.done:
+			if err := p.terminalError(); err != nil {
+				return err
+			}
+			return errPersistentGuestShellClosed
+		case <-time.After(2 * time.Second):
+			return fmt.Errorf("persistent host shell output did not drain after command completion")
 		}
 		p.lastCWD = record.cwd
 		if record.code != 0 {
@@ -5487,10 +5764,15 @@ func (p *persistentHostShell) cwd() string {
 	return p.lastCWD
 }
 
+func (p *persistentHostShell) terminalError() error {
+	p.doneMu.Lock()
+	defer p.doneMu.Unlock()
+	return p.doneErr
+}
+
 func (s *shellState) closeSessions() {
 	changed := s.guestShell != nil || s.hostShell != nil || len(s.sshShells) > 0
-	if s.guestShell != nil {
-		s.guestShell.close()
+	if s.guestShell != nil && s.guestShell.close() {
 		s.guestShell = nil
 	}
 	if s.hostShell != nil {
@@ -5511,12 +5793,14 @@ func (s *shellState) closeGuestSession() {
 		s.context.CWD = cwd
 		s.rememberContextCWD(s.context)
 	}
-	s.guestShell.close()
-	s.guestShell = nil
+	if s.guestShell.close() {
+		s.guestShell = nil
+	}
 	s.publishVMSHDSessionState()
 }
 
 func (p *persistentHostShell) close() {
+	defer p.closeControl()
 	if p.stdin != nil {
 		_, _ = fmt.Fprintln(p.stdin, "exit")
 		select {
@@ -5530,9 +5814,6 @@ func (p *persistentHostShell) close() {
 	} else if p.stdin != nil {
 		_ = p.stdin.Close()
 	}
-	if p.controlFile != nil {
-		_ = p.controlFile.Close()
-	}
 	select {
 	case <-p.done:
 	case <-time.After(500 * time.Millisecond):
@@ -5541,6 +5822,17 @@ func (p *persistentHostShell) close() {
 			<-p.done
 		}
 	}
+}
+
+func (p *persistentHostShell) closeControl() {
+	p.controlOnce.Do(func() {
+		if p.cleanupFIFO != nil {
+			p.cleanupFIFO()
+		}
+		if p.controlFile != nil {
+			_ = p.controlFile.Close()
+		}
+	})
 }
 
 func (s *shellState) hostCommandPrelude(tty bool) string {
@@ -5894,12 +6186,13 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 			sendGuestInputNonBlocking(session.inputs, client.ExecInput{Kind: "signal", Signal: name})
 		}
 		interrupts := newCommandInterruptEscalator(line, stderr, func() {
-			sendSignal("INT")
+			// Let the guest terminal deliver a soft interrupt to its foreground
+			// process group. The backend signal API intentionally targets the
+			// entire managed family, which includes this long-lived shell and its
+			// private control relay.
+			sendGuestInputNonBlocking(session.inputs, client.ExecInput{Kind: "stdin", Data: []byte{0x03}})
 		}, func() {
 			sendSignal("KILL")
-			if s.guestShell == session {
-				s.guestShell = nil
-			}
 			go session.close()
 		})
 		err = session.run(line, stdout, stderr, func() (func(), error) {
@@ -6071,13 +6364,19 @@ func persistentGuestCommandAllowed(line string) bool {
 func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequest, stdout, stderr io.Writer) (*persistentGuestShell, error) {
 	key := guestPersistentShellKey(ctx, req)
 	if s.guestShell != nil && s.guestShell.key == key {
-		if !s.guestShell.ended.Load() {
+		if !s.guestShell.ended.Load() && !s.guestShell.closing.Load() {
 			return s.guestShell, nil
 		}
-		s.guestShell = nil
+		if s.guestShell.ended.Load() {
+			s.guestShell = nil
+		} else {
+			return nil, fmt.Errorf("previous persistent guest shell is still closing")
+		}
 	}
 	if s.guestShell != nil {
-		s.guestShell.close()
+		if !s.guestShell.close() {
+			return nil, fmt.Errorf("previous persistent guest shell did not close; its recovery handle was retained")
+		}
 		s.guestShell = nil
 	}
 	req.Command = guestPersistentCommand()
@@ -6091,7 +6390,7 @@ func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequ
 	}
 	inputs := make(chan client.ExecInput, 8)
 	events := make(chan client.ExecEvent, 32)
-	done := make(chan error, 1)
+	done := make(chan struct{})
 	session := &persistentGuestShell{
 		key:     key,
 		inputs:  inputs,
@@ -6106,7 +6405,10 @@ func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequ
 		})
 		session.ended.Store(true)
 		close(events)
-		done <- err
+		session.doneMu.Lock()
+		session.doneErr = err
+		session.doneMu.Unlock()
+		close(done)
 	}()
 	if err := session.waitReady(stdout, stderr); err != nil {
 		session.close()
@@ -6146,23 +6448,30 @@ func shareMountKey(shares []client.ShareMount) string {
 }
 
 func guestPersistentCommand() []string {
-	return []string{"sh", "-lc", guestShellPrelude() + strings.Join([]string{
+	lines := []string{
+		"trap ':' INT QUIT",
 		"stty -echo 2>/dev/null || true",
 		colorPrelude("ls --color=always -C -w ${COLUMNS:-80}", "ls -G -C", false),
-		"__vmsh_control_fd=3",
-		"__vmsh_report() {",
-		"  printf '%s\\t%s\\t%s\\n' \"$1\" \"$2\" \"$PWD\" >&$__vmsh_control_fd",
-		"}",
+	}
+	lines = append(lines, persistentGuestControlRelayScript()...)
+	lines = append(lines, []string{
+		"set -m 2>/dev/null || true",
 		"__vmsh_run() {",
 		"  stty echo 2>/dev/null || true",
 		"  eval \" $1\"",
 		"  __vmsh_status=$?",
 		"  stty -echo 2>/dev/null || true",
+		// Emit the drain marker as part of the submitted command. The frontend
+		// still waits for both output and control, but no second input round trip
+		// is needed after a fast command completes.
+		"  command printf '%s' \"$2\" >/dev/tty",
 		"  __vmsh_report done \"$__vmsh_status\"",
 		"}",
+		"trap '__vmsh_cleanup' EXIT",
 		"__vmsh_report ready 0",
 		"while IFS= read -r __vmsh_line; do eval \"$__vmsh_line\"; done",
-	}, "\n")}
+	}...)
+	return []string{"sh", "-lc", guestShellPrelude() + strings.Join(lines, "\n")}
 }
 
 func (p *persistentGuestShell) waitReady(stdout, stderr io.Writer) error {
@@ -6214,7 +6523,8 @@ func (p *persistentGuestShell) waitReady(stdout, stderr io.Writer) error {
 				}
 				return fmt.Errorf("persistent guest shell failed before ready")
 			}
-		case err := <-p.done:
+		case <-p.done:
+			err := p.terminalError()
 			if err != nil {
 				return err
 			}
@@ -6271,6 +6581,10 @@ func parsePersistentReady(text string) (string, bool) {
 func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer, startForwarding func() (func(), error)) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	barrier, err := newPersistentOutputBarrier()
+	if err != nil {
+		return err
+	}
 	stopForwarding := func() {}
 	if startForwarding != nil {
 		stop, err := startForwarding()
@@ -6282,7 +6596,8 @@ func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer, startF
 		}
 	}
 	defer stopForwarding()
-	p.inputs <- client.ExecInput{Kind: "stdin", Data: []byte("__vmsh_run " + shellQuote(line) + "\n")}
+	p.inputs <- client.ExecInput{Kind: "stdin", Data: []byte("__vmsh_run " + shellQuote(line) + " " + shellQuote(string(barrier.marker)) + "\n")}
+	var completed *persistentHostControlRecord
 	for event := range p.events {
 		switch event.Kind {
 		case "control":
@@ -6293,25 +6608,89 @@ func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer, startF
 			if record.kind != "done" {
 				continue
 			}
-			p.lastCWD = record.cwd
-			if record.code != 0 {
-				return persistentShellExit{code: record.code}
-			}
-			return nil
+			completed = &record
 		case "stdout", "output":
-			writeTTYExecEventOutput(stdout, event)
+			barrier.write(stdout, execEventBytes(event))
 		case "stderr":
 			writeTTYExecEventOutput(stderr, event)
 		case "exit":
+			barrier.flush(stdout)
 			return errPersistentGuestShellExited
 		case "error":
+			barrier.flush(stdout)
 			if event.Error != "" {
 				return fmt.Errorf("%s", event.Error)
 			}
 			return fmt.Errorf("persistent guest shell failed")
 		}
+		if completed != nil && barrier.reached {
+			p.lastCWD = completed.cwd
+			if completed.code != 0 {
+				return persistentShellExit{code: completed.code}
+			}
+			return nil
+		}
 	}
+	barrier.flush(stdout)
 	return errPersistentGuestShellClosed
+}
+
+type persistentOutputBarrier struct {
+	marker  []byte
+	pending []byte
+	reached bool
+}
+
+func newPersistentOutputBarrier() (*persistentOutputBarrier, error) {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return nil, fmt.Errorf("create persistent output barrier: %w", err)
+	}
+	marker := persistentOutputBarrierPrefix + hex.EncodeToString(token[:]) + persistentOutputBarrierSuffix
+	return &persistentOutputBarrier{marker: []byte(marker)}, nil
+}
+
+func (b *persistentOutputBarrier) write(w io.Writer, data []byte) {
+	b.writeTo(w, data, func(w io.Writer, data []byte) {
+		_, _ = w.Write(normalizeTTYNewlines(data))
+	})
+}
+
+func (b *persistentOutputBarrier) writePTY(w io.Writer, data []byte) {
+	b.writeTo(w, data, writePTYOutput)
+}
+
+func (b *persistentOutputBarrier) writeTo(w io.Writer, data []byte, write func(io.Writer, []byte)) {
+	if b == nil || len(data) == 0 {
+		return
+	}
+	out := make([]byte, 0, len(data))
+	for _, value := range data {
+		if b.reached {
+			out = append(out, value)
+			continue
+		}
+		b.pending = append(b.pending, value)
+		for len(b.pending) > 0 && !bytes.HasPrefix(b.marker, b.pending) {
+			out = append(out, b.pending[0])
+			b.pending = b.pending[1:]
+		}
+		if bytes.Equal(b.pending, b.marker) {
+			b.pending = nil
+			b.reached = true
+		}
+	}
+	if len(out) > 0 {
+		write(w, out)
+	}
+}
+
+func (b *persistentOutputBarrier) flush(w io.Writer) {
+	if b == nil || len(b.pending) == 0 {
+		return
+	}
+	_, _ = w.Write(normalizeTTYNewlines(b.pending))
+	b.pending = nil
 }
 
 func persistentGuestShellEnded(err error) bool {
@@ -6355,15 +6734,28 @@ func (p *persistentGuestShell) cwd() string {
 	return p.lastCWD
 }
 
-func (p *persistentGuestShell) close() {
+func (p *persistentGuestShell) terminalError() error {
+	p.doneMu.Lock()
+	defer p.doneMu.Unlock()
+	return p.doneErr
+}
+
+func (p *persistentGuestShell) close() bool {
+	p.closing.Store(true)
 	p.closeOnce.Do(func() {
 		sendGuestInputNonBlocking(p.inputs, client.ExecInput{Kind: "stdin_close"})
 		close(p.inputs)
-		select {
-		case <-p.done:
-		case <-time.After(2 * time.Second):
-		}
 	})
+	wait := p.closeWait
+	if wait <= 0 {
+		wait = 2 * time.Second
+	}
+	select {
+	case <-p.done:
+		return true
+	case <-time.After(wait):
+		return false
+	}
 }
 
 func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, stderr io.Writer) error {
@@ -6374,9 +6766,9 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 		if err := s.api.RunStreamInContext(runCtx, id, req, func(event client.ExecEvent) error {
 			switch event.Kind {
 			case "stdout", "output":
-				writeExecEventOutput(stdout, event)
+				return writeExecEventOutput(stdout, event)
 			case "stderr":
-				writeExecEventOutput(stderr, event)
+				return writeExecEventOutput(stderr, event)
 			case "exit":
 				exitCode = event.ExitCode
 			case "error":
@@ -6435,9 +6827,9 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 	if err := s.api.RunInteractiveStreamInContext(runCtx, id, req, inputs, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stdout", "output":
-			writeTTYExecEventOutput(stdout, event)
+			return writeTTYExecEventOutput(stdout, event)
 		case "stderr":
-			writeTTYExecEventOutput(stderr, event)
+			return writeTTYExecEventOutput(stderr, event)
 		case "exit":
 			exitCode = event.ExitCode
 		case "error":
@@ -6490,9 +6882,9 @@ func (s *shellState) streamGuestRunWithInputContext(ctx context.Context, id stri
 		if err := s.api.RunStreamInContext(ctx, id, req, func(event client.ExecEvent) error {
 			switch event.Kind {
 			case "stdout", "output":
-				writeExecEventOutput(stdout, event)
+				return writeExecEventOutput(stdout, event)
 			case "stderr":
-				writeExecEventOutput(stderr, event)
+				return writeExecEventOutput(stderr, event)
 			case "exit":
 				exitCode = event.ExitCode
 			case "error":
@@ -6533,17 +6925,15 @@ func (s *shellState) streamGuestRunWithInputContext(ctx context.Context, id stri
 		inputErr <- streamReaderToGuestInput(stdin, inputs, done)
 		close(inputs)
 	}()
-	go func() {
-		<-ctx.Done()
-		closeDone()
-	}()
+	stopCancelWatcher := context.AfterFunc(ctx, closeDone)
+	defer stopCancelWatcher()
 	exitCode := 0
 	err := s.api.RunInteractiveStreamInContext(ctx, id, req, inputs, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stdout", "output":
-			writeExecEventOutput(stdout, event)
+			return writeExecEventOutput(stdout, event)
 		case "stderr":
-			writeExecEventOutput(stderr, event)
+			return writeExecEventOutput(stderr, event)
 		case "exit":
 			exitCode = event.ExitCode
 		case "error":
@@ -7150,24 +7540,34 @@ func sleepOrDone(done <-chan struct{}, delay time.Duration) {
 	}
 }
 
-func writeExecEventOutput(w io.Writer, event client.ExecEvent) {
+func writeExecEventOutput(w io.Writer, event client.ExecEvent) error {
+	if w == nil {
+		return nil
+	}
 	if len(event.Data) > 0 {
-		_, _ = w.Write(event.Data)
-		return
+		_, err := w.Write(event.Data)
+		return err
 	}
 	if event.Output != "" {
-		_, _ = fmt.Fprint(w, event.Output)
+		_, err := fmt.Fprint(w, event.Output)
+		return err
 	}
+	return nil
 }
 
-func writeTTYExecEventOutput(w io.Writer, event client.ExecEvent) {
+func writeTTYExecEventOutput(w io.Writer, event client.ExecEvent) error {
+	if w == nil {
+		return nil
+	}
 	if len(event.Data) > 0 {
-		_, _ = w.Write(normalizeTTYNewlines(event.Data))
-		return
+		_, err := w.Write(normalizeTTYNewlines(event.Data))
+		return err
 	}
 	if event.Output != "" {
-		_, _ = w.Write(normalizeTTYNewlines([]byte(event.Output)))
+		_, err := w.Write(normalizeTTYNewlines([]byte(event.Output)))
+		return err
 	}
+	return nil
 }
 
 func normalizeTTYNewlines(data []byte) []byte {
@@ -7850,12 +8250,57 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 	if err != nil {
 		return err
 	}
+	state, err = s.waitForInitialMemoryConvergence(runCtx, id, ctx.MemoryMB == 0, state, onEvent)
+	if err != nil {
+		return err
+	}
 	startedID := firstNonEmpty(state.ID, id)
 	if s.vmRunning == nil {
 		s.vmRunning = map[string]bool{}
 	}
 	s.vmRunning[startedID] = true
 	return nil
+}
+
+const initialMemoryConvergenceTimeout = 15 * time.Second
+
+func (s *shellState) waitForInitialMemoryConvergence(ctx context.Context, id string, automatic bool, state client.InstanceState, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
+	if !automatic || state.BalloonStatus == "" || state.BalloonStatus == "unsupported" || initialMemoryConverged(state) {
+		return state, nil
+	}
+	if onEvent != nil {
+		_ = onEvent(client.BootEvent{Kind: "status", Message: "waiting for initial memory safety"})
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, initialMemoryConvergenceTimeout)
+	defer cancel()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var err error
+		if api, ok := s.api.(instanceStatusContextAPI); ok {
+			state, err = api.InstanceStatusOfContext(waitCtx, id)
+		} else {
+			state, err = s.api.InstanceStatusOf(id)
+		}
+		if err != nil {
+			return state, fmt.Errorf("wait for VM %q initial memory target: %w; the VM remains running and can be inspected or stopped", id, err)
+		}
+		if state.Status == "stopped" || state.Status == "crashed" {
+			return state, fmt.Errorf("VM %q became %s before its initial memory target converged", id, state.Status)
+		}
+		if state.BalloonStatus == "" || state.BalloonStatus == "unsupported" || initialMemoryConverged(state) {
+			return state, nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return state, fmt.Errorf("VM %q initial memory target did not converge: target=%d MiB actual=%d MiB status=%s: %w; the VM remains running and can be inspected or stopped", id, state.BalloonMB, state.BalloonActualMB, state.BalloonStatus, waitCtx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func initialMemoryConverged(state client.InstanceState) bool {
+	return state.BalloonStatus == "converged" && state.BalloonMB == state.BalloonActualMB
 }
 
 func (s *shellState) startInstanceWithSnapshotFallback(ctx context.Context, id string, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
@@ -7869,14 +8314,57 @@ func (s *shellState) startInstanceWithSnapshotFallback(ctx context.Context, id s
 	if err == nil || ctx.Err() != nil || strings.TrimSpace(req.RestoreSnapshot) == "" || strings.TrimSpace(req.SnapshotDir) == "" {
 		return state, err
 	}
-	_ = os.RemoveAll(req.RestoreSnapshot)
+	failedRestore := req.RestoreSnapshot
+	quarantined, quarantineErr := quarantineStartupSnapshot(failedRestore)
+	if quarantineErr != nil {
+		return state, fmt.Errorf("restore startup snapshot %q: %w; preserve failed snapshot: %v", failedRestore, err, quarantineErr)
+	}
+	if onEvent != nil {
+		_ = onEvent(client.BootEvent{
+			Kind:    "warning",
+			Message: fmt.Sprintf("snapshot restore failed (%v); retained at %s and retrying with a cold boot", err, quarantined),
+		})
+	}
 	req.RestoreSnapshot = ""
-	return start(req)
+	coldState, coldErr := start(req)
+	if coldErr != nil {
+		return coldState, errors.Join(
+			fmt.Errorf("restore startup snapshot %q (retained at %q): %w", failedRestore, quarantined, err),
+			fmt.Errorf("cold boot fallback: %w", coldErr),
+		)
+	}
+	return coldState, nil
+}
+
+func quarantineStartupSnapshot(snapshot string) (string, error) {
+	snapshot = filepath.Clean(snapshot)
+	root := filepath.Dir(snapshot)
+	failedRoot := filepath.Join(root, "failed")
+	if err := os.MkdirAll(failedRoot, 0o700); err != nil {
+		return "", err
+	}
+	destination := filepath.Join(failedRoot, filepath.Base(snapshot))
+	if _, err := os.Lstat(destination); err == nil {
+		destination += "-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	if err := os.Rename(snapshot, destination); err != nil {
+		return "", err
+	}
+	return destination, nil
 }
 
 const (
 	startupSnapshotMemoryMB = 512
 	startupSnapshotCPUs     = 1
+	// Increment when restored guest memory is incompatible with the current
+	// runtime contract. Version 2 changes the Linux virtio-fs root mount tag so
+	// standard tools such as BusyBox df recognize the mounted root filesystem.
+	// Version 3 requires guest-init to stream the private control descriptor used
+	// by the persistent interactive shell; older snapshots visibly run the shell
+	// but discard its ready and completion records.
+	startupSnapshotFormatVersion = 3
 )
 
 func (s *shellState) applyStartupSnapshotDefaults(req *client.StartInstanceRequest) {
@@ -7917,6 +8405,10 @@ func startupSnapshotCompatible(req client.StartInstanceRequest) bool {
 }
 
 func startupSnapshotRoot(rootCache string, req client.StartInstanceRequest) (string, error) {
+	return startupSnapshotRootForVersion(rootCache, req, startupSnapshotFormatVersion)
+}
+
+func startupSnapshotRootForVersion(rootCache string, req client.StartInstanceRequest, version int) (string, error) {
 	keyReq := req
 	keyReq.ID = ""
 	keyReq.TimeoutSeconds = 0
@@ -7925,7 +8417,10 @@ func startupSnapshotRoot(rootCache string, req client.StartInstanceRequest) (str
 	if keyReq.CPUs == 0 {
 		keyReq.CPUs = startupSnapshotCPUs
 	}
-	data, err := json.Marshal(keyReq)
+	data, err := json.Marshal(struct {
+		Version int                         `json:"version"`
+		Request client.StartInstanceRequest `json:"request"`
+	}{Version: version, Request: keyReq})
 	if err != nil {
 		return "", err
 	}
@@ -8003,6 +8498,10 @@ func (b *bootStatus) Update(event client.BootEvent) {
 	}
 	msg := formatBootEvent(event)
 	if msg == "" {
+		return
+	}
+	if event.Kind == "warning" {
+		b.terminalHoldStatus.finishWith(msg)
 		return
 	}
 	if !b.tty {
@@ -8126,11 +8625,10 @@ func defaultNetworkConfig() *client.NetworkConfig {
 }
 
 func networkConfigForContext(ctx commandContext) *client.NetworkConfig {
-	cfg := defaultNetworkConfig()
 	if ctx.Isolated {
-		cfg.BlockHostAccess = true
+		return vmconfig.IsolatedNetworkConfig()
 	}
-	return cfg
+	return defaultNetworkConfig()
 }
 
 func (s *shellState) stopVM(id string) error {
@@ -8141,6 +8639,10 @@ func (s *shellState) stopVM(id string) error {
 	s.closeGuestSessionForBackendID(id)
 	if err := s.api.ShutdownInstanceWithID(id); err != nil {
 		return err
+	}
+	if s.guestShell != nil && strings.HasPrefix(s.guestShell.key, id+"\x00") {
+		s.guestShell = nil
+		s.publishVMSHDSessionState()
 	}
 	delete(s.vmRunning, id)
 	s.markJobsLostForVMBackendID(id, "parent VM stopped")
@@ -10251,6 +10753,9 @@ func (s *shellState) help(w io.Writer) error {
 @sessions                list vmshd shell sessions and resource counts
 @detach                  keep the current vmshd session after this frontend exits
 @install                 install or update the user-wide vmshd daemon copy
+@mcp                     start a session-scoped MCP endpoint for isolated VMs
+@mcp codex [-- args]     run host Codex with the MCP endpoint configured temporarily
+@mcp status|stop         inspect or stop the session MCP endpoint
 @status                  show vmsh and selected VM state
 @version                 show vmsh build metadata
 @start                   start the current VM
@@ -11291,6 +11796,11 @@ func formatBootEvent(event client.BootEvent) string {
 			return "Boot error: " + event.Error
 		}
 		return "Boot error"
+	case "warning":
+		if event.Message != "" {
+			return "Boot warning: " + event.Message
+		}
+		return "Boot warning"
 	}
 	return ""
 }

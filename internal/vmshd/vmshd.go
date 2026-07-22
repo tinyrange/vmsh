@@ -339,16 +339,19 @@ type streamRecord struct {
 }
 
 type Server struct {
-	token    string
-	registry *sessionRegistry
-	events   *eventHub
-	streams  *streamRegistry
-	jobs     *hostJobRunner
-	shells   *hostShellManager
-	balloon  *balloonController
-	trusted  *trustedManager
-	routeMu  sync.RWMutex
-	routes   []apiRoute
+	token                string
+	registry             *sessionRegistry
+	events               *eventHub
+	streams              *streamRegistry
+	jobs                 *hostJobRunner
+	shells               *hostShellManager
+	balloon              *balloonController
+	balloonMonitorOnce   sync.Once
+	balloonMonitorCancel context.CancelFunc
+	trusted              *trustedManager
+	mcp                  *mcpManager
+	routeMu              sync.RWMutex
+	routes               []apiRoute
 
 	startedAt time.Time
 }
@@ -455,7 +458,11 @@ func Run(args []string) (bool, error) {
 	defer os.Remove(tokenPath)
 
 	srv := NewServer(token)
+	defer srv.stopBalloonMonitor()
 	defer func() {
+		if srv.mcp != nil {
+			_ = srv.mcp.Close()
+		}
 		if srv.trusted != nil {
 			srv.trusted.close()
 		}
@@ -494,6 +501,7 @@ func Run(args []string) (bool, error) {
 		TokenPath:  tokenPath,
 		Persistent: strings.TrimSpace(statePath) != "",
 		OnStartup: func(hello client.ServerHello) error {
+			srv.mcp.SetControlURL(hello.Scheme + "://" + hello.Addr)
 			if strings.TrimSpace(statePath) == "" {
 				return nil
 			}
@@ -518,18 +526,16 @@ func Run(args []string) (bool, error) {
 			srv.RegisterHandlers(mux, runtime)
 		},
 		NormalizeCreateRequest: func(req *client.CreateInstanceRequest, runtime ccvmd.RuntimeView) error {
-			srv.normalizeCreateRequest(req, runtime)
-			return nil
+			return srv.normalizeCreateRequest(req, runtime)
 		},
 		NormalizeStartRequest: func(req *client.StartInstanceRequest, runtime ccvmd.RuntimeView) error {
-			srv.normalizeStartRequest(req, runtime)
-			return nil
+			return srv.normalizeStartRequest(req, runtime)
 		},
 		NormalizeRunRequest: func(req *client.RunRequest, runtime ccvmd.RuntimeView) error {
-			srv.normalizeRunRequest(req, runtime)
-			return nil
+			return srv.normalizeRunRequest(req, runtime)
 		},
-		WrapHandler: srv.Authenticate,
+		CompleteRequest: srv.completeStartRequest,
+		WrapHandler:     srv.Authenticate,
 	})
 }
 
@@ -613,7 +619,7 @@ func isLoopbackListenAddr(addr string) bool {
 
 func NewServer(token string) *Server {
 	trustedManager, _ := newTrustedManager()
-	return &Server{
+	server := &Server{
 		token:     token,
 		registry:  newSessionRegistry(),
 		events:    newEventHub(),
@@ -622,11 +628,15 @@ func NewServer(token string) *Server {
 		shells:    newHostShellManager(),
 		balloon:   newBalloonController(systemMemoryObserver{}),
 		trusted:   trustedManager,
+		mcp:       newMCPManager(token),
 		startedAt: time.Now(),
 	}
+	server.mcp.SetBalloonController(server.balloon)
+	return server
 }
 
 func (s *Server) RegisterHandlers(rawMux *http.ServeMux, runtime ccvmd.RuntimeView) {
+	s.startBalloonMonitor(runtime)
 	mux := &trackedServeMux{ServeMux: rawMux}
 	if s.trusted != nil {
 		s.trusted.register(mux, runtime)
@@ -686,6 +696,60 @@ func (s *Server) RegisterHandlers(rawMux *http.ServeMux, runtime ccvmd.RuntimeVi
 	})
 	mux.HandleFunc("GET /vmsh/jobs", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.registry.Jobs())
+	})
+	mux.HandleFunc("POST /vmsh/sessions/{id}/mcp", func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := s.registry.Get(r.PathValue("id")); !ok {
+			writeJSON(w, http.StatusNotFound, client.ErrorResponse{Error: "session not found"})
+			return
+		}
+		info, err := s.mcp.Start(r.PathValue("id"))
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, client.ErrorResponse{Error: err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, info)
+	})
+	mux.HandleFunc("GET /vmsh/sessions/{id}/mcp", func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := s.registry.Get(r.PathValue("id")); !ok {
+			writeJSON(w, http.StatusNotFound, client.ErrorResponse{Error: "session not found"})
+			return
+		}
+		info, ok := s.mcp.Status(r.PathValue("id"))
+		if !ok {
+			writeJSON(w, http.StatusNotFound, client.ErrorResponse{Error: "MCP endpoint is not running"})
+			return
+		}
+		writeJSON(w, http.StatusOK, info)
+	})
+	mux.HandleFunc("DELETE /vmsh/sessions/{id}/mcp", func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := s.registry.Get(r.PathValue("id")); !ok {
+			writeJSON(w, http.StatusNotFound, client.ErrorResponse{Error: "session not found"})
+			return
+		}
+		if err := s.mcp.Stop(r.PathValue("id")); err != nil {
+			writeJSON(w, http.StatusConflict, client.ErrorResponse{Error: err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"stopped": true})
+	})
+	mux.HandleFunc("POST /vmsh/sessions/{id}/mcp/credentials", func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := s.registry.Get(r.PathValue("id")); !ok {
+			writeJSON(w, http.StatusNotFound, client.ErrorResponse{Error: "session not found"})
+			return
+		}
+		credential, err := s.mcp.MintCredential(r.PathValue("id"))
+		if err != nil {
+			writeJSON(w, http.StatusConflict, client.ErrorResponse{Error: err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, credential)
+	})
+	mux.HandleFunc("DELETE /vmsh/sessions/{id}/mcp/credentials/{credential}", func(w http.ResponseWriter, r *http.Request) {
+		if !s.mcp.RevokeCredential(r.PathValue("id"), r.PathValue("credential")) {
+			writeJSON(w, http.StatusNotFound, client.ErrorResponse{Error: "MCP credential not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"revoked": true})
 	})
 	mux.HandleFunc("GET /vmsh/events", func(w http.ResponseWriter, r *http.Request) {
 		s.streamEvents(w, r)
@@ -853,6 +917,11 @@ func (s *Server) finishSessionCleanup(cleanup sessionCleanup, runtime ccvmd.Runt
 	s.streams.RevokeSession(cleanup.Session.ID)
 	s.shells.Close(cleanup.Session.ID)
 	failures := make([]VMCleanupFailure, 0)
+	if s.mcp != nil {
+		if err := s.mcp.Stop(cleanup.Session.ID); err != nil {
+			failures = append(failures, VMCleanupFailure{VMID: "mcp", Error: err.Error()})
+		}
+	}
 	for _, vmID := range cleanup.VMIDs {
 		if err := runtimeShutdownInstance(runtime, vmID); err != nil {
 			failures = append(failures, VMCleanupFailure{VMID: vmID, Error: err.Error()})
@@ -1191,7 +1260,9 @@ func (m *hostShellManager) Start(sessionID, requestedCWD string, term *Terminal)
 	go func() {
 		_ = cmd.Wait()
 		close(shell.exited)
-		shell.closeDone()
+		// The PTY reader owns natural stream completion so it can drain bytes
+		// already written by a shell that has just exited.
+		<-shell.done
 		m.mu.Lock()
 		if m.shells[sessionID] == shell {
 			delete(m.shells, sessionID)
@@ -1457,7 +1528,19 @@ func (s *Server) serveTerminalStream(ws *websocket.Conn) {
 					return
 				}
 			case <-outputDone:
-				return
+				// readLoop publishes before it closes outputDone. Drain anything
+				// already queued so a fast `command; exit` cannot lose its tail.
+				for {
+					select {
+					case data := <-output:
+						if err := send(TerminalStreamMessage{Kind: "data", Data: data}); err != nil {
+							sendErr <- err
+							return
+						}
+					default:
+						return
+					}
+				}
 			}
 		}
 	}()
