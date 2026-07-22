@@ -520,7 +520,7 @@ func TestCompletionMenuRendersFuzzyPickerAndAcceptsSelection(t *testing.T) {
 	}
 }
 
-func TestCompletionMenuUsesInlineLayoutOnWideTerminal(t *testing.T) {
+func TestCompletionMenuUsesVerticalLayoutOnWideTerminal(t *testing.T) {
 	e := New(Options{Reader: eofReader{}, Writer: io.Discard})
 	st := &lineState{prompt: "> ", width: 140, height: 12}
 	menu := completionMenu{active: true, selected: 0}
@@ -535,11 +535,17 @@ func TestCompletionMenuUsesInlineLayoutOnWideTerminal(t *testing.T) {
 	menu.filtered = append([]string(nil), menu.items...)
 
 	suffix := e.completionMenuSuffix(&menu, st)
-	if strings.Contains(suffix, "\n") {
-		t.Fatalf("suffix = %q, want inline picker", suffix)
+	below, inline := splitDisplaySuffix(suffix)
+	if inline != "" {
+		t.Fatalf("inline suffix = %q, want vertical picker", inline)
 	}
-	if w := visibleWidth(suffix); w > st.width-1 {
-		t.Fatalf("line width = %d > %d: %q", w, st.width-1, suffix)
+	if len(below) < 2 {
+		t.Fatalf("vertical lines = %#v, want header and candidates", below)
+	}
+	for _, line := range below {
+		if w := visibleWidth(line); w > st.width {
+			t.Fatalf("line width = %d > %d: %q", w, st.width, line)
+		}
 	}
 }
 
@@ -557,18 +563,18 @@ func TestCompletionMenuUsesVerticalLayoutOnNarrowTerminal(t *testing.T) {
 	menu.filtered = append([]string(nil), menu.items...)
 
 	suffix := e.completionMenuSuffix(&menu, st)
-	overlay, inline := splitOverlay(suffix)
+	below, inline := splitDisplaySuffix(suffix)
 	if inline != "" {
-		t.Fatalf("inline suffix = %q, want vertical overlay", inline)
+		t.Fatalf("inline suffix = %q, want vertical picker", inline)
 	}
-	if len(overlay) < 2 {
-		t.Fatalf("overlay lines = %d, want completion menu lines", len(overlay))
+	if len(below) < 2 {
+		t.Fatalf("picker lines = %d, want completion menu lines", len(below))
 	}
-	if visibleWidth(overlay[0]) > st.width {
-		t.Fatalf("header width = %d > %d: %q", visibleWidth(overlay[0]), st.width, overlay[0])
+	if visibleWidth(below[0]) > st.width {
+		t.Fatalf("header width = %d > %d: %q", visibleWidth(below[0]), st.width, below[0])
 	}
 	var selected bool
-	for _, line := range overlay[1:] {
+	for _, line := range below[1:] {
 		if visibleWidth(line) > st.width {
 			t.Fatalf("item width = %d > %d: %q", visibleWidth(line), st.width, line)
 		}
@@ -577,7 +583,46 @@ func TestCompletionMenuUsesVerticalLayoutOnNarrowTerminal(t *testing.T) {
 		}
 	}
 	if !selected {
-		t.Fatalf("overlay = %#v, want selected item marker", overlay)
+		t.Fatalf("picker = %#v, want selected item marker", below)
+	}
+}
+
+func TestRefreshRendersCompletionBelowInputAndPreservesOutput(t *testing.T) {
+	const width = 40
+	emulator := ptyterm.NewEmulator(ptyterm.Size{Cols: width, Rows: 10}, 20)
+	_, _ = emulator.Write([]byte("previous output\r\n"))
+	caps := terminal.Capabilities{Mode: terminal.ModeDynamicInteractive, Width: width, Height: 10}
+	ed := New(Options{Reader: eofReader{}, Writer: emulator, Capabilities: &caps})
+	st := &lineState{prompt: "> ", buf: []rune("a"), cursor: 1, width: width, height: 10}
+	menu := completionMenu{
+		active:   true,
+		items:    []string{"alpha", "alpine", "archive"},
+		filtered: []string{"alpha", "alpine", "archive"},
+	}
+
+	ed.refresh(st, ed.completionMenuSuffix(&menu, st))
+	snapshot := emulator.Snapshot()
+	if snapshot.Lines[0] != "previous output" || snapshot.Lines[1] != "> a" {
+		t.Fatalf("output and input rows = %q", snapshot.Lines[:2])
+	}
+	if snapshot.Cursor != (ptyterm.Cursor{X: 3, Y: 1}) {
+		t.Fatalf("cursor = %+v, want x=3 y=1", snapshot.Cursor)
+	}
+	for row, line := range snapshot.Lines {
+		if strings.Contains(line, "alpha") && row <= snapshot.Cursor.Y {
+			t.Fatalf("completion rendered above input on row %d: %q", row, line)
+		}
+	}
+
+	ed.refresh(st, "")
+	snapshot = emulator.Snapshot()
+	if snapshot.Lines[0] != "previous output" || snapshot.Lines[1] != "> a" {
+		t.Fatalf("output changed after closing completion: %q", snapshot.Lines[:2])
+	}
+	for row, line := range snapshot.Lines[2:] {
+		if line != "" {
+			t.Fatalf("completion content remained on row %d: %q", row+2, line)
+		}
 	}
 }
 

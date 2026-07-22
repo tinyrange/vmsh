@@ -81,15 +81,6 @@ type completionMenu struct {
 	selected   int
 }
 
-type completionLayout int
-
-const (
-	completionLayoutInline completionLayout = iota
-	completionLayoutVertical
-)
-
-const minInlineCompletionWidth = 100
-
 func New(opts Options) *Editor {
 	if opts.In == nil {
 		opts.In = os.Stdin
@@ -579,18 +570,9 @@ func (s *lineState) deleteRight() {
 }
 
 func (e *Editor) refresh(s *lineState, suffix string) {
-	overlay, inline := splitOverlay(suffix)
+	below, inline := splitDisplaySuffix(suffix)
 	e.clearRenderedBlock(s)
 
-	inputTop := 0
-	for _, line := range overlay {
-		line = normalizeDisplayNewlines(line)
-		fmt.Fprintf(e.out, "\r\x1b[2K%s", line)
-		pos := displayPosition(line, s.width)
-		terminal.WriteString(e.out, "\r")
-		fmt.Fprintf(e.out, "\x1b[%dB", pos.row+1)
-		inputTop += pos.row + 1
-	}
 	line := string(s.buf)
 	before := string(s.buf[:s.cursor])
 	rendered := normalizeDisplayNewlines(fmt.Sprintf("%s%s%s", s.prompt, line, inline))
@@ -602,14 +584,32 @@ func (e *Editor) refresh(s *lineState, suffix string) {
 		fmt.Fprintf(e.out, "\x1b[%dB", end.row-actualEnd.row)
 	}
 	cursor := canonicalDisplayPosition(normalizeDisplayNewlines(s.prompt+before), s.width)
-	if up := end.row - cursor.row; up > 0 {
+	renderedHeight := end.row + 1
+	currentRow := end.row
+	if len(below) > 0 {
+		terminal.WriteString(e.out, "\x1b[B")
+		currentRow++
+		for idx, displayLine := range below {
+			displayLine = normalizeDisplayNewlines(displayLine)
+			fmt.Fprintf(e.out, "\r\x1b[2K%s", displayLine)
+			pos := displayPosition(displayLine, s.width)
+			currentRow += pos.row
+			renderedHeight += pos.row + 1
+			terminal.WriteString(e.out, "\r")
+			if idx+1 < len(below) {
+				terminal.WriteString(e.out, "\x1b[B")
+				currentRow++
+			}
+		}
+	}
+	if up := currentRow - cursor.row; up > 0 {
 		fmt.Fprintf(e.out, "\x1b[%dA", up)
 	}
 	if cursor.col > 0 {
 		fmt.Fprintf(e.out, "\x1b[%dC", cursor.col)
 	}
-	s.renderedHeight = inputTop + end.row + 1
-	s.renderedCursorRow = inputTop + cursor.row
+	s.renderedHeight = renderedHeight
+	s.renderedCursorRow = cursor.row
 }
 
 func (e *Editor) clearRenderedBlock(s *lineState) {
@@ -629,7 +629,7 @@ func (e *Editor) clearRenderedBlock(s *lineState) {
 	}
 }
 
-func splitOverlay(suffix string) ([]string, string) {
+func splitDisplaySuffix(suffix string) ([]string, string) {
 	if !strings.HasPrefix(suffix, "\n") {
 		return nil, suffix
 	}
@@ -750,57 +750,7 @@ func (e *Editor) completionMenuSuffix(menu *completionMenu, st *lineState) strin
 	if menu == nil || !menu.active {
 		return ""
 	}
-	query := string(menu.query)
-	if len(menu.filtered) == 0 {
-		return fmt.Sprintf("  [complete %q: no matches]", query)
-	}
-	if e.completionLayout(menu, st) == completionLayoutVertical {
-		return e.verticalCompletionMenuSuffix(menu, st)
-	}
-	limit := 5
-	if len(menu.filtered) < limit {
-		limit = len(menu.filtered)
-	}
-	start := completionWindowStart(menu.selected, limit, len(menu.filtered))
-	end := start + limit
-	prefix := fmt.Sprintf("  [complete %q %d/%d (%d/%d): ", query, len(menu.filtered), len(menu.items), menu.selected+1, len(menu.filtered))
-	available := st.width - visibleWidth(st.prompt) - visibleWidth(string(st.buf)) - visibleWidth(prefix) - 2
-	if available < limit*4 {
-		available = limit * 4
-	}
-	itemWidth := available/limit - 1
-	if itemWidth < 3 {
-		itemWidth = 3
-	}
-	var b strings.Builder
-	b.WriteString(prefix)
-	for idx := start; idx < end; idx++ {
-		item := truncateCells(menu.filtered[idx], itemWidth)
-		if idx == menu.selected {
-			b.WriteString(" \x1b[7m>")
-			b.WriteString(truncateCells(item, itemWidth-1))
-			b.WriteString("\x1b[0m")
-			continue
-		}
-		b.WriteByte(' ')
-		b.WriteString(item)
-	}
-	if end < len(menu.filtered) {
-		b.WriteString(" ...")
-	}
-	b.WriteByte(']')
-	return b.String()
-}
-
-func (e *Editor) completionLayout(menu *completionMenu, st *lineState) completionLayout {
-	width := st.width
-	if width <= 0 {
-		width = 80
-	}
-	if width < minInlineCompletionWidth {
-		return completionLayoutVertical
-	}
-	return completionLayoutInline
+	return e.verticalCompletionMenuSuffix(menu, st)
 }
 
 func (e *Editor) verticalCompletionMenuSuffix(menu *completionMenu, st *lineState) string {
@@ -823,6 +773,10 @@ func (e *Editor) verticalCompletionMenuSuffix(menu *completionMenu, st *lineStat
 	header := fmt.Sprintf("[complete %q %d/%d]", query, len(menu.filtered), len(menu.items))
 	b.WriteByte('\n')
 	b.WriteString(truncateCells(header, width))
+	if len(menu.filtered) == 0 {
+		b.WriteString("\n no matches")
+		return b.String()
+	}
 	for idx := start; idx < end; idx++ {
 		b.WriteByte('\n')
 		if idx == menu.selected {
@@ -874,10 +828,6 @@ func (e *Editor) completionPageSize(menu *completionMenu, st *lineState) int {
 		return 1
 	}
 	return size
-}
-
-func (e *Editor) completionItemWidth(menu *completionMenu, st *lineState) int {
-	return st.width - 4
 }
 
 func completionToken(s *lineState, replaceLen int) string {
