@@ -5577,7 +5577,7 @@ func persistentGuestControlRelayScript() []string {
 		// Launch from a short-lived helper shell so the relay never enters the
 		// interactive shell's job table. Bash otherwise prints its PID even with
 		// monitor mode disabled; zsh can report it later during shell shutdown.
-		"__vmsh_control_relay=$( (exec 8<>\"$__vmsh_control_fifo\"; while IFS= read -r __vmsh_frame <&8; do [ \"$__vmsh_frame\" = __vmsh_relay_stop__ ] && break; printf '%s\\n' \"$__vmsh_frame\" >&3 || break; done) </dev/null >/dev/null 2>&1 & printf '%s' \"$!\" )",
+		"__vmsh_control_relay=$( (trap '' INT QUIT; exec 8<>\"$__vmsh_control_fifo\"; while IFS= read -r __vmsh_frame <&8; do [ \"$__vmsh_frame\" = __vmsh_relay_stop__ ] && break; printf '%s\\n' \"$__vmsh_frame\" >&3 || break; done) </dev/null >/dev/null 2>&1 & printf '%s' \"$!\" )",
 	}
 	return append(lines,
 		"exec 3</dev/null",
@@ -6186,7 +6186,11 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 			sendGuestInputNonBlocking(session.inputs, client.ExecInput{Kind: "signal", Signal: name})
 		}
 		interrupts := newCommandInterruptEscalator(line, stderr, func() {
-			sendSignal("INT")
+			// Let the guest terminal deliver a soft interrupt to its foreground
+			// process group. The backend signal API intentionally targets the
+			// entire managed family, which includes this long-lived shell and its
+			// private control relay.
+			sendGuestInputNonBlocking(session.inputs, client.ExecInput{Kind: "stdin", Data: []byte{0x03}})
 		}, func() {
 			sendSignal("KILL")
 			go session.close()
@@ -6451,6 +6455,7 @@ func guestPersistentCommand() []string {
 	}
 	lines = append(lines, persistentGuestControlRelayScript()...)
 	lines = append(lines, []string{
+		"set -m 2>/dev/null || true",
 		"__vmsh_run() {",
 		"  stty echo 2>/dev/null || true",
 		"  eval \" $1\"",
