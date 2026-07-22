@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tinyrange/vmsh/internal/ptyterm"
 	"github.com/tinyrange/vmsh/internal/termui/terminal"
 )
 
@@ -411,6 +412,91 @@ func TestRefreshMovesCursorLeft(t *testing.T) {
 	}
 	if got := data.String(); got != "\r\x1b[2K> abc\r\x1b[3C" {
 		t.Fatalf("refresh = %q", got)
+	}
+}
+
+func TestRefreshClearsWrappedHistoryEntry(t *testing.T) {
+	const width = 24
+	emulator := ptyterm.NewEmulator(ptyterm.Size{Cols: width, Rows: 10}, 20)
+	caps := terminal.Capabilities{Mode: terminal.ModeDynamicInteractive, Width: width, Height: 10}
+	ed := New(Options{Reader: eofReader{}, Writer: emulator, Capabilities: &caps})
+	st := &lineState{
+		prompt: "> ",
+		buf:    []rune("first-history-entry-that-wraps-across-several-terminal-lines"),
+		width:  width,
+		height: 10,
+	}
+	st.cursor = len(st.buf)
+
+	ed.refresh(st, "")
+	st.buf = []rune("short")
+	st.cursor = len(st.buf)
+	ed.refresh(st, "")
+
+	snapshot := emulator.Snapshot()
+	if got := snapshot.Lines[0]; got != "> short" {
+		t.Fatalf("current line = %q, want %q", got, "> short")
+	}
+	for row, line := range snapshot.Lines[1:] {
+		if line != "" {
+			t.Fatalf("stale wrapped content on row %d: %q", row+1, line)
+		}
+	}
+	if snapshot.Cursor != (ptyterm.Cursor{X: 7, Y: 0}) {
+		t.Fatalf("cursor = %+v, want x=7 y=0", snapshot.Cursor)
+	}
+}
+
+func TestRefreshPlacesCursorWithinWrappedLine(t *testing.T) {
+	const width = 12
+	emulator := ptyterm.NewEmulator(ptyterm.Size{Cols: width, Rows: 8}, 20)
+	caps := terminal.Capabilities{Mode: terminal.ModeDynamicInteractive, Width: width, Height: 8}
+	ed := New(Options{Reader: eofReader{}, Writer: emulator, Capabilities: &caps})
+	st := &lineState{
+		prompt: "> ",
+		buf:    []rune("abcdefghijklmno"),
+		cursor: 5,
+		width:  width,
+		height: 8,
+	}
+
+	ed.refresh(st, "")
+
+	snapshot := emulator.Snapshot()
+	if got := snapshot.Lines[0] + snapshot.Lines[1]; got != "> abcdefghijklmno" {
+		t.Fatalf("wrapped line = %q, want %q", got, "> abcdefghijklmno")
+	}
+	if snapshot.Cursor != (ptyterm.Cursor{X: 7, Y: 0}) {
+		t.Fatalf("cursor = %+v, want x=7 y=0", snapshot.Cursor)
+	}
+}
+
+func TestRefreshHandlesExactWidthBeforeShorterEntry(t *testing.T) {
+	for _, exact := range []string{"abcdef", "界界界"} {
+		t.Run(exact, func(t *testing.T) {
+			const width = 8
+			emulator := ptyterm.NewEmulator(ptyterm.Size{Cols: width, Rows: 5}, 10)
+			caps := terminal.Capabilities{Mode: terminal.ModeDynamicInteractive, Width: width, Height: 5}
+			ed := New(Options{Reader: eofReader{}, Writer: emulator, Capabilities: &caps})
+			st := &lineState{prompt: "> ", buf: []rune(exact), width: width, height: 5}
+			st.cursor = len(st.buf)
+
+			ed.refresh(st, "")
+			if cursor := emulator.Snapshot().Cursor; cursor != (ptyterm.Cursor{X: 0, Y: 1}) {
+				t.Fatalf("exact-width cursor = %+v, want x=0 y=1", cursor)
+			}
+			st.buf = []rune("x")
+			st.cursor = len(st.buf)
+			ed.refresh(st, "")
+
+			snapshot := emulator.Snapshot()
+			if snapshot.Lines[0] != "> x" || snapshot.Lines[1] != "" {
+				t.Fatalf("screen after shorter entry = %q", snapshot.Lines)
+			}
+			if snapshot.Cursor != (ptyterm.Cursor{X: 3, Y: 0}) {
+				t.Fatalf("short cursor = %+v, want x=3 y=0", snapshot.Cursor)
+			}
+		})
 	}
 }
 

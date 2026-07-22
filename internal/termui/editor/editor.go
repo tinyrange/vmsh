@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/tinyrange/vmsh/internal/termui/progress"
@@ -537,12 +538,13 @@ func (e *Editor) readPlainLine(ctx context.Context, prompt string) (string, erro
 }
 
 type lineState struct {
-	prompt       string
-	buf          []rune
-	cursor       int
-	width        int
-	height       int
-	renderedRows int
+	prompt            string
+	buf               []rune
+	cursor            int
+	width             int
+	height            int
+	renderedHeight    int
+	renderedCursorRow int
 }
 
 func (s *lineState) heightOrDefault() int {
@@ -578,31 +580,53 @@ func (s *lineState) deleteRight() {
 
 func (e *Editor) refresh(s *lineState, suffix string) {
 	overlay, inline := splitOverlay(suffix)
-	if s.renderedRows > 0 {
-		fmt.Fprintf(e.out, "\r\x1b[%dA", s.renderedRows)
-		for i := 0; i <= s.renderedRows; i++ {
-			terminal.WriteString(e.out, "\r\x1b[2K")
-			if i < s.renderedRows {
-				terminal.WriteString(e.out, "\x1b[B")
-			}
-		}
-	}
-	if len(overlay) > 0 {
-		fmt.Fprintf(e.out, "\r\x1b[%dA", len(overlay))
-		for _, line := range overlay {
-			fmt.Fprintf(e.out, "\r\x1b[2K%s\x1b[B", line)
-		}
+	e.clearRenderedBlock(s)
+
+	inputTop := 0
+	for _, line := range overlay {
+		line = normalizeDisplayNewlines(line)
+		fmt.Fprintf(e.out, "\r\x1b[2K%s", line)
+		pos := displayPosition(line, s.width)
+		terminal.WriteString(e.out, "\r")
+		fmt.Fprintf(e.out, "\x1b[%dB", pos.row+1)
+		inputTop += pos.row + 1
 	}
 	line := string(s.buf)
 	before := string(s.buf[:s.cursor])
-	rendered := fmt.Sprintf("%s%s%s", s.prompt, line, inline)
+	rendered := normalizeDisplayNewlines(fmt.Sprintf("%s%s%s", s.prompt, line, inline))
 	fmt.Fprintf(e.out, "\r\x1b[2K%s", rendered)
+	end := canonicalDisplayPosition(rendered, s.width)
 	terminal.WriteString(e.out, "\r")
-	right := visibleWidth(s.prompt) + visibleWidth(before)
-	if right > 0 {
-		fmt.Fprintf(e.out, "\x1b[%dC", right)
+	actualEnd := displayPosition(rendered, s.width)
+	if end.row > actualEnd.row {
+		fmt.Fprintf(e.out, "\x1b[%dB", end.row-actualEnd.row)
 	}
-	s.renderedRows = len(overlay)
+	cursor := canonicalDisplayPosition(normalizeDisplayNewlines(s.prompt+before), s.width)
+	if up := end.row - cursor.row; up > 0 {
+		fmt.Fprintf(e.out, "\x1b[%dA", up)
+	}
+	if cursor.col > 0 {
+		fmt.Fprintf(e.out, "\x1b[%dC", cursor.col)
+	}
+	s.renderedHeight = inputTop + end.row + 1
+	s.renderedCursorRow = inputTop + cursor.row
+}
+
+func (e *Editor) clearRenderedBlock(s *lineState) {
+	if s.renderedHeight <= 0 {
+		return
+	}
+	terminal.WriteString(e.out, "\r")
+	if s.renderedCursorRow > 0 {
+		fmt.Fprintf(e.out, "\x1b[%dA", s.renderedCursorRow)
+	}
+	for row := 1; row < s.renderedHeight; row++ {
+		terminal.WriteString(e.out, "\x1b[B")
+		terminal.WriteString(e.out, "\x1b[2K")
+	}
+	if s.renderedHeight > 1 {
+		fmt.Fprintf(e.out, "\x1b[%dA", s.renderedHeight-1)
+	}
 }
 
 func splitOverlay(suffix string) ([]string, string) {
@@ -1100,11 +1124,19 @@ func visibleWidth(s string) int {
 }
 
 func physicalRows(s string, width int) int {
+	return displayPosition(s, width).row
+}
+
+type displayPoint struct {
+	row int
+	col int
+}
+
+func displayPosition(s string, width int) displayPoint {
 	if width <= 0 {
 		width = 80
 	}
-	row := 0
-	col := 0
+	pos := displayPoint{}
 	escState := 0
 	for _, r := range s {
 		switch escState {
@@ -1126,25 +1158,65 @@ func physicalRows(s string, width int) int {
 			continue
 		}
 		if r == '\r' {
-			col = 0
+			pos.col = 0
 			continue
 		}
 		if r == '\n' {
-			row++
-			col = 0
+			pos.row++
+			pos.col = 0
 			continue
 		}
-		cell := 1
+		cell := runeDisplayWidth(r)
 		if r == '\t' {
 			cell = 4
 		}
-		col += cell
-		for col > width {
-			row++
-			col -= width
+		if cell == 0 {
+			continue
 		}
+		if pos.col == width || pos.col+cell > width {
+			pos.row++
+			pos.col = 0
+		}
+		pos.col += cell
 	}
-	return row
+	return pos
+}
+
+func canonicalDisplayPosition(s string, width int) displayPoint {
+	pos := displayPosition(s, width)
+	if width <= 0 {
+		width = 80
+	}
+	if pos.col == width {
+		pos.row++
+		pos.col = 0
+	}
+	return pos
+}
+
+func runeDisplayWidth(r rune) int {
+	if r == 0 || unicode.Is(unicode.Mn, r) {
+		return 0
+	}
+	if r >= 0x1100 &&
+		(r <= 0x115f ||
+			r == 0x2329 || r == 0x232a ||
+			(r >= 0x2e80 && r <= 0xa4cf) ||
+			(r >= 0xac00 && r <= 0xd7a3) ||
+			(r >= 0xf900 && r <= 0xfaff) ||
+			(r >= 0xfe10 && r <= 0xfe19) ||
+			(r >= 0xfe30 && r <= 0xfe6f) ||
+			(r >= 0xff00 && r <= 0xff60) ||
+			(r >= 0xffe0 && r <= 0xffe6)) {
+		return 2
+	}
+	return 1
+}
+
+func normalizeDisplayNewlines(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return strings.ReplaceAll(s, "\n", "\r\n")
 }
 
 func normalizePaste(s string) string {
