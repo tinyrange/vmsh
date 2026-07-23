@@ -548,6 +548,37 @@ func TestVMIntegrationInteractiveUIDrivesKeyboardAndRoutesCommands(t *testing.T)
 	position = enterUI(t, driver, session)
 	waitUILine(t, ctx, driver, "VMSH_UI_TAB=1", session)
 	waitUIPromptAfter(t, ctx, driver, position, session)
+	keyUI(t, driver, ptyterm.KeyTab, session)
+	completionSnapshot, err := driver.Wait(ctx, func(snapshot ptyterm.Snapshot) bool {
+		for _, row := range snapshot.Cells {
+			for _, cell := range row {
+				if cell.Attr.Inverse {
+					return true
+				}
+			}
+		}
+		return false
+	})
+	if err != nil {
+		t.Fatalf("wait for vertical completion menu: %v; %s", err, uiSnapshotSummary(session.Snapshot()))
+	}
+	for row, cells := range completionSnapshot.Cells {
+		for _, cell := range cells {
+			if cell.Attr.Inverse && row <= completionSnapshot.Cursor.Y {
+				t.Fatalf("completion selection rendered on row %d above input cursor row %d; %s", row, completionSnapshot.Cursor.Y, uiSnapshotSummary(completionSnapshot))
+			}
+		}
+	}
+	position = session.Snapshot().BytesRead
+	inputUI(t, driver, ptyterm.Ctrl('c'), session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+	for row, cells := range session.Snapshot().Cells {
+		for _, cell := range cells {
+			if cell.Attr.Inverse {
+				t.Fatalf("completion selection remained after cancellation on row %d; %s", row, uiSnapshotSummary(session.Snapshot()))
+			}
+		}
+	}
 
 	typeUI(t, driver, "pwd", session)
 	position = enterUI(t, driver, session)
@@ -595,6 +626,35 @@ func TestVMIntegrationInteractiveUIDrivesKeyboardAndRoutesCommands(t *testing.T)
 	typeUI(t, driver, "@host stty size", session)
 	position = enterUI(t, driver, session)
 	waitUIOutputAfter(t, ctx, driver, position, "17 73", session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+
+	longHistoryLine := "@host true " + strings.Repeat("history-wrap-", 20)
+	typeUI(t, driver, longHistoryLine, session)
+	position = enterUI(t, driver, session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+	typeUI(t, driver, "pwd", session)
+	position = enterUI(t, driver, session)
+	waitUIPromptAfter(t, ctx, driver, position, session)
+	position = session.Snapshot().BytesRead
+	inputUI(t, driver, ptyterm.Ctrl('l'), session)
+	waitUIRawAfter(t, ctx, driver, position, []byte("\x1b[H\x1b[2J"), session)
+	position = session.Snapshot().BytesRead
+	keyUI(t, driver, ptyterm.KeyUp, session)
+	waitUIRawAfter(t, ctx, driver, position, []byte("pwd"), session)
+	position = session.Snapshot().BytesRead
+	keyUI(t, driver, ptyterm.KeyUp, session)
+	waitUIRawAfter(t, ctx, driver, position, []byte("history-wrap-"), session)
+	position = session.Snapshot().BytesRead
+	keyUI(t, driver, ptyterm.KeyDown, session)
+	waitUIRawAfter(t, ctx, driver, position, []byte("pwd"), session)
+	historySnapshot := session.Snapshot()
+	for row, line := range historySnapshot.Lines {
+		if strings.Contains(line, "history-wrap-") {
+			t.Fatalf("wrapped history content remained on row %d after selecting a shorter entry: %q; %s", row, line, uiSnapshotSummary(historySnapshot))
+		}
+	}
+	position = session.Snapshot().BytesRead
+	inputUI(t, driver, ptyterm.Ctrl('c'), session)
 	waitUIPromptAfter(t, ctx, driver, position, session)
 
 	inputUI(t, driver, ptyterm.Ctrl('l'), session)
@@ -816,6 +876,13 @@ func waitUIRaw(t *testing.T, ctx context.Context, driver *ptyterm.Driver, sequen
 	t.Helper()
 	if _, err := driver.WaitRaw(ctx, sequence); err != nil {
 		t.Fatalf("wait for vmsh UI terminal sequence %q: %v; %s", sequence, err, uiSnapshotSummary(session.Snapshot()))
+	}
+}
+
+func waitUIRawAfter(t *testing.T, ctx context.Context, driver *ptyterm.Driver, position int64, sequence []byte, session *ptyterm.Session) {
+	t.Helper()
+	if _, err := driver.WaitRawAfter(ctx, position, sequence); err != nil {
+		t.Fatalf("wait for vmsh UI terminal sequence %q after byte %d: %v; %s", sequence, position, err, uiSnapshotSummary(session.Snapshot()))
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/tinyrange/vmsh/internal/termui/progress"
@@ -79,15 +80,6 @@ type completionMenu struct {
 	query      []rune
 	selected   int
 }
-
-type completionLayout int
-
-const (
-	completionLayoutInline completionLayout = iota
-	completionLayoutVertical
-)
-
-const minInlineCompletionWidth = 100
 
 func New(opts Options) *Editor {
 	if opts.In == nil {
@@ -243,6 +235,7 @@ func (e *Editor) readPreparedLine(ctx context.Context, prompt string) (string, e
 				continue
 			}
 			menu = completionMenu{}
+			e.refresh(&st, "")
 		}
 		switch ev.key {
 		case keyRune:
@@ -537,12 +530,13 @@ func (e *Editor) readPlainLine(ctx context.Context, prompt string) (string, erro
 }
 
 type lineState struct {
-	prompt       string
-	buf          []rune
-	cursor       int
-	width        int
-	height       int
-	renderedRows int
+	prompt            string
+	buf               []rune
+	cursor            int
+	width             int
+	height            int
+	renderedHeight    int
+	renderedCursorRow int
 }
 
 func (s *lineState) heightOrDefault() int {
@@ -577,35 +571,66 @@ func (s *lineState) deleteRight() {
 }
 
 func (e *Editor) refresh(s *lineState, suffix string) {
-	overlay, inline := splitOverlay(suffix)
-	if s.renderedRows > 0 {
-		fmt.Fprintf(e.out, "\r\x1b[%dA", s.renderedRows)
-		for i := 0; i <= s.renderedRows; i++ {
-			terminal.WriteString(e.out, "\r\x1b[2K")
-			if i < s.renderedRows {
-				terminal.WriteString(e.out, "\x1b[B")
+	below, inline := splitDisplaySuffix(suffix)
+	e.clearRenderedBlock(s)
+
+	line := string(s.buf)
+	before := string(s.buf[:s.cursor])
+	rendered := normalizeDisplayNewlines(fmt.Sprintf("%s%s%s", s.prompt, line, inline))
+	fmt.Fprintf(e.out, "\r\x1b[2K%s", rendered)
+	end := canonicalDisplayPosition(rendered, s.width)
+	terminal.WriteString(e.out, "\r")
+	actualEnd := displayPosition(rendered, s.width)
+	for row := actualEnd.row; row < end.row; row++ {
+		terminal.WriteString(e.out, "\r\n")
+	}
+	cursor := canonicalDisplayPosition(normalizeDisplayNewlines(s.prompt+before), s.width)
+	renderedHeight := end.row + 1
+	currentRow := end.row
+	if len(below) > 0 {
+		terminal.WriteString(e.out, "\r\n")
+		currentRow++
+		for idx, displayLine := range below {
+			displayLine = normalizeDisplayNewlines(displayLine)
+			fmt.Fprintf(e.out, "\r\x1b[2K%s", displayLine)
+			pos := displayPosition(displayLine, s.width)
+			currentRow += pos.row
+			renderedHeight += pos.row + 1
+			terminal.WriteString(e.out, "\r")
+			if idx+1 < len(below) {
+				terminal.WriteString(e.out, "\r\n")
+				currentRow++
 			}
 		}
 	}
-	if len(overlay) > 0 {
-		fmt.Fprintf(e.out, "\r\x1b[%dA", len(overlay))
-		for _, line := range overlay {
-			fmt.Fprintf(e.out, "\r\x1b[2K%s\x1b[B", line)
-		}
+	if up := currentRow - cursor.row; up > 0 {
+		fmt.Fprintf(e.out, "\x1b[%dA", up)
 	}
-	line := string(s.buf)
-	before := string(s.buf[:s.cursor])
-	rendered := fmt.Sprintf("%s%s%s", s.prompt, line, inline)
-	fmt.Fprintf(e.out, "\r\x1b[2K%s", rendered)
-	terminal.WriteString(e.out, "\r")
-	right := visibleWidth(s.prompt) + visibleWidth(before)
-	if right > 0 {
-		fmt.Fprintf(e.out, "\x1b[%dC", right)
+	if cursor.col > 0 {
+		fmt.Fprintf(e.out, "\x1b[%dC", cursor.col)
 	}
-	s.renderedRows = len(overlay)
+	s.renderedHeight = renderedHeight
+	s.renderedCursorRow = cursor.row
 }
 
-func splitOverlay(suffix string) ([]string, string) {
+func (e *Editor) clearRenderedBlock(s *lineState) {
+	if s.renderedHeight <= 0 {
+		return
+	}
+	terminal.WriteString(e.out, "\r")
+	if s.renderedCursorRow > 0 {
+		fmt.Fprintf(e.out, "\x1b[%dA", s.renderedCursorRow)
+	}
+	for row := 1; row < s.renderedHeight; row++ {
+		terminal.WriteString(e.out, "\x1b[B")
+		terminal.WriteString(e.out, "\x1b[2K")
+	}
+	if s.renderedHeight > 1 {
+		fmt.Fprintf(e.out, "\x1b[%dA", s.renderedHeight-1)
+	}
+}
+
+func splitDisplaySuffix(suffix string) ([]string, string) {
 	if !strings.HasPrefix(suffix, "\n") {
 		return nil, suffix
 	}
@@ -726,57 +751,7 @@ func (e *Editor) completionMenuSuffix(menu *completionMenu, st *lineState) strin
 	if menu == nil || !menu.active {
 		return ""
 	}
-	query := string(menu.query)
-	if len(menu.filtered) == 0 {
-		return fmt.Sprintf("  [complete %q: no matches]", query)
-	}
-	if e.completionLayout(menu, st) == completionLayoutVertical {
-		return e.verticalCompletionMenuSuffix(menu, st)
-	}
-	limit := 5
-	if len(menu.filtered) < limit {
-		limit = len(menu.filtered)
-	}
-	start := completionWindowStart(menu.selected, limit, len(menu.filtered))
-	end := start + limit
-	prefix := fmt.Sprintf("  [complete %q %d/%d (%d/%d): ", query, len(menu.filtered), len(menu.items), menu.selected+1, len(menu.filtered))
-	available := st.width - visibleWidth(st.prompt) - visibleWidth(string(st.buf)) - visibleWidth(prefix) - 2
-	if available < limit*4 {
-		available = limit * 4
-	}
-	itemWidth := available/limit - 1
-	if itemWidth < 3 {
-		itemWidth = 3
-	}
-	var b strings.Builder
-	b.WriteString(prefix)
-	for idx := start; idx < end; idx++ {
-		item := truncateCells(menu.filtered[idx], itemWidth)
-		if idx == menu.selected {
-			b.WriteString(" \x1b[7m>")
-			b.WriteString(truncateCells(item, itemWidth-1))
-			b.WriteString("\x1b[0m")
-			continue
-		}
-		b.WriteByte(' ')
-		b.WriteString(item)
-	}
-	if end < len(menu.filtered) {
-		b.WriteString(" ...")
-	}
-	b.WriteByte(']')
-	return b.String()
-}
-
-func (e *Editor) completionLayout(menu *completionMenu, st *lineState) completionLayout {
-	width := st.width
-	if width <= 0 {
-		width = 80
-	}
-	if width < minInlineCompletionWidth {
-		return completionLayoutVertical
-	}
-	return completionLayoutInline
+	return e.verticalCompletionMenuSuffix(menu, st)
 }
 
 func (e *Editor) verticalCompletionMenuSuffix(menu *completionMenu, st *lineState) string {
@@ -799,6 +774,10 @@ func (e *Editor) verticalCompletionMenuSuffix(menu *completionMenu, st *lineStat
 	header := fmt.Sprintf("[complete %q %d/%d]", query, len(menu.filtered), len(menu.items))
 	b.WriteByte('\n')
 	b.WriteString(truncateCells(header, width))
+	if len(menu.filtered) == 0 {
+		b.WriteString("\n no matches")
+		return b.String()
+	}
 	for idx := start; idx < end; idx++ {
 		b.WriteByte('\n')
 		if idx == menu.selected {
@@ -810,7 +789,7 @@ func (e *Editor) verticalCompletionMenuSuffix(menu *completionMenu, st *lineStat
 		b.WriteByte(' ')
 		b.WriteString(truncateCells(menu.filtered[idx], itemWidth-1))
 	}
-	if end < len(menu.filtered) {
+	if end < len(menu.filtered) && 1+limit < e.completionRowBudget(st) {
 		b.WriteString("\n ...")
 	}
 	return b.String()
@@ -838,10 +817,36 @@ func (e *Editor) completionRows(menu *completionMenu, st *lineState) int {
 	if len(menu.filtered) == 0 {
 		return 0
 	}
-	if len(menu.filtered) > 5 {
-		return 5
+	limit := len(menu.filtered)
+	if limit > 5 {
+		limit = 5
 	}
-	return len(menu.filtered)
+	available := e.completionRowBudget(st) - 1
+	if available < 1 {
+		available = 1
+	}
+	if len(menu.filtered) > available && available > 1 {
+		available--
+	}
+	if limit > available {
+		limit = available
+	}
+	return limit
+}
+
+func (e *Editor) completionRowBudget(st *lineState) int {
+	height := st.heightOrDefault()
+	width := st.width
+	if width <= 0 {
+		width = 80
+	}
+	input := normalizeDisplayNewlines(st.prompt + string(st.buf))
+	inputRows := canonicalDisplayPosition(input, width).row + 1
+	budget := height - inputRows
+	if budget < 2 {
+		return 2
+	}
+	return budget
 }
 
 func (e *Editor) completionPageSize(menu *completionMenu, st *lineState) int {
@@ -850,10 +855,6 @@ func (e *Editor) completionPageSize(menu *completionMenu, st *lineState) int {
 		return 1
 	}
 	return size
-}
-
-func (e *Editor) completionItemWidth(menu *completionMenu, st *lineState) int {
-	return st.width - 4
 }
 
 func completionToken(s *lineState, replaceLen int) string {
@@ -1100,11 +1101,19 @@ func visibleWidth(s string) int {
 }
 
 func physicalRows(s string, width int) int {
+	return displayPosition(s, width).row
+}
+
+type displayPoint struct {
+	row int
+	col int
+}
+
+func displayPosition(s string, width int) displayPoint {
 	if width <= 0 {
 		width = 80
 	}
-	row := 0
-	col := 0
+	pos := displayPoint{}
 	escState := 0
 	for _, r := range s {
 		switch escState {
@@ -1126,25 +1135,65 @@ func physicalRows(s string, width int) int {
 			continue
 		}
 		if r == '\r' {
-			col = 0
+			pos.col = 0
 			continue
 		}
 		if r == '\n' {
-			row++
-			col = 0
+			pos.row++
+			pos.col = 0
 			continue
 		}
-		cell := 1
+		cell := runeDisplayWidth(r)
 		if r == '\t' {
 			cell = 4
 		}
-		col += cell
-		for col > width {
-			row++
-			col -= width
+		if cell == 0 {
+			continue
 		}
+		if pos.col == width || pos.col+cell > width {
+			pos.row++
+			pos.col = 0
+		}
+		pos.col += cell
 	}
-	return row
+	return pos
+}
+
+func canonicalDisplayPosition(s string, width int) displayPoint {
+	pos := displayPosition(s, width)
+	if width <= 0 {
+		width = 80
+	}
+	if pos.col == width {
+		pos.row++
+		pos.col = 0
+	}
+	return pos
+}
+
+func runeDisplayWidth(r rune) int {
+	if r == 0 || unicode.Is(unicode.Mn, r) {
+		return 0
+	}
+	if r >= 0x1100 &&
+		(r <= 0x115f ||
+			r == 0x2329 || r == 0x232a ||
+			(r >= 0x2e80 && r <= 0xa4cf) ||
+			(r >= 0xac00 && r <= 0xd7a3) ||
+			(r >= 0xf900 && r <= 0xfaff) ||
+			(r >= 0xfe10 && r <= 0xfe19) ||
+			(r >= 0xfe30 && r <= 0xfe6f) ||
+			(r >= 0xff00 && r <= 0xff60) ||
+			(r >= 0xffe0 && r <= 0xffe6)) {
+		return 2
+	}
+	return 1
+}
+
+func normalizeDisplayNewlines(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return strings.ReplaceAll(s, "\n", "\r\n")
 }
 
 func normalizePaste(s string) string {

@@ -3766,6 +3766,24 @@ func TestCompletionsUseCachedImagesOptionsAndHostMappedPaths(t *testing.T) {
 	}
 }
 
+func TestCompletionWithoutArgumentsListsCommands(t *testing.T) {
+	sh := newUnitShell(t, newRecordingShellAPI())
+	c := newVMSHCompleter(sh)
+
+	for _, line := range []string{"", "@host "} {
+		candidates, replaceLen, kind := c.Complete([]rune(line), len([]rune(line)))
+		if kind != completionCommand || replaceLen != 0 || !hasString(candidates, "pwd") {
+			t.Fatalf("completion for %q candidates=%q replace=%d kind=%q, want commands", line, candidates, replaceLen, kind)
+		}
+	}
+
+	line := []rune("cat ")
+	_, _, kind := c.Complete(line, len(line))
+	if kind != completionPath {
+		t.Fatalf("completion after command argument = %q, want path", kind)
+	}
+}
+
 func TestPathCompletionAfterTrailingSlashAppendsChild(t *testing.T) {
 	sh := newUnitShell(t, newRecordingShellAPI())
 	if err := os.MkdirAll(filepath.Join(sh.hostCWD, "dprojects", "vmsh"), 0o755); err != nil {
