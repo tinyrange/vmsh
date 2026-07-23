@@ -3,6 +3,7 @@ package backend
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -117,15 +118,26 @@ func EnsureStableVMSHDCopy(exePath, cacheDir string) (string, error) {
 		cacheDir = filepath.Dir(exePath)
 	}
 	stablePath := filepath.Join(cacheDir, "bin", HostExecutableName("vmshd"))
-	if sameFileContents(exePath, stablePath) {
-		return stablePath, nil
+	return stablePath, InstallExecutable(exePath, stablePath)
+}
+
+// InstallExecutable copies src to dst and publishes the complete executable
+// atomically. A failed copy or replacement leaves the previous dst intact.
+func InstallExecutable(src, dst string) error {
+	src = strings.TrimSpace(src)
+	dst = strings.TrimSpace(dst)
+	if src == "" || dst == "" {
+		return fmt.Errorf("source and destination paths are required")
 	}
-	if err := os.MkdirAll(filepath.Dir(stablePath), 0o700); err != nil {
-		return "", err
+	if sameFileContents(src, dst) {
+		return nil
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(stablePath), ".vmshd-*")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+"-*")
 	if err != nil {
-		return "", err
+		return err
 	}
 	tmpPath := tmp.Name()
 	cleanup := true
@@ -134,32 +146,36 @@ func EnsureStableVMSHDCopy(exePath, cacheDir string) (string, error) {
 			_ = os.Remove(tmpPath)
 		}
 	}()
-	src, err := os.Open(exePath)
+	source, err := os.Open(src)
 	if err != nil {
 		_ = tmp.Close()
-		return "", err
+		return err
 	}
-	if _, err := io.Copy(tmp, src); err != nil {
-		_ = src.Close()
+	if _, err := io.Copy(tmp, source); err != nil {
+		_ = source.Close()
 		_ = tmp.Close()
-		return "", err
+		return err
 	}
-	if err := src.Close(); err != nil {
+	if err := source.Close(); err != nil {
 		_ = tmp.Close()
-		return "", err
+		return err
 	}
 	if err := tmp.Chmod(0o755); err != nil {
 		_ = tmp.Close()
-		return "", err
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
 	}
 	if err := tmp.Close(); err != nil {
-		return "", err
+		return err
 	}
-	if err := replaceFile(tmpPath, stablePath); err != nil {
-		return "", err
+	if err := replaceFile(tmpPath, dst); err != nil {
+		return err
 	}
 	cleanup = false
-	return stablePath, nil
+	return nil
 }
 
 func replaceFile(src, dst string) error {
@@ -175,15 +191,28 @@ func sameFileContents(a, b string) bool {
 	if err != nil || aInfo.Size() != bInfo.Size() {
 		return false
 	}
-	aData, err := os.ReadFile(a)
+	aDigest, err := executableDigest(a)
 	if err != nil {
 		return false
 	}
-	bData, err := os.ReadFile(b)
+	bDigest, err := executableDigest(b)
 	if err != nil {
 		return false
 	}
-	return bytes.Equal(aData, bData)
+	return bytes.Equal(aDigest, bDigest)
+}
+
+func executableDigest(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, f); err != nil {
+		return nil, err
+	}
+	return hash.Sum(nil), nil
 }
 
 func CCVMPathCandidates(exePath string) []string {
