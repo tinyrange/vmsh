@@ -214,6 +214,7 @@ uname -a                        # run in the selected context
 @jobs                           # list background jobs
 @status                         # show selected context and VM status
 @install                        # install/update the user-wide vmshd daemon copy
+@upgrade                        # install the latest release and restart vmsh
 @version                        # show vmsh build metadata
 @stop work                      # stop a named VM
 ```
@@ -228,6 +229,8 @@ Builtins:
 @detach
 @ps
 @status
+@install
+@upgrade
 @version
 @start
 @stop [name|vm:name|ssh:name]

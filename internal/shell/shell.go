@@ -66,7 +66,6 @@ const (
 
 var userCacheDir = os.UserCacheDir
 var userConfigDir = os.UserConfigDir
-var execProcess = syscall.Exec
 
 type shellMode string
 
@@ -106,6 +105,7 @@ type shellState struct {
 	confirmSystemd     func(io.Writer) (bool, error)
 	hasSystemdUser     func() bool
 	installSystemdUser func(string, string) error
+	performUpgrade     func(io.Writer) (vmshUpgradeResult, error)
 	sshPassword        func(resolvedSSHConfig) (string, error)
 	sshKeyboardAuth    func(resolvedSSHConfig, string, string, []string, []bool) ([]string, error)
 	sshBanner          func(resolvedSSHConfig, string) error
@@ -125,6 +125,9 @@ type shellState struct {
 	evaluatingPaste    bool
 	groupName          string
 	groupSnapshot      *group.Snapshot
+	upgradeNoticeMu    sync.Mutex
+	upgradeNotice      *vmshUpgradeNotice
+	upgradeNoticeSeen  string
 }
 
 type shellExecRequest struct {
@@ -380,7 +383,7 @@ func (c *vmshCompleter) completionContext(prefix string) commandContext {
 		if err == nil {
 			ctx = sshCommandContext(ctx, at.Options, host)
 		}
-	case "help", "ps", "jobs", "sessions", "detach", "install", "alias", "exec", "status", "where", "version", "start", "stop", "restart", "forward", "tmux", "mux", "agent":
+	case "help", "ps", "jobs", "sessions", "detach", "install", "upgrade", "alias", "exec", "status", "where", "version", "start", "stop", "restart", "forward", "tmux", "mux", "agent":
 	default:
 		if sshCtx, ok := c.shellSSHSessionContext(at.Target); ok {
 			ctx = sshCtx
@@ -399,7 +402,7 @@ func (c *vmshCompleter) shellSSHSessionContext(name string) (commandContext, boo
 }
 
 func (c *vmshCompleter) atTargetWords() []string {
-	words := []string{"@agent", "@alias", "@connect", "@copy", "@detach", "@exec", "@help", "@host", "@install", "@jobs", "@mcp", "@mux", "@permissions", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux", "@trust", "@version"}
+	words := []string{"@agent", "@alias", "@connect", "@copy", "@detach", "@exec", "@help", "@host", "@install", "@jobs", "@mcp", "@mux", "@permissions", "@ps", "@restart", "@sessions", "@status", "@start", "@stop", "@forward", "@rmi", "@ssh", "@sudo", "@tmux", "@trust", "@upgrade", "@version"}
 	if c.shell != nil {
 		for _, name := range c.shell.sshSessionNames() {
 			words = append(words, "@"+name)
@@ -1279,6 +1282,8 @@ func Run(args []string) (retErr error) {
 	}
 	sh.completion = newVMSHCompleter(sh)
 	defer sh.closeSessions()
+	stopUpgradeNoticeWatcher := sh.watchVMSHUpgradeNotices()
+	defer stopUpgradeNoticeWatcher()
 	execRequested := func(err error) (shellExecRequest, bool) {
 		var execReq shellExecRequest
 		if errors.As(err, &execReq) {
@@ -1860,6 +1865,7 @@ func (s *shellState) evalLineEditor(in *os.File, stdout, stderr io.Writer) error
 	}
 	for {
 		drainInterruptSignals(s.interruptSignals)
+		s.printVMSHUpgradeNotice(stdout)
 		s.updateTerminalTitle(stdout)
 		s.drawPromptStatus(stdout)
 		line, err := readLine(context.Background(), s.prompt())
@@ -2850,7 +2856,7 @@ func (s *shellState) preparePipelineStage(base commandContext, index int, segmen
 
 func isControlAtTarget(target string) bool {
 	switch target {
-	case "help", "?", "ps", "jobs", "sessions", "detach", "install", "alias", "status", "where", "version", "start", "stop", "restart", "save", "rmi", "tmux", "forward", "copy", "cp", "agent", "ssh":
+	case "help", "?", "ps", "jobs", "sessions", "detach", "install", "upgrade", "alias", "status", "where", "version", "start", "stop", "restart", "save", "rmi", "tmux", "forward", "copy", "cp", "agent", "ssh":
 		return true
 	default:
 		return false
@@ -3421,6 +3427,11 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("usage: @install")
 		}
 		return s.installVMSHD(stdout, stderr)
+	case "upgrade":
+		if at.Command != "" || len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @upgrade")
+		}
+		return s.upgradeVMSH(stdout, stderr)
 	case "alias":
 		if len(at.Options.OptionFields) != 0 {
 			return fmt.Errorf("usage: @alias [name=value] | @alias -d name | @alias expand <line>")
@@ -10753,6 +10764,7 @@ func (s *shellState) help(w io.Writer) error {
 @sessions                list vmshd shell sessions and resource counts
 @detach                  keep the current vmshd session after this frontend exits
 @install                 install or update the user-wide vmshd daemon copy
+@upgrade                 install the latest vmsh release and restart this shell
 @mcp                     start a session-scoped MCP endpoint for isolated VMs
 @mcp codex [-- args]     run host Codex with the MCP endpoint configured temporarily
 @mcp status|stop         inspect or stop the session MCP endpoint
