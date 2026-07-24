@@ -150,6 +150,9 @@ func run(args []string) (retErr error) {
 		Dmesg:            *dmesg,
 		TimeoutSeconds:   bootTimeout.Seconds(),
 	}, func(event client.BootEvent) error {
+		if *dmesg && event.Kind == "serial" && event.Data != "" {
+			_, _ = io.WriteString(os.Stderr, event.Data)
+		}
 		message := strings.TrimSpace(event.Message)
 		if message != "" && message != lastBootMessage {
 			fmt.Fprintln(os.Stderr, message)
