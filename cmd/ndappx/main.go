@@ -30,6 +30,9 @@ func main() {
 func run(args []string) (retErr error) {
 	fs := flag.NewFlagSet("ndappx", flag.ContinueOnError)
 	name := fs.String("name", "ndappx", "VM name")
+	home := fs.String("home", "", "Persistent home identity (defaults to the VM name)")
+	ephemeralHome := fs.Bool("ephemeral-home", false, "Discard home-directory changes when the VM stops")
+	user := fs.String("user", "jovyan", "Default desktop and command user")
 	cacheDir := fs.String("cache-dir", "", "Image and runtime cache directory")
 	vncListen := fs.String("vnc-listen", "127.0.0.1:0", "VNC listen address")
 	display := fs.String("display", "1440x900", "Initial display size WIDTHxHEIGHT")
@@ -53,6 +56,10 @@ func run(args []string) (retErr error) {
 	}
 	if *cpus <= 0 {
 		return fmt.Errorf("CPU count must be greater than zero")
+	}
+	persistentMounts, persistentHome, err := ndappxPersistentHome(*name, *home, *ephemeralHome)
+	if err != nil {
+		return err
 	}
 	width, height, err := parseDisplaySize(*display)
 	if err != nil {
@@ -128,18 +135,20 @@ func run(args []string) (retErr error) {
 	}
 	var lastBootMessage string
 	state, err := api.CreateInstanceStreamWithIDContext(lifetimeContext, *name, client.CreateInstanceRequest{
-		Image:      fs.Arg(0),
-		InitSystem: *initSystem,
-		Network:    networkConfig,
+		Image:       fs.Arg(0),
+		DefaultUser: *user,
+		InitSystem:  *initSystem,
+		Network:     networkConfig,
 		Display: &client.DisplayConfig{
 			Width:     uint32(width),
 			Height:    uint32(height),
 			VNCListen: *vncListen,
 		},
-		MemoryMB:       *memoryMB,
-		CPUs:           *cpus,
-		Dmesg:          *dmesg,
-		TimeoutSeconds: bootTimeout.Seconds(),
+		PersistentMounts: persistentMounts,
+		MemoryMB:         *memoryMB,
+		CPUs:             *cpus,
+		Dmesg:            *dmesg,
+		TimeoutSeconds:   bootTimeout.Seconds(),
 	}, func(event client.BootEvent) error {
 		message := strings.TrimSpace(event.Message)
 		if message != "" && message != lastBootMessage {
@@ -165,6 +174,11 @@ func run(args []string) (retErr error) {
 		fmt.Printf(" at %s", state.NetworkIPv4)
 	}
 	fmt.Println()
+	if persistentHome != "" {
+		fmt.Printf("Home directory persists as %q.\n", persistentHome)
+	} else {
+		fmt.Println("Home directory is ephemeral.")
+	}
 	fmt.Println("Press Ctrl-C to stop the VM.")
 
 	statusTicker := time.NewTicker(time.Second)
@@ -201,6 +215,20 @@ func run(args []string) (retErr error) {
 			}
 		}
 	}
+}
+
+func ndappxPersistentHome(vmName, homeName string, ephemeral bool) ([]client.PersistentMount, string, error) {
+	homeName = strings.TrimSpace(homeName)
+	if ephemeral {
+		if homeName != "" {
+			return nil, "", fmt.Errorf("--home and --ephemeral-home cannot be used together")
+		}
+		return nil, "", nil
+	}
+	if homeName == "" {
+		homeName = strings.TrimSpace(vmName)
+	}
+	return []client.PersistentMount{{Name: homeName}}, homeName, nil
 }
 
 func parseDisplaySize(value string) (int, int, error) {
