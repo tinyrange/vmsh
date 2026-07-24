@@ -66,7 +66,8 @@ jobs:
         run: |
           set -euo pipefail
           version="${RELEASE_VERSION}"
-          name="vmsh_${version}_${GOOS}_${GOARCH}${EXE}"
+          vmsh_name="vmsh_${version}_${GOOS}_${GOARCH}${EXE}"
+          ndappx_name="ndappx_${version}_${GOOS}_${GOARCH}${EXE}"
           mkdir -p dist build/release
 
           cd cc
@@ -74,7 +75,8 @@ jobs:
           cd ..
           build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           ldflags="-X github.com/tinyrange/vmsh/internal/version.Release=${version} -X github.com/tinyrange/vmsh/internal/version.Commit=${GITHUB_SHA} -X github.com/tinyrange/vmsh/internal/version.Dirty=false -X github.com/tinyrange/vmsh/internal/version.BuildDate=${build_date}"
-          GOOS="$GOOS" GOARCH="$GOARCH" go build -buildvcs=false -trimpath -ldflags "$ldflags" -o "dist/${name}" ./cmd/vmsh
+          GOOS="$GOOS" GOARCH="$GOARCH" go build -buildvcs=false -trimpath -ldflags "$ldflags" -o "dist/${vmsh_name}" ./cmd/vmsh
+          CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build -buildvcs=false -trimpath -ldflags "$ldflags" -o "dist/${ndappx_name}" ./cmd/ndappx
 
       - name: Verify embedded guest init payloads
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
@@ -96,12 +98,16 @@ jobs:
           grep -F "vmsh version ${RELEASE_VERSION}" <<<"$output"
           grep -F "platform linux/amd64" <<<"$output"
           grep -F "ccvm bundled" <<<"$output"
+          ndappx_name="ndappx_${RELEASE_VERSION}_linux_amd64"
+          "dist/${ndappx_name}" --help 2>&1 | grep -F "Usage of ndappx"
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: vmsh-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/vmsh_${{ env.RELEASE_VERSION }}_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext }}
+          path: |
+            dist/vmsh_${{ env.RELEASE_VERSION }}_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext }}
+            dist/ndappx_${{ env.RELEASE_VERSION }}_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext }}
           if-no-files-found: error
 
   build-macos:
@@ -165,7 +171,8 @@ jobs:
         run: |
           set -euo pipefail
           version="${RELEASE_VERSION}"
-          name="vmsh_${version}_darwin_arm64"
+          vmsh_name="vmsh_${version}_darwin_arm64"
+          ndappx_name="ndappx_${version}_darwin_arm64"
           mkdir -p dist build/release
 
           cd cc
@@ -173,7 +180,8 @@ jobs:
           cd ..
           build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           ldflags="-X github.com/tinyrange/vmsh/internal/version.Release=${version} -X github.com/tinyrange/vmsh/internal/version.Commit=${GITHUB_SHA} -X github.com/tinyrange/vmsh/internal/version.Dirty=false -X github.com/tinyrange/vmsh/internal/version.BuildDate=${build_date}"
-          GOOS=darwin GOARCH=arm64 go build -buildvcs=false -trimpath -ldflags "$ldflags" -o "dist/${name}" ./cmd/vmsh
+          GOOS=darwin GOARCH=arm64 go build -buildvcs=false -trimpath -ldflags "$ldflags" -o "dist/${vmsh_name}" ./cmd/vmsh
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -buildvcs=false -trimpath -ldflags "$ldflags" -o "dist/${ndappx_name}" ./cmd/ndappx
 
       - name: Verify embedded guest init payloads
         run: |
@@ -188,26 +196,35 @@ jobs:
       - name: Sign macOS binaries
         run: |
           set -euo pipefail
-          name="vmsh_${RELEASE_VERSION}_darwin_arm64"
-          codesign \
-            --force \
-            --sign "$MACOS_DEVELOPER_ID" \
-            --entitlements tools/entitlements.xml \
-            --timestamp \
-            --options runtime \
-            --keychain build.keychain \
-            "dist/${name}"
-          codesign --verify --strict --verbose=2 "dist/${name}"
-          codesign -d --verbose=4 "dist/${name}" 2>&1 | grep runtime
+          for name in \
+            "vmsh_${RELEASE_VERSION}_darwin_arm64" \
+            "ndappx_${RELEASE_VERSION}_darwin_arm64"
+          do
+            codesign \
+              --force \
+              --sign "$MACOS_DEVELOPER_ID" \
+              --entitlements tools/entitlements.xml \
+              --timestamp \
+              --options runtime \
+              --keychain build.keychain \
+              "dist/${name}"
+            codesign --verify --strict --verbose=2 "dist/${name}"
+            codesign -d --verbose=4 "dist/${name}" 2>&1 | grep runtime
+          done
 
       - name: Notarize macOS binary
         run: |
           set -euo pipefail
-          name="vmsh_${RELEASE_VERSION}_darwin_arm64"
-          notary_zip="dist/${name}_notary.zip"
+          notary_dir="build/release/notary"
+          notary_zip="build/release/ndappx_vmsh_notary.zip"
           notary_result="$(mktemp)"
           trap 'rm -f "$notary_zip" "$notary_result"' EXIT
-          ditto -c -k --keepParent "dist/${name}" "$notary_zip"
+          mkdir -p "$notary_dir"
+          cp \
+            "dist/vmsh_${RELEASE_VERSION}_darwin_arm64" \
+            "dist/ndappx_${RELEASE_VERSION}_darwin_arm64" \
+            "$notary_dir/"
+          ditto -c -k --keepParent "$notary_dir" "$notary_zip"
 
           if [[ "$APPLE_ID_PASSWORD" == @keychain:* ]]; then
             notary_profile="${APPLE_ID_PASSWORD#@keychain:}"
@@ -227,7 +244,8 @@ jobs:
           fi
 
           test "$(plutil -extract status raw -o - "$notary_result")" = Accepted
-          codesign --verify --strict --verbose=2 "dist/${name}"
+          codesign --verify --strict --verbose=2 "dist/vmsh_${RELEASE_VERSION}_darwin_arm64"
+          codesign --verify --strict --verbose=2 "dist/ndappx_${RELEASE_VERSION}_darwin_arm64"
 
       - name: Smoke-test signed macOS payload
         run: |
@@ -237,12 +255,16 @@ jobs:
           grep -F "vmsh version ${RELEASE_VERSION}" <<<"$output"
           grep -F "platform darwin/arm64" <<<"$output"
           grep -F "ccvm bundled" <<<"$output"
+          ndappx_name="ndappx_${RELEASE_VERSION}_darwin_arm64"
+          "dist/${ndappx_name}" --help 2>&1 | grep -F "Usage of ndappx"
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: vmsh-darwin-arm64
-          path: dist/vmsh_${{ env.RELEASE_VERSION }}_darwin_arm64
+          path: |
+            dist/vmsh_${{ env.RELEASE_VERSION }}_darwin_arm64
+            dist/ndappx_${{ env.RELEASE_VERSION }}_darwin_arm64
           if-no-files-found: error
 
   publish:
@@ -261,7 +283,7 @@ jobs:
       - name: Generate checksums
         run: |
           set -euo pipefail
-          find artifacts -type f -name 'vmsh_*' -print0 |
+          find artifacts -type f \( -name 'vmsh_*' -o -name 'ndappx_*' \) -print0 |
             sort -z |
             xargs -0 sha256sum |
             sed 's#artifacts/[^/]*/##' > checksums.txt
@@ -282,4 +304,5 @@ jobs:
           body_path: RELEASENOTES.md
           files: |
             artifacts/**/vmsh_*
+            artifacts/**/ndappx_*
             checksums.txt
