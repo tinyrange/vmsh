@@ -271,6 +271,7 @@ jobs:
           codesign \
             --force \
             --sign "$MACOS_DEVELOPER_ID" \
+            --entitlements tools/entitlements.xml \
             --timestamp \
             --options runtime \
             --keychain build.keychain \
@@ -278,6 +279,12 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "dist/NeurodeskAppX.app"
           codesign --verify --strict --verbose=2 "dist/vmsh_${RELEASE_VERSION}_darwin_arm64"
           codesign -d --verbose=4 "dist/NeurodeskAppX.app" 2>&1 | grep runtime
+          app_entitlements="$(mktemp)"
+          trap 'rm -f "$app_entitlements"' EXIT
+          codesign -d --entitlements :- "dist/NeurodeskAppX.app" > "$app_entitlements"
+          test "$(/usr/libexec/PlistBuddy \
+            -c 'Print :com.apple.security.hypervisor' \
+            "$app_entitlements")" = true
 
       - name: Notarize macOS binary
         run: |
