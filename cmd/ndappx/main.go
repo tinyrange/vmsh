@@ -29,13 +29,13 @@ func main() {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
-		fmt.Fprintln(os.Stderr, "ndappx:", err)
+		fmt.Fprintln(os.Stderr, "NeurodeskAppX:", err)
 		os.Exit(1)
 	}
 }
 
 func run(args []string) (retErr error) {
-	fs := flag.NewFlagSet("ndappx", flag.ContinueOnError)
+	fs := flag.NewFlagSet("NeurodeskAppX", flag.ContinueOnError)
 	name := fs.String("name", "ndappx", "VM name")
 	home := fs.String("home", "", "Persistent home identity (defaults to the VM name)")
 	ephemeralHome := fs.Bool("ephemeral-home", false, "Discard home-directory changes when the VM stops")
@@ -56,7 +56,7 @@ func run(args []string) (retErr error) {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: ndappx [OPTIONS] IMAGE")
+		return fmt.Errorf("usage: NeurodeskAppX [OPTIONS] IMAGE")
 	}
 	if strings.TrimSpace(*name) == "" {
 		return fmt.Errorf("VM name cannot be empty")
@@ -256,7 +256,7 @@ func run(args []string) (retErr error) {
 			}()
 			return session, nil
 		}
-		windowErr := openDisplayWindow(displayContext, "Neurodesktop", width, height, start)
+		windowErr := openDisplayWindow(displayContext, "NeurodeskAppX", width, height, start)
 		cancelDisplay()
 		if windowErr != nil {
 			return windowErr
@@ -294,7 +294,7 @@ func run(args []string) (retErr error) {
 	})
 	if err != nil {
 		if lifetimeContext.Err() != nil {
-			fmt.Fprintln(os.Stderr, "Stopping ndappx VM...")
+			fmt.Fprintln(os.Stderr, "Stopping NeurodeskAppX VM...")
 			return nil
 		}
 		return fmt.Errorf("boot %q: %w", imageName, err)
@@ -325,7 +325,7 @@ func run(args []string) (retErr error) {
 	for {
 		select {
 		case <-lifetimeContext.Done():
-			fmt.Fprintln(os.Stderr, "Stopping ndappx VM...")
+			fmt.Fprintln(os.Stderr, "Stopping NeurodeskAppX VM...")
 			return nil
 		case err := <-serverDone:
 			serverFinished = true
@@ -337,7 +337,7 @@ func run(args []string) (retErr error) {
 			current, err := api.InstanceStatusOfContext(lifetimeContext, *name)
 			if err != nil {
 				if lifetimeContext.Err() != nil {
-					fmt.Fprintln(os.Stderr, "Stopping ndappx VM...")
+					fmt.Fprintln(os.Stderr, "Stopping NeurodeskAppX VM...")
 					return nil
 				}
 				return fmt.Errorf("check VM status: %w", err)

@@ -5,17 +5,17 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>Neurodesk</string>
+	<string>NeurodeskAppX</string>
 	<key>CFBundleExecutable</key>
-	<string>Neurodesk</string>
+	<string>NeurodeskAppX</string>
 	<key>CFBundleIconFile</key>
-	<string>Neurodesk</string>
+	<string>NeurodeskAppX</string>
 	<key>CFBundleIdentifier</key>
-	<string>org.neurodesk.desktop</string>
+	<string>org.neurodesk.appx</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>Neurodesk</string>
+	<string>NeurodeskAppX</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
