@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"runtime"
 )
 
@@ -14,9 +13,6 @@ func init() {
 func platformArguments(args []string) []string {
 	if len(args) != 0 {
 		return args
-	}
-	if os.Getenv("TERM") != "" {
-		return []string{"--help"}
 	}
 	return []string{defaultNeurodesktopImage}
 }

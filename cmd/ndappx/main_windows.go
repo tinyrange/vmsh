@@ -15,12 +15,9 @@ var (
 )
 
 func platformArguments(args []string) []string {
-	hasParentConsole := attachParentConsole()
+	attachParentConsole()
 	if len(args) != 0 {
 		return args
-	}
-	if hasParentConsole {
-		return []string{"--help"}
 	}
 	return []string{defaultNeurodesktopImage}
 }

@@ -66,6 +66,24 @@ func TestNDAppXStorageShareIsWritableByJovyan(t *testing.T) {
 	}
 }
 
+func TestPlatformArgumentsDefaultToGraphicalDesktop(t *testing.T) {
+	args := platformArguments(nil)
+	if len(args) != 1 || args[0] != defaultNeurodesktopImage {
+		t.Fatalf("default arguments = %q, want default Neurodesktop image", args)
+	}
+
+	explicit := []string{"--vnc", "example.invalid/image:tag"}
+	args = platformArguments(explicit)
+	if len(args) != len(explicit) {
+		t.Fatalf("explicit arguments = %q, want %q", args, explicit)
+	}
+	for index := range explicit {
+		if args[index] != explicit[index] {
+			t.Fatalf("explicit arguments = %q, want %q", args, explicit)
+		}
+	}
+}
+
 func TestParseDisplaySizeRejectsUnusableFramebuffers(t *testing.T) {
 	width, height, err := parseDisplaySize("1920x1080")
 	if err != nil {
