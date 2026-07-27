@@ -99,6 +99,12 @@ func TestParseDisplaySizeRejectsUnusableFramebuffers(t *testing.T) {
 	}
 }
 
+func TestGuestDisplayUsesLogicalResolution(t *testing.T) {
+	if got := guestDisplaySize(2880, 1800, 2); got != image.Pt(1440, 900) {
+		t.Fatalf("guest display size = %v, want logical resolution", got)
+	}
+}
+
 func TestGeneratedVNCPasswordFitsProtocol(t *testing.T) {
 	password, err := generateVNCPassword()
 	if err != nil {

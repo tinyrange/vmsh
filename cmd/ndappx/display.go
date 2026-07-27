@@ -516,12 +516,7 @@ func fitStartupText(value string, width, size float32) string {
 
 func (v *displayViewer) handleResize() error {
 	backingWidth, backingHeight := v.window.BackingSize()
-	scale := v.window.Scale()
-	if scale <= 0 {
-		scale = 1
-	}
-	size := image.Pt(max(1, int(math.Round(float64(float32(backingWidth)/scale)))),
-		max(1, int(math.Round(float64(float32(backingHeight)/scale)))))
+	size := guestDisplaySize(backingWidth, backingHeight, v.window.Scale())
 	if size == v.lastResize {
 		v.pendingResize = image.Point{}
 		return nil
@@ -540,6 +535,21 @@ func (v *displayViewer) handleResize() error {
 	v.lastResize = size
 	v.pendingResize = image.Point{}
 	return nil
+}
+
+func guestDisplaySize(backingWidth, backingHeight int, scale float32) image.Point {
+	scale = normalizedDisplayScale(scale)
+	return image.Pt(
+		max(1, int(math.Round(float64(float32(backingWidth)/scale)))),
+		max(1, int(math.Round(float64(float32(backingHeight)/scale)))),
+	)
+}
+
+func normalizedDisplayScale(scale float32) float32 {
+	if scale < 1 {
+		return 1
+	}
+	return min(4, scale)
 }
 
 func (v *displayViewer) handleInput() error {
