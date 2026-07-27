@@ -123,9 +123,9 @@ jobs:
           set -euo pipefail
           name="NeurodeskAppX_${RELEASE_VERSION}_windows_amd64.exe"
           objdump -p "dist/${name}" |
-            grep -E 'Subsystem[[:space:]]+00000002[[:space:]]+\\(Windows GUI\\)'
+            grep -E 'Subsystem[[:space:]]+00000002[[:space:]]+[(]Windows GUI[)]'
           objdump -h "dist/${name}" |
-            grep -E '[[:space:]]\\.rsrc[[:space:]]'
+            grep -E '[[:space:]][.]rsrc[[:space:]]'
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
