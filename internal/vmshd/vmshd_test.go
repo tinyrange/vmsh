@@ -21,6 +21,7 @@ import (
 	"github.com/tinyrange/vmsh/internal/vmshdprotocol"
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
+	"j5.nz/cc/display"
 )
 
 func TestTokenFileIsPrivate(t *testing.T) {
@@ -1988,4 +1989,8 @@ func (f fakeRuntimeView) AllowServiceProxyPort(ctx context.Context, id string, p
 		return f.allowPort(ctx, id, port)
 	}
 	return nil
+}
+
+func (f fakeRuntimeView) Display(string) (display.Session, bool) {
+	return nil, false
 }

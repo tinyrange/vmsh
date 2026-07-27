@@ -1,0 +1,1004 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ndappx Pull and Start Plan</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18211f;
+      --muted: #60706c;
+      --line: #d7dfdc;
+      --paper: #f5f7f6;
+      --panel: #ffffff;
+      --soft: #eaf2ef;
+      --brand: #167565;
+      --brand-dark: #0e574b;
+      --blue: #2d6cdf;
+      --warn: #b65b19;
+      --danger: #b73737;
+      --shadow: 0 18px 50px rgba(24, 33, 31, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 12% -10%, #dceee8 0, transparent 30rem),
+        var(--paper);
+      color: var(--ink);
+      font: 15px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    button,
+    summary {
+      font: inherit;
+    }
+
+    main {
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 46px 0 80px;
+    }
+
+    header {
+      display: grid;
+      gap: 18px;
+      grid-template-columns: 1fr auto;
+      align-items: end;
+      margin-bottom: 30px;
+    }
+
+    h1,
+    h2,
+    h3,
+    p {
+      margin-top: 0;
+    }
+
+    h1 {
+      font-size: clamp(2rem, 5vw, 3.5rem);
+      line-height: 1;
+      letter-spacing: -0.045em;
+      margin-bottom: 16px;
+      max-width: 760px;
+    }
+
+    h2 {
+      font-size: 1.45rem;
+      letter-spacing: -0.02em;
+      margin-bottom: 12px;
+    }
+
+    h3 {
+      font-size: 1rem;
+      margin-bottom: 8px;
+    }
+
+    .lede {
+      color: var(--muted);
+      font-size: 1.08rem;
+      max-width: 760px;
+      margin-bottom: 0;
+    }
+
+    .tag {
+      background: var(--ink);
+      border-radius: 999px;
+      color: white;
+      font-size: 0.75rem;
+      font-weight: 750;
+      letter-spacing: 0.08em;
+      padding: 8px 12px;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .card {
+      background: rgba(255, 255, 255, 0.94);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: 0 1px 2px rgba(24, 33, 31, 0.03);
+      padding: 24px;
+    }
+
+    .decision {
+      background: var(--soft);
+      border-left: 4px solid var(--brand);
+      box-shadow: none;
+      margin-bottom: 24px;
+    }
+
+    .decision strong {
+      color: var(--brand-dark);
+    }
+
+    .demo {
+      overflow: hidden;
+      padding: 0;
+      box-shadow: var(--shadow);
+      margin-bottom: 36px;
+    }
+
+    .demo-toolbar {
+      align-items: center;
+      background: #edf1f0;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      gap: 12px;
+      justify-content: space-between;
+      padding: 12px 14px;
+    }
+
+    .window-title {
+      align-items: center;
+      display: flex;
+      font-weight: 700;
+      gap: 9px;
+      min-width: 0;
+    }
+
+    .app-mark {
+      background: var(--brand);
+      border-radius: 6px;
+      display: inline-block;
+      height: 20px;
+      position: relative;
+      width: 20px;
+    }
+
+    .app-mark::after {
+      background: white;
+      border-radius: 1px;
+      content: "";
+      height: 2px;
+      left: 5px;
+      position: absolute;
+      top: 9px;
+      width: 10px;
+    }
+
+    .scenarios {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      justify-content: flex-end;
+    }
+
+    button {
+      background: white;
+      border: 1px solid #bac7c3;
+      border-radius: 8px;
+      color: var(--ink);
+      cursor: pointer;
+      font-size: 0.82rem;
+      font-weight: 650;
+      padding: 7px 10px;
+    }
+
+    button:hover {
+      border-color: var(--brand);
+      color: var(--brand-dark);
+    }
+
+    button:focus-visible,
+    summary:focus-visible {
+      outline: 3px solid rgba(45, 108, 223, 0.32);
+      outline-offset: 2px;
+    }
+
+    button[aria-pressed="true"],
+    .primary {
+      background: var(--brand);
+      border-color: var(--brand);
+      color: white;
+    }
+
+    .primary:hover {
+      background: var(--brand-dark);
+      color: white;
+    }
+
+    .stage {
+      min-height: 465px;
+      position: relative;
+    }
+
+    .waiting-view {
+      align-content: center;
+      background:
+        linear-gradient(135deg, rgba(22, 117, 101, 0.07), transparent 42%),
+        #fbfcfc;
+      display: grid;
+      min-height: 465px;
+      padding: clamp(24px, 5vw, 56px);
+    }
+
+    .progress-panel {
+      margin: 0 auto;
+      max-width: 700px;
+      width: 100%;
+    }
+
+    .eyebrow {
+      color: var(--brand);
+      font-size: 0.75rem;
+      font-weight: 800;
+      letter-spacing: 0.1em;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+    }
+
+    .status-title {
+      font-size: clamp(1.45rem, 4vw, 2.15rem);
+      line-height: 1.15;
+      margin-bottom: 8px;
+    }
+
+    .status-copy {
+      color: var(--muted);
+      margin-bottom: 24px;
+    }
+
+    .bar {
+      background: #dfe7e4;
+      border-radius: 999px;
+      height: 10px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .bar-fill {
+      background: linear-gradient(90deg, var(--brand), #35a38f);
+      border-radius: inherit;
+      height: 100%;
+      transition: width 300ms ease;
+      width: 0;
+    }
+
+    .bar.indeterminate .bar-fill {
+      animation: sweep 1.4s ease-in-out infinite;
+      position: absolute;
+      width: 35%;
+    }
+
+    @keyframes sweep {
+      from { left: -35%; }
+      to { left: 100%; }
+    }
+
+    .progress-meta {
+      color: var(--muted);
+      display: flex;
+      font-size: 0.82rem;
+      justify-content: space-between;
+      margin-top: 8px;
+      min-height: 1.3em;
+    }
+
+    .steps {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(4, 1fr);
+      list-style: none;
+      margin: 28px 0 0;
+      padding: 0;
+    }
+
+    .step {
+      border-top: 3px solid #d9e1de;
+      color: #7a8884;
+      font-size: 0.78rem;
+      padding-top: 8px;
+    }
+
+    .step.done {
+      border-color: var(--brand);
+      color: var(--brand-dark);
+    }
+
+    .step.active {
+      border-color: var(--blue);
+      color: var(--ink);
+      font-weight: 750;
+    }
+
+    .actions {
+      align-items: center;
+      display: flex;
+      gap: 10px;
+      margin-top: 25px;
+    }
+
+    details {
+      border-top: 1px solid var(--line);
+      margin-top: 24px;
+      padding-top: 14px;
+    }
+
+    summary {
+      color: var(--muted);
+      cursor: pointer;
+      font-weight: 650;
+    }
+
+    .layers {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .layer {
+      align-items: center;
+      display: grid;
+      font: 0.78rem ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      gap: 12px;
+      grid-template-columns: minmax(100px, 1fr) 92px 86px;
+    }
+
+    .layer > span:first-child {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .layer-state {
+      color: var(--brand);
+      text-align: right;
+    }
+
+    .desktop-view {
+      background: #2c7778;
+      display: none;
+      min-height: 465px;
+      opacity: 0;
+      overflow: hidden;
+      position: relative;
+      transition: opacity 220ms ease;
+    }
+
+    .desktop-view.ready {
+      display: block;
+      opacity: 1;
+    }
+
+    .desktop-wallpaper {
+      background:
+        radial-gradient(circle at 76% 34%, rgba(255, 255, 255, 0.22), transparent 14rem),
+        linear-gradient(140deg, #204f62, #2d9180 58%, #8fc6a4);
+      inset: 0;
+      position: absolute;
+    }
+
+    .desktop-window {
+      background: #f8f9fa;
+      border: 1px solid rgba(0, 0, 0, 0.2);
+      border-radius: 7px;
+      box-shadow: 0 18px 45px rgba(0, 0, 0, 0.28);
+      left: 10%;
+      overflow: hidden;
+      position: absolute;
+      top: 12%;
+      width: min(620px, 80%);
+    }
+
+    .desktop-titlebar {
+      align-items: center;
+      background: #e9ecee;
+      border-bottom: 1px solid #cbd1d3;
+      display: flex;
+      font-size: 0.8rem;
+      font-weight: 700;
+      justify-content: space-between;
+      padding: 7px 10px;
+    }
+
+    .desktop-content {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: 140px 1fr;
+      min-height: 275px;
+      padding: 18px;
+    }
+
+    .desktop-nav {
+      border-right: 1px solid #dfe3e5;
+      color: #59666c;
+      line-height: 2.1;
+    }
+
+    .desktop-welcome {
+      align-content: center;
+      display: grid;
+    }
+
+    .desktop-welcome h3 {
+      font-size: 1.35rem;
+    }
+
+    .desktop-welcome p {
+      color: #667278;
+      max-width: 380px;
+    }
+
+    .desktop-panel {
+      align-items: center;
+      background: rgba(25, 31, 34, 0.94);
+      bottom: 0;
+      color: white;
+      display: flex;
+      font-size: 0.76rem;
+      gap: 12px;
+      height: 34px;
+      justify-content: space-between;
+      padding: 0 12px;
+      position: absolute;
+      width: 100%;
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    .section {
+      margin-top: 36px;
+    }
+
+    .grid {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .card ul,
+    .card ol {
+      margin: 10px 0 0;
+      padding-left: 20px;
+    }
+
+    .card li {
+      margin: 7px 0;
+    }
+
+    .flow {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      list-style: none;
+      margin: 16px 0 0;
+      padding: 0;
+    }
+
+    .flow li {
+      align-items: center;
+      display: flex;
+      gap: 8px;
+    }
+
+    .flow li:not(:last-child)::after {
+      color: #8a9692;
+      content: "→";
+    }
+
+    .state {
+      background: var(--soft);
+      border: 1px solid #cbdcd6;
+      border-radius: 999px;
+      color: var(--brand-dark);
+      font: 0.79rem ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      padding: 6px 9px;
+    }
+
+    pre {
+      background: #17221f;
+      border-radius: 10px;
+      color: #eaf5f1;
+      font: 0.8rem/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-x: auto;
+      padding: 16px;
+    }
+
+    code {
+      background: #eaf0ee;
+      border-radius: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.9em;
+      padding: 0.1rem 0.28rem;
+    }
+
+    pre code {
+      background: transparent;
+      padding: 0;
+    }
+
+    .note {
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .checks {
+      list-style: none;
+      padding-left: 0 !important;
+    }
+
+    .checks li {
+      padding-left: 24px;
+      position: relative;
+    }
+
+    .checks li::before {
+      color: var(--brand);
+      content: "✓";
+      font-weight: 900;
+      left: 2px;
+      position: absolute;
+    }
+
+    @media (max-width: 760px) {
+      header,
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      header {
+        align-items: start;
+      }
+
+      .tag {
+        justify-self: start;
+      }
+
+      .demo-toolbar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .scenarios {
+        justify-content: flex-start;
+      }
+
+      .steps {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .desktop-content {
+        grid-template-columns: 1fr;
+      }
+
+      .desktop-nav {
+        display: none;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        animation-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Pull quietly. Start clearly. Reveal when ready.</h1>
+        <p class="lede">
+          A proposed pull and startup experience for <code>ndappx</code>. Users
+          see truthful progress while the image and VM are prepared, then the
+          completed desktop replaces the readiness view in one clean transition.
+        </p>
+      </div>
+      <span class="tag">Interaction plan</span>
+    </header>
+
+    <aside class="card decision">
+      <strong>Presentation rule:</strong> the graphical surface stays hidden
+      until the guest session has declared itself ready and a complete, stable
+      desktop frame is available. Boot consoles, TTY output, greeter transitions,
+      and partially painted desktop frames are never presented to the user.
+    </aside>
+
+    <section class="card demo" aria-labelledby="demo-title">
+      <div class="demo-toolbar">
+        <div class="window-title" id="demo-title">
+          <span class="app-mark" aria-hidden="true"></span>
+          Neurodesktop
+        </div>
+        <div class="scenarios" aria-label="Demo scenarios">
+          <button data-scenario="first" aria-pressed="true">First pull</button>
+          <button data-scenario="cached" aria-pressed="false">Cached image</button>
+          <button data-scenario="resume" aria-pressed="false">Resume pull</button>
+        </div>
+      </div>
+
+      <div class="stage">
+        <div class="waiting-view" id="waiting-view">
+          <div class="progress-panel">
+            <div class="eyebrow" id="phase-label">Preparing</div>
+            <h2 class="status-title" id="status-title">Ready to start</h2>
+            <p class="status-copy" id="status-copy" aria-live="polite">
+              Run the demo to preview the pull and startup experience.
+            </p>
+
+            <div class="bar" id="progress-bar" role="progressbar"
+              aria-label="Startup progress" aria-valuemin="0" aria-valuemax="100"
+              aria-valuenow="0">
+              <div class="bar-fill" id="bar-fill"></div>
+            </div>
+            <div class="progress-meta">
+              <span id="progress-detail">No work started</span>
+              <span id="progress-eta"></span>
+            </div>
+
+            <ol class="steps" aria-label="Startup phases">
+              <li class="step" data-step="pull">Pull image</li>
+              <li class="step" data-step="prepare">Prepare</li>
+              <li class="step" data-step="boot">Start VM</li>
+              <li class="step" data-step="desktop">Open desktop</li>
+            </ol>
+
+            <div class="actions">
+              <button class="primary" id="run-demo">Run demo</button>
+              <button id="reset-demo">Reset</button>
+            </div>
+
+            <details id="pull-details">
+              <summary>Image details</summary>
+              <div class="layers">
+                <div class="layer">
+                  <span>sha256:71b2…e910</span>
+                  <span>1.42 GB</span>
+                  <span class="layer-state">waiting</span>
+                </div>
+                <div class="layer">
+                  <span>sha256:a83c…17f2</span>
+                  <span>824 MB</span>
+                  <span class="layer-state">waiting</span>
+                </div>
+                <div class="layer">
+                  <span>sha256:092e…b422</span>
+                  <span>318 MB</span>
+                  <span class="layer-state">waiting</span>
+                </div>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <div class="desktop-view" id="desktop-view" aria-label="Ready Neurodesktop session">
+          <div class="desktop-wallpaper"></div>
+          <div class="desktop-window">
+            <div class="desktop-titlebar">
+              <span>Neurodesktop</span>
+              <span aria-hidden="true">—　□　×</span>
+            </div>
+            <div class="desktop-content">
+              <nav class="desktop-nav" aria-label="Application categories">
+                Favorites<br>
+                Neuroimaging<br>
+                Terminal<br>
+                Files
+              </nav>
+              <div class="desktop-welcome">
+                <h3>Your desktop is ready</h3>
+                <p>
+                  Applications, shared storage, clipboard, keyboard, mouse, and
+                  resize handling are ready before this surface becomes visible.
+                </p>
+                <div><button>Browse applications</button></div>
+              </div>
+            </div>
+          </div>
+          <div class="desktop-panel">
+            <span>Applications　▣ Neurodesktop</span>
+            <span>100%　14:32</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="behavior-heading">
+      <h2 id="behavior-heading">Behavioral contract</h2>
+      <div class="grid">
+        <article class="card">
+          <h3>Pull flow</h3>
+          <ol>
+            <li>Resolve the image tag to a digest and fetch the manifest.</li>
+            <li>Check the content-addressed cache before requesting any layer.</li>
+            <li>Download missing layers concurrently with resumable transfers.</li>
+            <li>Report actual bytes, transfer rate, and ETA while totals are known.</li>
+            <li>Verify every digest, then atomically commit the usable image.</li>
+          </ol>
+          <p class="note">
+            A cached image skips straight to validation. An interrupted pull
+            resumes verified partial content rather than starting over.
+          </p>
+        </article>
+
+        <article class="card">
+          <h3>Start flow</h3>
+          <ol>
+            <li>Prepare the writable image state, home, and shared storage.</li>
+            <li>Start the VM and establish the guest control channel.</li>
+            <li>Attach the graphics transport to an off-screen surface.</li>
+            <li>Apply the current host window size and wait for desktop readiness.</li>
+            <li>Present the first stable frame, then enable normal interaction.</li>
+          </ol>
+          <p class="note">
+            The progress view owns the window until the final presentation gate
+            passes. There is no interval where the framebuffer leaks through.
+          </p>
+        </article>
+      </div>
+
+      <ul class="flow" aria-label="State machine">
+        <li><span class="state">idle</span></li>
+        <li><span class="state">resolving</span></li>
+        <li><span class="state">pulling</span></li>
+        <li><span class="state">verifying</span></li>
+        <li><span class="state">preparing</span></li>
+        <li><span class="state">booting</span></li>
+        <li><span class="state">guest-ready</span></li>
+        <li><span class="state">display-ready</span></li>
+        <li><span class="state">presented</span></li>
+      </ul>
+    </section>
+
+    <section class="section grid">
+      <article class="card">
+        <h2>Progress semantics</h2>
+        <ul>
+          <li>
+            Use determinate progress only when <code>current</code> and
+            <code>total</code> are real measurements.
+          </li>
+          <li>
+            Switch to an indeterminate bar for validation, boot, and guest
+            readiness instead of inventing a percentage.
+          </li>
+          <li>
+            Keep the primary label stable by phase; put changing detail in the
+            secondary line so the UI does not visually jump.
+          </li>
+          <li>
+            Show layer-level detail on demand. Normal operation remains simple.
+          </li>
+          <li>
+            Cancellation stops new work safely; verified cached layers remain
+            reusable. Failures keep a concise reason and offer retry.
+          </li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <h2>Desktop readiness gate</h2>
+        <p>All conditions must be true before the surface is presented:</p>
+        <ul class="checks">
+          <li>The guest control channel reports the desktop session started.</li>
+          <li>The graphics connection has received a full framebuffer update.</li>
+          <li>The requested display size has been acknowledged and painted.</li>
+          <li>Keyboard, pointer, clipboard, and resize handlers are attached.</li>
+          <li>The frame has remained valid through one compositor paint cycle.</li>
+        </ul>
+        <p class="note">
+          Readiness is a guest/display protocol event, not a timer and not a
+          search for particular console text.
+        </p>
+      </article>
+    </section>
+
+    <section class="section grid">
+      <article class="card">
+        <h2>Event shape</h2>
+        <p>
+          The puller and VM session should emit structured events. Frontends
+          choose wording without parsing logs.
+        </p>
+        <pre><code>{
+  "phase": "pulling",
+  "message": "Downloading image",
+  "current": 1702887424,
+  "total": 2751463424,
+  "unit": "bytes",
+  "rate": 84934656,
+  "eta_seconds": 12,
+  "detail": "3 of 5 layers"
+}</code></pre>
+        <p>
+          Terminal output remains available behind a diagnostic/debug option,
+          but it is not used as the graphical startup surface.
+        </p>
+      </article>
+
+      <article class="card">
+        <h2>Implementation slices</h2>
+        <ol>
+          <li>Add typed pull and boot progress events to the backend API.</li>
+          <li>Make the image cache resumable, verified, and atomic.</li>
+          <li>Render the readiness view in the native graphics window.</li>
+          <li>Add the guest and full-frame readiness handshake.</li>
+          <li>Swap the hidden graphics surface into the window on readiness.</li>
+          <li>Add recovery UI for offline, auth, disk-full, and guest failures.</li>
+        </ol>
+      </article>
+    </section>
+
+    <section class="section card">
+      <h2>Acceptance criteria</h2>
+      <div class="grid">
+        <ul class="checks">
+          <li>A first pull exposes real byte progress, rate, and ETA.</li>
+          <li>A cached start does not flash a redundant download phase.</li>
+          <li>An interrupted pull resumes without redownloading valid layers.</li>
+          <li>Cancel leaves the cache and image selection in a valid state.</li>
+        </ul>
+        <ul class="checks">
+          <li>No boot console or terminal content is visible by default.</li>
+          <li>No partial desktop frame is visible during startup or resize.</li>
+          <li>The first visible desktop accepts input immediately.</li>
+          <li>A startup failure stays in the progress view with retry details.</li>
+        </ul>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    (() => {
+      const scenarios = {
+        first: {
+          phases: [
+            ["Resolving", "Finding the requested image", "Reading manifest and cache index", "", "pull", null, 650],
+            ["Pulling image", "Downloading Neurodesktop", "1.66 GB of 2.56 GB · 81 MB/s", "about 12 sec", "pull", 65, 1600],
+            ["Verifying", "Checking downloaded content", "Verifying layer digests", "", "prepare", null, 850],
+            ["Preparing", "Preparing your workspace", "Attaching home and shared storage", "", "prepare", null, 750],
+            ["Starting", "Starting the virtual machine", "Waiting for the guest control channel", "", "boot", null, 1100],
+            ["Starting desktop", "Getting the desktop ready", "Applying display size and waiting for a complete frame", "", "desktop", null, 1200]
+          ]
+        },
+        cached: {
+          phases: [
+            ["Resolving", "Checking the local image", "Image already available · digest verified", "", "pull", null, 600],
+            ["Preparing", "Preparing your workspace", "Attaching home and shared storage", "", "prepare", null, 700],
+            ["Starting", "Starting the virtual machine", "Waiting for the guest control channel", "", "boot", null, 1000],
+            ["Starting desktop", "Getting the desktop ready", "Waiting for a complete frame", "", "desktop", null, 1100]
+          ]
+        },
+        resume: {
+          phases: [
+            ["Resolving", "Resuming the image pull", "1.84 GB already verified in the cache", "", "pull", null, 650],
+            ["Pulling image", "Downloading remaining content", "2.31 GB of 2.56 GB · 76 MB/s", "about 4 sec", "pull", 90, 1300],
+            ["Verifying", "Checking downloaded content", "Verifying remaining layer digests", "", "prepare", null, 800],
+            ["Preparing", "Preparing your workspace", "Attaching home and shared storage", "", "prepare", null, 700],
+            ["Starting", "Starting the virtual machine", "Waiting for the guest control channel", "", "boot", null, 1000],
+            ["Starting desktop", "Getting the desktop ready", "Applying display size and waiting for a complete frame", "", "desktop", null, 1100]
+          ]
+        }
+      };
+
+      const phaseLabel = document.querySelector("#phase-label");
+      const title = document.querySelector("#status-title");
+      const copy = document.querySelector("#status-copy");
+      const detail = document.querySelector("#progress-detail");
+      const eta = document.querySelector("#progress-eta");
+      const bar = document.querySelector("#progress-bar");
+      const fill = document.querySelector("#bar-fill");
+      const waiting = document.querySelector("#waiting-view");
+      const desktop = document.querySelector("#desktop-view");
+      const runButton = document.querySelector("#run-demo");
+      const resetButton = document.querySelector("#reset-demo");
+      const scenarioButtons = [...document.querySelectorAll("[data-scenario]")];
+      const steps = [...document.querySelectorAll(".step")];
+      const layerStates = [...document.querySelectorAll(".layer-state")];
+      let scenario = "first";
+      let timer = null;
+
+      function setStep(active) {
+        const order = ["pull", "prepare", "boot", "desktop"];
+        const activeIndex = order.indexOf(active);
+        steps.forEach((step) => {
+          const index = order.indexOf(step.dataset.step);
+          step.classList.toggle("done", index < activeIndex);
+          step.classList.toggle("active", index === activeIndex);
+        });
+      }
+
+      function setProgress(value) {
+        const determinate = typeof value === "number";
+        bar.classList.toggle("indeterminate", !determinate);
+        fill.style.width = determinate ? `${value}%` : "";
+        if (determinate) {
+          bar.setAttribute("aria-valuenow", String(value));
+        } else {
+          bar.removeAttribute("aria-valuenow");
+        }
+      }
+
+      function reset() {
+        window.clearTimeout(timer);
+        timer = null;
+        desktop.classList.remove("ready");
+        waiting.classList.remove("hidden");
+        phaseLabel.textContent = "Preparing";
+        title.textContent = "Ready to start";
+        copy.textContent = "Run the demo to preview the pull and startup experience.";
+        detail.textContent = "No work started";
+        eta.textContent = "";
+        bar.classList.remove("indeterminate");
+        fill.style.width = "0";
+        bar.setAttribute("aria-valuenow", "0");
+        steps.forEach((step) => step.classList.remove("done", "active"));
+        layerStates.forEach((state) => state.textContent = "waiting");
+        runButton.disabled = false;
+        runButton.textContent = "Run demo";
+      }
+
+      function revealDesktop() {
+        steps.forEach((step) => {
+          step.classList.remove("active");
+          step.classList.add("done");
+        });
+        layerStates.forEach((state) => state.textContent = "verified");
+        waiting.classList.add("hidden");
+        desktop.classList.add("ready");
+        runButton.disabled = false;
+        runButton.textContent = "Run again";
+      }
+
+      function play(index = 0) {
+        const phases = scenarios[scenario].phases;
+        if (index >= phases.length) {
+          revealDesktop();
+          return;
+        }
+
+        const [label, heading, message, remaining, step, progress, duration] = phases[index];
+        phaseLabel.textContent = label;
+        title.textContent = heading;
+        copy.textContent = message;
+        detail.textContent = progress === null ? "Working…" : `${progress}% downloaded`;
+        eta.textContent = remaining;
+        setStep(step);
+        setProgress(progress);
+
+        if (label === "Pulling image") {
+          layerStates[0].textContent = "verified";
+          layerStates[1].textContent = "downloading";
+        } else if (label === "Verifying") {
+          layerStates.forEach((state) => state.textContent = "verifying");
+        } else if (index > 1) {
+          layerStates.forEach((state) => state.textContent = "verified");
+        }
+
+        timer = window.setTimeout(() => play(index + 1), duration);
+      }
+
+      runButton.addEventListener("click", () => {
+        reset();
+        runButton.disabled = true;
+        runButton.textContent = "Starting…";
+        play();
+      });
+
+      resetButton.addEventListener("click", reset);
+
+      scenarioButtons.forEach((button) => {
+        button.addEventListener("click", () => {
+          scenario = button.dataset.scenario;
+          scenarioButtons.forEach((candidate) => {
+            candidate.setAttribute("aria-pressed", String(candidate === button));
+          });
+          reset();
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

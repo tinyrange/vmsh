@@ -36,14 +36,18 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
+            build_ndappx: true
           - goos: linux
             goarch: arm64
+            build_ndappx: false
           - goos: windows
             goarch: amd64
             ext: .exe
+            build_ndappx: true
           - goos: windows
             goarch: arm64
             ext: .exe
+            build_ndappx: false
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -63,10 +67,12 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           EXE: ${{ matrix.ext }}
+          BUILD_NDAPPX: ${{ matrix.build_ndappx }}
         run: |
           set -euo pipefail
           version="${RELEASE_VERSION}"
-          name="vmsh_${version}_${GOOS}_${GOARCH}${EXE}"
+          vmsh_name="vmsh_${version}_${GOOS}_${GOARCH}${EXE}"
+          ndappx_name="ndappx_${version}_${GOOS}_${GOARCH}${EXE}"
           mkdir -p dist build/release
 
           cd cc
@@ -74,7 +80,19 @@ jobs:
           cd ..
           build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           ldflags="-X github.com/tinyrange/vmsh/internal/version.Release=${version} -X github.com/tinyrange/vmsh/internal/version.Commit=${GITHUB_SHA} -X github.com/tinyrange/vmsh/internal/version.Dirty=false -X github.com/tinyrange/vmsh/internal/version.BuildDate=${build_date}"
-          GOOS="$GOOS" GOARCH="$GOARCH" go build -buildvcs=false -trimpath -ldflags "$ldflags" -o "dist/${name}" ./cmd/vmsh
+          GOOS="$GOOS" GOARCH="$GOARCH" go build -buildvcs=false -trimpath -ldflags "$ldflags" -o "dist/${vmsh_name}" ./cmd/vmsh
+          if [[ "$BUILD_NDAPPX" == "true" ]]; then
+            ndappx_ldflags="$ldflags"
+            if [[ "$GOOS" == "windows" ]]; then
+              ndappx_ldflags="$ndappx_ldflags -H=windowsgui"
+            fi
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build \
+              -buildvcs=false \
+              -trimpath \
+              -ldflags "$ndappx_ldflags" \
+              -o "dist/${ndappx_name}" \
+              ./cmd/ndappx
+          fi
 
       - name: Verify embedded guest init payloads
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
@@ -96,12 +114,26 @@ jobs:
           grep -F "vmsh version ${RELEASE_VERSION}" <<<"$output"
           grep -F "platform linux/amd64" <<<"$output"
           grep -F "ccvm bundled" <<<"$output"
+          ndappx_name="ndappx_${RELEASE_VERSION}_linux_amd64"
+          "dist/${ndappx_name}" --help 2>&1 | grep -F "Usage of ndappx"
+
+      - name: Verify Windows desktop subsystem
+        if: matrix.goos == 'windows' && matrix.goarch == 'amd64'
+        run: |
+          set -euo pipefail
+          name="ndappx_${RELEASE_VERSION}_windows_amd64.exe"
+          objdump -p "dist/${name}" |
+            grep -E 'Subsystem[[:space:]]+00000002[[:space:]]+\\(Windows GUI\\)'
+          objdump -h "dist/${name}" |
+            grep -E '[[:space:]]\\.rsrc[[:space:]]'
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: vmsh-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/vmsh_${{ env.RELEASE_VERSION }}_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext }}
+          path: |
+            dist/vmsh_${{ env.RELEASE_VERSION }}_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext }}
+            dist/ndappx_${{ env.RELEASE_VERSION }}_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext }}
           if-no-files-found: error
 
   build-macos:
@@ -165,15 +197,47 @@ jobs:
         run: |
           set -euo pipefail
           version="${RELEASE_VERSION}"
-          name="vmsh_${version}_darwin_arm64"
-          mkdir -p dist build/release
+          vmsh_name="vmsh_${version}_darwin_arm64"
+          app="dist/Neurodesk.app"
+          mkdir -p \
+            dist \
+            build/release \
+            "$app/Contents/MacOS" \
+            "$app/Contents/Resources"
 
           cd cc
           go run ./internal/cmd/build-guestinit -arch arm64
           cd ..
           build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           ldflags="-X github.com/tinyrange/vmsh/internal/version.Release=${version} -X github.com/tinyrange/vmsh/internal/version.Commit=${GITHUB_SHA} -X github.com/tinyrange/vmsh/internal/version.Dirty=false -X github.com/tinyrange/vmsh/internal/version.BuildDate=${build_date}"
-          GOOS=darwin GOARCH=arm64 go build -buildvcs=false -trimpath -ldflags "$ldflags" -o "dist/${name}" ./cmd/vmsh
+          GOOS=darwin GOARCH=arm64 go build -buildvcs=false -trimpath -ldflags "$ldflags" -o "dist/${vmsh_name}" ./cmd/vmsh
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build \
+            -buildvcs=false \
+            -trimpath \
+            -ldflags "$ldflags" \
+            -o "$app/Contents/MacOS/Neurodesk" \
+            ./cmd/ndappx
+
+          cp cmd/ndappx/macos/Info.plist "$app/Contents/Info.plist"
+          bundle_version="$(printf '%s' "$version" | sed -E 's/^[^0-9]*//; s/[^0-9.].*$//')"
+          if [[ -z "$bundle_version" ]]; then
+            bundle_version="0.0.0"
+          fi
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleShortVersionString $bundle_version" \
+            -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" \
+            "$app/Contents/Info.plist"
+
+          iconset="build/release/Neurodesk.iconset"
+          mkdir -p "$iconset"
+          for size in 16 32 128 256 512; do
+            double=$((size * 2))
+            sips -z "$size" "$size" cmd/ndappx/assets/neurodesk-icon.png \
+              --out "$iconset/icon_${size}x${size}.png"
+            sips -z "$double" "$double" cmd/ndappx/assets/neurodesk-icon.png \
+              --out "$iconset/icon_${size}x${size}@2x.png"
+          done
+          iconutil -c icns "$iconset" -o "$app/Contents/Resources/Neurodesk.icns"
 
       - name: Verify embedded guest init payloads
         run: |
@@ -188,7 +252,6 @@ jobs:
       - name: Sign macOS binaries
         run: |
           set -euo pipefail
-          name="vmsh_${RELEASE_VERSION}_darwin_arm64"
           codesign \
             --force \
             --sign "$MACOS_DEVELOPER_ID" \
@@ -196,18 +259,40 @@ jobs:
             --timestamp \
             --options runtime \
             --keychain build.keychain \
-            "dist/${name}"
-          codesign --verify --strict --verbose=2 "dist/${name}"
-          codesign -d --verbose=4 "dist/${name}" 2>&1 | grep runtime
+            "dist/vmsh_${RELEASE_VERSION}_darwin_arm64"
+          codesign \
+            --force \
+            --sign "$MACOS_DEVELOPER_ID" \
+            --entitlements tools/entitlements.xml \
+            --timestamp \
+            --options runtime \
+            --keychain build.keychain \
+            "dist/Neurodesk.app/Contents/MacOS/Neurodesk"
+          codesign \
+            --force \
+            --sign "$MACOS_DEVELOPER_ID" \
+            --timestamp \
+            --options runtime \
+            --keychain build.keychain \
+            "dist/Neurodesk.app"
+          codesign --verify --deep --strict --verbose=2 "dist/Neurodesk.app"
+          codesign --verify --strict --verbose=2 "dist/vmsh_${RELEASE_VERSION}_darwin_arm64"
+          codesign -d --verbose=4 "dist/Neurodesk.app" 2>&1 | grep runtime
 
       - name: Notarize macOS binary
         run: |
           set -euo pipefail
-          name="vmsh_${RELEASE_VERSION}_darwin_arm64"
-          notary_zip="dist/${name}_notary.zip"
+          notary_dir="build/release/notary"
+          notary_zip="build/release/ndappx_vmsh_notary.zip"
           notary_result="$(mktemp)"
           trap 'rm -f "$notary_zip" "$notary_result"' EXIT
-          ditto -c -k --keepParent "dist/${name}" "$notary_zip"
+          rm -rf "$notary_dir"
+          mkdir -p "$notary_dir"
+          cp \
+            "dist/vmsh_${RELEASE_VERSION}_darwin_arm64" \
+            "$notary_dir/"
+          ditto "dist/Neurodesk.app" "$notary_dir/Neurodesk.app"
+          ditto -c -k --keepParent "$notary_dir" "$notary_zip"
 
           if [[ "$APPLE_ID_PASSWORD" == @keychain:* ]]; then
             notary_profile="${APPLE_ID_PASSWORD#@keychain:}"
@@ -227,7 +312,17 @@ jobs:
           fi
 
           test "$(plutil -extract status raw -o - "$notary_result")" = Accepted
-          codesign --verify --strict --verbose=2 "dist/${name}"
+          codesign --verify --strict --verbose=2 "dist/vmsh_${RELEASE_VERSION}_darwin_arm64"
+          codesign --verify --deep --strict --verbose=2 "dist/Neurodesk.app"
+          xcrun stapler staple "dist/Neurodesk.app"
+          xcrun stapler validate "dist/Neurodesk.app"
+          ditto \
+            -c \
+            -k \
+            --sequesterRsrc \
+            --keepParent \
+            "dist/Neurodesk.app" \
+            "dist/Neurodesk_${RELEASE_VERSION}_darwin_arm64.zip"
 
       - name: Smoke-test signed macOS payload
         run: |
@@ -237,12 +332,16 @@ jobs:
           grep -F "vmsh version ${RELEASE_VERSION}" <<<"$output"
           grep -F "platform darwin/arm64" <<<"$output"
           grep -F "ccvm bundled" <<<"$output"
+          "dist/Neurodesk.app/Contents/MacOS/Neurodesk" --help 2>&1 |
+            grep -F "Usage of ndappx"
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: vmsh-darwin-arm64
-          path: dist/vmsh_${{ env.RELEASE_VERSION }}_darwin_arm64
+          path: |
+            dist/vmsh_${{ env.RELEASE_VERSION }}_darwin_arm64
+            dist/Neurodesk_${{ env.RELEASE_VERSION }}_darwin_arm64.zip
           if-no-files-found: error
 
   publish:
@@ -261,7 +360,7 @@ jobs:
       - name: Generate checksums
         run: |
           set -euo pipefail
-          find artifacts -type f -name 'vmsh_*' -print0 |
+          find artifacts -type f \( -name 'vmsh_*' -o -name 'ndappx_*' -o -name 'Neurodesk_*.zip' \) -print0 |
             sort -z |
             xargs -0 sha256sum |
             sed 's#artifacts/[^/]*/##' > checksums.txt
@@ -282,4 +381,6 @@ jobs:
           body_path: RELEASENOTES.md
           files: |
             artifacts/**/vmsh_*
+            artifacts/**/ndappx_*
+            artifacts/**/Neurodesk_*.zip
             checksums.txt
