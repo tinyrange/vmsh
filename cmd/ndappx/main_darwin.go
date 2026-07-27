@@ -16,3 +16,11 @@ func platformArguments(args []string) []string {
 	}
 	return []string{defaultNeurodesktopImage}
 }
+
+func platformDefaultCPUs() int {
+	return 4
+}
+
+func platformDefaultEphemeralHome() bool {
+	return false
+}

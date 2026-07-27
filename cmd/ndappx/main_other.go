@@ -8,3 +8,11 @@ func platformArguments(args []string) []string {
 	}
 	return args
 }
+
+func platformDefaultCPUs() int {
+	return 4
+}
+
+func platformDefaultEphemeralHome() bool {
+	return false
+}

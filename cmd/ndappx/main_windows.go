@@ -22,6 +22,14 @@ func platformArguments(args []string) []string {
 	return []string{defaultNeurodesktopImage}
 }
 
+func platformDefaultCPUs() int {
+	return 1
+}
+
+func platformDefaultEphemeralHome() bool {
+	return true
+}
+
 func attachParentConsole() bool {
 	attached, _, _ := attachConsoleAPI.Call(attachParentProcess)
 	if attached == 0 {
