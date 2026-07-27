@@ -147,6 +147,7 @@ func run(args []string) (retErr error) {
 		PersistentMounts: persistentMounts,
 		MemoryMB:         *memoryMB,
 		CPUs:             *cpus,
+		AMD64Emulation:   true,
 		Dmesg:            *dmesg,
 		TimeoutSeconds:   bootTimeout.Seconds(),
 	}, func(event client.BootEvent) error {
