@@ -37,6 +37,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libglib2.0-bin \
         python3.14 \
+        python3.14-dev \
         python3.14-venv \
     && git clone --filter=blob:none https://github.com/pwndbg/pwndbg.git /opt/pwndbg \
     && cd /opt/pwndbg \
