@@ -1,0 +1,11 @@
+Port 22
+ListenAddress 0.0.0.0
+HostKey /home/squad/.squadvm-ssh/ssh_host_ed25519_key
+AuthorizedKeysFile .ssh/authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AllowUsers squad
+UsePAM yes
+PidFile /run/squadvm-sshd.pid
+Subsystem sftp internal-sftp
