@@ -1,0 +1,118 @@
+#!/bin/sh
+set -eu
+
+user=squad
+uid=1000
+gid=1000
+home=/home/squad
+
+install -d -o "$uid" -g "$gid" -m 0700 "/run/user/$uid"
+install -d -m 0755 /run/dbus
+install -d -o "$uid" -g "$gid" -m 0700 "$home"
+install -d -o "$uid" -g "$gid" -m 0700 "$home/.cache"
+install -d -o root -g root -m 1777 /tmp/.ICE-unix /tmp/.X11-unix
+cp -an /usr/share/squadvm/skel/. "$home/"
+ln -sfn /shared "$home/Desktop/Shared"
+chown "$uid:$gid" "$home"
+chown -R "$uid:$gid" "$home/.cache" "$home/.config" "$home/Desktop"
+
+ready_file="/run/user/$uid/squadvm-desktop-ready"
+rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 "$ready_file"
+
+setsid /usr/bin/dbus-daemon --system --nofork --nopidfile </dev/null &
+dbus_pid=$!
+setsid /usr/lib/xorg/Xorg :0 \
+    -noreset \
+    -nolisten tcp \
+    -novtswitch \
+    -sharevts \
+    -logfile /var/log/squadvm-Xorg.log </dev/null &
+xorg_pid=$!
+desktop_pid=
+
+cleanup() {
+    if [ -n "$desktop_pid" ]; then
+        kill "$desktop_pid" 2>/dev/null || true
+    fi
+    kill "$xorg_pid" 2>/dev/null || true
+    kill "$dbus_pid" 2>/dev/null || true
+}
+trap cleanup EXIT TERM
+trap : INT HUP
+
+attempt=0
+while [ ! -S /tmp/.X11-unix/X0 ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 400 ]; then
+        echo "squadvm: Xorg did not create display :0" >&2
+        exit 1
+    fi
+    sleep 0.05
+done
+
+attempt=0
+while [ ! -S /run/dbus/system_bus_socket ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 400 ]; then
+        echo "squadvm: D-Bus did not create the system bus socket" >&2
+        exit 1
+    fi
+    sleep 0.05
+done
+
+setsid setpriv --reuid="$uid" --regid="$gid" --clear-groups env \
+    DISPLAY=:0 \
+    HOME="$home" \
+    USER="$user" \
+    GTK_THEME=Adwaita:dark \
+    XDG_CURRENT_DESKTOP=XFCE \
+    XDG_RUNTIME_DIR="/run/user/$uid" \
+    dbus-run-session -- sh -eu -c '
+        xfconf-query -c xfce4-session -p /general/SaveOnExit -n -t bool -s false || true
+        gsettings set org.gnome.desktop.interface color-scheme prefer-dark || true
+        gsettings set org.gnome.desktop.interface gtk-theme Adwaita-dark || true
+        xsetroot -solid "#170e1f"
+        /usr/local/bin/glass-clipboard &
+        /usr/local/bin/glass-resize &
+
+        for launcher in "$HOME"/Desktop/*.desktop; do
+            chmod 0755 "$launcher"
+            checksum=$(sha256sum "$launcher" | cut -d " " -f 1)
+            gio set -t string "$launcher" metadata::xfce-exe-checksum "$checksum"
+        done
+
+        startxfce4 &
+        session_pid=$!
+
+        attempt=0
+        while ! pgrep -x xfce4-session >/dev/null 2>&1 ||
+              ! pgrep -x xfwm4 >/dev/null 2>&1 ||
+              ! pgrep -x xfce4-panel >/dev/null 2>&1 ||
+              ! pgrep -x xfdesktop >/dev/null 2>&1; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge 400 ]; then
+                echo "squadvm: XFCE desktop did not become ready" >&2
+                exit 1
+            fi
+            sleep 0.05
+        done
+
+        xfconf-query \
+            -c xfce4-panel \
+            -p /panels/panel-2/autohide-behavior \
+            -s 0
+
+        touch "$XDG_RUNTIME_DIR/squadvm-desktop-ready"
+        wait "$session_pid"
+    ' </dev/null &
+desktop_pid=$!
+
+while kill -0 "$desktop_pid" 2>/dev/null; do
+    if wait "$desktop_pid"; then
+        exit 0
+    fi
+    status=$?
+    if ! kill -0 "$desktop_pid" 2>/dev/null; then
+        exit "$status"
+    fi
+done

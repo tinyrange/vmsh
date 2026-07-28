@@ -1,0 +1,7 @@
+[Configuration]
+ColorBackground=#170e1f
+ColorForeground=#f8f6fa
+ColorCursor=#f8f6fa
+ColorPalette=#170e1f;#ff5370;#74d680;#ffd866;#0aa7ff;#b678ff;#00d9ff;#e8e3ec;#665b70;#ff7690;#96e6a1;#ffe795;#60c5ff;#cf9dff;#68e9ff;#ffffff
+MiscUseSystemFont=FALSE
+FontName=DejaVu Sans Mono 11

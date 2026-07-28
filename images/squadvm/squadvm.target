@@ -1,0 +1,6 @@
+[Unit]
+Description=SquadVM desktop
+DefaultDependencies=no
+Wants=ccx3-stage2.service squadvm-desktop.service
+After=ccx3-stage2.service
+AllowIsolate=yes

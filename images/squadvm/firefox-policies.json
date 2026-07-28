@@ -1,0 +1,17 @@
+{
+  "policies": {
+    "DisableAppUpdate": true,
+    "DisableFirefoxStudies": true,
+    "DisablePocket": true,
+    "DisableTelemetry": true,
+    "Homepage": {
+      "StartPage": "homepage",
+      "URL": "https://cybersquad.uqcloud.net/"
+    },
+    "NewTabPage": false,
+    "Preferences": {
+      "layout.css.prefers-color-scheme.content-override": 0,
+      "ui.systemUsesDarkTheme": 1
+    }
+  }
+}

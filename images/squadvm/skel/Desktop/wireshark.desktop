@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Wireshark
+Comment=Capture and inspect network traffic
+TryExec=/usr/bin/wireshark
+Exec=/usr/bin/wireshark
+Icon=org.wireshark.Wireshark
+Terminal=false
+StartupNotify=true
+Categories=Network;Security;

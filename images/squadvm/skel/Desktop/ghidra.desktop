@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Ghidra
+Comment=Reverse engineering framework
+TryExec=/usr/bin/ghidra
+Exec=/usr/bin/ghidra
+Icon=squadvm-ghidra
+Terminal=false
+StartupNotify=true
+Categories=Development;Security;
