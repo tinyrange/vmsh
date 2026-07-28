@@ -14,6 +14,24 @@ COPY glass-clipboard.c glass-resize.c /src/
 RUN cc -O2 -Wall -Wextra -o /glass-clipboard /src/glass-clipboard.c -lX11 \
     && cc -O2 -Wall -Wextra -o /glass-resize /src/glass-resize.c
 
+FROM ${KALI_BASE} AS binwalk-build
+
+ARG BINWALK_VERSION=v3.1.0
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cargo \
+        git \
+        libfontconfig1-dev \
+        pkg-config \
+        rustc \
+    && git clone --branch "${BINWALK_VERSION}" --depth 1 \
+        https://github.com/ReFirmLabs/binwalk.git /src/binwalk \
+    && cd /src/binwalk \
+    && cargo build --release --locked
+
 FROM ${KALI_BASE}
 
 ARG SQUADVM_USER=squad
@@ -61,9 +79,13 @@ RUN useradd --create-home --uid "${SQUADVM_UID}" --shell /bin/bash "${SQUADVM_US
 
 COPY --from=bridge-build /glass-clipboard /usr/local/bin/glass-clipboard
 COPY --from=bridge-build /glass-resize /usr/local/bin/glass-resize
+COPY --from=binwalk-build /src/binwalk/target/release/binwalk /usr/local/bin/binwalk
 COPY squadvm-burpsuite /usr/local/bin/squadvm-burpsuite
 COPY squadvm-session /usr/local/sbin/squadvm-session
+COPY squadvm-sshd-prepare /usr/local/sbin/squadvm-sshd-prepare
 COPY squadvm-desktop.service /etc/systemd/system/squadvm-desktop.service
+COPY squadvm-sshd.service /etc/systemd/system/squadvm-sshd.service
+COPY squadvm-sshd_config /etc/ssh/squadvm-sshd_config
 COPY squadvm.target /etc/systemd/system/squadvm.target
 COPY xorg.conf /etc/X11/xorg.conf
 COPY squadvm-wallpaper.svg squadvm-icon.svg /usr/share/squadvm/
@@ -107,13 +129,18 @@ RUN curl --fail --location --silent --show-error \
         /usr/local/bin/glass-clipboard \
         /usr/local/bin/glass-resize \
         /usr/local/bin/squadvm-burpsuite \
+        /usr/local/bin/binwalk \
+        /usr/local/sbin/squadvm-sshd-prepare \
         /usr/local/sbin/squadvm-session \
     && chmod 0775 \
         /var/lib/AccountsService \
         /var/lib/AccountsService/icons \
     && chmod 0700 /var/lib/AccountsService/users \
     && install -d -m 0755 /etc/systemd/system \
-    && systemctl enable squadvm-desktop.service \
+    && rm -f /etc/ssh/ssh_host_* \
+    && (systemctl disable ssh.service ssh.socket 2>/dev/null || true)
+
+RUN systemctl enable squadvm-desktop.service squadvm-sshd.service \
     && ln -sfn /etc/systemd/system/squadvm.target /etc/systemd/system/default.target \
     && systemctl mask \
         apt-daily-upgrade.timer \

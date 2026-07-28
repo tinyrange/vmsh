@@ -36,18 +36,18 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
-            build_ndappx: true
+            build_desktops: true
           - goos: linux
             goarch: arm64
-            build_ndappx: false
+            build_desktops: false
           - goos: windows
             goarch: amd64
             ext: .exe
-            build_ndappx: true
+            build_desktops: true
           - goos: windows
             goarch: arm64
             ext: .exe
-            build_ndappx: false
+            build_desktops: false
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -67,12 +67,13 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           EXE: ${{ matrix.ext }}
-          BUILD_NDAPPX: ${{ matrix.build_ndappx }}
+          BUILD_DESKTOPS: ${{ matrix.build_desktops }}
         run: |
           set -euo pipefail
           version="${RELEASE_VERSION}"
           vmsh_name="vmsh_${version}_${GOOS}_${GOARCH}${EXE}"
           app_name="NeurodeskAppX_${version}_${GOOS}_${GOARCH}${EXE}"
+          squadvm_name="SquadVM_${version}_${GOOS}_${GOARCH}${EXE}"
           mkdir -p dist build/release
 
           cd cc
@@ -81,17 +82,23 @@ jobs:
           build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           ldflags="-X github.com/tinyrange/vmsh/internal/version.Release=${version} -X github.com/tinyrange/vmsh/internal/version.Commit=${GITHUB_SHA} -X github.com/tinyrange/vmsh/internal/version.Dirty=false -X github.com/tinyrange/vmsh/internal/version.BuildDate=${build_date}"
           GOOS="$GOOS" GOARCH="$GOARCH" go build -buildvcs=false -trimpath -ldflags "$ldflags" -o "dist/${vmsh_name}" ./cmd/vmsh
-          if [[ "$BUILD_NDAPPX" == "true" ]]; then
-            ndappx_ldflags="$ldflags"
+          if [[ "$BUILD_DESKTOPS" == "true" ]]; then
+            desktop_ldflags="$ldflags"
             if [[ "$GOOS" == "windows" ]]; then
-              ndappx_ldflags="$ndappx_ldflags -H=windowsgui"
+              desktop_ldflags="$desktop_ldflags -H=windowsgui"
             fi
             CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build \
               -buildvcs=false \
               -trimpath \
-              -ldflags "$ndappx_ldflags" \
+              -ldflags "$desktop_ldflags" \
               -o "dist/${app_name}" \
               ./cmd/ndappx
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build \
+              -buildvcs=false \
+              -trimpath \
+              -ldflags "$desktop_ldflags" \
+              -o "dist/${squadvm_name}" \
+              ./cmd/squadvm
           fi
 
       - name: Verify embedded guest init payloads
@@ -116,12 +123,19 @@ jobs:
           grep -F "ccvm bundled" <<<"$output"
           app_name="NeurodeskAppX_${RELEASE_VERSION}_linux_amd64"
           "dist/${app_name}" --help 2>&1 | grep -F "Usage of NeurodeskAppX"
+          squadvm_name="SquadVM_${RELEASE_VERSION}_linux_amd64"
+          "dist/${squadvm_name}" --help 2>&1 | grep -F "Usage of SquadVM"
 
       - name: Verify Windows desktop subsystem
         if: matrix.goos == 'windows' && matrix.goarch == 'amd64'
         run: |
           set -euo pipefail
           name="NeurodeskAppX_${RELEASE_VERSION}_windows_amd64.exe"
+          objdump -p "dist/${name}" |
+            grep -E 'Subsystem[[:space:]]+00000002[[:space:]]+[(]Windows GUI[)]'
+          objdump -h "dist/${name}" |
+            grep -E '[[:space:]][.]rsrc[[:space:]]'
+          name="SquadVM_${RELEASE_VERSION}_windows_amd64.exe"
           objdump -p "dist/${name}" |
             grep -E 'Subsystem[[:space:]]+00000002[[:space:]]+[(]Windows GUI[)]'
           objdump -h "dist/${name}" |
@@ -134,6 +148,7 @@ jobs:
           path: |
             dist/vmsh_${{ env.RELEASE_VERSION }}_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext }}
             dist/NeurodeskAppX_${{ env.RELEASE_VERSION }}_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext }}
+            dist/SquadVM_${{ env.RELEASE_VERSION }}_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext }}
           if-no-files-found: error
 
   build-macos:
@@ -199,11 +214,14 @@ jobs:
           version="${RELEASE_VERSION}"
           vmsh_name="vmsh_${version}_darwin_arm64"
           app="dist/NeurodeskAppX.app"
+          squad_app="dist/SquadVM.app"
           mkdir -p \
             dist \
             build/release \
             "$app/Contents/MacOS" \
-            "$app/Contents/Resources"
+            "$app/Contents/Resources" \
+            "$squad_app/Contents/MacOS" \
+            "$squad_app/Contents/Resources"
 
           cd cc
           go run ./internal/cmd/build-guestinit -arch arm64
@@ -217,8 +235,15 @@ jobs:
             -ldflags "$ldflags" \
             -o "$app/Contents/MacOS/NeurodeskAppX" \
             ./cmd/ndappx
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build \
+            -buildvcs=false \
+            -trimpath \
+            -ldflags "$ldflags" \
+            -o "$squad_app/Contents/MacOS/SquadVM" \
+            ./cmd/squadvm
 
           cp cmd/ndappx/macos/Info.plist "$app/Contents/Info.plist"
+          cp cmd/squadvm/macos/Info.plist "$squad_app/Contents/Info.plist"
           bundle_version="$(printf '%s' "$version" | sed -E 's/^[^0-9]*//; s/[^0-9.].*$//')"
           if [[ -z "$bundle_version" ]]; then
             bundle_version="0.0.0"
@@ -227,6 +252,10 @@ jobs:
             -c "Set :CFBundleShortVersionString $bundle_version" \
             -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" \
             "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleShortVersionString $bundle_version" \
+            -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" \
+            "$squad_app/Contents/Info.plist"
 
           iconset="build/release/NeurodeskAppX.iconset"
           mkdir -p "$iconset"
@@ -238,6 +267,17 @@ jobs:
               --out "$iconset/icon_${size}x${size}@2x.png"
           done
           iconutil -c icns "$iconset" -o "$app/Contents/Resources/NeurodeskAppX.icns"
+
+          squad_iconset="build/release/SquadVM.iconset"
+          mkdir -p "$squad_iconset"
+          for size in 16 32 128 256 512; do
+            double=$((size * 2))
+            sips -z "$size" "$size" cmd/squadvm/assets/squadvm-icon.png \
+              --out "$squad_iconset/icon_${size}x${size}.png"
+            sips -z "$double" "$double" cmd/squadvm/assets/squadvm-icon.png \
+              --out "$squad_iconset/icon_${size}x${size}@2x.png"
+          done
+          iconutil -c icns "$squad_iconset" -o "$squad_app/Contents/Resources/SquadVM.icns"
 
       - name: Verify embedded guest init payloads
         run: |
@@ -276,12 +316,34 @@ jobs:
             --options runtime \
             --keychain build.keychain \
             "dist/NeurodeskAppX.app"
+          codesign \
+            --force \
+            --sign "$MACOS_DEVELOPER_ID" \
+            --entitlements tools/entitlements.xml \
+            --timestamp \
+            --options runtime \
+            --keychain build.keychain \
+            "dist/SquadVM.app/Contents/MacOS/SquadVM"
+          codesign \
+            --force \
+            --sign "$MACOS_DEVELOPER_ID" \
+            --entitlements tools/entitlements.xml \
+            --timestamp \
+            --options runtime \
+            --keychain build.keychain \
+            "dist/SquadVM.app"
           codesign --verify --deep --strict --verbose=2 "dist/NeurodeskAppX.app"
+          codesign --verify --deep --strict --verbose=2 "dist/SquadVM.app"
           codesign --verify --strict --verbose=2 "dist/vmsh_${RELEASE_VERSION}_darwin_arm64"
           codesign -d --verbose=4 "dist/NeurodeskAppX.app" 2>&1 | grep runtime
+          codesign -d --verbose=4 "dist/SquadVM.app" 2>&1 | grep runtime
           app_entitlements="$(mktemp)"
           trap 'rm -f "$app_entitlements"' EXIT
           codesign -d --entitlements :- "dist/NeurodeskAppX.app" > "$app_entitlements"
+          test "$(/usr/libexec/PlistBuddy \
+            -c 'Print :com.apple.security.hypervisor' \
+            "$app_entitlements")" = true
+          codesign -d --entitlements :- "dist/SquadVM.app" > "$app_entitlements"
           test "$(/usr/libexec/PlistBuddy \
             -c 'Print :com.apple.security.hypervisor' \
             "$app_entitlements")" = true
@@ -290,7 +352,7 @@ jobs:
         run: |
           set -euo pipefail
           notary_dir="build/release/notary"
-          notary_zip="build/release/neurodesk_appx_vmsh_notary.zip"
+          notary_zip="build/release/desktop_apps_vmsh_notary.zip"
           notary_result="$(mktemp)"
           trap 'rm -f "$notary_zip" "$notary_result"' EXIT
           rm -rf "$notary_dir"
@@ -299,6 +361,7 @@ jobs:
             "dist/vmsh_${RELEASE_VERSION}_darwin_arm64" \
             "$notary_dir/"
           ditto "dist/NeurodeskAppX.app" "$notary_dir/NeurodeskAppX.app"
+          ditto "dist/SquadVM.app" "$notary_dir/SquadVM.app"
           ditto -c -k --keepParent "$notary_dir" "$notary_zip"
 
           if [[ "$APPLE_ID_PASSWORD" == @keychain:* ]]; then
@@ -321,8 +384,11 @@ jobs:
           test "$(plutil -extract status raw -o - "$notary_result")" = Accepted
           codesign --verify --strict --verbose=2 "dist/vmsh_${RELEASE_VERSION}_darwin_arm64"
           codesign --verify --deep --strict --verbose=2 "dist/NeurodeskAppX.app"
+          codesign --verify --deep --strict --verbose=2 "dist/SquadVM.app"
           xcrun stapler staple "dist/NeurodeskAppX.app"
           xcrun stapler validate "dist/NeurodeskAppX.app"
+          xcrun stapler staple "dist/SquadVM.app"
+          xcrun stapler validate "dist/SquadVM.app"
           ditto \
             -c \
             -k \
@@ -330,6 +396,13 @@ jobs:
             --keepParent \
             "dist/NeurodeskAppX.app" \
             "dist/NeurodeskAppX_${RELEASE_VERSION}_darwin_arm64.zip"
+          ditto \
+            -c \
+            -k \
+            --sequesterRsrc \
+            --keepParent \
+            "dist/SquadVM.app" \
+            "dist/SquadVM_${RELEASE_VERSION}_darwin_arm64.zip"
 
       - name: Smoke-test signed macOS payload
         run: |
@@ -341,6 +414,8 @@ jobs:
           grep -F "ccvm bundled" <<<"$output"
           "dist/NeurodeskAppX.app/Contents/MacOS/NeurodeskAppX" --help 2>&1 |
             grep -F "Usage of NeurodeskAppX"
+          "dist/SquadVM.app/Contents/MacOS/SquadVM" --help 2>&1 |
+            grep -F "Usage of SquadVM"
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -349,6 +424,7 @@ jobs:
           path: |
             dist/vmsh_${{ env.RELEASE_VERSION }}_darwin_arm64
             dist/NeurodeskAppX_${{ env.RELEASE_VERSION }}_darwin_arm64.zip
+            dist/SquadVM_${{ env.RELEASE_VERSION }}_darwin_arm64.zip
           if-no-files-found: error
 
   publish:
@@ -367,7 +443,7 @@ jobs:
       - name: Generate checksums
         run: |
           set -euo pipefail
-          find artifacts -type f \( -name 'vmsh_*' -o -name 'NeurodeskAppX_*' \) -print0 |
+          find artifacts -type f \( -name 'vmsh_*' -o -name 'NeurodeskAppX_*' -o -name 'SquadVM_*' \) -print0 |
             sort -z |
             xargs -0 sha256sum |
             sed 's#artifacts/[^/]*/##' > checksums.txt
@@ -389,4 +465,5 @@ jobs:
           files: |
             artifacts/**/vmsh_*
             artifacts/**/NeurodeskAppX_*
+            artifacts/**/SquadVM_*
             checksums.txt

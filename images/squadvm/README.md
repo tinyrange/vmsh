@@ -4,12 +4,31 @@ SquadVM is a curated Kali Linux desktop for UQ Cyber Squad. It boots systemd,
 Xorg, and XFCE against the Glass virtio display and input devices. The image
 includes the Glass clipboard and display-resize bridges, a non-root `squad`
 user with passwordless sudo, and an explicit security-tool manifest.
+The SSH daemon runs inside the isolated guest with password and root login
+disabled. SquadVM's optional host integration installs a dedicated key,
+forwards the service on host loopback, and manages the `Host squadvm` block in
+`~/.ssh/config`.
+
+The image builds the Rust rewrite of Binwalk from the pinned v3.1.0 release
+rather than installing Kali's Binwalk v2 package.
 
 Build the image from this directory:
 
 ```sh
 docker build --tag squadvm:dev .
 ```
+
+Run the native SquadVM frontend from the repository root:
+
+```sh
+go run ./cmd/squadvm
+```
+
+With no arguments it pulls the host architecture from
+`ghcr.io/tinyrange/squadvm:edge`, opens the Glass desktop in a native window,
+persists the image home directory, and maps `~/squadvm-shared` on the host to
+`/shared` in the guest. Pass another OCI reference as the final argument to
+test a locally published image.
 
 Import and start it with `cc`:
 

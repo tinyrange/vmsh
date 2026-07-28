@@ -36,6 +36,7 @@ locales
 man-db
 nano
 openssh-client
+openssh-server
 openssl
 python3
 python3-dev
@@ -61,7 +62,6 @@ wireshark
 python3-pwntools
 gdb
 gdbserver
-binwalk
 checksec
 patchelf
 ropper

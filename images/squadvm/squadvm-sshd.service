@@ -1,0 +1,16 @@
+[Unit]
+Description=SquadVM SSH server
+DefaultDependencies=no
+After=ccx3-stage2.service
+Wants=ccx3-stage2.service
+
+[Service]
+Type=notify
+ExecStartPre=/usr/local/sbin/squadvm-sshd-prepare
+ExecStart=/usr/sbin/sshd -D -f /etc/ssh/squadvm-sshd_config
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=on-failure
+
+[Install]
+WantedBy=squadvm.target

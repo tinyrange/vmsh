@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+key_dir=/home/squad/.squadvm-ssh
+key_path="$key_dir/ssh_host_ed25519_key"
+
+install -d -o root -g root -m 0755 /run/sshd
+install -d -o root -g root -m 0700 "$key_dir"
+if [ ! -s "$key_path" ]; then
+    ssh-keygen -q -t ed25519 -N "" -f "$key_path"
+fi
+chown root:root "$key_path" "$key_path.pub"
+chmod 0600 "$key_path"
+chmod 0644 "$key_path.pub"
