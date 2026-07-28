@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="1920" height="1080" viewBox="0 0 1920 1080">
+  <rect width="1920" height="1080" fill="#170e1f"/>
+  <image x="460" y="340" width="1000" height="400"
+         href="cyber-squad-logo.svg"
+         xlink:href="cyber-squad-logo.svg"
+         preserveAspectRatio="xMidYMid meet"/>
+</svg>

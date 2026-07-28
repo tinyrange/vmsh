@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Terminal
+Comment=Open the SquadVM command line
+TryExec=/usr/bin/xfce4-terminal
+Exec=/usr/bin/xfce4-terminal
+Icon=org.xfce.terminal
+Terminal=false
+StartupNotify=true
+Categories=System;TerminalEmulator;

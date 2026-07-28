@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Burp Suite
+Comment=Intercept and test web application traffic
+TryExec=/usr/local/bin/squadvm-burpsuite
+Exec=/usr/local/bin/squadvm-burpsuite
+Icon=squadvm-burpsuite
+Terminal=false
+StartupNotify=true
+Categories=Security;Network;
