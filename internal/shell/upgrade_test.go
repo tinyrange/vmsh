@@ -193,7 +193,11 @@ func TestUpgradeProcessEndToEnd(t *testing.T) {
 	if result.Version != releaseTag || result.Active != "" || result.Disable != "1" {
 		t.Fatalf("replacement process result = %+v", result)
 	}
-	wantArgs := []string{runningExecutable, "-cache-dir", cacheDir}
+	wantExecutable, err := filepath.EvalSymlinks(runningExecutable)
+	if err != nil {
+		t.Fatalf("resolve installed executable: %v", err)
+	}
+	wantArgs := []string{wantExecutable, "-cache-dir", cacheDir}
 	if !slices.Equal(result.Args, wantArgs) {
 		t.Fatalf("replacement process args = %q, want %q", result.Args, wantArgs)
 	}
@@ -211,7 +215,7 @@ func TestUpgradeProcessEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read process upgrade notice: %v", err)
 	}
-	if notice.Version != releaseTag || notice.Executable != runningExecutable {
+	if notice.Version != releaseTag || notice.Executable != wantExecutable {
 		t.Fatalf("process upgrade notice = %+v", notice)
 	}
 	for _, pattern := range []string{".upgrade-download-*", ".upgrade-rollback-*"} {
