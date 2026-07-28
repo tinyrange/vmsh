@@ -16,13 +16,14 @@ import (
 )
 
 type paths struct {
-	root   string
-	ccDir  string
-	build  string
-	ccBin  string
-	ccvm   string
-	ndappx string
-	vmsh   string
+	root    string
+	ccDir   string
+	build   string
+	ccBin   string
+	ccvm    string
+	ndappx  string
+	squadvm string
+	vmsh    string
 }
 
 var (
@@ -135,13 +136,14 @@ func makePaths(buildDirArg string) (paths, error) {
 	buildDir := resolveBuildDir(root, buildDirArg)
 	ccDir := filepath.Join(root, "cc")
 	return paths{
-		root:   root,
-		ccDir:  ccDir,
-		build:  buildDir,
-		ccBin:  filepath.Join(buildDir, "cc"+suffix),
-		ccvm:   filepath.Join(buildDir, "ccvm"+suffix),
-		ndappx: filepath.Join(buildDir, "ndappx"+suffix),
-		vmsh:   filepath.Join(buildDir, "vmsh"+suffix),
+		root:    root,
+		ccDir:   ccDir,
+		build:   buildDir,
+		ccBin:   filepath.Join(buildDir, "cc"+suffix),
+		ccvm:    filepath.Join(buildDir, "ccvm"+suffix),
+		ndappx:  filepath.Join(buildDir, "ndappx"+suffix),
+		squadvm: filepath.Join(buildDir, "squadvm"+suffix),
+		vmsh:    filepath.Join(buildDir, "vmsh"+suffix),
 	}, nil
 }
 
@@ -262,6 +264,11 @@ func build(p paths) error {
 	}); err != nil {
 		return err
 	}
+	if err := step("build squadvm", func() error {
+		return goBuild(p.root, []string{"CGO_ENABLED=0"}, p.squadvm, "./cmd/squadvm")
+	}); err != nil {
+		return err
+	}
 	if err := step("build vmsh", func() error {
 		args := []string{"./cmd/vmsh"}
 		if ldflags := vmshVersionLDFlags(p.root); ldflags != "" {
@@ -287,11 +294,17 @@ func build(p paths) error {
 		}); err != nil {
 			return err
 		}
+		if err := step("codesign squadvm", func() error {
+			return command(p.root, nil, "codesign", "-f", "-s", "-", "--entitlements", filepath.Join(p.root, "tools", "entitlements.xml"), p.squadvm)
+		}); err != nil {
+			return err
+		}
 	}
 
 	logf("built cc: %s", p.ccBin)
 	logf("built ccvm: %s", p.ccvm)
 	logf("built ndappx: %s", p.ndappx)
+	logf("built squadvm: %s", p.squadvm)
 	logf("built vmsh: %s", p.vmsh)
 
 	return nil
