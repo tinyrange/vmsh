@@ -6214,6 +6214,15 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 				return false
 			})
 		})
+		if interrupted.Load() && !persistentGuestShellEnded(err) {
+			// Some guest shells can report an interrupted command as complete
+			// immediately before the shell itself exits. Serialize a harmless
+			// command behind the interrupt so a dying session is discarded
+			// before the next prompt can reuse it.
+			if probeErr := session.run(":", io.Discard, io.Discard, nil); persistentGuestShellEnded(probeErr) {
+				err = probeErr
+			}
+		}
 		if persistentGuestShellEnded(err) && s.guestShell == session {
 			s.guestShell = nil
 		}
