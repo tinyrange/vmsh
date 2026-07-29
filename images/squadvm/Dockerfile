@@ -117,6 +117,7 @@ COPY --from=bridge-build /glass-resize /usr/local/bin/glass-resize
 COPY --from=binwalk-build /src/binwalk/target/release/binwalk /usr/local/bin/binwalk
 COPY --from=pwninit-build /src/pwninit/target/release/pwninit /usr/local/bin/pwninit
 COPY squadvm-burpsuite /usr/local/bin/squadvm-burpsuite
+COPY qemu-gdb /tmp/qemu-gdb
 COPY squadvm-session /usr/local/sbin/squadvm-session
 COPY squadvm-sshd-prepare /usr/local/sbin/squadvm-sshd-prepare
 COPY squadvm-binfmt.service /etc/systemd/system/squadvm-binfmt.service
@@ -170,6 +171,10 @@ RUN curl --fail --location --silent --show-error \
         /usr/local/bin/pwninit \
         /usr/local/sbin/squadvm-sshd-prepare \
         /usr/local/sbin/squadvm-session \
+    && if [ "${TARGETARCH}" = "arm64" ]; then \
+        install -m 0755 /tmp/qemu-gdb /usr/local/bin/qemu-gdb; \
+    fi \
+    && rm -f /tmp/qemu-gdb \
     && chmod 0775 \
         /var/lib/AccountsService \
         /var/lib/AccountsService/icons \
@@ -198,6 +203,8 @@ RUN systemctl enable squadvm-desktop.service squadvm-sshd.service \
         dpkg --print-foreign-architectures | grep -Fx amd64 \
         && test -x /usr/bin/qemu-x86_64 \
         && test "$(readlink -f /usr/local/bin/gdb)" = /usr/bin/gdb-multiarch \
+        && test -x /usr/local/bin/qemu-gdb \
+        && bash -n /usr/local/bin/qemu-gdb \
         && /usr/local/bin/gdb --batch --quiet -ex 'set architecture i386:x86-64' -ex quit \
         && test -f /usr/lib/binfmt.d/qemu-x86_64.conf \
         && test -x /usr/lib/systemd/systemd-binfmt \
