@@ -24,7 +24,7 @@ func TestDriverWindowsBuiltInConsoleProgram(t *testing.T) {
 	}
 	defer rec.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	s, err := Start(ctx, Options{
 		Command: []string{
