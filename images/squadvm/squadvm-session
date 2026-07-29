@@ -25,7 +25,6 @@ setsid /usr/lib/xorg/Xorg :0 \
     -noreset \
     -nolisten tcp \
     -novtswitch \
-    -sharevts \
     -logfile /var/log/squadvm-Xorg.log </dev/null &
 xorg_pid=$!
 desktop_pid=
