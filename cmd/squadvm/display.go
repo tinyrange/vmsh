@@ -74,6 +74,11 @@ type displayViewer struct {
 	settings          startupOptions
 	firstRunComplete  bool
 	showSettings      bool
+	updateShownAt     time.Time
+	releaseDismissed  bool
+	imageDismissed    bool
+	releaseUpdateErr  error
+	imageRestartReady chan struct{}
 	starting          bool
 	returnToSettings  bool
 	startCancel       context.CancelFunc
@@ -109,18 +114,19 @@ func openDisplayWindow(
 		return fmt.Errorf("open graphics window: %w", err)
 	}
 	viewer := &displayViewer{
-		window:           win,
-		keysDown:         make(map[window.Key]bool),
-		startup:          initialStartupProgress(),
-		startupEvents:    make(chan startupProgress, 16),
-		startDone:        make(chan displayStartResult, 1),
-		cancelDone:       make(chan struct{}, 1),
-		preflightDone:    make(chan displayPreflightResult, 1),
-		settings:         settings,
-		firstRunComplete: firstRunComplete,
-		showSettings:     !firstRunComplete,
-		parentContext:    ctx,
-		start:            start,
+		window:            win,
+		keysDown:          make(map[window.Key]bool),
+		startup:           initialStartupProgress(),
+		startupEvents:     make(chan startupProgress, 16),
+		startDone:         make(chan displayStartResult, 1),
+		cancelDone:        make(chan struct{}, 1),
+		preflightDone:     make(chan displayPreflightResult, 1),
+		imageRestartReady: make(chan struct{}, 1),
+		settings:          settings,
+		firstRunComplete:  firstRunComplete,
+		showSettings:      !firstRunComplete,
+		parentContext:     ctx,
+		start:             start,
 	}
 	if err := viewer.init(); err != nil {
 		win.Close()
@@ -307,11 +313,16 @@ func (v *displayViewer) loop(ctx context.Context) error {
 				}
 				v.preflight = result.preflight
 				v.preflightReady = true
-				if !v.firstRunComplete || !v.preflight.canStart() || v.preflight.hasUpdate() {
+				if !v.firstRunComplete || !v.preflight.canStart() {
 					v.showSettings = true
 				} else {
 					v.beginStart(false)
 				}
+			case <-v.imageRestartReady:
+				v.starting = false
+				v.startCancel = nil
+				v.attemptStopped = nil
+				v.beginStart(true)
 			default:
 				goto eventsDrained
 			}
@@ -361,6 +372,7 @@ func (v *displayViewer) loop(ctx context.Context) error {
 			v.gl.BindTexture(gl.Texture2D, v.texture)
 			v.gl.BindVertexArray(v.vertexArray)
 			v.gl.DrawArrays(gl.Triangles, 0, 6)
+			v.drawUpdateNotifications(backingWidth, backingHeight, time.Now())
 		} else if v.showSettings {
 			v.drawSettings(backingWidth, backingHeight)
 		} else {
@@ -384,19 +396,19 @@ func settingsControlLayout(width, height float32) startupControlLayout {
 	left := (width - panelWidth) / 2
 	contentTop := max(float32(24), (height-548)/2)
 	return startupControlLayout{
-		sshCheckbox:    image.Rect(int(left), int(contentTop+300), int(left+panelWidth), int(contentTop+350)),
-		systemCheckbox: image.Rect(int(left), int(contentTop+358), int(left+panelWidth), int(contentTop+408)),
+		sshCheckbox:    image.Rect(int(left), int(contentTop+350), int(left+panelWidth), int(contentTop+400)),
+		systemCheckbox: image.Rect(int(left), int(contentTop+408), int(left+panelWidth), int(contentTop+458)),
 		skip: image.Rect(
 			int(left+max(float32(0), panelWidth-432)),
-			int(contentTop+436),
-			int(left+max(float32(0), panelWidth-228)),
 			int(contentTop+486),
+			int(left+max(float32(0), panelWidth-228)),
+			int(contentTop+536),
 		),
 		button: image.Rect(
 			int(left+max(float32(0), panelWidth-216)),
-			int(contentTop+436),
-			int(left+panelWidth),
 			int(contentTop+486),
+			int(left+panelWidth),
+			int(contentTop+536),
 		),
 	}
 }
@@ -440,7 +452,7 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 			case window.KeySpace:
 				v.settings.SSHEnabled = !v.settings.SSHEnabled
 			case window.KeyEnter:
-				v.beginStart(v.preflight.hasUpdate())
+				v.beginSettingsStart(v.preflight.hasUpdate())
 			}
 		case window.InputEventMouseDown:
 			backingWidth, backingHeight := v.window.BackingSize()
@@ -452,12 +464,19 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 			case point.In(layout.systemCheckbox):
 				v.settings.SystemInstall = !v.settings.SystemInstall
 			case v.preflight.hasUpdate() && point.In(layout.skip):
-				v.beginStart(false)
+				v.beginSettingsStart(false)
 			case point.In(layout.button):
-				v.beginStart(v.preflight.hasUpdate())
+				v.beginSettingsStart(v.preflight.hasUpdate())
 			}
 		}
 	}
+}
+
+func (v *displayViewer) beginSettingsStart(refreshImage bool) {
+	if v.preflight.hasUpdate() {
+		v.imageDismissed = true
+	}
+	v.beginStart(refreshImage)
 }
 
 func (v *displayViewer) updateTexture() (display.FramebufferUpdate, error) {
@@ -508,12 +527,15 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 	} else if v.preflightReady {
 		title = "Ready to start"
 		detail = "SquadVM is ready."
-		if v.preflight.hasUpdate() {
-			title = "Update available"
-			detail = "Update now or start the installed image."
-		} else if !v.preflight.Image.Installed {
+		if !v.preflight.Image.Installed {
 			title = "Set up SquadVM"
 			detail = "Download the image to get started."
+		} else if v.preflight.hasUpdate() && v.preflight.ReleaseUpdate != nil {
+			title = "Updates available"
+			detail = "Review the available updates below."
+		} else if v.preflight.hasUpdate() || v.preflight.ReleaseUpdate != nil {
+			title = "Update available"
+			detail = "Review the update below."
 		}
 		if !v.preflight.canStart() {
 			title = "Can't start yet"
@@ -543,6 +565,11 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 		imagePreflightStatus(v.preflightReady, imageOK, v.preflight),
 		"IMAGE",
 		preflightImageDetail(v.preflightReady, v.preflight, v.settings.DownloadRate),
+	)
+	v.drawPreflightRow(backingWidth, backingHeight, scale, left, rowY+180, panelWidth,
+		releasePreflightStatus(v.preflightReady, v.preflight),
+		"VMM",
+		preflightReleaseDetail(v.preflightReady, v.preflight),
 	)
 
 	layout := settingsControlLayout(width, height)
@@ -658,6 +685,16 @@ func imagePreflightStatus(ready, ok bool, preflight startupPreflight) string {
 	return preflightStatus(ready, ok)
 }
 
+func releasePreflightStatus(ready bool, preflight startupPreflight) string {
+	if ready && preflight.ReleaseUpdate != nil {
+		return "UPDATE"
+	}
+	if ready && !preflight.ReleaseChecked {
+		return "SKIP"
+	}
+	return preflightStatus(ready, true)
+}
+
 func preflightVirtualizationDetail(ready bool, preflight startupPreflight) string {
 	if !ready {
 		return "Checking"
@@ -689,6 +726,26 @@ func preflightImageDetail(ready bool, preflight startupPreflight, downloadRate f
 		return fmt.Sprintf("%s update · %s", size, eta)
 	}
 	return fmt.Sprintf("%s download · %s", size, eta)
+}
+
+func preflightReleaseDetail(ready bool, preflight startupPreflight) string {
+	if !ready {
+		return "Checking GitHub Releases"
+	}
+	if !preflight.ReleaseChecked {
+		if preflight.ReleaseCheckDetail != "" {
+			return preflight.ReleaseCheckDetail
+		}
+		return "Check skipped"
+	}
+	if preflight.ReleaseUpdate == nil {
+		return "Current"
+	}
+	detail := preflight.ReleaseUpdate.Version
+	if preflight.ReleaseUpdate.Size > 0 {
+		detail += " · " + formatBytes(preflight.ReleaseUpdate.Size)
+	}
+	return detail
 }
 
 func (v *displayViewer) drawStartup(backingWidth, backingHeight int, now time.Time) {
@@ -949,6 +1006,10 @@ func normalizedDisplayScale(scale float32) float32 {
 
 func (v *displayViewer) handleInput() error {
 	for _, event := range v.window.DrainInputEvents() {
+		if event.Type == window.InputEventMouseDown &&
+			v.handleUpdateNotificationClick(event.MouseX, event.MouseY, time.Now()) {
+			continue
+		}
 		switch event.Type {
 		case window.InputEventKeyDown, window.InputEventKeyUp, window.InputEventFlagsChanged:
 			code, ok := linuxKeycode(event.Key)

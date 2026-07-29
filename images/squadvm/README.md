@@ -12,6 +12,21 @@ forwards the service on host loopback, and manages the `Host squadvm` block in
 The image builds the Rust rewrite of Binwalk from the pinned v3.1.0 release
 rather than installing Kali's Binwalk v2 package.
 
+On arm64, run an x86-64 program normally through binfmt:
+
+```sh
+./hello
+```
+
+Debug it through QEMU's GDB stub:
+
+```sh
+qemu-gdb ./hello
+```
+
+This opens Pwndbg with the x86-64 target connected. Set breakpoints and use
+`continue`; do not use GDB's `run` command for an emulated program.
+
 Build the image from this directory:
 
 ```sh

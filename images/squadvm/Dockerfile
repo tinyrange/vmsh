@@ -56,7 +56,7 @@ FROM ${KALI_BASE}
 ARG TARGETARCH
 ARG SQUADVM_USER=squad
 ARG SQUADVM_UID=1000
-ARG PWNDBG_COMMIT=3b90bbf18ced8293813952f11755f904dedefa71
+ARG PWNDBG_COMMIT=73c6ec27f91828408fa28e5604445bc3293d2d9b
 ARG ZSTEG_VERSION=0.2.14
 ARG CYBER_SQUAD_LOGO_SHA256=6d0285eb4427f1ddf430fca774c31a3e3a39aeb3c3148eabd2b58a0445c19724
 
@@ -73,10 +73,12 @@ RUN echo "wireshark-common wireshark-common/install-setuid boolean true" | debco
     && if [ "${TARGETARCH}" = "arm64" ]; then \
         apt-get install -y --no-install-recommends \
             qemu-user-binfmt \
+            gdb-multiarch \
             libc6:amd64 \
             libgcc-s1:amd64 \
             libstdc++6:amd64 \
-            zlib1g:amd64; \
+            zlib1g:amd64 \
+        && ln -sfn /usr/bin/gdb-multiarch /usr/local/bin/gdb; \
     fi \
     && rm -f /tmp/squadvm-packages.txt \
     && apt-get clean \
@@ -92,6 +94,7 @@ RUN apt-get update \
     && cd /opt/pwndbg \
     && git checkout "${PWNDBG_COMMIT}" \
     && PWNDBG_VENV_PATH=/opt/pwndbg/.venv PWNDBG_NO_AUTOUPDATE=1 ./setup.sh \
+    && sha256sum uv.lock | cut -d ' ' -f 1 > /opt/pwndbg/.venv/uv.lock.hash \
     && rm -f /root/.gdbinit \
     && gem install --no-document --version "${ZSTEG_VERSION}" zsteg \
     && chown -R "${SQUADVM_UID}:${SQUADVM_UID}" /opt/pwndbg \
@@ -114,6 +117,7 @@ COPY --from=bridge-build /glass-resize /usr/local/bin/glass-resize
 COPY --from=binwalk-build /src/binwalk/target/release/binwalk /usr/local/bin/binwalk
 COPY --from=pwninit-build /src/pwninit/target/release/pwninit /usr/local/bin/pwninit
 COPY squadvm-burpsuite /usr/local/bin/squadvm-burpsuite
+COPY qemu-gdb /tmp/qemu-gdb
 COPY squadvm-session /usr/local/sbin/squadvm-session
 COPY squadvm-sshd-prepare /usr/local/sbin/squadvm-sshd-prepare
 COPY squadvm-binfmt.service /etc/systemd/system/squadvm-binfmt.service
@@ -167,6 +171,10 @@ RUN curl --fail --location --silent --show-error \
         /usr/local/bin/pwninit \
         /usr/local/sbin/squadvm-sshd-prepare \
         /usr/local/sbin/squadvm-session \
+    && if [ "${TARGETARCH}" = "arm64" ]; then \
+        install -m 0755 /tmp/qemu-gdb /usr/local/bin/qemu-gdb; \
+    fi \
+    && rm -f /tmp/qemu-gdb \
     && chmod 0775 \
         /var/lib/AccountsService \
         /var/lib/AccountsService/icons \
@@ -189,10 +197,15 @@ RUN systemctl enable squadvm-desktop.service squadvm-sshd.service \
     && test -z "$(find /opt/pwndbg ! -user "${SQUADVM_USER}" -print -quit)" \
     && runuser -u "${SQUADVM_USER}" -- test -r /opt/pwndbg/gdbinit.py \
     && runuser -u "${SQUADVM_USER}" -- test -x /opt/pwndbg/.venv/bin/python \
+    && test "$(sha256sum /opt/pwndbg/uv.lock | cut -d ' ' -f 1)" = "$(cat /opt/pwndbg/.venv/uv.lock.hash)" \
     && runuser -u "${SQUADVM_USER}" -- /usr/local/bin/pwninit --version \
     && if [ "${TARGETARCH}" = "arm64" ]; then \
         dpkg --print-foreign-architectures | grep -Fx amd64 \
         && test -x /usr/bin/qemu-x86_64 \
+        && test "$(readlink -f /usr/local/bin/gdb)" = /usr/bin/gdb-multiarch \
+        && test -x /usr/local/bin/qemu-gdb \
+        && bash -n /usr/local/bin/qemu-gdb \
+        && /usr/local/bin/gdb --batch --quiet -ex 'set architecture i386:x86-64' -ex quit \
         && test -f /usr/lib/binfmt.d/qemu-x86_64.conf \
         && test -x /usr/lib/systemd/systemd-binfmt \
         && test -x /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 \

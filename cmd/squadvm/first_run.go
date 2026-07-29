@@ -50,6 +50,9 @@ type startupPreflight struct {
 	FreeBytes            int64
 	RequiredBytes        int64
 	Image                client.ImagePullPlan
+	ReleaseUpdate        *squadVMReleaseUpdate
+	ReleaseChecked       bool
+	ReleaseCheckDetail   string
 }
 
 func (p startupPreflight) canStart() bool {
@@ -116,18 +119,28 @@ func (s squadVMSettings) systemInstall() bool {
 	}
 }
 
-var squadVMExecutable = os.Executable
+var (
+	squadVMExecutable   = os.Executable
+	squadVMUserCacheDir = os.UserCacheDir
+)
 
 func resolveSquadVMCacheDir(explicit string, systemInstall bool) (string, error) {
 	if dir := strings.TrimSpace(explicit); dir != "" {
 		return filepath.Abs(dir)
 	}
 	if systemInstall {
-		userCache, err := os.UserCacheDir()
+		userCache, err := squadVMUserCacheDir()
 		if err != nil {
 			return "", fmt.Errorf("resolve user cache directory: %w", err)
 		}
 		return filepath.Join(userCache, "ccx3"), nil
+	}
+	// Releases before portable mode stored SquadVM in the regular ccx3 cache.
+	// Reuse that complete installation before looking beside the executable;
+	// otherwise an upgrade can appear to lose the image and download it again.
+	regularCache, err := resolveSquadVMCacheDir("", true)
+	if err == nil && squadVMCacheContainsImage(regularCache) {
+		return regularCache, nil
 	}
 	executable, err := squadVMExecutable()
 	if err != nil {
@@ -150,7 +163,31 @@ func resolveSquadVMCacheDir(explicit string, systemInstall bool) (string, error)
 	return filepath.Join(parent, "SquadVM-data", "cache"), nil
 }
 
+func squadVMCacheContainsImage(dir string) bool {
+	info, err := os.Stat(filepath.Join(dir, "images", "squadvm"))
+	return err == nil && info.IsDir()
+}
+
 func runSquadVMPreflight(ctx context.Context, api *client.Client, source, cacheDir string) (startupPreflight, error) {
+	type releaseCheckResult struct {
+		update *squadVMReleaseUpdate
+		err    error
+	}
+	releaseContext, cancelRelease := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelRelease()
+	releaseDone := make(chan releaseCheckResult, 1)
+	go func() {
+		update, err := checkLatestSquadVMRelease(
+			releaseContext,
+			squadVMReleaseHTTPClient,
+			squadVMLatestReleaseURL,
+			currentSquadVMVersion(),
+			runtime.GOOS,
+			runtime.GOARCH,
+		)
+		releaseDone <- releaseCheckResult{update: update, err: err}
+	}()
+
 	supported, err := api.VMSupportedContext(ctx)
 	if err != nil {
 		return startupPreflight{}, fmt.Errorf("check virtualization support: %w", err)
@@ -194,6 +231,18 @@ func runSquadVMPreflight(ctx context.Context, api *client.Client, source, cacheD
 	result.FreeBytes = free
 	result.RequiredBytes = estimatedSquadVMDiskRequirement(result.Image.BytesToDownload)
 	result.DiskOK = result.FreeBytes >= result.RequiredBytes
+	select {
+	case release := <-releaseDone:
+		// A release check must never prevent an offline user from starting.
+		if release.err == nil {
+			result.ReleaseChecked = true
+			result.ReleaseUpdate = release.update
+		} else {
+			result.ReleaseCheckDetail = "Check unavailable"
+		}
+	case <-releaseContext.Done():
+		result.ReleaseCheckDetail = "Check timed out"
+	}
 	return result, nil
 }
 

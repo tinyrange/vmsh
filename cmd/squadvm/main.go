@@ -109,6 +109,15 @@ func run(args []string) (retErr error) {
 	if err != nil {
 		return err
 	}
+	if strings.TrimSpace(*cacheDir) == "" && !systemInstall {
+		regularCacheDir, regularErr := resolveSquadVMCacheDir("", true)
+		if regularErr == nil && filepath.Clean(activeCacheDir) == filepath.Clean(regularCacheDir) {
+			// A populated cache from an existing installation takes precedence
+			// over the new portable default. Keep the checkbox honest about the
+			// location that is actually in use.
+			systemInstall = true
+		}
+	}
 	backend, err := startEmbeddedSquadVMBackend(activeCacheDir, *name, displayReady)
 	if err != nil && strings.TrimSpace(*cacheDir) == "" && !systemInstall {
 		// A portable directory may be unavailable beside an installed app.
@@ -328,6 +337,9 @@ func run(args []string) (retErr error) {
 			publish(desktopStartupProgress("Waiting for a complete desktop frame"))
 			go func() {
 				err := monitorDisplayVM(ctx, api, *name)
+				if ctx.Err() != nil {
+					return
+				}
 				if err != nil {
 					publish(failedStartupProgress(err))
 				}
@@ -551,13 +563,6 @@ attempt=0
 while [ "$attempt" -lt 900 ]; do
     if [ -S /tmp/.X11-unix/X0 ] &&
        [ -f /run/user/1000/squadvm-desktop-ready ]; then
-        if [ "$(uname -m)" = "aarch64" ] &&
-           { ! grep -qs ' /proc/sys/fs/binfmt_misc binfmt_misc ' /proc/mounts ||
-             [ ! -x /usr/bin/qemu-x86_64 ] ||
-             [ ! -x /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 ] ||
-             [ ! -r /proc/sys/fs/binfmt_misc/qemu-x86_64 ]; }; then
-            exit 1
-        fi
         exit 0
     fi
     attempt=$((attempt + 1))
