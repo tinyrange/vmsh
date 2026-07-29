@@ -50,6 +50,9 @@ type startupPreflight struct {
 	FreeBytes            int64
 	RequiredBytes        int64
 	Image                client.ImagePullPlan
+	ReleaseUpdate        *squadVMReleaseUpdate
+	ReleaseChecked       bool
+	ReleaseCheckDetail   string
 }
 
 func (p startupPreflight) canStart() bool {
@@ -151,6 +154,25 @@ func resolveSquadVMCacheDir(explicit string, systemInstall bool) (string, error)
 }
 
 func runSquadVMPreflight(ctx context.Context, api *client.Client, source, cacheDir string) (startupPreflight, error) {
+	type releaseCheckResult struct {
+		update *squadVMReleaseUpdate
+		err    error
+	}
+	releaseContext, cancelRelease := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelRelease()
+	releaseDone := make(chan releaseCheckResult, 1)
+	go func() {
+		update, err := checkLatestSquadVMRelease(
+			releaseContext,
+			squadVMReleaseHTTPClient,
+			squadVMLatestReleaseURL,
+			currentSquadVMVersion(),
+			runtime.GOOS,
+			runtime.GOARCH,
+		)
+		releaseDone <- releaseCheckResult{update: update, err: err}
+	}()
+
 	supported, err := api.VMSupportedContext(ctx)
 	if err != nil {
 		return startupPreflight{}, fmt.Errorf("check virtualization support: %w", err)
@@ -194,6 +216,18 @@ func runSquadVMPreflight(ctx context.Context, api *client.Client, source, cacheD
 	result.FreeBytes = free
 	result.RequiredBytes = estimatedSquadVMDiskRequirement(result.Image.BytesToDownload)
 	result.DiskOK = result.FreeBytes >= result.RequiredBytes
+	select {
+	case release := <-releaseDone:
+		// A release check must never prevent an offline user from starting.
+		if release.err == nil {
+			result.ReleaseChecked = true
+			result.ReleaseUpdate = release.update
+		} else {
+			result.ReleaseCheckDetail = "Check unavailable"
+		}
+	case <-releaseContext.Done():
+		result.ReleaseCheckDetail = "Check timed out"
+	}
 	return result, nil
 }
 

@@ -328,6 +328,9 @@ func run(args []string) (retErr error) {
 			publish(desktopStartupProgress("Waiting for a complete desktop frame"))
 			go func() {
 				err := monitorDisplayVM(ctx, api, *name)
+				if ctx.Err() != nil {
+					return
+				}
 				if err != nil {
 					publish(failedStartupProgress(err))
 				}
