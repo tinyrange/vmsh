@@ -18,7 +18,6 @@ import (
 	"syscall"
 	"time"
 
-	"j5.nz/cc/ccvmd"
 	"j5.nz/cc/client"
 	ccdisplay "j5.nz/cc/display"
 )
@@ -104,51 +103,27 @@ func run(args []string) (retErr error) {
 		return err
 	}
 
-	ready := make(chan client.ServerHello, 1)
 	displayReady := make(chan ccdisplay.Session, 1)
-	serverDone := make(chan error, 1)
-	serverArgs := []string{"-addr", "127.0.0.1:0"}
-	if strings.TrimSpace(*cacheDir) != "" {
-		serverArgs = append(serverArgs, "-cache-dir", *cacheDir)
+	systemInstall := settings.systemInstall()
+	activeCacheDir, err := resolveSquadVMCacheDir(*cacheDir, systemInstall)
+	if err != nil {
+		return err
 	}
-	go func() {
-		_, err := ccvmd.RunServer(serverArgs, ccvmd.ServerOptions{
-			Kind:          "squadvm",
-			StartupWriter: io.Discard,
-			OnStartup: func(hello client.ServerHello) error {
-				ready <- hello
-				return nil
-			},
-			OnDisplay: func(id string, session ccdisplay.Session) {
-				if id != *name {
-					return
-				}
-				select {
-				case displayReady <- session:
-				default:
-				}
-			},
-		})
-		serverDone <- err
-	}()
-
-	var hello client.ServerHello
-	select {
-	case hello = <-ready:
-	case err := <-serverDone:
+	backend, err := startEmbeddedSquadVMBackend(activeCacheDir, *name, displayReady)
+	if err != nil && strings.TrimSpace(*cacheDir) == "" && !systemInstall {
+		// A portable directory may be unavailable beside an installed app.
+		// Keep the first-run UI reachable by falling back to the user cache and
+		// presenting the system-install checkbox as selected.
+		systemInstall = true
+		activeCacheDir, err = resolveSquadVMCacheDir("", true)
 		if err == nil {
-			return fmt.Errorf("embedded VM backend stopped before startup")
+			backend, err = startEmbeddedSquadVMBackend(activeCacheDir, *name, displayReady)
 		}
-		return fmt.Errorf("start embedded VM backend: %w", err)
 	}
-	if hello.Addr == "" {
-		return fmt.Errorf("embedded VM backend did not publish an address")
+	if err != nil {
+		return err
 	}
-	scheme := hello.Scheme
-	if scheme == "" {
-		scheme = "http"
-	}
-	api := client.NewClient(scheme+"://"+hello.Addr, nil)
+	api := backend.api
 	// Some launch environments forward Control-C from the focused native
 	// graphics window to the process's controlling terminal as SIGINT. Do not
 	// let a guest keyboard shortcut tear down the VM. Native sessions stop when
@@ -162,26 +137,9 @@ func run(args []string) (retErr error) {
 	}
 	lifetimeContext, stopSignals := signal.NotifyContext(context.Background(), signals...)
 	defer stopSignals()
-	serverFinished := false
 	defer func() {
-		if serverFinished {
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		shutdownErr := api.ShutdownContext(ctx)
-		cancel()
-		if shutdownErr != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("stop embedded VM backend: %w", shutdownErr))
-			return
-		}
-		select {
-		case err := <-serverDone:
-			serverFinished = true
-			if err != nil {
-				retErr = errors.Join(retErr, fmt.Errorf("embedded VM backend shutdown: %w", err))
-			}
-		case <-time.After(15 * time.Second):
-			retErr = errors.Join(retErr, fmt.Errorf("embedded VM backend did not stop"))
+		if err := backend.stop(); err != nil {
+			retErr = errors.Join(retErr, err)
 		}
 	}()
 
@@ -198,6 +156,10 @@ func run(args []string) (retErr error) {
 		vncAddress = *vncListen
 		password = *vncPassword
 	}
+	// The arm64 image carries qemu-x86_64 and its binfmt declaration. Ensure
+	// the VM kernel also has binfmt_misc available so systemd can register the
+	// interpreter during early boot.
+	kernelModules := squadVMKernelModules(runtimeArchitecture())
 	request := client.CreateInstanceRequest{
 		DefaultUser: *user,
 		InitSystem:  *initSystem,
@@ -210,6 +172,7 @@ func run(args []string) (retErr error) {
 		},
 		Shares:           []client.ShareMount{storageShare},
 		PersistentMounts: persistentMounts,
+		KernelModules:    kernelModules,
 		MemoryMB:         *memoryMB,
 		CPUs:             *cpus,
 		AMD64Emulation:   false,
@@ -221,9 +184,32 @@ func run(args []string) (retErr error) {
 		displayContext, cancelDisplay := context.WithCancel(lifetimeContext)
 		monitorDone := make(chan error, 1)
 		preflight := func(ctx context.Context) (startupPreflight, error) {
-			return runSquadVMPreflight(ctx, api, fs.Arg(0), *cacheDir)
+			return runSquadVMPreflight(ctx, api, fs.Arg(0), activeCacheDir)
 		}
 		start := func(ctx context.Context, options startupOptions, publish func(startupProgress)) (started displayStarted, retErr error) {
+			desiredCacheDir, err := resolveSquadVMCacheDir(*cacheDir, options.SystemInstall)
+			if err != nil {
+				return displayStarted{}, err
+			}
+			if desiredCacheDir != activeCacheDir {
+				publish(desktopStartupProgress("Switching install location"))
+				if err := backend.stop(); err != nil {
+					return displayStarted{}, err
+				}
+				backend, err = startEmbeddedSquadVMBackend(desiredCacheDir, *name, displayReady)
+				if err != nil {
+					return displayStarted{}, err
+				}
+				api = backend.api
+				activeCacheDir = desiredCacheDir
+				selectedPreflight, err := runSquadVMPreflight(ctx, api, fs.Arg(0), activeCacheDir)
+				if err != nil {
+					return displayStarted{}, err
+				}
+				if !selectedPreflight.canStart() {
+					return displayStarted{}, fmt.Errorf("selected install location did not pass startup checks")
+				}
+			}
 			stopped := make(chan struct{})
 			var stopOnce sync.Once
 			stopVM := func() {
@@ -241,6 +227,11 @@ func run(args []string) (retErr error) {
 			}()
 			settings.FirstRunComplete = true
 			settings.SSHEnabled = options.SSHEnabled
+			if options.SystemInstall {
+				settings.InstallMode = squadVMInstallSystem
+			} else {
+				settings.InstallMode = squadVMInstallPortable
+			}
 			if err := saveSquadVMSettings(settingsDir, settings); err != nil {
 				return displayStarted{}, err
 			}
@@ -349,7 +340,11 @@ func run(args []string) (retErr error) {
 			"SquadVM",
 			width,
 			height,
-			startupOptions{SSHEnabled: settings.SSHEnabled, DownloadRate: settings.DownloadRate},
+			startupOptions{
+				SSHEnabled:    settings.SSHEnabled,
+				SystemInstall: systemInstall,
+				DownloadRate:  settings.DownloadRate,
+			},
 			settings.FirstRunComplete,
 			preflight,
 			start,
@@ -424,8 +419,8 @@ func run(args []string) (retErr error) {
 		case <-lifetimeContext.Done():
 			fmt.Fprintln(os.Stderr, "Stopping SquadVM VM...")
 			return nil
-		case err := <-serverDone:
-			serverFinished = true
+		case err := <-backend.done:
+			backend.finished = true
 			if err == nil {
 				return fmt.Errorf("embedded VM backend stopped unexpectedly")
 			}
@@ -556,6 +551,11 @@ attempt=0
 while [ "$attempt" -lt 900 ]; do
     if [ -S /tmp/.X11-unix/X0 ] &&
        [ -f /run/user/1000/squadvm-desktop-ready ]; then
+        if [ "$(uname -m)" = "aarch64" ] &&
+           { [ ! -x /usr/bin/qemu-x86_64 ] ||
+             [ ! -r /proc/sys/fs/binfmt_misc/qemu-x86_64 ]; }; then
+            exit 1
+        fi
         exit 0
     fi
     attempt=$((attempt + 1))
@@ -563,15 +563,21 @@ while [ "$attempt" -lt 900 ]; do
 done
 exit 1
 `
-	response, err := api.RunInContext(ctx, name, client.RunRequest{
+	exitCode := -1
+	err := api.RunStreamInContext(ctx, name, client.RunRequest{
 		Command:        []string{"/bin/sh", "-c", readinessScript},
 		User:           "root",
 		TimeoutSeconds: 95,
+	}, func(event client.ExecEvent) error {
+		if event.Kind == "exit" {
+			exitCode = event.ExitCode
+		}
+		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("wait for SquadVM session: %w", err)
 	}
-	if response.ExitCode != 0 {
+	if exitCode != 0 {
 		return fmt.Errorf("SquadVM session did not become ready")
 	}
 	return nil

@@ -1787,12 +1787,19 @@ func TestMCPContextCaptureCursorDoesNotReadPastSizeSnapshot(t *testing.T) {
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
-		deadline := time.Now().Add(time.Second)
+		deadline := time.Now().Add(10 * time.Second)
+		observed := false
 		for time.Now().Before(deadline) {
 			if _, err := os.Stat(signal); err == nil {
+				observed = true
 				break
 			}
 			time.Sleep(time.Millisecond)
+		}
+		if !observed {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatal("timed out waiting for capture size snapshot")
 		}
 		if appendBlock {
 			file, err := os.OpenFile(capture, os.O_APPEND|os.O_WRONLY, 0)
