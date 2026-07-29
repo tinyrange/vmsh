@@ -47,6 +47,7 @@ func TestSessionRoutesStdinAndResize(t *testing.T) {
 		Command:      shellReadResizeCommand(),
 		Size:         Size{Cols: 22, Rows: 6},
 		HistoryLimit: 10,
+		Env:          []string{ptyTermHelperEnv},
 	})
 	if err != nil {
 		t.Fatalf("start session: %v", err)
@@ -241,7 +242,7 @@ func shellOutputCommand() []string {
 
 func shellReadResizeCommand() []string {
 	if runtime.GOOS == "windows" {
-		return []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "$p = { [Console]::Out.WriteLine(([string][Console]::WindowHeight) + ' ' + ([string][Console]::WindowWidth)); [Console]::Out.Flush() }; & $p; [Console]::In.ReadLine() | Out-Null; & $p"}
+		return ptyTermTestHelperCommand("size")
 	}
 	return []string{"sh", "-lc", "stty size; IFS= read -r _; stty size"}
 }
@@ -255,14 +256,14 @@ func shellExitCommand(code int) []string {
 
 func shellPrintCommand(text string) []string {
 	if runtime.GOOS == "windows" {
-		return []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write(" + strconv.Quote(text) + "); [Console]::Out.Flush()"}
+		return ptyTermTestHelperCommand("print", text)
 	}
 	return []string{"sh", "-lc", "printf " + shellQuote(text)}
 }
 
 func shellAltScreenTeardownCommand() []string {
 	if runtime.GOOS == "windows" {
-		return []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "$e=[char]27; [Console]::Out.Write('main' + $e + '[?1049hALT' + $e + '[?1049lRESTORE'); [Console]::Out.Flush()"}
+		return ptyTermTestHelperCommand("alt-screen")
 	}
 	return []string{"sh", "-lc", "printf main; printf '\\033[?1049hALT\\033[?1049lRESTORE'"}
 }

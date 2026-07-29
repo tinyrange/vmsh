@@ -23,7 +23,7 @@ func platformArguments(args []string) []string {
 }
 
 func platformDefaultCPUs() int {
-	return 1
+	return 4
 }
 
 func platformDefaultEphemeralHome() bool {

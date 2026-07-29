@@ -97,8 +97,6 @@ jobs:
             runner: macos-15
           - name: windows-amd64
             runner: windows-2025
-          - name: windows-arm64
-            runner: windows-11-arm
     steps:
       - name: Checkout
         uses: actions/checkout@v6

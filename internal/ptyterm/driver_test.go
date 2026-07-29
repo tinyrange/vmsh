@@ -47,6 +47,7 @@ func TestDriverSendsTextKeysAndRecordsAsciicast(t *testing.T) {
 		Command:      driverEchoCommand(),
 		Size:         Size{Cols: 24, Rows: 4},
 		HistoryLimit: 10,
+		Env:          []string{ptyTermHelperEnv},
 		Recorder:     rec,
 	})
 	if err != nil {
@@ -109,7 +110,7 @@ func assertAsciicastHasOutput(t *testing.T, path string) {
 
 func driverEchoCommand() []string {
 	if runtime.GOOS == "windows" {
-		return []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write('ready'); [Console]::Out.Flush(); $line = [Console]::In.ReadLine(); [Console]::Out.Write(\"`r`ngot:$line`r`n\"); [Console]::Out.Flush()"}
+		return ptyTermTestHelperCommand("echo")
 	}
 	return []string{"sh", "-lc", "printf ready; IFS= read -r line; printf '\\r\\ngot:%s\\r\\n' \"$line\""}
 }
