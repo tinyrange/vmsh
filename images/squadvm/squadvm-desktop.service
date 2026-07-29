@@ -1,8 +1,8 @@
 [Unit]
 Description=SquadVM Glass desktop
 DefaultDependencies=no
-After=ccx3-stage2.service
-Wants=ccx3-stage2.service
+After=ccx3-stage2.service squadvm-binfmt.service
+Wants=ccx3-stage2.service squadvm-binfmt.service
 
 [Service]
 Type=simple

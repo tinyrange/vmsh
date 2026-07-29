@@ -23,20 +23,24 @@ import (
 )
 
 const (
-	squadVMSSHConfigBegin = "# BEGIN SQUADVM MANAGED CONFIG"
-	squadVMSSHConfigEnd   = "# END SQUADVM MANAGED CONFIG"
+	squadVMSSHConfigBegin  = "# BEGIN SQUADVM MANAGED CONFIG"
+	squadVMSSHConfigEnd    = "# END SQUADVM MANAGED CONFIG"
+	squadVMInstallPortable = "portable"
+	squadVMInstallSystem   = "system"
 )
 
 type squadVMSettings struct {
 	FirstRunComplete bool    `json:"first_run_complete"`
 	SSHEnabled       bool    `json:"ssh_enabled"`
+	InstallMode      string  `json:"install_mode,omitempty"`
 	DownloadRate     float64 `json:"download_rate_bytes_per_second,omitempty"`
 }
 
 type startupOptions struct {
-	SSHEnabled   bool
-	RefreshImage bool
-	DownloadRate float64
+	SSHEnabled    bool
+	SystemInstall bool
+	RefreshImage  bool
+	DownloadRate  float64
 }
 
 type startupPreflight struct {
@@ -96,6 +100,54 @@ func saveSquadVMSettings(dir string, settings squadVMSettings) error {
 	}
 	data = append(data, '\n')
 	return writeFileAtomically(filepath.Join(dir, "settings.json"), data, 0o600)
+}
+
+func (s squadVMSettings) systemInstall() bool {
+	switch s.InstallMode {
+	case squadVMInstallSystem:
+		return true
+	case squadVMInstallPortable:
+		return false
+	default:
+		// Settings written before install modes existed used the system cache.
+		// Preserve that location for existing installations while making a
+		// genuinely new installation portable by default.
+		return s.FirstRunComplete
+	}
+}
+
+var squadVMExecutable = os.Executable
+
+func resolveSquadVMCacheDir(explicit string, systemInstall bool) (string, error) {
+	if dir := strings.TrimSpace(explicit); dir != "" {
+		return filepath.Abs(dir)
+	}
+	if systemInstall {
+		userCache, err := os.UserCacheDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve user cache directory: %w", err)
+		}
+		return filepath.Join(userCache, "ccx3"), nil
+	}
+	executable, err := squadVMExecutable()
+	if err != nil {
+		return "", fmt.Errorf("resolve SquadVM executable: %w", err)
+	}
+	executable, err = filepath.EvalSymlinks(executable)
+	if err != nil {
+		return "", fmt.Errorf("resolve SquadVM executable path: %w", err)
+	}
+	executable, err = filepath.Abs(executable)
+	if err != nil {
+		return "", fmt.Errorf("resolve absolute SquadVM executable path: %w", err)
+	}
+	parent := filepath.Dir(executable)
+	appMarker := ".app" + string(filepath.Separator) + "Contents" + string(filepath.Separator) + "MacOS"
+	if index := strings.LastIndex(executable, appMarker); index >= 0 {
+		bundle := executable[:index+len(".app")]
+		parent = filepath.Dir(bundle)
+	}
+	return filepath.Join(parent, "SquadVM-data", "cache"), nil
 }
 
 func runSquadVMPreflight(ctx context.Context, api *client.Client, source, cacheDir string) (startupPreflight, error) {
@@ -158,6 +210,13 @@ func estimatedSquadVMDiskRequirement(downloadBytes int64) int64 {
 
 func runtimeArchitecture() string {
 	return runtimeGOARCH
+}
+
+func squadVMKernelModules(architecture string) []string {
+	if architecture == "arm64" {
+		return []string{"CONFIG_BINFMT_MISC"}
+	}
+	return nil
 }
 
 var runtimeGOARCH = runtimeArch()

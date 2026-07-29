@@ -32,8 +32,28 @@ RUN apt-get update \
     && cd /src/binwalk \
     && cargo build --release --locked
 
+FROM ${KALI_BASE} AS pwninit-build
+
+ARG PWNINIT_COMMIT=0c123dd79c2ebfc1dca68aeec0dc2b840c066c32
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cargo \
+        git \
+        liblzma-dev \
+        libssl-dev \
+        pkg-config \
+        rustc \
+    && git clone --filter=blob:none https://github.com/io12/pwninit.git /src/pwninit \
+    && cd /src/pwninit \
+    && git checkout "${PWNINIT_COMMIT}" \
+    && cargo build --release --locked
+
 FROM ${KALI_BASE}
 
+ARG TARGETARCH
 ARG SQUADVM_USER=squad
 ARG SQUADVM_UID=1000
 ARG PWNDBG_COMMIT=3b90bbf18ced8293813952f11755f904dedefa71
@@ -47,6 +67,9 @@ RUN echo "wireshark-common wireshark-common/install-setuid boolean true" | debco
     && apt-get update \
     && sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' /tmp/squadvm-packages.txt \
         | xargs apt-get install -y --no-install-recommends \
+    && if [ "${TARGETARCH}" = "arm64" ]; then \
+        apt-get install -y --no-install-recommends qemu-user-binfmt; \
+    fi \
     && rm -f /tmp/squadvm-packages.txt \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
@@ -63,6 +86,7 @@ RUN apt-get update \
     && PWNDBG_VENV_PATH=/opt/pwndbg/.venv PWNDBG_NO_AUTOUPDATE=1 ./setup.sh \
     && rm -f /root/.gdbinit \
     && gem install --no-document --version "${ZSTEG_VERSION}" zsteg \
+    && chown -R "${SQUADVM_UID}:${SQUADVM_UID}" /opt/pwndbg \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
@@ -80,9 +104,11 @@ RUN useradd --create-home --uid "${SQUADVM_UID}" --shell /bin/bash "${SQUADVM_US
 COPY --from=bridge-build /glass-clipboard /usr/local/bin/glass-clipboard
 COPY --from=bridge-build /glass-resize /usr/local/bin/glass-resize
 COPY --from=binwalk-build /src/binwalk/target/release/binwalk /usr/local/bin/binwalk
+COPY --from=pwninit-build /src/pwninit/target/release/pwninit /usr/local/bin/pwninit
 COPY squadvm-burpsuite /usr/local/bin/squadvm-burpsuite
 COPY squadvm-session /usr/local/sbin/squadvm-session
 COPY squadvm-sshd-prepare /usr/local/sbin/squadvm-sshd-prepare
+COPY squadvm-binfmt.service /etc/systemd/system/squadvm-binfmt.service
 COPY squadvm-desktop.service /etc/systemd/system/squadvm-desktop.service
 COPY squadvm-sshd.service /etc/systemd/system/squadvm-sshd.service
 COPY squadvm-sshd_config /etc/ssh/squadvm-sshd_config
@@ -130,6 +156,7 @@ RUN curl --fail --location --silent --show-error \
         /usr/local/bin/glass-resize \
         /usr/local/bin/squadvm-burpsuite \
         /usr/local/bin/binwalk \
+        /usr/local/bin/pwninit \
         /usr/local/sbin/squadvm-sshd-prepare \
         /usr/local/sbin/squadvm-session \
     && chmod 0775 \
@@ -150,7 +177,18 @@ RUN systemctl enable squadvm-desktop.service squadvm-sshd.service \
     && cp -a /usr/share/squadvm/skel/. "/home/${SQUADVM_USER}/" \
     && chmod 0755 "/home/${SQUADVM_USER}/Desktop/"*.desktop /usr/share/squadvm/skel/Desktop/*.desktop \
     && desktop-file-validate "/home/${SQUADVM_USER}/Desktop/"*.desktop \
-    && chown -R "${SQUADVM_UID}:${SQUADVM_UID}" "/home/${SQUADVM_USER}"
+    && chown -R "${SQUADVM_UID}:${SQUADVM_UID}" "/home/${SQUADVM_USER}" \
+    && test -z "$(find /opt/pwndbg ! -user "${SQUADVM_USER}" -print -quit)" \
+    && runuser -u "${SQUADVM_USER}" -- test -r /opt/pwndbg/gdbinit.py \
+    && runuser -u "${SQUADVM_USER}" -- test -x /opt/pwndbg/.venv/bin/python \
+    && runuser -u "${SQUADVM_USER}" -- /usr/local/bin/pwninit --version \
+    && if [ "${TARGETARCH}" = "arm64" ]; then \
+        test -x /usr/bin/qemu-x86_64 \
+        && test -f /usr/lib/binfmt.d/qemu-x86_64.conf \
+        && test -x /usr/lib/systemd/systemd-binfmt \
+        && test -e /usr/lib/systemd/system/proc-sys-fs-binfmt_misc.automount \
+        && test -e /usr/lib/systemd/system/sysinit.target.wants/systemd-binfmt.service; \
+    fi
 
 ENV USER=${SQUADVM_USER}
 ENV HOME=/home/${SQUADVM_USER}
