@@ -64,11 +64,19 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 COPY packages.txt /tmp/squadvm-packages.txt
 RUN echo "wireshark-common wireshark-common/install-setuid boolean true" | debconf-set-selections \
+    && if [ "${TARGETARCH}" = "arm64" ]; then \
+        dpkg --add-architecture amd64; \
+    fi \
     && apt-get update \
     && sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' /tmp/squadvm-packages.txt \
         | xargs apt-get install -y --no-install-recommends \
     && if [ "${TARGETARCH}" = "arm64" ]; then \
-        apt-get install -y --no-install-recommends qemu-user-binfmt; \
+        apt-get install -y --no-install-recommends \
+            qemu-user-binfmt \
+            libc6:amd64 \
+            libgcc-s1:amd64 \
+            libstdc++6:amd64 \
+            zlib1g:amd64; \
     fi \
     && rm -f /tmp/squadvm-packages.txt \
     && apt-get clean \
@@ -183,11 +191,15 @@ RUN systemctl enable squadvm-desktop.service squadvm-sshd.service \
     && runuser -u "${SQUADVM_USER}" -- test -x /opt/pwndbg/.venv/bin/python \
     && runuser -u "${SQUADVM_USER}" -- /usr/local/bin/pwninit --version \
     && if [ "${TARGETARCH}" = "arm64" ]; then \
-        test -x /usr/bin/qemu-x86_64 \
+        dpkg --print-foreign-architectures | grep -Fx amd64 \
+        && test -x /usr/bin/qemu-x86_64 \
         && test -f /usr/lib/binfmt.d/qemu-x86_64.conf \
         && test -x /usr/lib/systemd/systemd-binfmt \
-        && test -e /usr/lib/systemd/system/proc-sys-fs-binfmt_misc.automount \
-        && test -e /usr/lib/systemd/system/sysinit.target.wants/systemd-binfmt.service; \
+        && test -x /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 \
+        && test "$(dpkg-query -W -f='${Architecture}' libc6:amd64)" = amd64 \
+        && test "$(dpkg-query -W -f='${Architecture}' libgcc-s1:amd64)" = amd64 \
+        && test "$(dpkg-query -W -f='${Architecture}' libstdc++6:amd64)" = amd64 \
+        && test "$(dpkg-query -W -f='${Architecture}' zlib1g:amd64)" = amd64; \
     fi
 
 ENV USER=${SQUADVM_USER}
