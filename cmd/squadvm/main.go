@@ -552,7 +552,9 @@ while [ "$attempt" -lt 900 ]; do
     if [ -S /tmp/.X11-unix/X0 ] &&
        [ -f /run/user/1000/squadvm-desktop-ready ]; then
         if [ "$(uname -m)" = "aarch64" ] &&
-           { [ ! -x /usr/bin/qemu-x86_64 ] ||
+           { ! grep -qs ' /proc/sys/fs/binfmt_misc binfmt_misc ' /proc/mounts ||
+             [ ! -x /usr/bin/qemu-x86_64 ] ||
+             [ ! -x /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 ] ||
              [ ! -r /proc/sys/fs/binfmt_misc/qemu-x86_64 ]; }; then
             exit 1
         fi
