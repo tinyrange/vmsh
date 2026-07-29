@@ -256,14 +256,14 @@ func shellExitCommand(code int) []string {
 
 func shellPrintCommand(text string) []string {
 	if runtime.GOOS == "windows" {
-		return []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write(" + strconv.Quote(text) + "); [Console]::Out.Flush()"}
+		return ptyTermTestHelperCommand("print", text)
 	}
 	return []string{"sh", "-lc", "printf " + shellQuote(text)}
 }
 
 func shellAltScreenTeardownCommand() []string {
 	if runtime.GOOS == "windows" {
-		return []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "$e=[char]27; [Console]::Out.Write('main' + $e + '[?1049hALT' + $e + '[?1049lRESTORE'); [Console]::Out.Flush()"}
+		return ptyTermTestHelperCommand("alt-screen")
 	}
 	return []string{"sh", "-lc", "printf main; printf '\\033[?1049hALT\\033[?1049lRESTORE'"}
 }
