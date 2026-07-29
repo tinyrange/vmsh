@@ -119,18 +119,28 @@ func (s squadVMSettings) systemInstall() bool {
 	}
 }
 
-var squadVMExecutable = os.Executable
+var (
+	squadVMExecutable   = os.Executable
+	squadVMUserCacheDir = os.UserCacheDir
+)
 
 func resolveSquadVMCacheDir(explicit string, systemInstall bool) (string, error) {
 	if dir := strings.TrimSpace(explicit); dir != "" {
 		return filepath.Abs(dir)
 	}
 	if systemInstall {
-		userCache, err := os.UserCacheDir()
+		userCache, err := squadVMUserCacheDir()
 		if err != nil {
 			return "", fmt.Errorf("resolve user cache directory: %w", err)
 		}
 		return filepath.Join(userCache, "ccx3"), nil
+	}
+	// Releases before portable mode stored SquadVM in the regular ccx3 cache.
+	// Reuse that complete installation before looking beside the executable;
+	// otherwise an upgrade can appear to lose the image and download it again.
+	regularCache, err := resolveSquadVMCacheDir("", true)
+	if err == nil && squadVMCacheContainsImage(regularCache) {
+		return regularCache, nil
 	}
 	executable, err := squadVMExecutable()
 	if err != nil {
@@ -151,6 +161,11 @@ func resolveSquadVMCacheDir(explicit string, systemInstall bool) (string, error)
 		parent = filepath.Dir(bundle)
 	}
 	return filepath.Join(parent, "SquadVM-data", "cache"), nil
+}
+
+func squadVMCacheContainsImage(dir string) bool {
+	info, err := os.Stat(filepath.Join(dir, "images", "squadvm"))
+	return err == nil && info.IsDir()
 }
 
 func runSquadVMPreflight(ctx context.Context, api *client.Client, source, cacheDir string) (startupPreflight, error) {

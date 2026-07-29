@@ -109,6 +109,15 @@ func run(args []string) (retErr error) {
 	if err != nil {
 		return err
 	}
+	if strings.TrimSpace(*cacheDir) == "" && !systemInstall {
+		regularCacheDir, regularErr := resolveSquadVMCacheDir("", true)
+		if regularErr == nil && filepath.Clean(activeCacheDir) == filepath.Clean(regularCacheDir) {
+			// A populated cache from an existing installation takes precedence
+			// over the new portable default. Keep the checkbox honest about the
+			// location that is actually in use.
+			systemInstall = true
+		}
+	}
 	backend, err := startEmbeddedSquadVMBackend(activeCacheDir, *name, displayReady)
 	if err != nil && strings.TrimSpace(*cacheDir) == "" && !systemInstall {
 		// A portable directory may be unavailable beside an installed app.

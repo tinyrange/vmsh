@@ -264,13 +264,19 @@ func TestSquadVMInstallModeDefaultsPortableOnlyForNewInstallations(t *testing.T)
 
 func TestResolveSquadVMPortableCacheBesideExecutable(t *testing.T) {
 	root := t.TempDir()
+	userCache := t.TempDir()
 	executable := filepath.Join(root, "SquadVM")
 	if err := os.WriteFile(executable, []byte("test"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	previousExecutable := squadVMExecutable
+	previousUserCacheDir := squadVMUserCacheDir
 	squadVMExecutable = func() (string, error) { return executable, nil }
-	defer func() { squadVMExecutable = previousExecutable }()
+	squadVMUserCacheDir = func() (string, error) { return userCache, nil }
+	defer func() {
+		squadVMExecutable = previousExecutable
+		squadVMUserCacheDir = previousUserCacheDir
+	}()
 
 	got, err := resolveSquadVMCacheDir("", false)
 	if err != nil {
@@ -288,6 +294,7 @@ func TestResolveSquadVMPortableCacheBesideExecutable(t *testing.T) {
 
 func TestResolveSquadVMPortableCacheBesideMacApp(t *testing.T) {
 	root := t.TempDir()
+	userCache := t.TempDir()
 	executable := filepath.Join(root, "SquadVM.app", "Contents", "MacOS", "SquadVM")
 	if err := os.MkdirAll(filepath.Dir(executable), 0o755); err != nil {
 		t.Fatal(err)
@@ -296,8 +303,13 @@ func TestResolveSquadVMPortableCacheBesideMacApp(t *testing.T) {
 		t.Fatal(err)
 	}
 	previousExecutable := squadVMExecutable
+	previousUserCacheDir := squadVMUserCacheDir
 	squadVMExecutable = func() (string, error) { return executable, nil }
-	defer func() { squadVMExecutable = previousExecutable }()
+	squadVMUserCacheDir = func() (string, error) { return userCache, nil }
+	defer func() {
+		squadVMExecutable = previousExecutable
+		squadVMUserCacheDir = previousUserCacheDir
+	}()
 
 	got, err := resolveSquadVMCacheDir("", false)
 	if err != nil {
@@ -310,6 +322,36 @@ func TestResolveSquadVMPortableCacheBesideMacApp(t *testing.T) {
 	want := filepath.Join(resolvedRoot, "SquadVM-data", "cache")
 	if got != want {
 		t.Fatalf("portable app cache = %q, want %q", got, want)
+	}
+}
+
+func TestResolveSquadVMPortableCacheReusesRegularInstallation(t *testing.T) {
+	root := t.TempDir()
+	userCache := t.TempDir()
+	executable := filepath.Join(root, "SquadVM")
+	if err := os.WriteFile(executable, []byte("test"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	regularCache := filepath.Join(userCache, "ccx3")
+	if err := os.MkdirAll(filepath.Join(regularCache, "images", "squadvm"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	previousExecutable := squadVMExecutable
+	previousUserCacheDir := squadVMUserCacheDir
+	squadVMExecutable = func() (string, error) { return executable, nil }
+	squadVMUserCacheDir = func() (string, error) { return userCache, nil }
+	defer func() {
+		squadVMExecutable = previousExecutable
+		squadVMUserCacheDir = previousUserCacheDir
+	}()
+
+	got, err := resolveSquadVMCacheDir("", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != regularCache {
+		t.Fatalf("portable cache = %q, want existing regular cache %q", got, regularCache)
 	}
 }
 
