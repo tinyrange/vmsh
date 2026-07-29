@@ -373,28 +373,30 @@ func (v *displayViewer) loop(ctx context.Context) error {
 }
 
 type startupControlLayout struct {
-	checkbox image.Rectangle
-	skip     image.Rectangle
-	button   image.Rectangle
+	sshCheckbox    image.Rectangle
+	systemCheckbox image.Rectangle
+	skip           image.Rectangle
+	button         image.Rectangle
 }
 
 func settingsControlLayout(width, height float32) startupControlLayout {
 	panelWidth := max(float32(1), min(float32(680), width-64))
 	left := (width - panelWidth) / 2
-	contentTop := max(float32(24), (height-490)/2)
+	contentTop := max(float32(24), (height-548)/2)
 	return startupControlLayout{
-		checkbox: image.Rect(int(left), int(contentTop+300), int(left+panelWidth), int(contentTop+350)),
+		sshCheckbox:    image.Rect(int(left), int(contentTop+300), int(left+panelWidth), int(contentTop+350)),
+		systemCheckbox: image.Rect(int(left), int(contentTop+358), int(left+panelWidth), int(contentTop+408)),
 		skip: image.Rect(
 			int(left+max(float32(0), panelWidth-432)),
-			int(contentTop+378),
+			int(contentTop+436),
 			int(left+max(float32(0), panelWidth-228)),
-			int(contentTop+428),
+			int(contentTop+486),
 		),
 		button: image.Rect(
 			int(left+max(float32(0), panelWidth-216)),
-			int(contentTop+378),
+			int(contentTop+436),
 			int(left+panelWidth),
-			int(contentTop+428),
+			int(contentTop+486),
 		),
 	}
 }
@@ -445,8 +447,10 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 			layout := settingsControlLayout(float32(backingWidth)/scale, float32(backingHeight)/scale)
 			point := image.Pt(int(event.MouseX/scale), int(event.MouseY/scale))
 			switch {
-			case point.In(layout.checkbox):
+			case point.In(layout.sshCheckbox):
 				v.settings.SSHEnabled = !v.settings.SSHEnabled
+			case point.In(layout.systemCheckbox):
+				v.settings.SystemInstall = !v.settings.SystemInstall
 			case v.preflight.hasUpdate() && point.In(layout.skip):
 				v.beginStart(false)
 			case point.In(layout.button):
@@ -487,7 +491,7 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 
 	panelWidth := max(float32(1), min(float32(680), width-64))
 	left := (width - panelWidth) / 2
-	contentTop := max(float32(24), (height-490)/2)
+	contentTop := max(float32(24), (height-548)/2)
 	brandWidth := min(float32(68), panelWidth)
 	brandHeight := brandWidth * float32(v.brandHeight) / float32(v.brandWidth)
 	v.drawTexture(v.brandTexture, backingWidth, backingHeight, scale, left, contentTop, brandWidth, brandHeight)
@@ -542,7 +546,7 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 	)
 
 	layout := settingsControlLayout(width, height)
-	check := layout.checkbox
+	check := layout.sshCheckbox
 	v.drawRect(backingWidth, backingHeight, scale, float32(check.Min.X), float32(check.Min.Y),
 		float32(check.Dx()), float32(check.Dy()), color.RGBA{R: 40, G: 28, B: 51, A: 255})
 	boxX := float32(check.Min.X + 14)
@@ -554,6 +558,20 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 	v.text.BeginDraw()
 	v.drawTextBold("Enable SSH access", boxX+34, float32(check.Min.Y+21), 15, color.RGBA{R: 243, G: 245, B: 239, A: 255})
 	v.drawText("Adds \"ssh squadvm\" to ~/.ssh/config", boxX+34, float32(check.Min.Y+41), 12, color.RGBA{R: 190, G: 177, B: 201, A: 255})
+	v.text.EndDraw()
+
+	systemCheck := layout.systemCheckbox
+	v.drawRect(backingWidth, backingHeight, scale, float32(systemCheck.Min.X), float32(systemCheck.Min.Y),
+		float32(systemCheck.Dx()), float32(systemCheck.Dy()), color.RGBA{R: 40, G: 28, B: 51, A: 255})
+	systemBoxX := float32(systemCheck.Min.X + 14)
+	systemBoxY := float32(systemCheck.Min.Y + 15)
+	v.drawRect(backingWidth, backingHeight, scale, systemBoxX, systemBoxY, 20, 20, color.RGBA{R: 82, G: 63, B: 96, A: 255})
+	if v.settings.SystemInstall {
+		v.drawRect(backingWidth, backingHeight, scale, systemBoxX+4, systemBoxY+4, 12, 12, color.RGBA{R: 250, G: 238, B: 52, A: 255})
+	}
+	v.text.BeginDraw()
+	v.drawTextBold("System install", systemBoxX+34, float32(systemCheck.Min.Y+21), 15, color.RGBA{R: 243, G: 245, B: 239, A: 255})
+	v.drawText("Store data in your user cache", systemBoxX+34, float32(systemCheck.Min.Y+41), 12, color.RGBA{R: 190, G: 177, B: 201, A: 255})
 	v.text.EndDraw()
 
 	button := layout.button

@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"image"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -241,5 +244,106 @@ func TestSquadVMSSHIdentityIsStableAndUsable(t *testing.T) {
 	// Windows protects the key with ACLs and does not report Unix permission bits.
 	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("SSH private key mode = %o", info.Mode().Perm())
+	}
+}
+
+func TestSquadVMInstallModeDefaultsPortableOnlyForNewInstallations(t *testing.T) {
+	if (squadVMSettings{}).systemInstall() {
+		t.Fatal("new installation defaulted to the system cache")
+	}
+	if !(squadVMSettings{FirstRunComplete: true}).systemInstall() {
+		t.Fatal("existing installation did not retain the system cache")
+	}
+	if !(squadVMSettings{InstallMode: squadVMInstallSystem}).systemInstall() {
+		t.Fatal("saved system install mode was ignored")
+	}
+	if (squadVMSettings{FirstRunComplete: true, InstallMode: squadVMInstallPortable}).systemInstall() {
+		t.Fatal("saved portable install mode was ignored")
+	}
+}
+
+func TestResolveSquadVMPortableCacheBesideExecutable(t *testing.T) {
+	root := t.TempDir()
+	executable := filepath.Join(root, "SquadVM")
+	if err := os.WriteFile(executable, []byte("test"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	previousExecutable := squadVMExecutable
+	squadVMExecutable = func() (string, error) { return executable, nil }
+	defer func() { squadVMExecutable = previousExecutable }()
+
+	got, err := resolveSquadVMCacheDir("", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(resolvedRoot, "SquadVM-data", "cache")
+	if got != want {
+		t.Fatalf("portable cache = %q, want %q", got, want)
+	}
+}
+
+func TestResolveSquadVMPortableCacheBesideMacApp(t *testing.T) {
+	root := t.TempDir()
+	executable := filepath.Join(root, "SquadVM.app", "Contents", "MacOS", "SquadVM")
+	if err := os.MkdirAll(filepath.Dir(executable), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(executable, []byte("test"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	previousExecutable := squadVMExecutable
+	squadVMExecutable = func() (string, error) { return executable, nil }
+	defer func() { squadVMExecutable = previousExecutable }()
+
+	got, err := resolveSquadVMCacheDir("", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(resolvedRoot, "SquadVM-data", "cache")
+	if got != want {
+		t.Fatalf("portable app cache = %q, want %q", got, want)
+	}
+}
+
+func TestSquadVMArm64RequestsBinfmtKernelSupport(t *testing.T) {
+	modules := squadVMKernelModules("arm64")
+	if len(modules) != 1 || modules[0] != "CONFIG_BINFMT_MISC" {
+		t.Fatalf("arm64 kernel modules = %v", modules)
+	}
+	if modules := squadVMKernelModules("amd64"); len(modules) != 0 {
+		t.Fatalf("amd64 kernel modules = %v, want none", modules)
+	}
+}
+
+func TestWaitForSquadVMDesktopStreamsLongRunningProbe(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/vm/run" || r.URL.Query().Get("stream") != "1" {
+			t.Errorf("readiness request URL = %q", r.URL.String())
+		}
+		if got := r.Header.Get("Accept"); got != "application/x-ndjson" {
+			t.Errorf("readiness request Accept = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		time.Sleep(100 * time.Millisecond)
+		_, _ = w.Write([]byte("{\"kind\":\"exit\",\"exit_code\":0}\n"))
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := waitForSquadVMDesktop(ctx, client.NewClient(server.URL, nil), "squadvm"); err != nil {
+		t.Fatal(err)
 	}
 }
