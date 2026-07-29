@@ -65,14 +65,14 @@ func (v *displayViewer) activeUpdateNotifications(now time.Time) []updateNotific
 }
 
 func updateNotificationLayouts(width float32, notifications []updateNotification) []updateNotificationLayout {
-	cardWidth := max(float32(280), min(float32(390), width-36))
+	cardWidth := max(float32(1), min(float32(390), width-36))
 	const (
-		left       = float32(18)
 		top        = float32(18)
 		cardHeight = float32(112)
 		gap        = float32(10)
 		buttonGap  = float32(8)
 	)
+	left := max(float32(18), width-18-cardWidth)
 	buttonWidth := (cardWidth - 36 - buttonGap) / 2
 	layouts := make([]updateNotificationLayout, 0, len(notifications))
 	for index, notification := range notifications {
