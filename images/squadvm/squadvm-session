@@ -61,10 +61,12 @@ while [ ! -S /run/dbus/system_bus_socket ]; do
 done
 
 setsid setpriv --reuid="$uid" --regid="$gid" --clear-groups env \
+    -u GDK_CORE_DEVICE_EVENTS \
     DISPLAY=:0 \
     HOME="$home" \
     USER="$user" \
     GTK_THEME=Adwaita:dark \
+    MOZ_USE_XINPUT2=1 \
     XDG_CURRENT_DESKTOP=XFCE \
     XDG_RUNTIME_DIR="/run/user/$uid" \
     dbus-run-session -- sh -eu -c '
@@ -81,7 +83,7 @@ setsid setpriv --reuid="$uid" --regid="$gid" --clear-groups env \
             gio set -t string "$launcher" metadata::xfce-exe-checksum "$checksum"
         done
 
-        startxfce4 &
+        GIO_USE_VFS=local startxfce4 &
         session_pid=$!
 
         attempt=0

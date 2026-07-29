@@ -3,11 +3,13 @@ Description=SquadVM foreign-architecture binary support
 DefaultDependencies=no
 ConditionArchitecture=arm64
 ConditionPathExists=/usr/lib/binfmt.d/qemu-x86_64.conf
-Wants=ccx3-stage2.service proc-sys-fs-binfmt_misc.automount
-After=ccx3-stage2.service proc-sys-fs-binfmt_misc.automount
+Wants=ccx3-stage2.service
+After=ccx3-stage2.service
 Before=squadvm-desktop.service
 
 [Service]
 Type=oneshot
+ExecStart=/bin/sh -ec 'mountpoint -q /proc/sys/fs/binfmt_misc || mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc'
 ExecStart=/usr/lib/systemd/systemd-binfmt
+ExecStart=/bin/test -r /proc/sys/fs/binfmt_misc/qemu-x86_64
 RemainAfterExit=yes

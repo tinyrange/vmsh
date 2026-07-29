@@ -42,6 +42,7 @@ func run(args []string) (retErr error) {
 	storage := fs.String("storage", "~/squadvm-shared", "Host directory shared at /shared")
 	user := fs.String("user", "root", "Default command user")
 	cacheDir := fs.String("cache-dir", "", "Image and runtime cache directory")
+	refreshImage := fs.Bool("refresh-image", false, "Refresh and rebuild the cached image")
 	vnc := fs.Bool("vnc", false, "Use a VNC client instead of the native graphics window")
 	vncListen := fs.String("vnc-listen", "127.0.0.1:0", "VNC listen address (requires --vnc)")
 	vncPassword := fs.String("vnc-password", "", "VNC password (generated when omitted; requires --vnc)")
@@ -271,7 +272,7 @@ func run(args []string) (retErr error) {
 			}
 
 			var measuredDownloadRate float64
-			imageName, err := prepareSquadVMImage(ctx, api, fs.Arg(0), options.RefreshImage, func(progress startupProgress) {
+			imageName, err := prepareSquadVMImage(ctx, api, fs.Arg(0), options.RefreshImage || *refreshImage, func(progress startupProgress) {
 				if progress.Rate > 0 {
 					measuredDownloadRate = progress.Rate
 				}
@@ -364,7 +365,7 @@ func run(args []string) (retErr error) {
 	}
 
 	var lastBootMessage string
-	imageName, err := prepareSquadVMImage(lifetimeContext, api, fs.Arg(0), false, func(progress startupProgress) {
+	imageName, err := prepareSquadVMImage(lifetimeContext, api, fs.Arg(0), *refreshImage, func(progress startupProgress) {
 		if progress.Detail != "" {
 			fmt.Fprintln(os.Stderr, progress.Detail)
 		}
@@ -552,7 +553,9 @@ while [ "$attempt" -lt 900 ]; do
     if [ -S /tmp/.X11-unix/X0 ] &&
        [ -f /run/user/1000/squadvm-desktop-ready ]; then
         if [ "$(uname -m)" = "aarch64" ] &&
-           { [ ! -x /usr/bin/qemu-x86_64 ] ||
+           { ! grep -qs ' /proc/sys/fs/binfmt_misc binfmt_misc ' /proc/mounts ||
+             [ ! -x /usr/bin/qemu-x86_64 ] ||
+             [ ! -x /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 ] ||
              [ ! -r /proc/sys/fs/binfmt_misc/qemu-x86_64 ]; }; then
             exit 1
         fi

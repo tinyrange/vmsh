@@ -1,6 +1,6 @@
 [Unit]
 Description=SquadVM desktop
 DefaultDependencies=no
-Wants=ccx3-stage2.service squadvm-binfmt.service squadvm-desktop.service
-After=ccx3-stage2.service squadvm-binfmt.service
+Wants=ccx3-stage2.service systemd-udev-trigger.service squadvm-binfmt.service squadvm-desktop.service
+After=ccx3-stage2.service systemd-udev-trigger.service squadvm-binfmt.service
 AllowIsolate=yes
