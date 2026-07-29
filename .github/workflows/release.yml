@@ -17,6 +17,7 @@ on:
         default: false
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
@@ -467,3 +468,9 @@ jobs:
             artifacts/**/NeurodeskAppX_*
             artifacts/**/SquadVM_*
             checksums.txt
+
+      - name: Refresh website release data
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pages.yml --ref main
