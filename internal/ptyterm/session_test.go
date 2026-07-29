@@ -47,6 +47,7 @@ func TestSessionRoutesStdinAndResize(t *testing.T) {
 		Command:      shellReadResizeCommand(),
 		Size:         Size{Cols: 22, Rows: 6},
 		HistoryLimit: 10,
+		Env:          []string{ptyTermHelperEnv},
 	})
 	if err != nil {
 		t.Fatalf("start session: %v", err)
@@ -241,7 +242,7 @@ func shellOutputCommand() []string {
 
 func shellReadResizeCommand() []string {
 	if runtime.GOOS == "windows" {
-		return []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "$p = { [Console]::Out.WriteLine(([string][Console]::WindowHeight) + ' ' + ([string][Console]::WindowWidth)); [Console]::Out.Flush() }; & $p; [Console]::In.ReadLine() | Out-Null; & $p"}
+		return ptyTermTestHelperCommand("size")
 	}
 	return []string{"sh", "-lc", "stty size; IFS= read -r _; stty size"}
 }
