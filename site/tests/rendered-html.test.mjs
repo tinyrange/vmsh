@@ -5,20 +5,40 @@ import test from "node:test";
 const release = JSON.parse(
   await readFile(new URL("../app/release-data.json", import.meta.url), "utf8"),
 );
-const html = await readFile(new URL("../out/index.html", import.meta.url), "utf8");
 
-test("static site renders the default app downloads and every vmsh download", () => {
+async function render() {
+  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
+  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
+  const { default: worker } = await import(workerUrl.href);
+
+  return worker.fetch(
+    new Request("http://localhost/", {
+      headers: { accept: "text/html" },
+    }),
+    {
+      ASSETS: {
+        fetch: async () => new Response("Not found", { status: 404 }),
+      },
+    },
+    {
+      waitUntil() {},
+      passThroughOnException() {},
+    },
+  );
+}
+
+test("server renders the default app downloads and every vmsh download", async () => {
+  const response = await render();
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
+
+  const html = await response.text();
   const renderedDownloads = release.assets.filter(
     (asset) => asset.product === "vmsh" || asset.platform === "macOS",
   );
-
   for (const asset of renderedDownloads) {
-    assert.match(
-      html,
-      new RegExp(asset.url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
-    );
+    assert.match(html, new RegExp(asset.url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
-
   assert.match(
     html,
     new RegExp(release.checksums.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
