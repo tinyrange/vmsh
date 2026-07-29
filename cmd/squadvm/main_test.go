@@ -17,6 +17,39 @@ import (
 	"j5.nz/cc/display"
 )
 
+func TestScrollDeltaPreservesFractionalMovement(t *testing.T) {
+	var remainder float64
+	if got := consumeScrollDelta(0.25, &remainder); got != 30 {
+		t.Fatalf("quarter-detent scroll = %d, want 30", got)
+	}
+	var accumulated int32
+	for range 4 {
+		accumulated += consumeScrollDelta(0.0025, &remainder)
+	}
+	if accumulated != 1 {
+		t.Fatalf("accumulated sub-unit scroll = %d, want 1", accumulated)
+	}
+	remainder = 0
+	if got := consumeScrollDelta(-1, &remainder); got != -120 {
+		t.Fatalf("reverse detent scroll = %d, want -120", got)
+	}
+}
+
+func TestPreciseScrollDeltaPreservesFractionalHostPoints(t *testing.T) {
+	var remainder float64
+	if got := consumePreciseScrollDelta(2.5, &remainder); got != 7 {
+		t.Fatalf("2.5-point precise scroll = %d, want 7", got)
+	}
+	for range 10 {
+		if got := consumePreciseScrollDelta(0.005, &remainder); got > 1 {
+			t.Fatalf("sub-unit precise scroll = %d, want at most 1", got)
+		}
+	}
+	if remainder < 0.64 || remainder > 0.66 {
+		t.Fatalf("precise scroll remainder = %v, want approximately 0.65", remainder)
+	}
+}
+
 func TestImagePipelineKeepsDownloadAndIndexProgressSeparate(t *testing.T) {
 	progress := pullStartupProgress(client.ProgressEvent{
 		Status:           "processing",
