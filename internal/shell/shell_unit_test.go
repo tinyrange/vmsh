@@ -69,7 +69,7 @@ func TestShellCommandPassingBuildsGuestRunRequests(t *testing.T) {
 	api := newRecordingShellAPI("alpine", "alpine@amd64")
 	sh := newUnitShell(t, api)
 	script := strings.Join([]string{
-		"@work --from alpine --arch amd64 --memory 2g --cpus 4 --no-network --nested --cwd /work --user app",
+		"@work --from alpine --arch amd64 --memory 2g --cpus 4 --shmem packets,0xd1000000 --no-network --nested --cwd /work --user app",
 		"printf 'hello | %s' \"$USER\"",
 		"@sudo whoami",
 	}, "\n")
@@ -91,6 +91,9 @@ func TestShellCommandPassingBuildsGuestRunRequests(t *testing.T) {
 	}
 	if start.req.Network != nil {
 		t.Fatalf("start network = %+v, want nil for --no-network", start.req.Network)
+	}
+	if start.req.SharedMemory == nil || start.req.SharedMemory.Domain != "packets" || start.req.SharedMemory.PhysAddr != 0xd1000000 {
+		t.Fatalf("start shared memory = %+v", start.req.SharedMemory)
 	}
 
 	if len(api.runs) != 2 {
@@ -9484,7 +9487,7 @@ func (a *recordingShellAPI) StartInstanceStreamWithIDContext(ctx context.Context
 		return a.startStream(ctx, id, req, onEvent)
 	}
 	a.starts = append(a.starts, recordedStart{id: id, req: req})
-	state := client.InstanceState{ID: id, Status: "running", Image: req.Image, InitSystem: req.InitSystem, Kernel: req.Kernel, MemoryMB: req.MemoryMB, CPUs: req.CPUs, NestedVirt: req.NestedVirt}
+	state := client.InstanceState{ID: id, Status: "running", Image: req.Image, InitSystem: req.InitSystem, Kernel: req.Kernel, MemoryMB: req.MemoryMB, CPUs: req.CPUs, NestedVirt: req.NestedVirt, SharedMemory: cloneSharedMemoryConfig(req.SharedMemory)}
 	a.instances[id] = state
 	if onEvent != nil {
 		if err := onEvent(client.BootEvent{Kind: "ready", State: state}); err != nil {

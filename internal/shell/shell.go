@@ -1069,24 +1069,25 @@ func uniqueStrings(items []string) []string {
 }
 
 type commandContext struct {
-	Mode       shellMode `json:"mode"`
-	SystemName string    `json:"system,omitempty"`
-	Image      string    `json:"image,omitempty"`
-	SSHHost    string    `json:"ssh_host,omitempty"`
-	Arch       string    `json:"arch,omitempty"`
-	VMID       string    `json:"vm,omitempty"`
-	CWD        string    `json:"cwd,omitempty"`
-	User       string    `json:"user,omitempty"`
-	InitSystem string    `json:"init,omitempty"`
-	Kernel     string    `json:"kernel,omitempty"`
-	MemoryMB   uint64    `json:"memory_mb,omitempty"`
-	CPUs       int       `json:"cpus,omitempty"`
-	Network    bool      `json:"network,omitempty"`
-	NestedVirt bool      `json:"nested_virtualization,omitempty"`
-	Debug      bool      `json:"debug,omitempty"`
-	Isolated   bool      `json:"isolated,omitempty"`
-	ParentKey  string    `json:"parent_key,omitempty"`
-	ParentText string    `json:"parent_text,omitempty"`
+	Mode         shellMode                  `json:"mode"`
+	SystemName   string                     `json:"system,omitempty"`
+	Image        string                     `json:"image,omitempty"`
+	SSHHost      string                     `json:"ssh_host,omitempty"`
+	Arch         string                     `json:"arch,omitempty"`
+	VMID         string                     `json:"vm,omitempty"`
+	CWD          string                     `json:"cwd,omitempty"`
+	User         string                     `json:"user,omitempty"`
+	InitSystem   string                     `json:"init,omitempty"`
+	Kernel       string                     `json:"kernel,omitempty"`
+	MemoryMB     uint64                     `json:"memory_mb,omitempty"`
+	CPUs         int                        `json:"cpus,omitempty"`
+	Network      bool                       `json:"network,omitempty"`
+	NestedVirt   bool                       `json:"nested_virtualization,omitempty"`
+	Debug        bool                       `json:"debug,omitempty"`
+	Isolated     bool                       `json:"isolated,omitempty"`
+	SharedMemory *client.SharedMemoryConfig `json:"shared_memory,omitempty"`
+	ParentKey    string                     `json:"parent_key,omitempty"`
+	ParentText   string                     `json:"parent_text,omitempty"`
 }
 
 type atLine struct {
@@ -1111,6 +1112,7 @@ type commandOptions struct {
 	NestedVirt   *bool
 	Debug        bool
 	Isolated     *bool
+	SharedMemory *client.SharedMemoryConfig
 	OptionFields []string
 }
 
@@ -4396,17 +4398,18 @@ func vmContextFromState(id string, state client.InstanceState) commandContext {
 		vmID = strings.TrimSuffix(backendID, isolatedVMSuffix)
 	}
 	return commandContext{
-		Mode:       modeVM,
-		SystemName: vmID,
-		VMID:       vmID,
-		Image:      state.Image,
-		InitSystem: state.InitSystem,
-		Kernel:     state.Kernel,
-		MemoryMB:   state.MemoryMB,
-		CPUs:       state.CPUs,
-		NestedVirt: state.NestedVirt,
-		Network:    state.NetworkIPv4 != "",
-		Isolated:   isolated,
+		Mode:         modeVM,
+		SystemName:   vmID,
+		VMID:         vmID,
+		Image:        state.Image,
+		InitSystem:   state.InitSystem,
+		Kernel:       state.Kernel,
+		MemoryMB:     state.MemoryMB,
+		CPUs:         state.CPUs,
+		NestedVirt:   state.NestedVirt,
+		SharedMemory: cloneSharedMemoryConfig(state.SharedMemory),
+		Network:      state.NetworkIPv4 != "",
+		Isolated:     isolated,
 	}
 }
 
@@ -8188,6 +8191,9 @@ func validateRunningVMContext(id string, ctx commandContext, state client.Instan
 	if gotImage != "" && wantImage != "" && gotImage != wantImage {
 		return fmt.Errorf("VM %q is already running from %s, not %s; run @%s to switch to it or choose another name", displayID, sourceTextForImage(gotImage), sourceTextForImage(wantImage), visibleVMNameFromBackendID(displayID))
 	}
+	if !sharedMemoryConfigEqual(ctx.SharedMemory, state.SharedMemory) {
+		return fmt.Errorf("VM %q is already running with different shared-memory configuration; stop or restart it first", displayID)
+	}
 	if kernelStateEqual(wantKernel, gotKernel) && wantInit == gotInit {
 		return nil
 	}
@@ -8207,6 +8213,13 @@ func validateRunningVMContext(id string, ctx commandContext, state client.Instan
 		return fmt.Errorf("VM %q is already running without tracked init %q; run @restart or @stop before using --init", displayID, wantInit)
 	}
 	return fmt.Errorf("VM %q is already running with init %q, not %q; run @restart or @stop first", displayID, gotInit, wantInit)
+}
+
+func sharedMemoryConfigEqual(a, b *client.SharedMemoryConfig) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return strings.TrimSpace(a.Domain) == strings.TrimSpace(b.Domain) && a.PhysAddr == b.PhysAddr
 }
 
 func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) error {
@@ -8230,6 +8243,7 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 		CPUs:           ctx.CPUs,
 		NestedVirt:     ctx.NestedVirt,
 		Dmesg:          ctx.Debug,
+		SharedMemory:   cloneSharedMemoryConfig(ctx.SharedMemory),
 		TimeoutSeconds: vmshBootTimeoutSeconds(ctx.Image),
 	}
 	if startMountsHostShare(ctx) {
@@ -9040,6 +9054,9 @@ func restartContextFromState(ctx commandContext, state client.InstanceState) com
 	}
 	if !ctx.NestedVirt {
 		ctx.NestedVirt = state.NestedVirt
+	}
+	if ctx.SharedMemory == nil {
+		ctx.SharedMemory = cloneSharedMemoryConfig(state.SharedMemory)
 	}
 	if !ctx.Network && strings.TrimSpace(state.NetworkIPv4) != "" {
 		ctx.Network = true
@@ -10788,7 +10805,7 @@ func (s *shellState) help(w io.Writer) error {
 @tmux [session]          open tmux with vmsh as the default pane command
 @mux [cmd]               open native vmsh pane frontend; Ctrl+G q exits, Ctrl+G c creates panes
 @forward H:G             forward host port H to guest port G
-opts: --from source --vm id --cwd path --user user --sudo --init --no-init --kernel default|ubuntu --debug --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
+opts: --from source --vm id --cwd path --user user --sudo --init --no-init --kernel default|ubuntu --debug --memory-mb n --memory n[m|g] --cpus n --shmem domain,physaddr --network --no-network --nested --no-nested --isolated --shared --proxy(@agent)
 keys: Ctrl+R reverse history search; Esc/Ctrl+G cancel search
 cd <dir>                 change the current host, VM, or SSH working directory
 exit [--force]           leave the current subshell, or vmsh at top level
@@ -11029,6 +11046,16 @@ func parseCommandOptions(tokens []shellToken, start int, target string) (command
 				return opts, i, fmt.Errorf("invalid --cpus value %q", v)
 			}
 			opts.CPUs = cpus
+		case "--shmem":
+			v, err := readValue()
+			if err != nil {
+				return opts, i, err
+			}
+			config, err := parseSharedMemoryConfig(v)
+			if err != nil {
+				return opts, i, err
+			}
+			opts.SharedMemory = config
 		case "--network":
 			if hasInlineValue {
 				return opts, i, fmt.Errorf("--network does not take a value")
@@ -11114,6 +11141,10 @@ func (c commandContext) withOptions(opts commandOptions) commandContext {
 	}
 	if opts.Isolated != nil {
 		c.Isolated = *opts.Isolated
+	}
+	if opts.SharedMemory != nil {
+		config := *opts.SharedMemory
+		c.SharedMemory = &config
 	}
 	if opts.Isolated != nil && c.Isolated != wasIsolated && !explicitCWD {
 		c.CWD = ""
@@ -11532,6 +11563,28 @@ func parseMemoryMB(value string) (uint64, error) {
 		return 0, fmt.Errorf("invalid memory value %q", value)
 	}
 	return n * multiplier, nil
+}
+
+func parseSharedMemoryConfig(value string) (*client.SharedMemoryConfig, error) {
+	domain, address, ok := strings.Cut(strings.TrimSpace(value), ",")
+	domain = strings.TrimSpace(domain)
+	address = strings.TrimSpace(address)
+	if !ok || domain == "" || address == "" {
+		return nil, fmt.Errorf("invalid shared memory value %q; expected domain,physaddr", value)
+	}
+	physAddr, err := strconv.ParseUint(address, 0, 64)
+	if err != nil || physAddr == 0 || physAddr%4096 != 0 {
+		return nil, fmt.Errorf("invalid shared memory physical address %q", address)
+	}
+	return &client.SharedMemoryConfig{Domain: domain, PhysAddr: physAddr}, nil
+}
+
+func cloneSharedMemoryConfig(config *client.SharedMemoryConfig) *client.SharedMemoryConfig {
+	if config == nil {
+		return nil
+	}
+	cloned := *config
+	return &cloned
 }
 
 func parseCD(line string) (string, bool, error) {
