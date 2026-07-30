@@ -4,6 +4,7 @@ package main
 
 import (
 	"os"
+	"runtime"
 	"syscall"
 )
 
@@ -23,6 +24,10 @@ func platformArguments(args []string) []string {
 }
 
 func platformDefaultCPUs() int {
+	if runtime.GOARCH == "arm64" {
+		// cc's Windows ARM64 backend currently exposes one virtual processor.
+		return 1
+	}
 	return 4
 }
 
