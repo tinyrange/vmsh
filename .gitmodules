@@ -2,3 +2,7 @@
 	path = cc
 	url = https://github.com/tinyrange/cc.git
 	branch = main
+[submodule "gowin"]
+	path = gowin
+	url = https://github.com/tinyrange/gowin.git
+	branch = main

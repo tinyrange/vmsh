@@ -99,16 +99,33 @@ func run(args []string) (retErr error) {
 	if err != nil {
 		return err
 	}
-	settings, settingsDir, err := loadSquadVMSettings()
-	if err != nil {
-		return err
-	}
-
 	displayReady := make(chan ccdisplay.Session, 1)
-	systemInstall := settings.systemInstall()
-	activeCacheDir, err := resolveSquadVMCacheDir(*cacheDir, systemInstall)
-	if err != nil {
-		return err
+	var (
+		settings       squadVMSettings
+		settingsDir    string
+		systemInstall  bool
+		activeCacheDir string
+	)
+	if strings.TrimSpace(*cacheDir) != "" {
+		activeCacheDir, err = resolveSquadVMCacheDir(*cacheDir, false)
+		if err != nil {
+			return err
+		}
+		settingsDir = filepath.Join(activeCacheDir, "frontend")
+		settings, err = loadSquadVMSettingsFromDir(settingsDir)
+		if err != nil {
+			return err
+		}
+	} else {
+		settings, settingsDir, err = loadSquadVMSettings()
+		if err != nil {
+			return err
+		}
+		systemInstall = settings.systemInstall()
+		activeCacheDir, err = resolveSquadVMCacheDir("", systemInstall)
+		if err != nil {
+			return err
+		}
 	}
 	if strings.TrimSpace(*cacheDir) == "" && !systemInstall {
 		regularCacheDir, regularErr := resolveSquadVMCacheDir("", true)

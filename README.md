@@ -58,7 +58,7 @@ sh -lc 'uname -m && whoami'
 ## Requirements
 
 - Go 1.25 or newer, matching `go.mod`.
-- A checked-out `cc` submodule.
+- Checked-out `cc` and `gowin` submodules.
 - A supported virtualization host when running VM commands:
   - `linux/amd64` with KVM and user access to `/dev/kvm`.
   - `windows/amd64` or `windows/arm64` with Windows Hypervisor Platform enabled.
@@ -71,10 +71,12 @@ sh -lc 'uname -m && whoami'
 - `cmd/vmsh`: the `vmsh` shell.
 - `cc`: git submodule containing `ccvm`, VM backends, image import, and the
   lower-level `cc` CLI.
+- `gowin`: git submodule containing the native window, input, and OpenGL
+  frontend used by SquadVM and NeurodeskAppX.
 - `docs`: focused development notes and test recipes.
-- `tools/build.go`: local build and run helper for `cc`, `ccvm`, and `vmsh`.
-  It builds `ccvm` from the submodule as a sidecar artifact, builds `vmsh`,
-  signs `ccvm` on macOS, and can launch the built `vmsh`.
+- `tools/build.go`: local build and run helper for `cc`, `ccvm`, the native
+  desktop frontends, and `vmsh`. It uses the checked-out `cc` and `gowin`
+  sources, signs the native payloads on macOS, and can launch the built `vmsh`.
 - `.github/workflows/release.yml`: tag-triggered single-binary releases for
   Linux, Windows, and signed macOS ARM64.
 - `docs/design`: accepted plans for cross-cutting vmsh features.
