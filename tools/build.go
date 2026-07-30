@@ -16,14 +16,15 @@ import (
 )
 
 type paths struct {
-	root    string
-	ccDir   string
-	build   string
-	ccBin   string
-	ccvm    string
-	ndappx  string
-	squadvm string
-	vmsh    string
+	root     string
+	ccDir    string
+	gowinDir string
+	build    string
+	ccBin    string
+	ccvm     string
+	ndappx   string
+	squadvm  string
+	vmsh     string
 }
 
 var (
@@ -136,14 +137,15 @@ func makePaths(buildDirArg string) (paths, error) {
 	buildDir := resolveBuildDir(root, buildDirArg)
 	ccDir := filepath.Join(root, "cc")
 	return paths{
-		root:    root,
-		ccDir:   ccDir,
-		build:   buildDir,
-		ccBin:   filepath.Join(buildDir, "cc"+suffix),
-		ccvm:    filepath.Join(buildDir, "ccvm"+suffix),
-		ndappx:  filepath.Join(buildDir, "ndappx"+suffix),
-		squadvm: filepath.Join(buildDir, "squadvm"+suffix),
-		vmsh:    filepath.Join(buildDir, "vmsh"+suffix),
+		root:     root,
+		ccDir:    ccDir,
+		gowinDir: filepath.Join(root, "gowin"),
+		build:    buildDir,
+		ccBin:    filepath.Join(buildDir, "cc"+suffix),
+		ccvm:     filepath.Join(buildDir, "ccvm"+suffix),
+		ndappx:   filepath.Join(buildDir, "ndappx"+suffix),
+		squadvm:  filepath.Join(buildDir, "squadvm"+suffix),
+		vmsh:     filepath.Join(buildDir, "vmsh"+suffix),
 	}, nil
 }
 
@@ -228,13 +230,18 @@ func isRepoRoot(dir string) bool {
 	if !strings.Contains(string(mod), "module github.com/tinyrange/vmsh") {
 		return false
 	}
-	_, err = os.Stat(filepath.Join(dir, "cc", "go.mod"))
-	return err == nil
+	return true
 }
 
 func build(p paths) error {
 	logf("repo root: %s", p.root)
 	logf("build dir: %s", p.build)
+	if err := requireSubmodule("cc", p.ccDir); err != nil {
+		return err
+	}
+	if err := requireSubmodule("gowin", p.gowinDir); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(p.build, 0o755); err != nil {
 		return err
 	}
@@ -308,6 +315,13 @@ func build(p paths) error {
 	logf("built vmsh: %s", p.vmsh)
 
 	return nil
+}
+
+func requireSubmodule(name, dir string) error {
+	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s submodule is not initialized at %s; run `git submodule update --init --recursive`", name, dir)
 }
 
 func step(name string, fn func() error) error {

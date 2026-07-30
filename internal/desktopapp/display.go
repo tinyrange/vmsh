@@ -132,6 +132,7 @@ type displayViewer struct {
 	lastResize          image.Point
 	pendingResize       image.Point
 	resizeChangedAt     time.Time
+	resizeInitialized   bool
 	windowMinimized     bool
 	startup             startupProgress
 	startupChecklist    []startupChecklistItem
@@ -2552,6 +2553,18 @@ func (v *displayViewer) handleResize() error {
 		v.generation = 0
 	}
 	size := v.guestDisplaySize(backingWidth, backingHeight)
+	if !v.resizeInitialized {
+		// Cocoa may constrain the requested content rectangle to the visible
+		// screen before the first frame. Treat that platform-adjusted size as
+		// the presentation baseline, not a user resize. Otherwise a direct-DRM
+		// guest can allocate its initial framebuffer and immediately receive a
+		// different hotplug mode before its first page flip, leaving the CRTC
+		// permanently rejected with EINVAL.
+		v.lastResize = size
+		v.pendingResize = image.Point{}
+		v.resizeInitialized = true
+		return nil
+	}
 	if size == v.lastResize {
 		v.pendingResize = image.Point{}
 		return nil

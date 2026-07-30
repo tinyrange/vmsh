@@ -170,18 +170,23 @@ func loadAppSettings() (appSettings, string, error) {
 		return appSettings{}, "", fmt.Errorf("resolve user configuration directory: %w", err)
 	}
 	dir := filepath.Join(configDir, appConfig.ConfigDirName)
+	settings, err := loadAppSettingsFromDir(dir)
+	return settings, dir, err
+}
+
+func loadAppSettingsFromDir(dir string) (appSettings, error) {
 	data, err := os.ReadFile(filepath.Join(dir, "settings.json"))
 	if errors.Is(err, fs.ErrNotExist) {
-		return appSettings{}, dir, nil
+		return appSettings{}, nil
 	}
 	if err != nil {
-		return appSettings{}, "", fmt.Errorf("read %s settings: %w", productName(), err)
+		return appSettings{}, fmt.Errorf("read %s settings: %w", productName(), err)
 	}
 	var settings appSettings
 	if err := json.Unmarshal(data, &settings); err != nil {
-		return appSettings{}, "", fmt.Errorf("decode %s settings: %w", productName(), err)
+		return appSettings{}, fmt.Errorf("decode %s settings: %w", productName(), err)
 	}
-	return settings, dir, nil
+	return settings, nil
 }
 
 func saveAppSettings(dir string, settings appSettings) error {

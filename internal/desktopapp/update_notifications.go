@@ -321,6 +321,7 @@ func (v *displayViewer) beginImageUpdate() {
 	v.textureHeight = 0
 	v.lastResize = image.Point{}
 	v.pendingResize = image.Point{}
+	v.resizeInitialized = false
 	v.buttons = 0
 	v.sentButtons = 0
 	clear(v.keysDown)

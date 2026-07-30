@@ -32,6 +32,7 @@ jobs:
           cache-dependency-path: |
             go.sum
             cc/go.sum
+            gowin/go.sum
 
       - name: Build guest init payloads
         working-directory: cc
@@ -72,6 +73,7 @@ jobs:
           cache-dependency-path: |
             go.sum
             cc/go.sum
+            gowin/go.sum
 
       - name: Build guest init payloads
         working-directory: cc
@@ -110,6 +112,7 @@ jobs:
           cache-dependency-path: |
             go.sum
             cc/go.sum
+            gowin/go.sum
 
       - name: Build guest init payloads
         working-directory: cc
@@ -117,6 +120,10 @@ jobs:
 
       - name: Run tests
         run: go test -short ./... -count=1 -timeout 20m
+
+      - name: Run Gowin tests
+        working-directory: gowin
+        run: go test ./... -count=1 -timeout 20m
 
   build:
     name: Build vmsh payload
@@ -134,6 +141,7 @@ jobs:
           cache-dependency-path: |
             go.sum
             cc/go.sum
+            gowin/go.sum
 
       - name: Build
         run: ./tools/build.go build
@@ -155,6 +163,7 @@ jobs:
           cache-dependency-path: |
             go.sum
             cc/go.sum
+            gowin/go.sum
 
       - name: Enable KVM for the runner user
         run: |
@@ -169,7 +178,7 @@ jobs:
           path: |
             ~/.cache/ccx3
             ~/.cache/vmsh
-          key: vmsh-runtime-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'cc/go.sum') }}
+          key: vmsh-runtime-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'cc/go.sum', 'gowin/go.sum') }}
           restore-keys: |
             vmsh-runtime-${{ runner.os }}-${{ runner.arch }}-
 

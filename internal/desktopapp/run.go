@@ -109,9 +109,32 @@ func Run(config Config, args []string) (retErr error) {
 	if err != nil {
 		return err
 	}
-	settings, settingsDir, err := loadAppSettings()
-	if err != nil {
-		return err
+	var (
+		settings       appSettings
+		settingsDir    string
+		systemInstall  bool
+		activeCacheDir string
+	)
+	if strings.TrimSpace(*cacheDir) != "" {
+		activeCacheDir, err = resolveAppCacheDir(*cacheDir, false)
+		if err != nil {
+			return err
+		}
+		settingsDir = filepath.Join(activeCacheDir, "frontend")
+		settings, err = loadAppSettingsFromDir(settingsDir)
+		if err != nil {
+			return err
+		}
+	} else {
+		settings, settingsDir, err = loadAppSettings()
+		if err != nil {
+			return err
+		}
+		systemInstall = settings.systemInstall()
+		activeCacheDir, err = resolveAppCacheDir("", systemInstall)
+		if err != nil {
+			return err
+		}
 	}
 	storageValue := *storage
 	if !storageOptionSet && strings.TrimSpace(settings.SharedFolder) != "" {
@@ -142,11 +165,6 @@ func Run(config Config, args []string) (retErr error) {
 	})
 
 	displayReady := make(chan ccdisplay.Session, 1)
-	systemInstall := settings.systemInstall()
-	activeCacheDir, err := resolveAppCacheDir(*cacheDir, systemInstall)
-	if err != nil {
-		return err
-	}
 	if strings.TrimSpace(*cacheDir) == "" && !systemInstall {
 		regularCacheDir, regularErr := resolveAppCacheDir("", true)
 		if regularErr == nil && filepath.Clean(activeCacheDir) == filepath.Clean(regularCacheDir) {
