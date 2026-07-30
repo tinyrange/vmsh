@@ -18,5 +18,5 @@ npm run release-data
 
 ## Builds
 
-`npm run build` creates the local static site in `out/`. GitHub Pages uses
-`npm run build:pages` to create the same site with the repository base path.
+`npm run build` validates the site using the normal vinext build. GitHub Pages
+uses `npm run build:pages` to create the static site in `out/`.

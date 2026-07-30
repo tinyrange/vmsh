@@ -40,35 +40,38 @@ void main() {
 )
 
 type displayViewer struct {
-	session           display.Session
-	window            window.Window
-	gl                gl.OpenGL
-	text              *gowintext.Stash
-	font              int
-	program           uint32
-	vertexArray       uint32
-	vertexBuffer      uint32
-	texture           uint32
-	wordmarkTexture   uint32
-	wordmarkWidth     int
-	wordmarkHeight    int
-	textureWidth      int
-	textureHeight     int
-	generation        uint64
-	buttons           uint8
-	sentButtons       uint8
-	keysDown          map[window.Key]bool
-	guestClipboardGen uint64
-	hostClipboard     string
-	lastResize        image.Point
-	pendingResize     image.Point
-	resizeChangedAt   time.Time
-	startup           startupProgress
-	startupEvents     chan startupProgress
-	startDone         chan displayStartResult
-	presentation      desktopPresentationGate
-	desktopVisible    bool
-	startErr          error
+	session             display.Session
+	window              window.Window
+	gl                  gl.OpenGL
+	text                *gowintext.Stash
+	font                int
+	program             uint32
+	vertexArray         uint32
+	vertexBuffer        uint32
+	texture             uint32
+	wordmarkTexture     uint32
+	wordmarkWidth       int
+	wordmarkHeight      int
+	textureWidth        int
+	textureHeight       int
+	generation          uint64
+	buttons             uint8
+	sentButtons         uint8
+	scrollX120Remainder float64
+	scrollY120Remainder float64
+	legacyScrollY120    int64
+	keysDown            map[window.Key]bool
+	guestClipboardGen   uint64
+	hostClipboard       string
+	lastResize          image.Point
+	pendingResize       image.Point
+	resizeChangedAt     time.Time
+	startup             startupProgress
+	startupEvents       chan startupProgress
+	startDone           chan displayStartResult
+	presentation        desktopPresentationGate
+	desktopVisible      bool
+	startErr            error
 }
 
 type displayStartResult struct {
@@ -586,18 +589,17 @@ func (v *displayViewer) handleInput() error {
 				return err
 			}
 		case window.InputEventScroll:
-			if event.ScrollY == 0 {
+			if event.PreciseScroll {
+				deltaX120 := consumePreciseScrollDelta(event.RawScrollX, &v.scrollX120Remainder)
+				deltaY120 := consumePreciseScrollDelta(event.RawScrollY, &v.scrollY120Remainder)
+				if err := v.sendScroll(deltaX120, deltaY120); err != nil {
+					return err
+				}
 				continue
 			}
-			mask := uint8(8)
-			if event.ScrollY < 0 {
-				mask = 16
-			}
-			x, y := v.window.Cursor()
-			if err := v.sendPointer(x, y, v.buttons|mask); err != nil {
-				return err
-			}
-			if err := v.sendPointer(x, y, v.buttons); err != nil {
+			deltaX120 := consumeScrollDelta(event.ScrollX, &v.scrollX120Remainder)
+			deltaY120 := consumeScrollDelta(event.ScrollY, &v.scrollY120Remainder)
+			if err := v.sendScroll(deltaX120, deltaY120); err != nil {
 				return err
 			}
 		}
@@ -615,6 +617,69 @@ func (v *displayViewer) handleInput() error {
 		v.keysDown[key] = false
 	}
 	return nil
+}
+
+func (v *displayViewer) sendScroll(deltaX120, deltaY120 int32) error {
+	if scroller, ok := v.session.(display.HighResolutionScroller); ok {
+		if err := scroller.Scroll(deltaX120, deltaY120); err != nil {
+			return fmt.Errorf("send scroll input: %w", err)
+		}
+		return nil
+	}
+	v.legacyScrollY120 += int64(deltaY120)
+	steps := v.legacyScrollY120 / 120
+	v.legacyScrollY120 -= steps * 120
+	x, y := v.window.Cursor()
+	for steps != 0 {
+		mask := uint8(8)
+		if steps < 0 {
+			mask = 16
+			steps++
+		} else {
+			steps--
+		}
+		if err := v.sendPointer(x, y, v.buttons|mask); err != nil {
+			return err
+		}
+		if err := v.sendPointer(x, y, v.buttons); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// consumePreciseScrollDelta maps macOS logical-point deltas onto Linux's v120
+// high-resolution wheel units. Forty logical points correspond to one
+// traditional wheel detent, preserving movement down to 1/120th of a detent.
+func consumePreciseScrollDelta(points float32, remainder *float64) int32 {
+	const v120PerLogicalPoint = 3.0
+	total := float64(points)*v120PerLogicalPoint + *remainder
+	whole, fraction := math.Modf(total)
+	*remainder = fraction
+	if whole > math.MaxInt32 {
+		*remainder = 0
+		return math.MaxInt32
+	}
+	if whole < math.MinInt32 {
+		*remainder = 0
+		return math.MinInt32
+	}
+	return int32(whole)
+}
+
+func consumeScrollDelta(ticks float32, remainder *float64) int32 {
+	value := float64(ticks)*120 + *remainder
+	whole, fraction := math.Modf(value)
+	*remainder = fraction
+	if whole > math.MaxInt32 {
+		*remainder = 0
+		return math.MaxInt32
+	}
+	if whole < math.MinInt32 {
+		*remainder = 0
+		return math.MinInt32
+	}
+	return int32(whole)
 }
 
 func modifierTransitionDown(key window.Key, mods window.KeyMods, wasDown bool) (bool, bool) {
