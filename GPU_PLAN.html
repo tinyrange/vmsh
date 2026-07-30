@@ -2200,7 +2200,7 @@ type DisplayState struct {
 
           <h3 style="margin-top: 24px;">Compatibility corpus</h3>
           <ul>
-            <li>The first live ARM64 SquadVM corpus is <code>images/gpu-glmark2</code>: two indexed build paths, linear texture sampling, Gouraud shading, and a four-window desktop blur scene.</li>
+            <li>The live ARM64 SquadVM corpus is <code>images/gpu-glmark2</code>: it runs glmark2's complete 33-scene built-in suite, including build, texture, shading, bump, effects, desktop, buffer updates, complex models, conditionals, functions, and loops.</li>
             <li>The fixture builds on <code>astra-pi5</code>, boots under systemd, selects the host-preferred DRM mode, requires an XRGB/depth visual, identifies the guest renderer as <code>virgl</code>, and loops without an environment-variable gate.</li>
             <li>Next add explicit blend/scissor pixel cases, resize and reattach cycles, and a representative translated application workload.</li>
             <li>Add Neurodesk visualization traces when the renderer moves from the host-sharing experiment into the neuroimaging product slice.</li>
@@ -2279,17 +2279,18 @@ type DisplayState struct {
 
           <article class="milestone">
             <div class="milestone-id">M3</div>
-            <h3>Bounded VirGL decoder <span class="status now">Application subset live</span></h3>
+            <h3>Bounded VirGL decoder <span class="status now">glmark2 profile live</span></h3>
             <p>
               Bounded framing, contexts, resource and object handle tables,
               vertex/rasterizer/framebuffer/shader state, sampler views and
               states, depth targets, indexing, multi-buffer vertices,
               texture transfers, blits, validation, and explicit
               unsupported-command errors are implemented. The TGSI compiler
-              now links unnamed varyings and translates the sampler declarations
-              and texture instructions exercised by the SquadVM corpus.
+              now links unnamed varyings and translates the sampler, arithmetic,
+              integer, indirect-addressing, discard, and structured-control-flow
+              instructions exercised by the complete SquadVM glmark2 corpus.
             </p>
-            <div class="gate">Current evidence: malformed framing and unsupported TGSI are rejected; standard kmscube renders continuously; and five unmodified OpenGL ES glmark2 scenes repeatedly create contexts, compile shaders, sample textures, use depth and indexed draws, and complete through Mesa VirGL.</div>
+            <div class="gate">Current evidence: malformed framing and unsupported TGSI are rejected; standard kmscube renders continuously; and all 33 stock OpenGL ES glmark2 benchmarks repeatedly create contexts, compile shaders, sample textures, use depth-only and color framebuffers, exercise indexed and non-indexed primitive modes, and complete through Mesa VirGL without a rejected renderer operation.</div>
           </article>
 
           <article class="milestone">
@@ -2309,29 +2310,34 @@ type DisplayState struct {
 
           <article class="milestone">
             <div class="milestone-id">M5</div>
-            <h3>SquadVM application profile <span class="status now">First corpus implemented</span></h3>
+            <h3>SquadVM application profile <span class="status now">Full glmark2 corpus implemented</span></h3>
             <p>
               The reproducible ARM64 <code>images/gpu-glmark2</code> guest
-              expands the cube into a regular application corpus covering VBO
-              and client-vertex upload paths, indexed draws, linear texture
-              sampling, varyings, 24-bit depth, render-target blits, and
-              repeated scene cycles in one long-lived context. Separate fixture
-              launches also verify clean context teardown and recreation. It
-              runs as an ordinary systemd service and keeps all host cache,
-              storage, and capture artifacts beneath the repository.
+              expands the cube into a regular application corpus covering the
+              complete built-in glmark2-es2-drm suite: VBO and client-vertex
+              upload paths, indexed draws, all core primitive modes used by the
+              suite, texture and mipmap sampling, varyings, 24-bit depth,
+              depth-only shadow passes, render-target blits, integer shader
+              operations, indirect constants, and repeated scene cycles.
+              Separate fixture launches also verify clean context teardown and
+              recreation. It runs as an ordinary systemd service and keeps all
+              host cache, storage, and capture artifacts beneath the repository.
             </p>
-            <div class="gate">Current evidence: the guest reports Mesa/X.org, renderer “virgl”, OpenGL ES 2.0, an XRGB 24-bit-depth 1440×900 surface, and repeatedly completes build/VBO, build/client, texture/linear, shading/Gouraud, and desktop/blur scenes. Remaining M5 work is blend/scissor correctness, resize lifecycle, and the first real SquadVM desktop application.</div>
+            <div class="gate">Current evidence: the guest reports Mesa/X.org, renderer “virgl”, OpenGL ES 2.0, and an XRGB 24-bit-depth 1440×900 surface; all 33 stock scenes complete and the suite begins its next cycle without a host renderer rejection. The next M5 step is a real SquadVM OpenGL desktop application rather than another synthetic benchmark.</div>
           </article>
 
           <article class="milestone">
             <div class="milestone-id">M6</div>
-            <h3>Native shared-texture scanout</h3>
+            <h3>Native shared-texture scanout <span class="status now">Implemented on Darwin</span></h3>
             <p>
-              Add optional native frames, producer/consumer fencing, damage,
-              release, resize, and Glass composition. Keep CPU snapshots
-              available for VNC and diagnostics.
+              Gowin exposes the visible window's complete NSOpenGL share group.
+              cc publishes leased frames from a bounded three-texture pool with
+              producer and consumer fences, generation, damage, release, and
+              resize-safe teardown. Glass samples those textures directly.
+              CPU readback is deferred until a VNC or diagnostic snapshot
+              explicitly requests it.
             </p>
-            <div class="gate">Exit gate: normal Glass presentation performs no full-frame GPU readback/upload and survives repeated resize and attach cycles.</div>
+            <div class="gate">Current evidence: a renderer behavior test proves that a native flush performs zero readbacks and that the first CPU snapshot performs exactly one lazy readback; Gowin's cross-context fence test verifies shared texture ownership; and the native 1440×900 guest corpus runs through the shared-texture path at roughly 2,000–4,400 frames/second in early scenes versus roughly 500–1,000 through VNC readback. Repeated resize and attach soak remains ongoing hardening.</div>
           </article>
 
           <article class="milestone">

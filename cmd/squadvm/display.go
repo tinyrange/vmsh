@@ -43,6 +43,7 @@ type displayViewer struct {
 	session             display.Session
 	window              window.Window
 	gl                  gl.OpenGL
+	synchronization     gl.Synchronization
 	text                *gowintext.Stash
 	font                int
 	program             uint32
@@ -55,6 +56,8 @@ type displayViewer struct {
 	textureWidth        int
 	textureHeight       int
 	generation          uint64
+	nativeFrame         display.OpenGLFrame
+	nativeConsumerFence gl.Sync
 	buttons             uint8
 	sentButtons         uint8
 	scrollX120Remainder float64
@@ -112,10 +115,18 @@ func openDisplayWindow(
 	firstRunComplete bool,
 	preflight displayPreflight,
 	start displayStart,
+	publishOpenGLShareGroup func(context, pixelFormat uintptr),
 ) error {
 	win, err := window.New(title, width, height, true)
 	if err != nil {
 		return fmt.Errorf("open graphics window: %w", err)
+	}
+	if publishOpenGLShareGroup != nil {
+		if provider, ok := win.(window.OpenGLShareGroupProvider); ok {
+			context, pixelFormat := provider.OpenGLShareGroup()
+			publishOpenGLShareGroup(context, pixelFormat)
+			defer publishOpenGLShareGroup(0, 0)
+		}
 	}
 	viewer := &displayViewer{
 		window:            win,
@@ -186,6 +197,7 @@ func (v *displayViewer) init() error {
 	if err != nil {
 		return fmt.Errorf("initialize graphics: %w", err)
 	}
+	v.synchronization, _ = v.gl.(gl.Synchronization)
 	// The low-level display path does not pass through gowin/graphics, which
 	// normally establishes alpha blending for Fontstash glyph textures.
 	v.gl.Enable(gl.Blend)
@@ -240,6 +252,7 @@ func (v *displayViewer) init() error {
 }
 
 func (v *displayViewer) close() {
+	v.releaseNativeFrame()
 	if v.brandTexture != 0 {
 		v.gl.DeleteTextures(1, &v.brandTexture)
 	}
@@ -357,7 +370,11 @@ func (v *displayViewer) loop(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			v.presentation.observe(update, time.Now())
+			if v.nativeFrame.Texture != 0 {
+				v.presentation.observeOpenGLFrame(v.nativeFrame, time.Now())
+			} else {
+				v.presentation.observe(update, time.Now())
+			}
 			if v.presentation.ready(time.Now()) {
 				v.desktopVisible = true
 			}
@@ -373,9 +390,14 @@ func (v *displayViewer) loop(ctx context.Context) error {
 			v.gl.Clear(gl.ColorBufferBit)
 			v.gl.UseProgram(v.program)
 			v.gl.ActiveTexture(gl.Texture0)
-			v.gl.BindTexture(gl.Texture2D, v.texture)
+			texture := v.texture
+			if v.nativeFrame.Texture != 0 {
+				texture = v.nativeFrame.Texture
+			}
+			v.gl.BindTexture(gl.Texture2D, texture)
 			v.gl.BindVertexArray(v.vertexArray)
 			v.gl.DrawArrays(gl.Triangles, 0, 6)
+			v.markNativeFrameConsumed()
 			v.drawUpdateNotifications(backingWidth, backingHeight, time.Now())
 		} else if v.showSettings {
 			v.drawSettings(backingWidth, backingHeight)
@@ -438,6 +460,7 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 					v.returnToSettings = true
 					v.startCancel()
 				}
+				v.releaseNativeFrame()
 				v.session = nil
 				v.presentation = desktopPresentationGate{}
 				v.desktopVisible = false
@@ -484,6 +507,29 @@ func (v *displayViewer) beginSettingsStart(refreshImage bool) {
 }
 
 func (v *displayViewer) updateTexture() (display.FramebufferUpdate, error) {
+	if provider, ok := v.session.(display.OpenGLFrameSession); ok && v.synchronization != nil {
+		frame, available, err := provider.AcquireOpenGLFrame(v.generation)
+		if err != nil {
+			return display.FramebufferUpdate{}, err
+		}
+		if available {
+			v.releaseNativeFrame()
+			v.synchronization.WaitSync(gl.Sync(frame.ProducerFence), 0, gl.TimeoutIgnored)
+			v.nativeFrame = frame
+			v.textureWidth, v.textureHeight = frame.Width, frame.Height
+			v.generation = frame.Generation
+			return display.FramebufferUpdate{
+				Width: frame.Width, Height: frame.Height, Generation: frame.Generation,
+				Rect: image.Rect(0, 0, frame.Width, frame.Height),
+			}, nil
+		}
+		if v.nativeFrame.Texture != 0 {
+			return display.FramebufferUpdate{
+				Width: v.nativeFrame.Width, Height: v.nativeFrame.Height,
+				Generation: v.nativeFrame.Generation,
+			}, nil
+		}
+	}
 	width, height := v.session.Size()
 	update := v.session.Snapshot(image.Rect(0, 0, width, height), v.generation, v.generation != 0)
 	if update.Generation == v.generation && update.Rect.Empty() {
@@ -502,6 +548,26 @@ func (v *displayViewer) updateTexture() (display.FramebufferUpdate, error) {
 	}
 	v.generation = update.Generation
 	return update, nil
+}
+
+func (v *displayViewer) markNativeFrameConsumed() {
+	if v.nativeFrame.Texture == 0 || v.synchronization == nil {
+		return
+	}
+	if v.nativeConsumerFence != 0 {
+		v.synchronization.DeleteSync(v.nativeConsumerFence)
+	}
+	v.nativeConsumerFence = v.synchronization.FenceSync(gl.SyncGPUCommandsComplete, 0)
+	v.synchronization.Flush()
+}
+
+func (v *displayViewer) releaseNativeFrame() {
+	if v.nativeFrame.Texture == 0 {
+		return
+	}
+	v.nativeFrame.Release(uintptr(v.nativeConsumerFence))
+	v.nativeFrame = display.OpenGLFrame{}
+	v.nativeConsumerFence = 0
 }
 
 func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {

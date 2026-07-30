@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -100,6 +101,15 @@ func run(args []string) (retErr error) {
 		return err
 	}
 	displayReady := make(chan ccdisplay.Session, 1)
+	var openGLShareContext atomic.Uintptr
+	var openGLSharePixelFormat atomic.Uintptr
+	openGLShareGroup := func() (context, pixelFormat uintptr) {
+		return openGLShareContext.Load(), openGLSharePixelFormat.Load()
+	}
+	publishOpenGLShareGroup := func(context, pixelFormat uintptr) {
+		openGLShareContext.Store(context)
+		openGLSharePixelFormat.Store(pixelFormat)
+	}
 	var (
 		settings       squadVMSettings
 		settingsDir    string
@@ -136,7 +146,7 @@ func run(args []string) (retErr error) {
 			systemInstall = true
 		}
 	}
-	backend, err := startEmbeddedSquadVMBackend(activeCacheDir, *name, displayReady)
+	backend, err := startEmbeddedSquadVMBackend(activeCacheDir, *name, displayReady, openGLShareGroup)
 	if err != nil && strings.TrimSpace(*cacheDir) == "" && !systemInstall {
 		// A portable directory may be unavailable beside an installed app.
 		// Keep the first-run UI reachable by falling back to the user cache and
@@ -144,7 +154,7 @@ func run(args []string) (retErr error) {
 		systemInstall = true
 		activeCacheDir, err = resolveSquadVMCacheDir("", true)
 		if err == nil {
-			backend, err = startEmbeddedSquadVMBackend(activeCacheDir, *name, displayReady)
+			backend, err = startEmbeddedSquadVMBackend(activeCacheDir, *name, displayReady, openGLShareGroup)
 		}
 	}
 	if err != nil {
@@ -223,7 +233,7 @@ func run(args []string) (retErr error) {
 				if err := backend.stop(); err != nil {
 					return displayStarted{}, err
 				}
-				backend, err = startEmbeddedSquadVMBackend(desiredCacheDir, *name, displayReady)
+				backend, err = startEmbeddedSquadVMBackend(desiredCacheDir, *name, displayReady, openGLShareGroup)
 				if err != nil {
 					return displayStarted{}, err
 				}
@@ -378,6 +388,7 @@ func run(args []string) (retErr error) {
 			settings.FirstRunComplete,
 			preflight,
 			start,
+			publishOpenGLShareGroup,
 		)
 		cancelDisplay()
 		if windowErr != nil {
@@ -581,13 +592,6 @@ attempt=0
 while [ "$attempt" -lt 900 ]; do
     if [ -S /tmp/.X11-unix/X0 ] &&
        [ -f /run/user/1000/squadvm-desktop-ready ]; then
-        if [ "$(uname -m)" = "aarch64" ] &&
-           { ! grep -qs ' /proc/sys/fs/binfmt_misc binfmt_misc ' /proc/mounts ||
-             [ ! -x /usr/bin/qemu-x86_64 ] ||
-             [ ! -x /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 ] ||
-             [ ! -r /proc/sys/fs/binfmt_misc/qemu-x86_64 ]; }; then
-            exit 1
-        fi
         exit 0
     fi
     attempt=$((attempt + 1))

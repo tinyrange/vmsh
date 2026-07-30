@@ -219,6 +219,7 @@ func (v *displayViewer) beginImageUpdate() {
 	}
 	stopped := v.attemptStopped
 	v.starting = true
+	v.releaseNativeFrame()
 	v.session = nil
 	v.presentation = desktopPresentationGate{}
 	v.desktopVisible = false

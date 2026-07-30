@@ -18,14 +18,19 @@ type embeddedSquadVMBackend struct {
 	finished bool
 }
 
-func startEmbeddedSquadVMBackend(cacheDir, name string, displayReady chan<- display.Session) (*embeddedSquadVMBackend, error) {
+func startEmbeddedSquadVMBackend(
+	cacheDir, name string,
+	displayReady chan<- display.Session,
+	openGLShareGroup func() (context, pixelFormat uintptr),
+) (*embeddedSquadVMBackend, error) {
 	ready := make(chan client.ServerHello, 1)
 	done := make(chan error, 1)
 	serverArgs := []string{"-addr", "127.0.0.1:0", "-cache-dir", cacheDir}
 	go func() {
 		_, err := ccvmd.RunServer(serverArgs, ccvmd.ServerOptions{
-			Kind:          "squadvm",
-			StartupWriter: io.Discard,
+			Kind:             "squadvm",
+			StartupWriter:    io.Discard,
+			OpenGLShareGroup: openGLShareGroup,
 			OnStartup: func(hello client.ServerHello) error {
 				ready <- hello
 				return nil
