@@ -13,14 +13,11 @@ trap 'kill "$readiness_pid" 2>/dev/null || true' EXIT INT TERM
 
 touch /run/user/1000/squadvm-desktop-ready
 
-# Keep this corpus explicit and deterministic. Add scenes only after the owned
-# decoder passes the existing list without falling back to software rendering.
+# Run glmark2's complete built-in suite. The persistent log makes scene
+# completion and renderer failures observable from the host through /shared
+# without changing the guest workload.
 exec glmark2-es2-drm \
     --annotate \
     --run-forever \
     --visual-config alpha=0 \
-    --benchmark build:use-vbo=true \
-    --benchmark build:use-vbo=false \
-    --benchmark texture:texture-filter=linear \
-    --benchmark shading:shading=gouraud \
-    --benchmark desktop:effect=blur:windows=4
+    >/shared/glmark2-full.log 2>&1

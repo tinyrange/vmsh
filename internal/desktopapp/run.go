@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -165,6 +166,15 @@ func Run(config Config, args []string) (retErr error) {
 	})
 
 	displayReady := make(chan ccdisplay.Session, 1)
+	var openGLShareContext atomic.Uintptr
+	var openGLSharePixelFormat atomic.Uintptr
+	openGLShareGroup := func() (context, pixelFormat uintptr) {
+		return openGLShareContext.Load(), openGLSharePixelFormat.Load()
+	}
+	publishOpenGLShareGroup := func(context, pixelFormat uintptr) {
+		openGLShareContext.Store(context)
+		openGLSharePixelFormat.Store(pixelFormat)
+	}
 	if strings.TrimSpace(*cacheDir) == "" && !systemInstall {
 		regularCacheDir, regularErr := resolveAppCacheDir("", true)
 		if regularErr == nil && filepath.Clean(activeCacheDir) == filepath.Clean(regularCacheDir) {
@@ -174,7 +184,7 @@ func Run(config Config, args []string) (retErr error) {
 			systemInstall = true
 		}
 	}
-	backend, err := startEmbeddedBackend(activeCacheDir, *name, displayReady)
+	backend, err := startEmbeddedBackend(activeCacheDir, *name, displayReady, openGLShareGroup)
 	if err != nil && strings.TrimSpace(*cacheDir) == "" && !systemInstall {
 		// A portable directory may be unavailable beside an installed app.
 		// Keep the first-run UI reachable by falling back to the user cache and
@@ -182,7 +192,7 @@ func Run(config Config, args []string) (retErr error) {
 		systemInstall = true
 		activeCacheDir, err = resolveAppCacheDir("", true)
 		if err == nil {
-			backend, err = startEmbeddedBackend(activeCacheDir, *name, displayReady)
+			backend, err = startEmbeddedBackend(activeCacheDir, *name, displayReady, openGLShareGroup)
 		}
 	}
 	if err != nil {
@@ -274,7 +284,7 @@ func Run(config Config, args []string) (retErr error) {
 				if err := backend.stop(); err != nil {
 					return displayStarted{}, err
 				}
-				backend, err = startEmbeddedBackend(desiredCacheDir, *name, displayReady)
+				backend, err = startEmbeddedBackend(desiredCacheDir, *name, displayReady, openGLShareGroup)
 				if err != nil {
 					return displayStarted{}, err
 				}
@@ -540,6 +550,7 @@ func Run(config Config, args []string) (retErr error) {
 			preflight,
 			start,
 			cvmfsStatus,
+			publishOpenGLShareGroup,
 		)
 		cancelDisplay()
 		if windowErr != nil {

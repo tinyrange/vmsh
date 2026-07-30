@@ -18,13 +18,18 @@ type embeddedBackend struct {
 	finished bool
 }
 
-func startEmbeddedBackend(cacheDir, name string, displayReady chan<- display.Session) (*embeddedBackend, error) {
+func startEmbeddedBackend(
+	cacheDir, name string,
+	displayReady chan<- display.Session,
+	openGLShareGroup func() (context, pixelFormat uintptr),
+) (*embeddedBackend, error) {
 	ready := make(chan client.ServerHello, 1)
 	done := make(chan error, 1)
 	serverArgs := []string{"-addr", "127.0.0.1:0", "-cache-dir", cacheDir}
 	serverOptions := ccvmd.ServerOptions{
-		Kind:          appConfig.Kind,
-		StartupWriter: io.Discard,
+		Kind:             appConfig.Kind,
+		StartupWriter:    io.Discard,
+		OpenGLShareGroup: openGLShareGroup,
 		OnStartup: func(hello client.ServerHello) error {
 			ready <- hello
 			return nil

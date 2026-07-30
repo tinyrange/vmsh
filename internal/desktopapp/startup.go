@@ -285,6 +285,21 @@ func (g *desktopPresentationGate) observe(update display.FramebufferUpdate, now 
 	}
 }
 
+func (g *desktopPresentationGate) observeOpenGLFrame(frame display.OpenGLFrame, now time.Time) {
+	if !g.guestReady || frame.Width <= 0 || frame.Height <= 0 || frame.Texture == 0 {
+		return
+	}
+	size := image.Pt(frame.Width, frame.Height)
+	if size != g.fullSize {
+		g.fullSize = size
+		g.fullFrameAt = now
+		return
+	}
+	if g.fullFrameAt.IsZero() {
+		g.fullFrameAt = now
+	}
+}
+
 func (g desktopPresentationGate) ready(now time.Time) bool {
 	return g.guestReady && !g.fullFrameAt.IsZero() && now.Sub(g.fullFrameAt) >= desktopFrameSettleDelay
 }
