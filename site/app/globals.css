@@ -343,6 +343,14 @@ nav .github-link {
   font-weight: 500;
 }
 
+.system-requirement {
+  color: #77777e;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 10px;
+  min-height: 15px;
+  padding-top: 10px;
+}
+
 .vmsh-section {
   display: grid;
   gap: 100px;

@@ -111,6 +111,11 @@ function DownloadCard({ product }: { product: Product }) {
             {selected.arch} · {prettySize(selected.size)}
           </span>
         </a>
+        <div className="system-requirement" aria-live="polite">
+          {selected.platform === "macOS"
+            ? "Requires macOS 15 or newer."
+            : null}
+        </div>
       </div>
     </article>
   );

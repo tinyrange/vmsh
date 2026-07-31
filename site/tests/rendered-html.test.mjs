@@ -43,6 +43,11 @@ test("server renders the default app downloads and every vmsh download", async (
     html,
     new RegExp(release.checksums.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
   );
+  assert.equal(
+    html.split("Requires macOS 15 or newer.").length - 1,
+    2,
+    "both desktop applications should document the macOS requirement",
+  );
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/);
 });
 

@@ -55,6 +55,9 @@ func run(args []string) (retErr error) {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if err := platformCompatibilityError(); err != nil {
+		return err
+	}
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: NeurodeskAppX [OPTIONS] IMAGE")
 	}
