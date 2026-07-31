@@ -84,6 +84,16 @@ function formatTime(seconds: number) {
   return `${Math.floor(rounded / 60)}:${String(rounded % 60).padStart(2, "0")}`;
 }
 
+function replayMetadata(terminal: Terminal, value: unknown) {
+  if (typeof value !== "object" || !value) return;
+  const metadata = value as { name?: string; fields?: Record<string, unknown> };
+  if (metadata.name !== "ptyterm.resize" || !metadata.fields) return;
+  const { cols, rows } = metadata.fields;
+  if (typeof cols === "number" && typeof rows === "number" && cols > 0 && rows > 0) {
+    terminal.resize(cols, rows);
+  }
+}
+
 export default function TourPlayer({ castUrl }: { castUrl: string }) {
   const terminalHost = useRef<HTMLDivElement>(null);
   const terminal = useRef<Terminal | null>(null);
@@ -115,6 +125,7 @@ export default function TourPlayer({ castUrl }: { castUrl: string }) {
     const currentTerminal = terminal.current;
     if (!currentTour || !currentTerminal) return;
     if (reset) {
+      currentTerminal.resize(currentTour.header.width, currentTour.header.height);
       currentTerminal.reset();
       eventIndex.current = 0;
     }
@@ -125,6 +136,8 @@ export default function TourPlayer({ castUrl }: { castUrl: string }) {
       const event = currentTour.events[eventIndex.current];
       if (event[1] === "o" && typeof event[2] === "string") {
         currentTerminal.write(event[2]);
+      } else if (event[1] === "m") {
+        replayMetadata(currentTerminal, event[2]);
       }
       eventIndex.current += 1;
     }

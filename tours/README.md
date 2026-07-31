@@ -3,6 +3,9 @@
 Tours are executable user stories. Each `.star` file drives a real interactive
 vmsh session through a PTY, asserts user-visible behavior, and produces an
 asciinema v2 cast with timed `vmsh.tour.section` metadata events.
+The website replays the recorded terminal bytes and resize events with Xterm.js,
+so alternate-screen applications such as tmux and nvim use normal terminal
+semantics rather than a transcript-specific renderer.
 
 Generate the context-switching tour after building vmsh and ccvm:
 
@@ -49,3 +52,9 @@ go run ./cmd/vmsh-tour \
 
 Prefer prompt and behavioral assertions over pauses. Avoid assertions on prose,
 colors, incidental progress messages, or wall-clock timing.
+
+The runner defaults to a readable presentation pace: 45 ms between typed runes,
+350 ms between typing and Enter, and 650 ms after revealing a section. Override
+these with `-type-delay`, `-enter-delay`, and `-section-delay` when a particular
+tour needs different pacing. These pauses affect presentation only; assertions
+must still wait for observable terminal behavior.

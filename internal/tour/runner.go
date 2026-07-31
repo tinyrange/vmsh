@@ -19,17 +19,19 @@ const SchemaVersion = 1
 var validTourID = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
 type Options struct {
-	ScriptPath string
-	OutputPath string
-	Command    []string
-	Dir        string
-	Env        []string
-	Size       ptyterm.Size
-	Timeout    time.Duration
-	TypeDelay  time.Duration
-	Version    string
-	Commit     string
-	Values     map[string]string
+	ScriptPath   string
+	OutputPath   string
+	Command      []string
+	Dir          string
+	Env          []string
+	Size         ptyterm.Size
+	Timeout      time.Duration
+	TypeDelay    time.Duration
+	EnterDelay   time.Duration
+	SectionDelay time.Duration
+	Version      string
+	Commit       string
+	Values       map[string]string
 }
 
 type Result struct {
@@ -122,11 +124,13 @@ func Run(parent context.Context, opts Options) (Result, error) {
 	driver := ptyterm.NewDriver(session)
 	driver.SetDelay(opts.TypeDelay)
 	tourCtx := &contextValue{
-		ctx:      ctx,
-		driver:   driver,
-		session:  session,
-		recorder: recorder,
-		values:   cloneValues(opts.Values),
+		ctx:          ctx,
+		driver:       driver,
+		session:      session,
+		recorder:     recorder,
+		values:       cloneValues(opts.Values),
+		enterDelay:   opts.EnterDelay,
+		sectionDelay: opts.SectionDelay,
 	}
 
 	if _, err := starlark.Call(thread, mainFn, starlark.Tuple{tourCtx}, nil); err != nil {
@@ -195,6 +199,8 @@ type contextValue struct {
 	session      *ptyterm.Session
 	recorder     *asciicast.Recorder
 	values       map[string]string
+	enterDelay   time.Duration
+	sectionDelay time.Duration
 	lastPosition int64
 	sections     int
 }
@@ -244,6 +250,9 @@ func (c *contextValue) typeText(_ *starlark.Thread, fn *starlark.Builtin, args s
 
 func (c *contextValue) enter(_ *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	if err := starlark.UnpackArgs(fn.Name(), args, kwargs); err != nil {
+		return nil, err
+	}
+	if err := c.wait(c.enterDelay); err != nil {
 		return nil, err
 	}
 	c.lastPosition = c.session.Snapshot().BytesRead
@@ -351,6 +360,9 @@ func (c *contextValue) section(_ *starlark.Thread, fn *starlark.Builtin, args st
 		"title":    title,
 		"markdown": markdown,
 	})
+	if err := c.wait(c.sectionDelay); err != nil {
+		return nil, err
+	}
 	return starlark.None, nil
 }
 
@@ -373,13 +385,23 @@ func (c *contextValue) pause(_ *starlark.Thread, fn *starlark.Builtin, args star
 	if milliseconds < 0 || milliseconds > 10000 {
 		return nil, fmt.Errorf("pause must be between 0 and 10000 milliseconds")
 	}
-	timer := time.NewTimer(time.Duration(milliseconds) * time.Millisecond)
+	if err := c.wait(time.Duration(milliseconds) * time.Millisecond); err != nil {
+		return nil, err
+	}
+	return starlark.None, nil
+}
+
+func (c *contextValue) wait(delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-c.ctx.Done():
-		return nil, c.ctx.Err()
+		return c.ctx.Err()
 	case <-timer.C:
-		return starlark.None, nil
+		return nil
 	}
 }
 
