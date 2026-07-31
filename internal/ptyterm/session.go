@@ -117,6 +117,14 @@ func (s *Session) Write(data []byte) (int, error) {
 	}
 	n, err := s.pty.Write(data)
 	s.bytesStdin.Add(int64(n))
+	if n > 0 {
+		s.mu.Lock()
+		recorder := s.recorder
+		s.mu.Unlock()
+		if inputRecorder, ok := recorder.(interface{ Input([]byte) }); ok {
+			inputRecorder.Input(data[:n])
+		}
+	}
 	return n, err
 }
 

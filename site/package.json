@@ -16,10 +16,12 @@
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
+    "@xterm/xterm": "^6.0.0",
     "drizzle-orm": "0.45.2",
     "next": "16.2.12",
     "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "react-dom": "19.2.6",
+    "react-markdown": "^10.1.0"
   },
   "overrides": {
     "postcss": "8.5.25",

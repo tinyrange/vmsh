@@ -28,6 +28,68 @@ env:
   RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
 
 jobs:
+  tours:
+    name: Regenerate tested tutorials
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            cc/go.sum
+
+      - name: Enable KVM for the runner user
+        run: |
+          set -euo pipefail
+          test -e /dev/kvm
+          sudo chmod 666 /dev/kvm
+          test -r /dev/kvm -a -w /dev/kvm
+
+      - name: Cache runtime artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/ccx3
+            ~/.cache/vmsh
+          key: vmsh-tour-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'cc/go.sum', 'tours/*.star') }}
+          restore-keys: |
+            vmsh-tour-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build vmsh and ccvm
+        run: ./tools/build.go build
+
+      - name: Run every tested tutorial
+        run: |
+          set -euo pipefail
+          build/vmsh/cc \
+            -ccvm build/vmsh/ccvm \
+            -cache-dir build/tour-cache \
+            pull vmsh-tour-alpine cc/fixtures/alpine.simg
+          go run ./cmd/vmsh-tour \
+            -vmsh build/vmsh/vmsh \
+            -ccvm build/vmsh/ccvm \
+            -cache-dir build/tour-cache \
+            -out-dir site/public/tours \
+            -version "${RELEASE_VERSION}" \
+            -commit "${GITHUB_SHA}" \
+            -var image=vmsh-tour-alpine \
+            tours/*.star
+
+      - name: Upload tested tutorials
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmsh-tours
+          path: site/public/tours/*.cast
+          if-no-files-found: error
+
   build-unix-windows:
     name: Build ${{ matrix.goos }} ${{ matrix.goarch }}
     runs-on: ubuntu-24.04
@@ -430,7 +492,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [build-unix-windows, build-macos]
+    needs: [build-unix-windows, build-macos, tours]
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout release notes
@@ -444,7 +506,7 @@ jobs:
       - name: Generate checksums
         run: |
           set -euo pipefail
-          find artifacts -type f \( -name 'vmsh_*' -o -name 'NeurodeskAppX_*' -o -name 'SquadVM_*' \) -print0 |
+          find artifacts -type f \( -name 'vmsh_*' -o -name 'NeurodeskAppX_*' -o -name 'SquadVM_*' -o -name '*.cast' \) -print0 |
             sort -z |
             xargs -0 sha256sum |
             sed 's#artifacts/[^/]*/##' > checksums.txt
@@ -467,6 +529,7 @@ jobs:
             artifacts/**/vmsh_*
             artifacts/**/NeurodeskAppX_*
             artifacts/**/SquadVM_*
+            artifacts/**/*.cast
             checksums.txt
 
       - name: Refresh website release data

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import release from "./release-data.json";
 
 type Platform = "macOS" | "Windows" | "Linux";
@@ -68,10 +69,13 @@ function DownloadCard({ product }: { product: Product }) {
   const [platform, setPlatform] = useState<Platform>("macOS");
 
   useEffect(() => {
-    const detected = detectPlatform();
-    if (downloads.some((download) => download.platform === detected)) {
-      setPlatform(detected);
-    }
+    const frame = window.requestAnimationFrame(() => {
+      const detected = detectPlatform();
+      if (downloads.some((download) => download.platform === detected)) {
+        setPlatform(detected);
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, [downloads]);
 
   const selected =
@@ -136,6 +140,7 @@ export default function Home() {
         <nav aria-label="Main navigation">
           <a href="#apps">Apps</a>
           <a href="#vmsh">vmsh</a>
+          <Link href="/tours/context-switching">Tours</Link>
           <a
             className="github-link"
             href="https://github.com/tinyrange/vmsh"
@@ -198,6 +203,9 @@ export default function Home() {
           >
             Read the documentation <span aria-hidden="true">→</span>
           </a>
+          <Link className="tour-link" href="/tours/context-switching">
+            Watch the tested context tour <span aria-hidden="true">▶</span>
+          </Link>
         </div>
 
         <div className="cli-panel">

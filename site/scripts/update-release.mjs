@@ -1,9 +1,13 @@
-import { writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 
 const repository = "tinyrange/vmsh";
 const apiUrl = `https://api.github.com/repos/${repository}/releases/latest`;
 const outputUrl = new URL("../app/release-data.json", import.meta.url);
 const token = process.env.GITHUB_TOKEN;
+
+function safeReleasePath(tag) {
+  return String(tag).replace(/[^A-Za-z0-9._-]/g, "-");
+}
 
 const headers = {
   Accept: "application/vnd.github+json",
@@ -24,6 +28,8 @@ if (!response.ok) {
 }
 
 const latest = await response.json();
+const releaseDirectory = new URL(`../public/tours/${safeReleasePath(latest.tag_name)}/`, import.meta.url);
+await mkdir(releaseDirectory, { recursive: true });
 const platforms = {
   darwin: "macOS",
   linux: "Linux",
@@ -82,6 +88,31 @@ const assets = latest.assets
       architectureOrder[a.arch] - architectureOrder[b.arch],
   );
 
+async function parseTourAsset(asset) {
+  if (!asset.name.endsWith(".cast")) return null;
+  const castResponse = await fetch(asset.browser_download_url, { headers });
+  if (!castResponse.ok) {
+    throw new Error(`Could not load released tour ${asset.name}: ${castResponse.status}`);
+  }
+  const cast = await castResponse.text();
+  const firstLine = cast.split(/\r?\n/, 1)[0];
+  const header = JSON.parse(firstLine);
+  if (header.version !== 2 || header.vmsh_tour?.schema !== 1) {
+    throw new Error(`Released tour ${asset.name} has an unsupported header.`);
+  }
+  const filename = `${header.vmsh_tour.id}.cast`;
+  await writeFile(new URL(filename, releaseDirectory), cast);
+  return {
+    id: header.vmsh_tour.id,
+    title: header.vmsh_tour.title,
+    url: `/tours/${safeReleasePath(latest.tag_name)}/${filename}`,
+  };
+}
+
+const tours = (await Promise.all(latest.assets.map(parseTourAsset)))
+  .filter(Boolean)
+  .sort((a, b) => a.id.localeCompare(b.id));
+
 if (!assets.some((asset) => asset.product === "NeurodeskAppX")) {
   throw new Error("The latest release does not contain NeurodeskAppX.");
 }
@@ -104,10 +135,9 @@ const releaseData = {
   checksums:
     checksumAsset?.browser_download_url ??
     `https://github.com/${repository}/releases/tag/${latest.tag_name}`,
+  tours,
   assets,
 };
 
 await writeFile(outputUrl, `${JSON.stringify(releaseData, null, 2)}\n`);
-console.log(
-  `Prepared ${assets.length} downloads from vmsh ${latest.tag_name}.`,
-);
+console.log(`Prepared ${assets.length} downloads and ${tours.length} tours from vmsh ${latest.tag_name}.`);

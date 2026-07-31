@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestRecorderWritesOutputAndMetadataEvents(t *testing.T) {
+func TestRecorderWritesTourInputOutputAndMetadataEvents(t *testing.T) {
 	file, err := os.CreateTemp("", "termui-cast-*.cast")
 	if err != nil {
 		t.Fatal(err)
@@ -16,7 +16,13 @@ func TestRecorderWritesOutputAndMetadataEvents(t *testing.T) {
 	file.Close()
 	defer os.Remove(path)
 
-	rec, err := Create(path, 80, 24)
+	rec, err := CreateTour(path, 80, 24, &TourHeader{
+		Schema:      1,
+		ID:          "context-switching",
+		Title:       "Move between host and VM contexts",
+		VMSHVersion: "v1.2.3",
+		Commit:      "abc123",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,6 +30,7 @@ func TestRecorderWritesOutputAndMetadataEvents(t *testing.T) {
 	if _, err := rec.Writer(&dst).Write([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
+	rec.Input([]byte("uname -s\r"))
 	rec.Metadata("termui.slow_interaction", map[string]any{"elapsed_ms": 51})
 	if err := rec.Close(); err != nil {
 		t.Fatal(err)
@@ -43,6 +50,9 @@ func TestRecorderWritesOutputAndMetadataEvents(t *testing.T) {
 	if header.Version != 2 || header.Width != 80 || header.Height != 24 {
 		t.Fatalf("header = %+v, want version 2 and 80x24", header)
 	}
+	if header.VMSHTour == nil || header.VMSHTour.Schema != 1 || header.VMSHTour.ID != "context-switching" || header.VMSHTour.VMSHVersion != "v1.2.3" || header.VMSHTour.Commit != "abc123" {
+		t.Fatalf("tour header = %+v", header.VMSHTour)
+	}
 
 	var output []any
 	if err := dec.Decode(&output); err != nil {
@@ -50,6 +60,14 @@ func TestRecorderWritesOutputAndMetadataEvents(t *testing.T) {
 	}
 	if len(output) != 3 || output[1] != "o" || output[2] != "hello" {
 		t.Fatalf("output event = %#v", output)
+	}
+
+	var input []any
+	if err := dec.Decode(&input); err != nil {
+		t.Fatalf("decode input event: %v", err)
+	}
+	if len(input) != 3 || input[1] != "i" || input[2] != "uname -s\r" {
+		t.Fatalf("input event = %#v", input)
 	}
 
 	var metadata []any

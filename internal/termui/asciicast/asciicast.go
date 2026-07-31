@@ -22,9 +22,26 @@ type Header struct {
 	Timestamp int64             `json:"timestamp"`
 	Env       map[string]string `json:"env,omitempty"`
 	Termui    map[string]any    `json:"termui,omitempty"`
+	VMSHTour  *TourHeader       `json:"vmsh_tour,omitempty"`
+}
+
+// TourHeader identifies an enhanced vmsh tutorial cast. Section content is
+// emitted as timed vmsh.tour.section metadata events so it stays synchronized
+// with terminal output without changing the asciinema v2 event stream.
+type TourHeader struct {
+	Schema      int    `json:"schema"`
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description,omitempty"`
+	VMSHVersion string `json:"vmsh_version,omitempty"`
+	Commit      string `json:"commit,omitempty"`
 }
 
 func Create(path string, width, height int) (*Recorder, error) {
+	return CreateTour(path, width, height, nil)
+}
+
+func CreateTour(path string, width, height int, tour *TourHeader) (*Recorder, error) {
 	file, err := os.Create(path)
 	if err != nil {
 		return nil, err
@@ -42,12 +59,20 @@ func Create(path string, width, height int) (*Recorder, error) {
 		Termui: map[string]any{
 			"metadata_events": true,
 		},
+		VMSHTour: tour,
 	}
 	if err := json.NewEncoder(file).Encode(header); err != nil {
 		_ = file.Close()
 		return nil, err
 	}
 	return &Recorder{file: file, started: now}, nil
+}
+
+func (r *Recorder) Input(data []byte) {
+	if r == nil || len(data) == 0 {
+		return
+	}
+	r.event("i", string(data))
 }
 
 func (r *Recorder) Writer(dst io.Writer) io.Writer {

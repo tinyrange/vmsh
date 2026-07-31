@@ -6,13 +6,13 @@ const release = JSON.parse(
   await readFile(new URL("../app/release-data.json", import.meta.url), "utf8"),
 );
 
-async function render() {
+async function render(path = "/") {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
   const { default: worker } = await import(workerUrl.href);
 
   return worker.fetch(
-    new Request("http://localhost/", {
+    new Request(`http://localhost${path}`, {
       headers: { accept: "text/html" },
     }),
     {
@@ -49,6 +49,29 @@ test("server renders the default app downloads and every vmsh download", async (
     "both desktop applications should document the macOS requirement",
   );
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/);
+});
+
+test("the guided tour route and enhanced cast are published together", async () => {
+  const response = await render("/tours/context-switching/");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /Move between host and VM contexts/);
+  assert.match(html, /TESTED DOCUMENTATION/);
+
+  const cast = await readFile(
+    new URL("../public/tours/context-switching.cast", import.meta.url),
+    "utf8",
+  );
+  const lines = cast.trim().split(/\r?\n/);
+  const header = JSON.parse(lines[0]);
+  assert.equal(header.version, 2);
+  assert.equal(header.vmsh_tour.schema, 1);
+  assert.equal(header.vmsh_tour.id, "context-switching");
+  const sections = lines
+    .slice(1)
+    .map((line) => JSON.parse(line))
+    .filter((event) => event[1] === "m" && event[2]?.name === "vmsh.tour.section");
+  assert.ok(sections.length > 0, "the cast should contain guided sections");
 });
 
 test("release data contains the three downloadable products", () => {
