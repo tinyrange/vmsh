@@ -441,3 +441,44 @@ func TestWaitForSquadVMDesktopStreamsLongRunningProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+type nativeReadinessTestSession struct {
+	resizeTestSession
+	frame    display.OpenGLFrame
+	released bool
+}
+
+func (s *nativeReadinessTestSession) AcquireOpenGLFrame(uint64) (display.OpenGLFrame, bool, error) {
+	if s.frame.Texture == 0 {
+		return display.OpenGLFrame{}, false, nil
+	}
+	frame := s.frame
+	s.frame = display.OpenGLFrame{}
+	return frame, true, nil
+}
+
+func TestNativeDisplayUsesAcceleratedFrameAsReadinessProof(t *testing.T) {
+	session := &nativeReadinessTestSession{
+		resizeTestSession: resizeTestSession{changed: make(chan struct{})},
+	}
+	session.frame = display.NewOpenGLFrame(
+		1440,
+		900,
+		1,
+		image.Rect(0, 0, 1440, 900),
+		42,
+		0,
+		func(uintptr) {
+			session.released = true
+		},
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := waitForDisplayReady(ctx, nil, "squadvm", session); err != nil {
+		t.Fatal(err)
+	}
+	if !session.released {
+		t.Fatal("readiness frame lease was not released")
+	}
+}

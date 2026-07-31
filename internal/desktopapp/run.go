@@ -490,7 +490,7 @@ func Run(config Config, args []string) (retErr error) {
 				return displayStarted{}, ctx.Err()
 			}
 			publish(desktopStartupProgress("Waiting for the " + productName() + " session"))
-			if err := waitForDesktop(ctx, api, *name); err != nil {
+			if err := waitForDisplayReady(ctx, api, *name, session); err != nil {
 				return displayStarted{}, err
 			}
 			publish(desktopStartupProgress("Waiting for a complete desktop frame"))
@@ -814,6 +814,36 @@ exit 1
 		return fmt.Errorf("%s session did not become ready", productName())
 	}
 	return nil
+}
+
+func waitForDisplayReady(ctx context.Context, api *client.Client, name string, session ccdisplay.Session) error {
+	native, ok := session.(ccdisplay.OpenGLFrameSession)
+	if !ok {
+		return waitForDesktop(ctx, api, name)
+	}
+
+	var generation uint64
+	for {
+		frame, available, err := native.AcquireOpenGLFrame(generation)
+		if err != nil {
+			return fmt.Errorf("wait for accelerated %s frame: %w", productName(), err)
+		}
+		if available {
+			generation = frame.Generation
+			valid := frame.Width > 0 && frame.Height > 0 && frame.Texture != 0
+			frame.Release(0)
+			if valid {
+				return nil
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-session.Changed():
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 func generateVNCPassword() (string, error) {
