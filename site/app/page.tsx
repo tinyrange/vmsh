@@ -140,7 +140,7 @@ export default function Home() {
         <nav aria-label="Main navigation">
           <a href="#apps">Apps</a>
           <a href="#vmsh">vmsh</a>
-          <Link href="/tours/context-switching">Tours</Link>
+          <Link href="/tours">Tours</Link>
           <a
             className="github-link"
             href="https://github.com/tinyrange/vmsh"

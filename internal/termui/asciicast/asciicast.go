@@ -2,6 +2,7 @@ package asciicast
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -26,8 +27,7 @@ type Header struct {
 }
 
 // TourHeader identifies an enhanced vmsh tutorial cast. Section content is
-// emitted as timed vmsh.tour.section metadata events so it stays synchronized
-// with terminal output without changing the asciinema v2 event stream.
+// emitted as an extension event alongside a standard asciinema marker.
 type TourHeader struct {
 	Schema      int    `json:"schema"`
 	ID          string `json:"id"`
@@ -90,11 +90,37 @@ func (r *Recorder) Metadata(name string, fields map[string]any) {
 	if r == nil {
 		return
 	}
+	if name == "ptyterm.resize" {
+		cols, colsOK := integerField(fields["cols"])
+		rows, rowsOK := integerField(fields["rows"])
+		if colsOK && rowsOK {
+			r.event("r", fmt.Sprintf("%dx%d", cols, rows))
+			return
+		}
+	}
+	if name == "vmsh.tour.section" {
+		if title, ok := fields["title"].(string); ok {
+			r.event("m", title)
+		}
+	}
 	payload := map[string]any{
 		"name":   name,
 		"fields": fields,
 	}
-	r.event("m", payload)
+	r.event("vmsh", payload)
+}
+
+func integerField(value any) (int, bool) {
+	switch value := value.(type) {
+	case int:
+		return value, true
+	case int32:
+		return int(value), true
+	case int64:
+		return int(value), true
+	default:
+		return 0, false
+	}
 }
 
 func (r *Recorder) Close() error {

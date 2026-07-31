@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -113,6 +114,7 @@ func Run(parent context.Context, opts Options) (Result, error) {
 		Command:      append([]string(nil), opts.Command...),
 		Dir:          opts.Dir,
 		Env:          append([]string(nil), opts.Env...),
+		CleanEnv:     true,
 		Size:         opts.Size,
 		HistoryLimit: 2000,
 		Recorder:     recorder,
@@ -150,10 +152,50 @@ func Run(parent context.Context, opts Options) (Result, error) {
 		return Result{}, fmt.Errorf("close tour cast: %w", err)
 	}
 	closedRecorder = true
+	if err := RedactCast(opts.OutputPath, privacyRedactions(opts.Dir, opts.Env)); err != nil {
+		return Result{}, fmt.Errorf("redact tour cast: %w", err)
+	}
 	if err := ValidateCast(opts.OutputPath); err != nil {
 		return Result{}, fmt.Errorf("validate tour cast: %w", err)
 	}
 	return Result{ID: metadata.id, Title: metadata.title, Sections: tourCtx.sections, Output: opts.OutputPath}, nil
+}
+
+func privacyRedactions(workingDir string, environment []string) []Redaction {
+	redactions := make([]Redaction, 0, 6)
+	addPath := func(value, replacement string) {
+		value = strings.TrimSpace(value)
+		if value != "" && value != string(filepath.Separator) {
+			redactions = append(redactions, LiteralRedaction(value, replacement))
+		}
+	}
+	addIdentity := func(value, replacement string) {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			redactions = append(redactions, LiteralRedaction(value, replacement))
+		}
+	}
+	addPath(workingDir, "/workspace")
+	if base := filepath.Base(filepath.Clean(workingDir)); base != "." && base != string(filepath.Separator) && base != "vmsh" {
+		addIdentity(base, "workspace")
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		addPath(home, "/home/user")
+	}
+	for _, entry := range environment {
+		if home, ok := strings.CutPrefix(entry, "HOME="); ok {
+			addPath(home, "/home/user")
+		}
+	}
+	if hostname, err := os.Hostname(); err == nil {
+		addIdentity(hostname, "host")
+	}
+	if current, err := user.Current(); err == nil {
+		addIdentity(current.Name, "User")
+		addIdentity(current.Username, "user")
+	}
+	addIdentity(os.Getenv("USER"), "user")
+	return redactions
 }
 
 func readMetadata(globals starlark.StringDict) (scriptMetadata, error) {

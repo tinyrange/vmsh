@@ -80,6 +80,7 @@ func run(args []string) error {
 	}
 	env := []string{
 		"HOME=" + home,
+		"PATH=" + os.Getenv("PATH"),
 		"TERM=xterm-256color",
 		"NO_COLOR=1",
 		"TERMUI_REDUCED_MOTION=1",

@@ -31,6 +31,8 @@ func TestRecorderWritesTourInputOutputAndMetadataEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec.Input([]byte("uname -s\r"))
+	rec.Metadata("vmsh.tour.section", map[string]any{"title": "Run a command", "markdown": "Use `uname`."})
+	rec.Metadata("ptyterm.resize", map[string]any{"cols": 100, "rows": 30})
 	rec.Metadata("termui.slow_interaction", map[string]any{"elapsed_ms": 51})
 	if err := rec.Close(); err != nil {
 		t.Fatal(err)
@@ -70,11 +72,35 @@ func TestRecorderWritesTourInputOutputAndMetadataEvents(t *testing.T) {
 		t.Fatalf("input event = %#v", input)
 	}
 
+	var marker []any
+	if err := dec.Decode(&marker); err != nil {
+		t.Fatalf("decode marker event: %v", err)
+	}
+	if len(marker) != 3 || marker[1] != "m" || marker[2] != "Run a command" {
+		t.Fatalf("marker event = %#v", marker)
+	}
+
+	var section []any
+	if err := dec.Decode(&section); err != nil {
+		t.Fatalf("decode section event: %v", err)
+	}
+	if len(section) != 3 || section[1] != "vmsh" {
+		t.Fatalf("section event = %#v", section)
+	}
+
+	var resize []any
+	if err := dec.Decode(&resize); err != nil {
+		t.Fatalf("decode resize event: %v", err)
+	}
+	if len(resize) != 3 || resize[1] != "r" || resize[2] != "100x30" {
+		t.Fatalf("resize event = %#v", resize)
+	}
+
 	var metadata []any
 	if err := dec.Decode(&metadata); err != nil {
 		t.Fatalf("decode metadata event: %v", err)
 	}
-	if len(metadata) != 3 || metadata[1] != "m" {
+	if len(metadata) != 3 || metadata[1] != "vmsh" {
 		t.Fatalf("metadata event = %#v", metadata)
 	}
 	payload, ok := metadata[2].(map[string]any)

@@ -105,6 +105,9 @@ async function parseTourAsset(asset) {
   return {
     id: header.vmsh_tour.id,
     title: header.vmsh_tour.title,
+    description: header.vmsh_tour.description ?? "",
+    version: header.vmsh_tour.vmsh_version ?? latest.tag_name,
+    commit: header.vmsh_tour.commit ?? "",
     url: `/tours/${safeReleasePath(latest.tag_name)}/${filename}`,
   };
 }

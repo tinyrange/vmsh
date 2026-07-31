@@ -766,20 +766,155 @@ footer > span {
 
 .tour-transcript {
   border-top: 1px solid var(--line);
-  color: #77777e;
+  padding: 110px 80px 130px;
+}
+
+.tour-transcript > h2,
+.tour-catalog > h2 {
+  font-size: clamp(42px, 5vw, 72px);
+  letter-spacing: -0.055em;
+  line-height: 0.98;
+  margin: 0;
+  max-width: 820px;
+}
+
+.tour-transcript-intro {
+  color: #929298;
+  line-height: 1.65;
+  max-width: 680px;
+}
+
+.tour-transcript > ol,
+.tour-catalog > ul {
+  list-style: none;
+  margin: 52px 0 0;
+  padding: 0;
+}
+
+.tour-transcript > ol {
+  display: grid;
+  gap: 18px;
+}
+
+.tour-transcript article {
+  background: #111114;
+  border: 1px solid var(--line);
+  padding: 28px;
+}
+
+.tour-transcript article > header {
+  display: grid;
+  gap: 7px 18px;
+  grid-template-columns: 1fr auto;
+}
+
+.tour-transcript article > header span,
+.tour-transcript article > header time {
+  color: #7f7f86;
+  font-family: var(--font-geist-mono), monospace;
   font-size: 11px;
-  margin-top: 16px;
-  padding: 18px 28px 28px;
+  text-transform: uppercase;
+}
+
+.tour-transcript article h3 {
+  font-size: 25px;
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.tour-transcript-instruction {
+  color: #b4b4ba;
+  line-height: 1.65;
+  max-width: 760px;
+}
+
+.tour-transcript-commands h4 {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.tour-transcript-commands ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.tour-transcript-commands code {
+  background: #08090b;
+  border: 1px solid var(--line);
+  color: #d4eeb8;
+  display: inline-block;
+  padding: 7px 9px;
+}
+
+.tour-transcript details {
+  border-top: 1px solid var(--line);
+  margin-top: 24px;
+  padding-top: 18px;
 }
 
 .tour-transcript summary {
   cursor: pointer;
+  font-weight: 700;
 }
 
 .tour-transcript pre {
+  background: #08090b;
+  color: #c7c7cc;
   font-family: var(--font-geist-mono), monospace;
+  line-height: 1.55;
+  max-height: 420px;
   overflow: auto;
+  padding: 18px;
   white-space: pre-wrap;
+}
+
+.tour-catalog {
+  padding: 90px 80px 130px;
+}
+
+.tour-catalog > ul {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.tour-catalog li a {
+  background: #111114;
+  border: 1px solid var(--line);
+  color: var(--ink);
+  display: flex;
+  flex-direction: column;
+  min-height: 230px;
+  padding: 28px;
+  text-decoration: none;
+}
+
+.tour-catalog li a:hover,
+.tour-catalog li a:focus-visible {
+  border-color: #80bd43;
+}
+
+.tour-catalog li span {
+  color: #80bd43;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.tour-catalog li strong {
+  font-size: 25px;
+  line-height: 1.1;
+  margin-top: 35px;
+}
+
+.tour-catalog li p {
+  color: #929298;
+  line-height: 1.55;
 }
 
 .tour-error {
@@ -979,6 +1114,8 @@ footer > span {
   }
 
   .tour-hero,
+  .tour-catalog,
+  .tour-transcript,
   .tour-followup {
     padding-left: 22px;
     padding-right: 22px;
@@ -1020,6 +1157,14 @@ footer > span {
 @media (prefers-reduced-motion: reduce) {
   html {
     scroll-behavior: auto;
+  }
+
+  .tour-player *,
+  .tour-catalog * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
   }
 
 }

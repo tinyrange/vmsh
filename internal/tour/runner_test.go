@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ func TestRunProducesGuidedCastFromBehavioralSession(t *testing.T) {
 		t.Skip("tour test helper currently requires Unix terminal line discipline")
 	}
 	dir := t.TempDir()
+	t.Setenv("VMSH_TOUR_PARENT_SECRET", "must-not-reach-tour")
 	script := filepath.Join(dir, "example.star")
 	if err := os.WriteFile(script, []byte(`
 tour_id = "example-tour"
@@ -33,6 +35,10 @@ def main(ctx):
     ctx.type("hello")
     ctx.enter()
     ctx.expect_line("RESULT=hello")
+    ctx.wait_prompt()
+    ctx.type("environment")
+    ctx.enter()
+    ctx.expect_line("PARENT_SECRET=absent")
     ctx.wait_prompt()
     if ctx.value("expected", "missing") != "configured":
         fail("tour value was not provided")
@@ -96,7 +102,7 @@ def main(ctx):
 			haveInput = true
 		case "o":
 			haveOutput = true
-		case "m":
+		case "vmsh":
 			payload, _ := event[2].(map[string]any)
 			if payload["name"] == "vmsh.tour.section" {
 				sections++
@@ -105,6 +111,41 @@ def main(ctx):
 	}
 	if sections != 2 || !haveInput || !haveOutput {
 		t.Fatalf("cast events: sections=%d input=%v output=%v", sections, haveInput, haveOutput)
+	}
+}
+
+func TestRedactCastRemovesPrivateHostIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "private.cast")
+	data := "{\"version\":2,\"width\":80,\"height\":24,\"vmsh_tour\":{\"schema\":1,\"id\":\"private-tour\",\"title\":\"Private tour\"}}\n" +
+		"[0.1,\"o\",\"alice@workstation:/Users/alice/project $ pwd\\r\\n/Users/alice/project\\r\\n\"]\n" +
+		"[0.2,\"m\",\"Finish\"]\n" +
+		"[0.2,\"vmsh\",{\"name\":\"vmsh.tour.section\",\"fields\":{\"title\":\"Finish\",\"markdown\":\"Done\"}}]\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	redactions := []Redaction{
+		LiteralRedaction("/Users/alice/project", "/workspace"),
+		LiteralRedaction("/Users/alice", "/home/user"),
+		WordRedaction("alice", "user"),
+		WordRedaction("workstation", "host"),
+	}
+	if err := RedactCast(path, redactions); err != nil {
+		t.Fatal(err)
+	}
+	redacted, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(redacted)
+	for _, private := range []string{"alice", "workstation", "/Users/alice", "/Users/alice/project"} {
+		if strings.Contains(text, private) {
+			t.Fatalf("redacted cast still contains %q: %s", private, text)
+		}
+	}
+	for _, replacement := range []string{"user@host", "/workspace"} {
+		if !strings.Contains(text, replacement) {
+			t.Fatalf("redacted cast does not contain %q: %s", replacement, text)
+		}
 	}
 }
 
@@ -120,6 +161,12 @@ func TestTourHelperProcess(t *testing.T) {
 			os.Exit(0)
 		case "hello":
 			fmt.Print("\x1b[?2004l\r\nRESULT=hello\r\n\x1b[?2004h")
+		case "environment":
+			secret := "absent"
+			if os.Getenv("VMSH_TOUR_PARENT_SECRET") != "" {
+				secret = "inherited"
+			}
+			fmt.Printf("\x1b[?2004l\r\nPARENT_SECRET=%s\r\n\x1b[?2004h", secret)
 		default:
 			fmt.Printf("\x1b[?2004l\r\nRESULT=unexpected:%s\r\n\x1b[?2004h", scanner.Text())
 		}

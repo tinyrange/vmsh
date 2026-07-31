@@ -914,17 +914,19 @@ Linux
     "id": "context-switching",
     "title": "Move between host and VM contexts",
     "vmsh_version": "v0.x.0",
-    "commit": "&lt;release commit&gt;",
-    "sections": [
-      {
-        "at": 0.0,
-        "title": "Select Alpine",
-        "markdown": "Select the **Alpine** system context."
-      }
-    ]
+    "commit": "&lt;release commit&gt;"
   }
 }
 [0.14, "o", "host ~/work ❯ "]
+[0.80, "m", "Select Alpine"]
+[0.80, "vmsh", {
+  "name": "vmsh.tour.section",
+  "fields": {
+    "index": 1,
+    "title": "Select Alpine",
+    "markdown": "Select the **Alpine** system context."
+  }
+}]
 [1.02, "i", "@alpine\\r"]</pre>
         </article>
       </div>
@@ -1134,9 +1136,10 @@ prose part of the behavioral contract.</pre>
     </section>
 
     <footer>
-      <strong>Plan status:</strong> proposed. Start with the context-switching tour,
-      learn from the first real implementation, and keep policy lightweight until the
-      maintenance pattern is visible.
+      <strong>Plan status:</strong> implemented. The context-switching vertical slice,
+      portable enhanced cast, data-driven website player, author guidance, privacy
+      redaction, and release gate are complete; the GitHub-hosted release job remains
+      to be exercised when the implementation branch is published.
     </footer>
   </main>
 

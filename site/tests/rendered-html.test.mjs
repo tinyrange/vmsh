@@ -70,8 +70,21 @@ test("the guided tour route and enhanced cast are published together", async () 
   const sections = lines
     .slice(1)
     .map((line) => JSON.parse(line))
-    .filter((event) => event[1] === "m" && event[2]?.name === "vmsh.tour.section");
+    .filter((event) => event[1] === "vmsh" && event[2]?.name === "vmsh.tour.section");
   assert.ok(sections.length > 0, "the cast should contain guided sections");
+  assert.ok(
+    lines.slice(1).map((line) => JSON.parse(line)).filter((event) => event[1] === "m")
+      .every((event) => typeof event[2] === "string"),
+    "ordinary asciinema markers should use string labels",
+  );
+});
+
+test("the tour catalog links every available guided tour", async () => {
+  const response = await render("/tours/");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /Choose a workflow/);
+  assert.match(html, /\/tours\/context-switching/);
 });
 
 test("release data contains the three downloadable products", () => {

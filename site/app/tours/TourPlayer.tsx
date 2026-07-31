@@ -3,95 +3,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Terminal } from "@xterm/xterm";
-
-type TourHeader = {
-  version: number;
-  width: number;
-  height: number;
-  vmsh_tour: {
-    schema: number;
-    id: string;
-    title: string;
-    description?: string;
-    vmsh_version?: string;
-    commit?: string;
-  };
-};
-
-type CastEvent = [number, "o" | "i" | "m", unknown];
-
-type TourSection = {
-  at: number;
-  index: number;
-  title: string;
-  markdown: string;
-};
-
-type ParsedTour = {
-  header: TourHeader;
-  events: CastEvent[];
-  sections: TourSection[];
-  duration: number;
-  transcript: string;
-};
-
-function parseTour(source: string): ParsedTour {
-  const lines = source.split(/\r?\n/).filter(Boolean);
-  if (lines.length === 0) throw new Error("The tour cast is empty.");
-
-  const header = JSON.parse(lines[0]) as TourHeader;
-  if (header.version !== 2 || header.vmsh_tour?.schema !== 1) {
-    throw new Error("This tour uses an unsupported cast format.");
-  }
-
-  const events = lines.slice(1).map((line) => JSON.parse(line) as CastEvent);
-  const sections: TourSection[] = [];
-  const output: string[] = [];
-
-  for (const event of events) {
-    if (event[1] === "o" && typeof event[2] === "string") {
-      output.push(event[2]);
-    }
-    if (event[1] !== "m" || typeof event[2] !== "object" || !event[2]) continue;
-    const metadata = event[2] as {
-      name?: string;
-      fields?: Record<string, unknown>;
-    };
-    if (metadata.name !== "vmsh.tour.section" || !metadata.fields) continue;
-    const { index, title, markdown } = metadata.fields;
-    if (typeof title !== "string" || typeof markdown !== "string") continue;
-    sections.push({
-      at: event[0],
-      index: typeof index === "number" ? index : sections.length + 1,
-      title,
-      markdown,
-    });
-  }
-
-  if (sections.length === 0) throw new Error("The tour does not contain guided sections.");
-  const duration = Math.max(0.1, ...events.map((event) => event[0]));
-  const transcript = output
-    .join("")
-    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/\r/g, "")
-    .trim();
-  return { header, events, sections, duration, transcript };
-}
+import { parseTour, resizeForEvent, type ParsedTour } from "./tour-model";
 
 function formatTime(seconds: number) {
   const rounded = Math.max(0, Math.floor(seconds));
   return `${Math.floor(rounded / 60)}:${String(rounded % 60).padStart(2, "0")}`;
-}
-
-function replayMetadata(terminal: Terminal, value: unknown) {
-  if (typeof value !== "object" || !value) return;
-  const metadata = value as { name?: string; fields?: Record<string, unknown> };
-  if (metadata.name !== "ptyterm.resize" || !metadata.fields) return;
-  const { cols, rows } = metadata.fields;
-  if (typeof cols === "number" && typeof rows === "number" && cols > 0 && rows > 0) {
-    terminal.resize(cols, rows);
-  }
 }
 
 export default function TourPlayer({ castUrl }: { castUrl: string }) {
@@ -136,9 +52,9 @@ export default function TourPlayer({ castUrl }: { castUrl: string }) {
       const event = currentTour.events[eventIndex.current];
       if (event[1] === "o" && typeof event[2] === "string") {
         currentTerminal.write(event[2]);
-      } else if (event[1] === "m") {
-        replayMetadata(currentTerminal, event[2]);
       }
+      const resize = resizeForEvent(event);
+      if (resize) currentTerminal.resize(resize.cols, resize.rows);
       eventIndex.current += 1;
     }
   }, []);
@@ -240,10 +156,31 @@ export default function TourPlayer({ castUrl }: { castUrl: string }) {
     frame.current = requestAnimationFrame(tick);
   }
 
+  function handlePlayerKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (event.target !== event.currentTarget || !tour) return;
+    if (event.key === " ") {
+      event.preventDefault();
+      togglePlayback();
+    } else if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      seek(position - 5);
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      seek(position + 5);
+    }
+  }
+
   if (error) return <div className="tour-error" role="alert">{error}</div>;
 
   return (
-    <div className="tour-player" aria-busy={!tour}>
+    <>
+    <div
+      className="tour-player"
+      aria-busy={!tour}
+      aria-label="Tour playback"
+      onKeyDown={handlePlayerKeyDown}
+      tabIndex={0}
+    >
       <section className="tour-terminal" aria-label="Recorded terminal session">
         <div className="tour-window-bar">
           <span className="tour-window-dots" aria-hidden="true"><i /><i /><i /></span>
@@ -301,13 +238,44 @@ export default function TourPlayer({ castUrl }: { castUrl: string }) {
         <article className="tour-markdown">
           <ReactMarkdown>{activeSection?.markdown ?? "Preparing the lesson…"}</ReactMarkdown>
         </article>
-        {tour ? (
-          <details className="tour-transcript">
-            <summary>Accessible transcript</summary>
-            <pre>{tour.transcript}</pre>
-          </details>
-        ) : null}
       </aside>
     </div>
+    {tour ? (
+      <section className="tour-transcript" aria-labelledby="tour-transcript-heading">
+        <p className="kicker"><span /> ACCESSIBLE TRANSCRIPT</p>
+        <h2 id="tour-transcript-heading">Read the lesson without replaying it</h2>
+        <p className="tour-transcript-intro">
+          Each step includes its instruction, recorded commands, and a text version of
+          the terminal output. Times identify the matching point in the replay.
+        </p>
+        <ol>
+          {tour.transcript.map((section) => (
+            <li key={`${section.index}-${section.at}`}>
+              <article aria-labelledby={`transcript-step-${section.index}`}>
+                <header>
+                  <span>Step {section.index}</span>
+                  <time dateTime={`PT${section.at.toFixed(3)}S`}>{formatTime(section.at)}</time>
+                  <h3 id={`transcript-step-${section.index}`}>{section.title}</h3>
+                </header>
+                <div className="tour-transcript-instruction"><ReactMarkdown>{section.markdown}</ReactMarkdown></div>
+                {section.commands.length ? (
+                  <div className="tour-transcript-commands">
+                    <h4>Commands entered</h4>
+                    <ul>{section.commands.map((command, index) => <li key={`${command}-${index}`}><code>{command}</code></li>)}</ul>
+                  </div>
+                ) : null}
+                {section.output ? (
+                  <details>
+                    <summary>Terminal output for {section.title}</summary>
+                    <pre tabIndex={0} aria-label={`Terminal output for step ${section.index}`}>{section.output}</pre>
+                  </details>
+                ) : null}
+              </article>
+            </li>
+          ))}
+        </ol>
+      </section>
+    ) : null}
+    </>
   );
 }
