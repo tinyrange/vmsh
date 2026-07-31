@@ -32,10 +32,15 @@ void main() {
 }`
 	displayFragmentShader = `#version 150
 uniform sampler2D framebuffer;
+uniform bool flipY;
 in vec2 uv;
 out vec4 color;
 void main() {
-	color = texture(framebuffer, uv);
+	vec2 samplePosition = uv;
+	if (flipY) {
+		samplePosition.y = 1.0 - samplePosition.y;
+	}
+	color = texture(framebuffer, samplePosition);
 }`
 )
 
@@ -47,6 +52,7 @@ type displayViewer struct {
 	text                *gowintext.Stash
 	font                int
 	program             uint32
+	flipY               int32
 	vertexArray         uint32
 	vertexBuffer        uint32
 	texture             uint32
@@ -56,6 +62,8 @@ type displayViewer struct {
 	textureWidth        int
 	textureHeight       int
 	generation          uint64
+	nativeGeneration    uint64
+	presentedGeneration uint64
 	nativeFrame         display.OpenGLFrame
 	nativeConsumerFence gl.Sync
 	buttons             uint8
@@ -238,6 +246,8 @@ func (v *displayViewer) init() error {
 	v.gl.PixelStorei(gl.UnpackAlignment, 1)
 	v.gl.UseProgram(v.program)
 	v.gl.Uniform1i(v.gl.GetUniformLocation(v.program, "framebuffer"), 0)
+	v.flipY = v.gl.GetUniformLocation(v.program, "flipY")
+	v.gl.Uniform1i(v.flipY, 0)
 	if err := v.loadBrandTexture(); err != nil {
 		return err
 	}
@@ -379,6 +389,14 @@ func (v *displayViewer) loop(ctx context.Context) error {
 				v.desktopVisible = true
 			}
 		}
+		if v.desktopVisible && v.nativeFrame.Texture != 0 &&
+			v.presentedGeneration == v.nativeGeneration {
+			// A native guest frame is already resident in the window's front
+			// buffer. Re-presenting it forces AppKit to synchronize a second
+			// shared OpenGL context without producing a new visible result.
+			time.Sleep(time.Second / 120)
+			continue
+		}
 		backingWidth, backingHeight := v.window.BackingSize()
 		v.gl.Viewport(0, 0, int32(backingWidth), int32(backingHeight))
 		if v.desktopVisible && v.textureWidth > 0 && v.textureHeight > 0 {
@@ -395,8 +413,10 @@ func (v *displayViewer) loop(ctx context.Context) error {
 				texture = v.nativeFrame.Texture
 			}
 			v.gl.BindTexture(gl.Texture2D, texture)
+			v.gl.Uniform1i(v.flipY, boolInt32(v.nativeFrame.Texture != 0))
 			v.gl.BindVertexArray(v.vertexArray)
 			v.gl.DrawArrays(gl.Triangles, 0, 6)
+			v.gl.Uniform1i(v.flipY, 0)
 			v.markNativeFrameConsumed()
 			v.drawUpdateNotifications(backingWidth, backingHeight, time.Now())
 		} else if v.showSettings {
@@ -405,6 +425,9 @@ func (v *displayViewer) loop(ctx context.Context) error {
 			v.drawStartup(backingWidth, backingHeight, time.Now())
 		}
 		v.window.Swap()
+		if v.desktopVisible && v.nativeFrame.Texture != 0 {
+			v.presentedGeneration = v.nativeGeneration
+		}
 		time.Sleep(time.Second / 120)
 	}
 	return v.startErr
@@ -508,7 +531,7 @@ func (v *displayViewer) beginSettingsStart(refreshImage bool) {
 
 func (v *displayViewer) updateTexture() (display.FramebufferUpdate, error) {
 	if provider, ok := v.session.(display.OpenGLFrameSession); ok && v.synchronization != nil {
-		frame, available, err := provider.AcquireOpenGLFrame(v.generation)
+		frame, available, err := provider.AcquireOpenGLFrame(v.nativeGeneration)
 		if err != nil {
 			return display.FramebufferUpdate{}, err
 		}
@@ -517,7 +540,7 @@ func (v *displayViewer) updateTexture() (display.FramebufferUpdate, error) {
 			v.synchronization.WaitSync(gl.Sync(frame.ProducerFence), 0, gl.TimeoutIgnored)
 			v.nativeFrame = frame
 			v.textureWidth, v.textureHeight = frame.Width, frame.Height
-			v.generation = frame.Generation
+			v.nativeGeneration = frame.Generation
 			return display.FramebufferUpdate{
 				Width: frame.Width, Height: frame.Height, Generation: frame.Generation,
 				Rect: image.Rect(0, 0, frame.Width, frame.Height),
@@ -963,11 +986,19 @@ func (v *displayViewer) drawTexture(texture uint32, backingWidth, backingHeight 
 	pixelHeight := int32(math.Ceil(float64(height * scale)))
 	v.gl.Viewport(left, bottom, pixelWidth, pixelHeight)
 	v.gl.UseProgram(v.program)
+	v.gl.Uniform1i(v.flipY, 0)
 	v.gl.ActiveTexture(gl.Texture0)
 	v.gl.BindTexture(gl.Texture2D, texture)
 	v.gl.BindVertexArray(v.vertexArray)
 	v.gl.DrawArrays(gl.Triangles, 0, 6)
 	v.gl.Viewport(0, 0, int32(backingWidth), int32(backingHeight))
+}
+
+func boolInt32(value bool) int32 {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func startupEyebrow(progress startupProgress) string {
