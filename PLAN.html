@@ -3,1002 +3,706 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ndappx Pull and Start Plan</title>
+  <title>SquadVM UI Modernization Plan</title>
   <style>
     :root {
-      color-scheme: light;
-      --ink: #18211f;
-      --muted: #60706c;
-      --line: #d7dfdc;
-      --paper: #f5f7f6;
-      --panel: #ffffff;
-      --soft: #eaf2ef;
-      --brand: #167565;
-      --brand-dark: #0e574b;
-      --blue: #2d6cdf;
-      --warn: #b65b19;
-      --danger: #b73737;
-      --shadow: 0 18px 50px rgba(24, 33, 31, 0.12);
+      color-scheme: dark;
+      --page: #0d0912;
+      --paper: #15101c;
+      --panel: #1d1626;
+      --panel-2: #261d30;
+      --line: #3c3048;
+      --line-strong: #5a4869;
+      --text: #f5f2f7;
+      --muted: #c5bacd;
+      --quiet: #998aa5;
+      --purple: #8d5cff;
+      --purple-deep: #651df1;
+      --yellow: #faee34;
+      --green: #8fe29c;
+      --orange: #ffc176;
+      --red: #ff9090;
+      --shadow: 0 24px 70px rgba(0, 0, 0, 0.38);
+      --radius: 14px;
     }
 
-    * {
-      box-sizing: border-box;
-    }
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
 
     body {
       margin: 0;
       background:
-        radial-gradient(circle at 12% -10%, #dceee8 0, transparent 30rem),
-        var(--paper);
-      color: var(--ink);
-      font: 15px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        radial-gradient(circle at 8% -10%, rgba(101, 29, 241, 0.26), transparent 32rem),
+        radial-gradient(circle at 96% 4%, rgba(250, 238, 52, 0.08), transparent 28rem),
+        var(--page);
+      color: var(--text);
+      font: 16px/1.55 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
 
-    button,
-    summary {
-      font: inherit;
-    }
+    a { color: #bfa8ff; }
+    button { font: inherit; }
 
     main {
-      width: min(1120px, calc(100% - 32px));
+      width: min(1180px, calc(100% - 32px));
       margin: 0 auto;
-      padding: 46px 0 80px;
+      padding: 52px 0 88px;
     }
 
-    header {
-      display: grid;
-      gap: 18px;
-      grid-template-columns: 1fr auto;
-      align-items: end;
-      margin-bottom: 30px;
-    }
-
-    h1,
-    h2,
-    h3,
-    p {
-      margin-top: 0;
-    }
+    h1, h2, h3, p { margin-top: 0; }
 
     h1 {
-      font-size: clamp(2rem, 5vw, 3.5rem);
-      line-height: 1;
-      letter-spacing: -0.045em;
-      margin-bottom: 16px;
-      max-width: 760px;
+      max-width: 850px;
+      margin-bottom: 18px;
+      font-size: clamp(2.4rem, 6vw, 4.9rem);
+      line-height: 0.98;
+      letter-spacing: -0.055em;
     }
 
     h2 {
-      font-size: 1.45rem;
-      letter-spacing: -0.02em;
       margin-bottom: 12px;
+      font-size: clamp(1.55rem, 3vw, 2.15rem);
+      line-height: 1.12;
+      letter-spacing: -0.035em;
     }
 
     h3 {
+      margin-bottom: 7px;
       font-size: 1rem;
-      margin-bottom: 8px;
-    }
-
-    .lede {
-      color: var(--muted);
-      font-size: 1.08rem;
-      max-width: 760px;
-      margin-bottom: 0;
-    }
-
-    .tag {
-      background: var(--ink);
-      border-radius: 999px;
-      color: white;
-      font-size: 0.75rem;
-      font-weight: 750;
-      letter-spacing: 0.08em;
-      padding: 8px 12px;
-      text-transform: uppercase;
-      white-space: nowrap;
-    }
-
-    .card {
-      background: rgba(255, 255, 255, 0.94);
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      box-shadow: 0 1px 2px rgba(24, 33, 31, 0.03);
-      padding: 24px;
-    }
-
-    .decision {
-      background: var(--soft);
-      border-left: 4px solid var(--brand);
-      box-shadow: none;
-      margin-bottom: 24px;
-    }
-
-    .decision strong {
-      color: var(--brand-dark);
-    }
-
-    .demo {
-      overflow: hidden;
-      padding: 0;
-      box-shadow: var(--shadow);
-      margin-bottom: 36px;
-    }
-
-    .demo-toolbar {
-      align-items: center;
-      background: #edf1f0;
-      border-bottom: 1px solid var(--line);
-      display: flex;
-      gap: 12px;
-      justify-content: space-between;
-      padding: 12px 14px;
-    }
-
-    .window-title {
-      align-items: center;
-      display: flex;
-      font-weight: 700;
-      gap: 9px;
-      min-width: 0;
-    }
-
-    .app-mark {
-      background: var(--brand);
-      border-radius: 6px;
-      display: inline-block;
-      height: 20px;
-      position: relative;
-      width: 20px;
-    }
-
-    .app-mark::after {
-      background: white;
-      border-radius: 1px;
-      content: "";
-      height: 2px;
-      left: 5px;
-      position: absolute;
-      top: 9px;
-      width: 10px;
-    }
-
-    .scenarios {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      justify-content: flex-end;
-    }
-
-    button {
-      background: white;
-      border: 1px solid #bac7c3;
-      border-radius: 8px;
-      color: var(--ink);
-      cursor: pointer;
-      font-size: 0.82rem;
-      font-weight: 650;
-      padding: 7px 10px;
-    }
-
-    button:hover {
-      border-color: var(--brand);
-      color: var(--brand-dark);
-    }
-
-    button:focus-visible,
-    summary:focus-visible {
-      outline: 3px solid rgba(45, 108, 223, 0.32);
-      outline-offset: 2px;
-    }
-
-    button[aria-pressed="true"],
-    .primary {
-      background: var(--brand);
-      border-color: var(--brand);
-      color: white;
-    }
-
-    .primary:hover {
-      background: var(--brand-dark);
-      color: white;
-    }
-
-    .stage {
-      min-height: 465px;
-      position: relative;
-    }
-
-    .waiting-view {
-      align-content: center;
-      background:
-        linear-gradient(135deg, rgba(22, 117, 101, 0.07), transparent 42%),
-        #fbfcfc;
-      display: grid;
-      min-height: 465px;
-      padding: clamp(24px, 5vw, 56px);
-    }
-
-    .progress-panel {
-      margin: 0 auto;
-      max-width: 700px;
-      width: 100%;
+      line-height: 1.3;
     }
 
     .eyebrow {
-      color: var(--brand);
-      font-size: 0.75rem;
+      margin-bottom: 12px;
+      color: var(--yellow);
+      font-size: 0.76rem;
       font-weight: 800;
-      letter-spacing: 0.1em;
-      margin-bottom: 8px;
+      letter-spacing: 0.13em;
       text-transform: uppercase;
     }
 
-    .status-title {
-      font-size: clamp(1.45rem, 4vw, 2.15rem);
-      line-height: 1.15;
-      margin-bottom: 8px;
-    }
-
-    .status-copy {
+    .lede {
+      max-width: 810px;
+      margin-bottom: 0;
       color: var(--muted);
-      margin-bottom: 24px;
+      font-size: 1.12rem;
     }
 
-    .bar {
-      background: #dfe7e4;
-      border-radius: 999px;
-      height: 10px;
-      overflow: hidden;
-      position: relative;
-    }
-
-    .bar-fill {
-      background: linear-gradient(90deg, var(--brand), #35a38f);
-      border-radius: inherit;
-      height: 100%;
-      transition: width 300ms ease;
-      width: 0;
-    }
-
-    .bar.indeterminate .bar-fill {
-      animation: sweep 1.4s ease-in-out infinite;
-      position: absolute;
-      width: 35%;
-    }
-
-    @keyframes sweep {
-      from { left: -35%; }
-      to { left: 100%; }
-    }
-
-    .progress-meta {
-      color: var(--muted);
-      display: flex;
-      font-size: 0.82rem;
-      justify-content: space-between;
-      margin-top: 8px;
-      min-height: 1.3em;
-    }
-
-    .steps {
-      display: grid;
-      gap: 8px;
-      grid-template-columns: repeat(4, 1fr);
-      list-style: none;
-      margin: 28px 0 0;
-      padding: 0;
-    }
-
-    .step {
-      border-top: 3px solid #d9e1de;
-      color: #7a8884;
-      font-size: 0.78rem;
-      padding-top: 8px;
-    }
-
-    .step.done {
-      border-color: var(--brand);
-      color: var(--brand-dark);
-    }
-
-    .step.active {
-      border-color: var(--blue);
-      color: var(--ink);
-      font-weight: 750;
-    }
-
-    .actions {
-      align-items: center;
-      display: flex;
-      gap: 10px;
-      margin-top: 25px;
-    }
-
-    details {
-      border-top: 1px solid var(--line);
-      margin-top: 24px;
-      padding-top: 14px;
-    }
-
-    summary {
-      color: var(--muted);
-      cursor: pointer;
-      font-weight: 650;
-    }
-
-    .layers {
-      display: grid;
-      gap: 8px;
-      margin-top: 12px;
-    }
-
-    .layer {
-      align-items: center;
-      display: grid;
-      font: 0.78rem ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      gap: 12px;
-      grid-template-columns: minmax(100px, 1fr) 92px 86px;
-    }
-
-    .layer > span:first-child {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .layer-state {
-      color: var(--brand);
-      text-align: right;
-    }
-
-    .desktop-view {
-      background: #2c7778;
-      display: none;
-      min-height: 465px;
-      opacity: 0;
-      overflow: hidden;
-      position: relative;
-      transition: opacity 220ms ease;
-    }
-
-    .desktop-view.ready {
-      display: block;
-      opacity: 1;
-    }
-
-    .desktop-wallpaper {
-      background:
-        radial-gradient(circle at 76% 34%, rgba(255, 255, 255, 0.22), transparent 14rem),
-        linear-gradient(140deg, #204f62, #2d9180 58%, #8fc6a4);
-      inset: 0;
-      position: absolute;
-    }
-
-    .desktop-window {
-      background: #f8f9fa;
-      border: 1px solid rgba(0, 0, 0, 0.2);
-      border-radius: 7px;
-      box-shadow: 0 18px 45px rgba(0, 0, 0, 0.28);
-      left: 10%;
-      overflow: hidden;
-      position: absolute;
-      top: 12%;
-      width: min(620px, 80%);
-    }
-
-    .desktop-titlebar {
-      align-items: center;
-      background: #e9ecee;
-      border-bottom: 1px solid #cbd1d3;
-      display: flex;
-      font-size: 0.8rem;
-      font-weight: 700;
-      justify-content: space-between;
-      padding: 7px 10px;
-    }
-
-    .desktop-content {
-      display: grid;
-      gap: 16px;
-      grid-template-columns: 140px 1fr;
-      min-height: 275px;
-      padding: 18px;
-    }
-
-    .desktop-nav {
-      border-right: 1px solid #dfe3e5;
-      color: #59666c;
-      line-height: 2.1;
-    }
-
-    .desktop-welcome {
-      align-content: center;
-      display: grid;
-    }
-
-    .desktop-welcome h3 {
-      font-size: 1.35rem;
-    }
-
-    .desktop-welcome p {
-      color: #667278;
-      max-width: 380px;
-    }
-
-    .desktop-panel {
-      align-items: center;
-      background: rgba(25, 31, 34, 0.94);
-      bottom: 0;
-      color: white;
-      display: flex;
-      font-size: 0.76rem;
-      gap: 12px;
-      height: 34px;
-      justify-content: space-between;
-      padding: 0 12px;
-      position: absolute;
-      width: 100%;
-    }
-
-    .hidden {
-      display: none !important;
-    }
-
-    .section {
-      margin-top: 36px;
-    }
-
-    .grid {
-      display: grid;
-      gap: 16px;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-
-    .card ul,
-    .card ol {
-      margin: 10px 0 0;
-      padding-left: 20px;
-    }
-
-    .card li {
-      margin: 7px 0;
-    }
-
-    .flow {
+    .header-meta {
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
-      list-style: none;
-      margin: 16px 0 0;
-      padding: 0;
+      margin-top: 24px;
     }
 
-    .flow li {
-      align-items: center;
-      display: flex;
-      gap: 8px;
-    }
-
-    .flow li:not(:last-child)::after {
-      color: #8a9692;
-      content: "→";
-    }
-
-    .state {
-      background: var(--soft);
-      border: 1px solid #cbdcd6;
+    .chip {
+      border: 1px solid var(--line);
       border-radius: 999px;
-      color: var(--brand-dark);
-      font: 0.79rem ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      padding: 6px 9px;
-    }
-
-    pre {
-      background: #17221f;
-      border-radius: 10px;
-      color: #eaf5f1;
-      font: 0.8rem/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      overflow-x: auto;
-      padding: 16px;
-    }
-
-    code {
-      background: #eaf0ee;
-      border-radius: 4px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 0.9em;
-      padding: 0.1rem 0.28rem;
-    }
-
-    pre code {
-      background: transparent;
-      padding: 0;
-    }
-
-    .note {
+      background: rgba(29, 22, 38, 0.7);
       color: var(--muted);
-      font-size: 0.9rem;
+      font-size: 0.78rem;
+      font-weight: 700;
+      padding: 6px 10px;
     }
+
+    .proposal {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 24px;
+      align-items: center;
+      margin: 34px 0;
+      padding: 22px 24px;
+      border: 1px solid rgba(141, 92, 255, 0.48);
+      border-radius: var(--radius);
+      background: linear-gradient(105deg, rgba(101, 29, 241, 0.19), rgba(29, 22, 38, 0.88));
+    }
+
+    .proposal p { margin: 0; color: var(--muted); }
+    .proposal strong { color: var(--text); }
+
+    .delta {
+      min-width: 136px;
+      text-align: right;
+      color: var(--yellow);
+      font-size: 1.6rem;
+      font-weight: 820;
+      letter-spacing: -0.04em;
+    }
+
+    .delta small {
+      display: block;
+      color: var(--quiet);
+      font-size: 0.7rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    section { margin-top: 54px; }
+    section > p { max-width: 780px; color: var(--muted); }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(21, 16, 28, 0.86);
+    }
+
+    .demo-shell {
+      overflow: hidden;
+      margin-top: 22px;
+      box-shadow: var(--shadow);
+    }
+
+    .demo-controls {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      background: #18121f;
+    }
+
+    .control-group { display: flex; flex-wrap: wrap; gap: 6px; }
+
+    .demo-controls button {
+      min-height: 36px;
+      padding: 7px 11px;
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 0.82rem;
+      font-weight: 720;
+    }
+
+    .demo-controls button[aria-pressed="true"] {
+      border-color: var(--purple);
+      background: var(--purple-deep);
+      color: white;
+    }
+
+    button:focus-visible {
+      outline: 3px solid rgba(250, 238, 52, 0.55);
+      outline-offset: 2px;
+    }
+
+    .stage {
+      min-height: 660px;
+      padding: 28px;
+      overflow: auto;
+      background:
+        linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px),
+        #100b15;
+      background-size: 24px 24px;
+    }
+
+    .vm-window {
+      width: min(100%, 1000px);
+      min-height: 600px;
+      margin: auto;
+      overflow: hidden;
+      border: 1px solid #4b3b57;
+      border-radius: 12px;
+      background: #170e1f;
+      box-shadow: 0 18px 50px rgba(0,0,0,.48);
+      transition: width 180ms ease, min-height 180ms ease;
+    }
+
+    .vm-window.compact {
+      width: min(100%, 760px);
+      min-height: 520px;
+    }
+
+    .native-bar {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      height: 38px;
+      padding: 0 13px;
+      border-bottom: 1px solid #33273e;
+      background: #211728;
+      color: #bfb3c7;
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .traffic { display: flex; gap: 6px; }
+    .traffic i { width: 9px; height: 9px; border-radius: 50%; background: #5c4c67; }
+
+    .app {
+      min-height: 562px;
+      padding: 24px 28px 20px;
+      background:
+        radial-gradient(circle at 92% -8%, rgba(101, 29, 241, .22), transparent 24rem),
+        #170e1f;
+    }
+
+    .compact .app { min-height: 482px; padding: 18px 20px 16px; }
+
+    .app-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 22px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      min-width: 0;
+    }
+
+    .mark {
+      width: 38px;
+      height: 38px;
+      flex: 0 0 auto;
+      border-radius: 10px;
+      object-fit: contain;
+    }
+
+    .brand-name { font-size: 17px; font-weight: 800; line-height: 1.1; }
+    .brand-sub { color: var(--quiet); font-size: 13px; line-height: 1.25; }
+
+    .state-pill {
+      flex: 0 0 auto;
+      padding: 6px 10px;
+      border: 1px solid #4c3b5a;
+      border-radius: 999px;
+      background: #251b2e;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+
+    .hero-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 22px;
+      align-items: end;
+      margin-bottom: 18px;
+    }
+
+    .hero-row h3 {
+      margin: 0 0 5px;
+      font-size: 29px;
+      line-height: 1.08;
+      letter-spacing: -.035em;
+    }
+
+    .hero-row p { margin: 0; color: var(--muted); font-size: 16px; }
 
     .checks {
-      list-style: none;
-      padding-left: 0 !important;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 12px;
     }
 
-    .checks li {
-      padding-left: 24px;
-      position: relative;
+    .check {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      align-items: center;
+      gap: 11px;
+      min-height: 60px;
+      padding: 10px 12px;
+      border: 1px solid #372940;
+      border-radius: 10px;
+      background: #211629;
     }
 
-    .checks li::before {
-      color: var(--brand);
-      content: "✓";
+    .check-badge {
+      display: grid;
+      place-items: center;
+      width: 33px;
+      height: 33px;
+      border-radius: 9px;
+      background: #203b2a;
+      color: var(--green);
+      font-size: 17px;
       font-weight: 900;
-      left: 2px;
-      position: absolute;
     }
 
-    @media (max-width: 760px) {
-      header,
-      .grid {
-        grid-template-columns: 1fr;
-      }
+    .check.warn .check-badge { background: #493622; color: var(--orange); }
+    .check.fail .check-badge { background: #48252d; color: var(--red); }
+    .check-title { font-size: 15px; font-weight: 760; line-height: 1.25; }
+    .check-detail { color: var(--muted); font-size: 14px; line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-      header {
-        align-items: start;
-      }
-
-      .tag {
-        justify-self: start;
-      }
-
-      .demo-toolbar {
-        align-items: flex-start;
-        flex-direction: column;
-      }
-
-      .scenarios {
-        justify-content: flex-start;
-      }
-
-      .steps {
-        grid-template-columns: repeat(2, 1fr);
-      }
-
-      .desktop-content {
-        grid-template-columns: 1fr;
-      }
-
-      .desktop-nav {
-        display: none;
-      }
+    .options {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 14px;
     }
 
-    @media (prefers-reduced-motion: reduce) {
-      *,
-      *::before,
-      *::after {
-        animation-duration: 0.01ms !important;
-        scroll-behavior: auto !important;
-        transition-duration: 0.01ms !important;
-      }
+    .option {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      align-items: center;
+      gap: 11px;
+      min-height: 58px;
+      padding: 9px 12px;
+      border: 1px solid #44344f;
+      border-radius: 10px;
+      background: #261b2f;
+    }
+
+    .toggle {
+      width: 36px;
+      height: 22px;
+      padding: 3px;
+      border-radius: 999px;
+      background: var(--purple-deep);
+    }
+
+    .toggle::after {
+      display: block;
+      width: 16px;
+      height: 16px;
+      margin-left: 14px;
+      border-radius: 50%;
+      background: white;
+      content: "";
+    }
+
+    .option-title { font-size: 15px; font-weight: 760; line-height: 1.25; }
+    .option-detail { color: var(--muted); font-size: 13px; line-height: 1.3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    .action-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding-top: 14px;
+      border-top: 1px solid #392b43;
+    }
+
+    .shortcut { color: var(--quiet); font-size: 13px; }
+    kbd { border: 1px solid #594966; border-radius: 5px; background: #2a2032; color: var(--muted); padding: 2px 6px; font: 700 12px/1.2 inherit; }
+
+    .actions { display: flex; gap: 8px; }
+    .action {
+      min-height: 44px;
+      min-width: 150px;
+      padding: 0 18px;
+      border: 0;
+      border-radius: 9px;
+      background: var(--purple-deep);
+      color: white;
+      font-size: 14px;
+      font-weight: 820;
+      letter-spacing: .025em;
+    }
+    .action.secondary { min-width: auto; border: 1px solid #4c3b59; background: #291e32; color: var(--muted); }
+
+    .progress-view { display: none; max-width: 820px; margin: 46px auto 0; }
+    .progress-view .app-header { margin-bottom: 38px; }
+    .progress-view h3 { margin-bottom: 7px; font-size: 31px; letter-spacing: -.035em; }
+    .progress-view > p { margin-bottom: 27px; color: var(--muted); font-size: 16px; }
+    .progress-meta { display: flex; justify-content: space-between; gap: 14px; margin-bottom: 8px; color: var(--muted); font-size: 14px; }
+    .progress-track { height: 10px; overflow: hidden; border-radius: 999px; background: #392b43; }
+    .progress-fill { width: 62%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--purple-deep), var(--purple)); }
+    .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 32px; }
+    .step { padding-top: 10px; border-top: 3px solid #463650; color: var(--quiet); font-size: 14px; font-weight: 750; }
+    .step.done { border-color: var(--purple); color: #c9b6ff; }
+    .step.active { border-color: var(--yellow); color: var(--text); }
+    .progress-footer { display: flex; justify-content: space-between; margin-top: 48px; color: var(--quiet); font-size: 14px; }
+
+    .vm-window[data-screen="starting"] .setup-view { display: none; }
+    .vm-window[data-screen="starting"] .progress-view { display: block; }
+    .vm-window[data-state="download"] .state-pill { color: var(--orange); }
+    .vm-window[data-state="error"] .state-pill { color: var(--red); }
+    .vm-window[data-state="error"] .check:first-child .check-badge { background: #48252d; color: var(--red); }
+    .vm-window[data-state="error"] .check:first-child .check-badge::before { content: "!"; }
+    .vm-window[data-state="error"] .check:first-child .check-badge { font-size: 0; }
+    .vm-window[data-state="error"] .check:first-child .check-badge::before { font-size: 17px; }
+
+    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; margin-top: 22px; }
+    .principle { grid-column: span 4; padding: 19px; }
+    .principle p { margin: 0; color: var(--muted); font-size: 0.92rem; }
+    .number { margin-bottom: 13px; color: var(--yellow); font-size: 0.76rem; font-weight: 850; letter-spacing: .1em; }
+
+    .metrics { overflow-x: auto; margin-top: 20px; }
+    table { width: 100%; border-collapse: collapse; min-width: 700px; }
+    th, td { padding: 13px 15px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--quiet); font-size: 0.74rem; letter-spacing: .09em; text-transform: uppercase; }
+    td { color: var(--muted); }
+    td:first-child { color: var(--text); font-weight: 730; }
+
+    .flow { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 22px; }
+    .phase { position: relative; padding: 18px; }
+    .phase::after { position: absolute; top: 28px; right: -11px; z-index: 2; color: var(--purple); content: "→"; font-weight: 900; }
+    .phase:last-child::after { display: none; }
+    .phase p, .phase li { color: var(--muted); font-size: .9rem; }
+    .phase ul { margin: 10px 0 0; padding-left: 18px; }
+
+    .checklist { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 22px; }
+    .checklist-item { display: grid; grid-template-columns: auto 1fr; gap: 11px; padding: 15px 17px; }
+    .tick { color: var(--green); font-weight: 900; }
+    .checklist-item p { margin: 2px 0 0; color: var(--muted); font-size: .9rem; }
+
+    .note { margin-top: 20px; padding: 17px 19px; border-left: 3px solid var(--yellow); background: rgba(250, 238, 52, .055); color: var(--muted); }
+    .note strong { color: var(--text); }
+
+    footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--quiet); font-size: .86rem; }
+
+    @media (max-width: 840px) {
+      .proposal { grid-template-columns: 1fr; }
+      .delta { text-align: left; }
+      .principle { grid-column: span 6; }
+      .flow { grid-template-columns: 1fr 1fr; }
+      .phase:nth-child(2)::after { display: none; }
+      .stage { padding: 14px; }
+    }
+
+    @media (max-width: 620px) {
+      main { width: min(100% - 20px, 1180px); padding-top: 28px; }
+      .principle { grid-column: 1 / -1; }
+      .flow, .checklist { grid-template-columns: 1fr; }
+      .phase::after { display: none; }
+      .checks, .options { grid-template-columns: 1fr; }
+      .hero-row { grid-template-columns: 1fr; }
+      .app { padding: 16px; }
+      .action-row { align-items: stretch; flex-direction: column; }
+      .actions { width: 100%; }
+      .action { flex: 1; min-width: 0; }
+      .shortcut { order: 2; }
     }
   </style>
 </head>
 <body>
   <main>
     <header>
-      <div>
-        <h1>Pull quietly. Start clearly. Reveal when ready.</h1>
-        <p class="lede">
-          A proposed pull and startup experience for <code>ndappx</code>. Users
-          see truthful progress while the image and VM are prepared, then the
-          completed desktop replaces the readiness view in one clean transition.
-        </p>
+      <div class="eyebrow">SquadVM interface plan · August 2026</div>
+      <h1>More useful pixels. More readable words.</h1>
+      <p class="lede">Modernize the native SquadVM chrome around the guest without turning it into a new product. The setup and startup screens become compact control surfaces: clear at a glance, comfortable at normal viewing distance, and able to fit common laptop windows without clipping.</p>
+      <div class="header-meta">
+        <span class="chip">Scope: native viewer UI</span>
+        <span class="chip">Targets: Windows · macOS · Linux</span>
+        <span class="chip">No guest desktop redesign</span>
       </div>
-      <span class="tag">Interaction plan</span>
     </header>
 
-    <aside class="card decision">
-      <strong>Presentation rule:</strong> the graphical surface stays hidden
-      until the guest session has declared itself ready and a complete, stable
-      desktop frame is available. Boot consoles, TTY output, greeter transitions,
-      and partially painted desktop frames are never presented to the user.
-    </aside>
+    <div class="proposal">
+      <p><strong>Proposal in one sentence:</strong> replace the tall, poster-like composition with a persistent compact header, a two-column status grid, inline options, and one anchored action row—while making every meaningful sentence at least 14–16 logical pixels.</p>
+      <div class="delta">≈ 22% shorter<small>target setup footprint</small></div>
+    </div>
 
-    <section class="card demo" aria-labelledby="demo-title">
-      <div class="demo-toolbar">
-        <div class="window-title" id="demo-title">
-          <span class="app-mark" aria-hidden="true"></span>
-          Neurodesktop
-        </div>
-        <div class="scenarios" aria-label="Demo scenarios">
-          <button data-scenario="first" aria-pressed="true">First pull</button>
-          <button data-scenario="cached" aria-pressed="false">Cached image</button>
-          <button data-scenario="resume" aria-pressed="false">Resume pull</button>
-        </div>
-      </div>
+    <section aria-labelledby="prototype-title">
+      <div class="eyebrow">Interactive direction</div>
+      <h2 id="prototype-title">Proposed setup and startup surfaces</h2>
+      <p>Use the controls to inspect the proposed density. “Compact” represents a constrained laptop window, not a separate mobile interface.</p>
 
-      <div class="stage">
-        <div class="waiting-view" id="waiting-view">
-          <div class="progress-panel">
-            <div class="eyebrow" id="phase-label">Preparing</div>
-            <h2 class="status-title" id="status-title">Ready to start</h2>
-            <p class="status-copy" id="status-copy" aria-live="polite">
-              Run the demo to preview the pull and startup experience.
-            </p>
-
-            <div class="bar" id="progress-bar" role="progressbar"
-              aria-label="Startup progress" aria-valuemin="0" aria-valuemax="100"
-              aria-valuenow="0">
-              <div class="bar-fill" id="bar-fill"></div>
-            </div>
-            <div class="progress-meta">
-              <span id="progress-detail">No work started</span>
-              <span id="progress-eta"></span>
-            </div>
-
-            <ol class="steps" aria-label="Startup phases">
-              <li class="step" data-step="pull">Pull image</li>
-              <li class="step" data-step="prepare">Prepare</li>
-              <li class="step" data-step="boot">Start VM</li>
-              <li class="step" data-step="desktop">Open desktop</li>
-            </ol>
-
-            <div class="actions">
-              <button class="primary" id="run-demo">Run demo</button>
-              <button id="reset-demo">Reset</button>
-            </div>
-
-            <details id="pull-details">
-              <summary>Image details</summary>
-              <div class="layers">
-                <div class="layer">
-                  <span>sha256:71b2…e910</span>
-                  <span>1.42 GB</span>
-                  <span class="layer-state">waiting</span>
-                </div>
-                <div class="layer">
-                  <span>sha256:a83c…17f2</span>
-                  <span>824 MB</span>
-                  <span class="layer-state">waiting</span>
-                </div>
-                <div class="layer">
-                  <span>sha256:092e…b422</span>
-                  <span>318 MB</span>
-                  <span class="layer-state">waiting</span>
-                </div>
-              </div>
-            </details>
+      <div class="demo-shell card">
+        <div class="demo-controls">
+          <div class="control-group" aria-label="Screen">
+            <button type="button" data-screen="setup" aria-pressed="true">Setup</button>
+            <button type="button" data-screen="starting" aria-pressed="false">Starting</button>
+          </div>
+          <div class="control-group" aria-label="State">
+            <button type="button" data-state="ready" aria-pressed="true">Ready</button>
+            <button type="button" data-state="download" aria-pressed="false">Download</button>
+            <button type="button" data-state="error" aria-pressed="false">Failure</button>
+          </div>
+          <div class="control-group" aria-label="Viewport">
+            <button type="button" data-size="wide" aria-pressed="true">Wide</button>
+            <button type="button" data-size="compact" aria-pressed="false">Compact</button>
           </div>
         </div>
+        <div class="stage">
+          <div class="vm-window" id="prototype" data-screen="setup" data-state="ready">
+            <div class="native-bar"><span class="traffic"><i></i><i></i><i></i></span>SquadVM</div>
+            <div class="app">
+              <div class="setup-view">
+                <div class="app-header">
+                  <div class="brand"><img class="mark" src="cmd/squadvm/assets/squadvm-brand.png" alt=""><div><div class="brand-name">SquadVM</div><div class="brand-sub">UQ Cyber Squad</div></div></div>
+                  <div class="state-pill" id="state-label">Ready</div>
+                </div>
+                <div class="hero-row">
+                  <div><h3 id="setup-title">Ready to start</h3><p id="setup-detail">Your system and image are ready.</p></div>
+                </div>
+                <div class="checks">
+                  <div class="check"><div class="check-badge">✓</div><div><div class="check-title">Virtualization</div><div class="check-detail">Available</div></div></div>
+                  <div class="check"><div class="check-badge">✓</div><div><div class="check-title">Disk space</div><div class="check-detail">86 GB free · 18 GB needed</div></div></div>
+                  <div class="check" id="image-check"><div class="check-badge">✓</div><div><div class="check-title">Desktop image</div><div class="check-detail" id="image-detail">Current and ready</div></div></div>
+                  <div class="check"><div class="check-badge">✓</div><div><div class="check-title">Virtual machine manager</div><div class="check-detail">Current</div></div></div>
+                </div>
+                <div class="options">
+                  <div class="option"><div class="toggle"></div><div><div class="option-title">SSH access</div><div class="option-detail">Adds “ssh squadvm” to your SSH config</div></div></div>
+                  <div class="option"><div class="toggle"></div><div><div class="option-title">System install</div><div class="option-detail">Store data in your user cache</div></div></div>
+                </div>
+                <div class="action-row">
+                  <div class="shortcut"><kbd>Space</kbd> SSH &nbsp; <kbd>Enter</kbd> start</div>
+                  <div class="actions"><button class="action secondary" type="button" id="secondary-action" hidden>Skip</button><button class="action" type="button" id="primary-action">Start SquadVM</button></div>
+                </div>
+              </div>
 
-        <div class="desktop-view" id="desktop-view" aria-label="Ready Neurodesktop session">
-          <div class="desktop-wallpaper"></div>
-          <div class="desktop-window">
-            <div class="desktop-titlebar">
-              <span>Neurodesktop</span>
-              <span aria-hidden="true">—　□　×</span>
-            </div>
-            <div class="desktop-content">
-              <nav class="desktop-nav" aria-label="Application categories">
-                Favorites<br>
-                Neuroimaging<br>
-                Terminal<br>
-                Files
-              </nav>
-              <div class="desktop-welcome">
-                <h3>Your desktop is ready</h3>
-                <p>
-                  Applications, shared storage, clipboard, keyboard, mouse, and
-                  resize handling are ready before this surface becomes visible.
-                </p>
-                <div><button>Browse applications</button></div>
+              <div class="progress-view">
+                <div class="app-header">
+                  <div class="brand"><img class="mark" src="cmd/squadvm/assets/squadvm-brand.png" alt=""><div><div class="brand-name">SquadVM</div><div class="brand-sub">UQ Cyber Squad · Starting local machine</div></div></div>
+                  <div class="state-pill">In progress</div>
+                </div>
+                <h3>Preparing the desktop image</h3>
+                <p>Downloading and indexing the files needed to start SquadVM.</p>
+                <div class="progress-meta"><strong>Download</strong><span>2.8 GB of 4.5 GB · about 2 min</span></div>
+                <div class="progress-track"><div class="progress-fill"></div></div>
+                <div class="steps"><div class="step done">1 · Image</div><div class="step active">2 · Start VM</div><div class="step">3 · Desktop</div></div>
+                <div class="progress-footer"><span><kbd>Esc</kbd> settings</span><span>Close window to cancel</span></div>
               </div>
             </div>
-          </div>
-          <div class="desktop-panel">
-            <span>Applications　▣ Neurodesktop</span>
-            <span>100%　14:32</span>
           </div>
         </div>
       </div>
     </section>
 
-    <section class="section" aria-labelledby="behavior-heading">
-      <h2 id="behavior-heading">Behavioral contract</h2>
+    <section>
+      <div class="eyebrow">Design principles</div>
+      <h2>What changes—and what does not</h2>
       <div class="grid">
-        <article class="card">
-          <h3>Pull flow</h3>
-          <ol>
-            <li>Resolve the image tag to a digest and fetch the manifest.</li>
-            <li>Check the content-addressed cache before requesting any layer.</li>
-            <li>Download missing layers concurrently with resumable transfers.</li>
-            <li>Report actual bytes, transfer rate, and ETA while totals are known.</li>
-            <li>Verify every digest, then atomically commit the usable image.</li>
-          </ol>
-          <p class="note">
-            A cached image skips straight to validation. An interrupted pull
-            resumes verified partial content rather than starting over.
-          </p>
-        </article>
-
-        <article class="card">
-          <h3>Start flow</h3>
-          <ol>
-            <li>Prepare the writable image state, home, and shared storage.</li>
-            <li>Start the VM and establish the guest control channel.</li>
-            <li>Attach the graphics transport to an off-screen surface.</li>
-            <li>Apply the current host window size and wait for desktop readiness.</li>
-            <li>Present the first stable frame, then enable normal interaction.</li>
-          </ol>
-          <p class="note">
-            The progress view owns the window until the final presentation gate
-            passes. There is no interval where the framebuffer leaks through.
-          </p>
-        </article>
+        <article class="principle card"><div class="number">01</div><h3>Text first</h3><p>Primary copy is 16 px or larger. Secondary copy is 14 px or larger. Tiny uppercase text is reserved for short status tokens, never instructions or errors.</p></article>
+        <article class="principle card"><div class="number">02</div><h3>Density through structure</h3><p>Recover space by using columns and removing ornamental gaps—not by shrinking controls, line height, or text.</p></article>
+        <article class="principle card"><div class="number">03</div><h3>One clear action area</h3><p>Options live together; start/update actions live together. The eye should not travel across unrelated controls at the bottom edge.</p></article>
+        <article class="principle card"><div class="number">04</div><h3>Stable geometry</h3><p>Checking, ready, update, and failure states share the same layout so content changes do not cause the whole interface to jump.</p></article>
+        <article class="principle card"><div class="number">05</div><h3>Logical pixels everywhere</h3><p>Layout is calculated in logical units and rendered through the platform scale. A 16 px label should have the same perceived size at 100% and 200% DPI.</p></article>
+        <article class="principle card"><div class="number">06</div><h3>Guest remains primary</h3><p>Once the desktop is ready, native chrome stays out of the way. Update notices remain compact, dismissible, and keyboard reachable.</p></article>
       </div>
-
-      <ul class="flow" aria-label="State machine">
-        <li><span class="state">idle</span></li>
-        <li><span class="state">resolving</span></li>
-        <li><span class="state">pulling</span></li>
-        <li><span class="state">verifying</span></li>
-        <li><span class="state">preparing</span></li>
-        <li><span class="state">booting</span></li>
-        <li><span class="state">guest-ready</span></li>
-        <li><span class="state">display-ready</span></li>
-        <li><span class="state">presented</span></li>
-      </ul>
     </section>
 
-    <section class="section grid">
-      <article class="card">
-        <h2>Progress semantics</h2>
-        <ul>
-          <li>
-            Use determinate progress only when <code>current</code> and
-            <code>total</code> are real measurements.
-          </li>
-          <li>
-            Switch to an indeterminate bar for validation, boot, and guest
-            readiness instead of inventing a percentage.
-          </li>
-          <li>
-            Keep the primary label stable by phase; put changing detail in the
-            secondary line so the UI does not visually jump.
-          </li>
-          <li>
-            Show layer-level detail on demand. Normal operation remains simple.
-          </li>
-          <li>
-            Cancellation stops new work safely; verified cached layers remain
-            reusable. Failures keep a concise reason and offer retry.
-          </li>
-        </ul>
-      </article>
-
-      <article class="card">
-        <h2>Desktop readiness gate</h2>
-        <p>All conditions must be true before the surface is presented:</p>
-        <ul class="checks">
-          <li>The guest control channel reports the desktop session started.</li>
-          <li>The graphics connection has received a full framebuffer update.</li>
-          <li>The requested display size has been acknowledged and painted.</li>
-          <li>Keyboard, pointer, clipboard, and resize handlers are attached.</li>
-          <li>The frame has remained valid through one compositor paint cycle.</li>
-        </ul>
-        <p class="note">
-          Readiness is a guest/display protocol event, not a timer and not a
-          search for particular console text.
-        </p>
-      </article>
+    <section>
+      <div class="eyebrow">Layout specification</div>
+      <h2>A smaller footprint with larger type</h2>
+      <p>The dimensions below are implementation targets, not fragile snapshot contracts. The layout engine should preserve relationships when available space changes.</p>
+      <div class="metrics card">
+        <table>
+          <thead><tr><th>Element</th><th>Current tendency</th><th>Proposed target</th><th>Reason</th></tr></thead>
+          <tbody>
+            <tr><td>Setup content height</td><td>≈ 548 logical px</td><td>420–440 logical px</td><td>Fits comfortably in a 760×520 client area.</td></tr>
+            <tr><td>Brand artwork</td><td>68–112 px and vertically isolated</td><td>38–44 px in persistent header</td><td>Keeps identity without consuming a content row.</td></tr>
+            <tr><td>Body / status detail</td><td>12–16 px</td><td>14–16 px</td><td>Readable on laptop displays and at normal viewing distance.</td></tr>
+            <tr><td>Primary title</td><td>32–34 px</td><td>28–32 px</td><td>Still dominant, with less poster-like vertical space.</td></tr>
+            <tr><td>Status rows</td><td>Four full-width rows × 52 px</td><td>2×2 grid, 60–68 px cards</td><td>Uses width to recover roughly 120 vertical pixels.</td></tr>
+            <tr><td>Options</td><td>Two full-width rows</td><td>Two equal inline cards</td><td>Related choices scan as one group.</td></tr>
+            <tr><td>Buttons</td><td>50 px high</td><td>44–48 px high</td><td>Retains a generous target while tightening the footer.</td></tr>
+            <tr><td>Outer gutters</td><td>32 px each side</td><td>20–28 px, responsive</td><td>More room at compact sizes without crowding.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note"><strong>Important:</strong> do not solve narrow windows by silently scaling the whole interface down. Reflow from two columns to one, wrap details where necessary, and allow vertical scrolling only below the supported minimum height.</div>
     </section>
 
-    <section class="section grid">
-      <article class="card">
-        <h2>Event shape</h2>
-        <p>
-          The puller and VM session should emit structured events. Frontends
-          choose wording without parsing logs.
-        </p>
-        <pre><code>{
-  "phase": "pulling",
-  "message": "Downloading image",
-  "current": 1702887424,
-  "total": 2751463424,
-  "unit": "bytes",
-  "rate": 84934656,
-  "eta_seconds": 12,
-  "detail": "3 of 5 layers"
-}</code></pre>
-        <p>
-          Terminal output remains available behind a diagnostic/debug option,
-          but it is not used as the graphical startup surface.
-        </p>
-      </article>
-
-      <article class="card">
-        <h2>Implementation slices</h2>
-        <ol>
-          <li>Add typed pull and boot progress events to the backend API.</li>
-          <li>Make the image cache resumable, verified, and atomic.</li>
-          <li>Render the readiness view in the native graphics window.</li>
-          <li>Add the guest and full-frame readiness handshake.</li>
-          <li>Swap the hidden graphics surface into the window on readiness.</li>
-          <li>Add recovery UI for offline, auth, disk-full, and guest failures.</li>
-        </ol>
-      </article>
+    <section>
+      <div class="eyebrow">Behavior and accessibility</div>
+      <h2>Readable also means operable</h2>
+      <div class="checklist">
+        <div class="checklist-item card"><span class="tick">✓</span><div><h3>Keyboard navigation</h3><p>Tab traverses options and actions in visual order; Space toggles the focused option; Enter activates the primary action; Escape returns to settings.</p></div></div>
+        <div class="checklist-item card"><span class="tick">✓</span><div><h3>Visible focus</h3><p>Focused controls receive a high-contrast outline that is distinct from selected, enabled, and hover states.</p></div></div>
+        <div class="checklist-item card"><span class="tick">✓</span><div><h3>Errors get room</h3><p>Error details may wrap to two lines or open a detail region. They must not be reduced to an unreadable ellipsis when remediation matters.</p></div></div>
+        <div class="checklist-item card"><span class="tick">✓</span><div><h3>Meaning beyond color</h3><p>PASS, UPDATE, WAIT, and FAIL retain text or icons; progress includes a textual amount or activity description.</p></div></div>
+        <div class="checklist-item card"><span class="tick">✓</span><div><h3>Contrast budget</h3><p>Normal text targets WCAG AA contrast. Muted text is brighter than the current tertiary purple-grey, especially at 13–14 px.</p></div></div>
+        <div class="checklist-item card"><span class="tick">✓</span><div><h3>No animation dependency</h3><p>Indeterminate motion is supplementary. A static frame still communicates the current phase and operation.</p></div></div>
+      </div>
     </section>
 
-    <section class="section card">
+    <section>
+      <div class="eyebrow">Implementation sequence</div>
+      <h2>Build it as a layout system, not another set of coordinates</h2>
+      <div class="flow">
+        <article class="phase card"><div class="number">Phase 1</div><h3>Tokens and measurements</h3><ul><li>Centralize type sizes, colors, spacing, radii, and control heights.</li><li>Add text wrapping and measured truncation helpers.</li><li>Define supported logical viewport sizes.</li></ul></article>
+        <article class="phase card"><div class="number">Phase 2</div><h3>Pure layout model</h3><ul><li>Return rectangles for header, status grid, options, and actions.</li><li>Share rectangles between drawing and hit testing.</li><li>Switch to one column at the compact breakpoint.</li></ul></article>
+        <article class="phase card"><div class="number">Phase 3</div><h3>Render all states</h3><ul><li>Modernize preflight, ready, update, failure, and startup screens.</li><li>Align update notices with the same tokens.</li><li>Add focus and keyboard traversal state.</li></ul></article>
+        <article class="phase card"><div class="number">Phase 4</div><h3>Platform review</h3><ul><li>Capture reference screenshots at supported DPI scales.</li><li>Check long errors and large byte/version values.</li><li>Have the Windows reporter retest the packaged build.</li></ul></article>
+      </div>
+    </section>
+
+    <section>
+      <div class="eyebrow">Verification</div>
       <h2>Acceptance criteria</h2>
-      <div class="grid">
-        <ul class="checks">
-          <li>A first pull exposes real byte progress, rate, and ETA.</li>
-          <li>A cached start does not flash a redundant download phase.</li>
-          <li>An interrupted pull resumes without redownloading valid layers.</li>
-          <li>Cancel leaves the cache and image selection in a valid state.</li>
-        </ul>
-        <ul class="checks">
-          <li>No boot console or terminal content is visible by default.</li>
-          <li>No partial desktop frame is visible during startup or resize.</li>
-          <li>The first visible desktop accepts input immediately.</li>
-          <li>A startup failure stays in the progress view with retry details.</li>
-        </ul>
+      <div class="checklist">
+        <div class="checklist-item card"><span class="tick">✓</span><div><h3>Fits common windows</h3><p>The normal two-column setup view fits without clipping at 1024×640 logical pixels; compact mode remains usable at 760×520.</p></div></div>
+        <div class="checklist-item card"><span class="tick">✓</span><div><h3>Minimum readable sizes</h3><p>No instructional or status-detail text below 14 logical pixels; no primary control label below 14 pixels.</p></div></div>
+        <div class="checklist-item card"><span class="tick">✓</span><div><h3>Objective layout tests</h3><p>Tests verify non-overlap, bounds containment, minimum target sizes, correct responsive mode, and matching draw/hit rectangles—not exact prose or incidental coordinates.</p></div></div>
+        <div class="checklist-item card"><span class="tick">✓</span><div><h3>State coverage</h3><p>Checking, first download, ready, image update, application update, combined updates, failure, cancellation, and desktop notification states are reviewed.</p></div></div>
+        <div class="checklist-item card"><span class="tick">✓</span><div><h3>DPI matrix</h3><p>Windows 100/125/150/200%, macOS 1×/2×, and representative Linux scale values preserve logical geometry and crisp text.</p></div></div>
+        <div class="checklist-item card"><span class="tick">✓</span><div><h3>No workflow regression</h3><p>First launch remains download-and-start; returning users still auto-start; Escape still reveals settings; the guest desktop keeps full ownership after readiness.</p></div></div>
       </div>
     </section>
+
+    <section>
+      <div class="eyebrow">Non-goals</div>
+      <h2>Keep this pass disciplined</h2>
+      <p>This work does not redesign the guest desktop, introduce a general widget toolkit, change image/update policy, add onboarding pages, or replace the native OpenGL renderer. If the existing text renderer cannot support wrapping and focus affordances cleanly, add the smallest reusable primitives needed and stop there.</p>
+    </section>
+
+    <footer>Planning artifact for SquadVM’s native viewer UI. The mockup is directional; implementation truth remains behavior, legibility, and responsive geometry across real host platforms.</footer>
   </main>
 
   <script>
-    (() => {
-      const scenarios = {
-        first: {
-          phases: [
-            ["Resolving", "Finding the requested image", "Reading manifest and cache index", "", "pull", null, 650],
-            ["Pulling image", "Downloading Neurodesktop", "1.66 GB of 2.56 GB · 81 MB/s", "about 12 sec", "pull", 65, 1600],
-            ["Verifying", "Checking downloaded content", "Verifying layer digests", "", "prepare", null, 850],
-            ["Preparing", "Preparing your workspace", "Attaching home and shared storage", "", "prepare", null, 750],
-            ["Starting", "Starting the virtual machine", "Waiting for the guest control channel", "", "boot", null, 1100],
-            ["Starting desktop", "Getting the desktop ready", "Applying display size and waiting for a complete frame", "", "desktop", null, 1200]
-          ]
-        },
-        cached: {
-          phases: [
-            ["Resolving", "Checking the local image", "Image already available · digest verified", "", "pull", null, 600],
-            ["Preparing", "Preparing your workspace", "Attaching home and shared storage", "", "prepare", null, 700],
-            ["Starting", "Starting the virtual machine", "Waiting for the guest control channel", "", "boot", null, 1000],
-            ["Starting desktop", "Getting the desktop ready", "Waiting for a complete frame", "", "desktop", null, 1100]
-          ]
-        },
-        resume: {
-          phases: [
-            ["Resolving", "Resuming the image pull", "1.84 GB already verified in the cache", "", "pull", null, 650],
-            ["Pulling image", "Downloading remaining content", "2.31 GB of 2.56 GB · 76 MB/s", "about 4 sec", "pull", 90, 1300],
-            ["Verifying", "Checking downloaded content", "Verifying remaining layer digests", "", "prepare", null, 800],
-            ["Preparing", "Preparing your workspace", "Attaching home and shared storage", "", "prepare", null, 700],
-            ["Starting", "Starting the virtual machine", "Waiting for the guest control channel", "", "boot", null, 1000],
-            ["Starting desktop", "Getting the desktop ready", "Applying display size and waiting for a complete frame", "", "desktop", null, 1100]
-          ]
-        }
-      };
+    const prototype = document.getElementById("prototype");
+    const stateLabel = document.getElementById("state-label");
+    const setupTitle = document.getElementById("setup-title");
+    const setupDetail = document.getElementById("setup-detail");
+    const imageCheck = document.getElementById("image-check");
+    const imageDetail = document.getElementById("image-detail");
+    const primaryAction = document.getElementById("primary-action");
+    const secondaryAction = document.getElementById("secondary-action");
 
-      const phaseLabel = document.querySelector("#phase-label");
-      const title = document.querySelector("#status-title");
-      const copy = document.querySelector("#status-copy");
-      const detail = document.querySelector("#progress-detail");
-      const eta = document.querySelector("#progress-eta");
-      const bar = document.querySelector("#progress-bar");
-      const fill = document.querySelector("#bar-fill");
-      const waiting = document.querySelector("#waiting-view");
-      const desktop = document.querySelector("#desktop-view");
-      const runButton = document.querySelector("#run-demo");
-      const resetButton = document.querySelector("#reset-demo");
-      const scenarioButtons = [...document.querySelectorAll("[data-scenario]")];
-      const steps = [...document.querySelectorAll(".step")];
-      const layerStates = [...document.querySelectorAll(".layer-state")];
-      let scenario = "first";
-      let timer = null;
+    function select(group, selected) {
+      document.querySelectorAll(`.demo-controls button[data-${group}]`).forEach((button) => {
+        const active = button.dataset[group] === selected;
+        button.setAttribute("aria-pressed", String(active));
+      });
+    }
 
-      function setStep(active) {
-        const order = ["pull", "prepare", "boot", "desktop"];
-        const activeIndex = order.indexOf(active);
-        steps.forEach((step) => {
-          const index = order.indexOf(step.dataset.step);
-          step.classList.toggle("done", index < activeIndex);
-          step.classList.toggle("active", index === activeIndex);
-        });
-      }
+    document.querySelectorAll(".demo-controls button[data-screen]").forEach((button) => {
+      button.addEventListener("click", () => {
+        prototype.dataset.screen = button.dataset.screen;
+        select("screen", button.dataset.screen);
+      });
+    });
 
-      function setProgress(value) {
-        const determinate = typeof value === "number";
-        bar.classList.toggle("indeterminate", !determinate);
-        fill.style.width = determinate ? `${value}%` : "";
-        if (determinate) {
-          bar.setAttribute("aria-valuenow", String(value));
+    document.querySelectorAll(".demo-controls button[data-size]").forEach((button) => {
+      button.addEventListener("click", () => {
+        prototype.classList.toggle("compact", button.dataset.size === "compact");
+        select("size", button.dataset.size);
+      });
+    });
+
+    document.querySelectorAll(".demo-controls button[data-state]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const state = button.dataset.state;
+        prototype.dataset.state = state;
+        select("state", state);
+        imageCheck.className = "check";
+        secondaryAction.hidden = true;
+        if (state === "ready") {
+          stateLabel.textContent = "Ready";
+          setupTitle.textContent = "Ready to start";
+          setupDetail.textContent = "Your system and image are ready.";
+          imageDetail.textContent = "Current and ready";
+          primaryAction.textContent = "Start SquadVM";
+        } else if (state === "download") {
+          stateLabel.textContent = "Download needed";
+          setupTitle.textContent = "Set up SquadVM";
+          setupDetail.textContent = "Download the desktop image, then start automatically.";
+          imageDetail.textContent = "4.5 GB · about 3 min";
+          imageCheck.classList.add("warn");
+          primaryAction.textContent = "Download & start";
+          secondaryAction.hidden = false;
+          secondaryAction.textContent = "Not now";
         } else {
-          bar.removeAttribute("aria-valuenow");
+          stateLabel.textContent = "Action needed";
+          setupTitle.textContent = "Virtualization unavailable";
+          setupDetail.textContent = "Review the host requirement before starting SquadVM.";
+          imageDetail.textContent = "Image is ready";
+          primaryAction.textContent = "View details";
         }
-      }
-
-      function reset() {
-        window.clearTimeout(timer);
-        timer = null;
-        desktop.classList.remove("ready");
-        waiting.classList.remove("hidden");
-        phaseLabel.textContent = "Preparing";
-        title.textContent = "Ready to start";
-        copy.textContent = "Run the demo to preview the pull and startup experience.";
-        detail.textContent = "No work started";
-        eta.textContent = "";
-        bar.classList.remove("indeterminate");
-        fill.style.width = "0";
-        bar.setAttribute("aria-valuenow", "0");
-        steps.forEach((step) => step.classList.remove("done", "active"));
-        layerStates.forEach((state) => state.textContent = "waiting");
-        runButton.disabled = false;
-        runButton.textContent = "Run demo";
-      }
-
-      function revealDesktop() {
-        steps.forEach((step) => {
-          step.classList.remove("active");
-          step.classList.add("done");
-        });
-        layerStates.forEach((state) => state.textContent = "verified");
-        waiting.classList.add("hidden");
-        desktop.classList.add("ready");
-        runButton.disabled = false;
-        runButton.textContent = "Run again";
-      }
-
-      function play(index = 0) {
-        const phases = scenarios[scenario].phases;
-        if (index >= phases.length) {
-          revealDesktop();
-          return;
-        }
-
-        const [label, heading, message, remaining, step, progress, duration] = phases[index];
-        phaseLabel.textContent = label;
-        title.textContent = heading;
-        copy.textContent = message;
-        detail.textContent = progress === null ? "Working…" : `${progress}% downloaded`;
-        eta.textContent = remaining;
-        setStep(step);
-        setProgress(progress);
-
-        if (label === "Pulling image") {
-          layerStates[0].textContent = "verified";
-          layerStates[1].textContent = "downloading";
-        } else if (label === "Verifying") {
-          layerStates.forEach((state) => state.textContent = "verifying");
-        } else if (index > 1) {
-          layerStates.forEach((state) => state.textContent = "verified");
-        }
-
-        timer = window.setTimeout(() => play(index + 1), duration);
-      }
-
-      runButton.addEventListener("click", () => {
-        reset();
-        runButton.disabled = true;
-        runButton.textContent = "Starting…";
-        play();
       });
-
-      resetButton.addEventListener("click", reset);
-
-      scenarioButtons.forEach((button) => {
-        button.addEventListener("click", () => {
-          scenario = button.dataset.scenario;
-          scenarioButtons.forEach((candidate) => {
-            candidate.setAttribute("aria-pressed", String(candidate === button));
-          });
-          reset();
-        });
-      });
-    })();
+    });
   </script>
 </body>
 </html>

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/tinyrange/gowin/gl"
+	"github.com/tinyrange/gowin/window"
 )
 
 const updateNotificationLifetime = 30 * time.Second
@@ -65,15 +66,15 @@ func (v *displayViewer) activeUpdateNotifications(now time.Time) []updateNotific
 }
 
 func updateNotificationLayouts(width float32, notifications []updateNotification) []updateNotificationLayout {
-	cardWidth := max(float32(1), min(float32(390), width-36))
+	cardWidth := max(float32(1), min(float32(420), width-32))
 	const (
-		top        = float32(18)
-		cardHeight = float32(112)
+		top        = float32(16)
+		cardHeight = float32(128)
 		gap        = float32(10)
 		buttonGap  = float32(8)
 	)
-	left := max(float32(18), width-18-cardWidth)
-	buttonWidth := (cardWidth - 36 - buttonGap) / 2
+	left := max(float32(16), width-16-cardWidth)
+	buttonWidth := (cardWidth - 32 - buttonGap) / 2
 	layouts := make([]updateNotificationLayout, 0, len(notifications))
 	for index, notification := range notifications {
 		y := top + float32(index)*(cardHeight+gap)
@@ -82,15 +83,15 @@ func updateNotificationLayouts(width float32, notifications []updateNotification
 			bounds:       image.Rect(int(left), int(y), int(left+cardWidth), int(y+cardHeight)),
 			dismiss: image.Rect(
 				int(left+14),
-				int(y+70),
+				int(y+72),
 				int(left+14+buttonWidth),
-				int(y+98),
+				int(y+116),
 			),
 			apply: image.Rect(
 				int(left+22+buttonWidth),
-				int(y+70),
+				int(y+72),
 				int(left+22+buttonWidth*2),
-				int(y+98),
+				int(y+116),
 			),
 		})
 	}
@@ -108,43 +109,62 @@ func (v *displayViewer) drawUpdateNotifications(backingWidth, backingHeight int,
 	height := float32(backingHeight) / scale
 	v.text.SetViewport(int32(width), int32(height))
 	v.text.SetScale(scale)
-	for _, layout := range updateNotificationLayouts(width, notifications) {
+	for index, layout := range updateNotificationLayouts(width, notifications) {
 		bounds := layout.bounds
+		v.drawPanel(backingWidth, backingHeight, scale, bounds, 10,
+			color.RGBA{R: 76, G: 59, B: 89, A: 255}, color.RGBA{R: 31, G: 22, B: 40, A: 255})
 		v.drawRect(
 			backingWidth, backingHeight, scale,
-			float32(bounds.Min.X), float32(bounds.Min.Y),
-			float32(bounds.Dx()), float32(bounds.Dy()),
-			color.RGBA{R: 31, G: 22, B: 40, A: 255},
+			float32(bounds.Min.X), float32(bounds.Min.Y), 4, float32(bounds.Dy()),
+			color.RGBA{R: 141, G: 92, B: 255, A: 255},
 		)
 		v.text.BeginDraw()
 		v.drawTextBold(
-			fitStartupText(layout.notification.title, float32(bounds.Dx()-28), 15),
-			float32(bounds.Min.X+14), float32(bounds.Min.Y+25), 15,
+			fitStartupText(layout.notification.title, float32(bounds.Dx()-32), 16),
+			float32(bounds.Min.X+16), float32(bounds.Min.Y+27), 16,
 			color.RGBA{R: 243, G: 245, B: 239, A: 255},
 		)
-		detailColor := color.RGBA{R: 195, G: 183, B: 204, A: 255}
+		detailColor := color.RGBA{R: 211, G: 202, B: 218, A: 255}
 		if layout.notification.kind == releaseUpdateNotification && v.releaseUpdateErr != nil {
 			detailColor = color.RGBA{R: 255, G: 137, B: 137, A: 255}
 		}
 		v.drawText(
-			fitStartupText(layout.notification.detail, float32(bounds.Dx()-28), 12),
-			float32(bounds.Min.X+14), float32(bounds.Min.Y+48), 12,
+			fitStartupText(layout.notification.detail, float32(bounds.Dx()-152), 14),
+			float32(bounds.Min.X+16), float32(bounds.Min.Y+53), 14,
 			detailColor,
+		)
+		focusHint := "F6: CONTROLS"
+		focusHintWidth := float32(v.text.GetAdvance(v.font, 14, focusHint))
+		v.drawTextBold(
+			focusHint,
+			float32(bounds.Max.X-16)-focusHintWidth, float32(bounds.Min.Y+53), 14,
+			color.RGBA{R: 189, G: 151, B: 255, A: 255},
 		)
 		v.text.EndDraw()
 
-		v.drawRect(
-			backingWidth, backingHeight, scale,
-			float32(layout.dismiss.Min.X), float32(layout.dismiss.Min.Y),
-			float32(layout.dismiss.Dx()), float32(layout.dismiss.Dy()),
-			color.RGBA{R: 54, G: 41, B: 65, A: 255},
-		)
-		v.drawRect(
-			backingWidth, backingHeight, scale,
-			float32(layout.apply.Min.X), float32(layout.apply.Min.Y),
-			float32(layout.apply.Dx()), float32(layout.apply.Dy()),
-			color.RGBA{R: 95, G: 23, B: 238, A: 255},
-		)
+		dismissBorder := color.RGBA{R: 76, G: 59, B: 89, A: 255}
+		dismissFill := color.RGBA{R: 54, G: 41, B: 65, A: 255}
+		applyFill := color.RGBA{R: 95, G: 23, B: 238, A: 255}
+		if v.updateHoverActive {
+			switch v.updateHover {
+			case index * 2:
+				dismissBorder = color.RGBA{R: 111, G: 84, B: 130, A: 255}
+				dismissFill = color.RGBA{R: 67, G: 50, B: 79, A: 255}
+			case index*2 + 1:
+				applyFill = color.RGBA{R: 117, G: 49, B: 255, A: 255}
+			}
+		}
+		v.drawPanel(backingWidth, backingHeight, scale, layout.dismiss, 8, dismissBorder, dismissFill)
+		v.drawRoundedRect(backingWidth, backingHeight, scale, layout.apply, 8, applyFill)
+		if v.updateFocusActive {
+			focusColor := color.RGBA{R: 250, G: 238, B: 52, A: 255}
+			switch v.updateFocus {
+			case index * 2:
+				v.drawOutline(backingWidth, backingHeight, scale, layout.dismiss, focusColor)
+			case index*2 + 1:
+				v.drawOutline(backingWidth, backingHeight, scale, layout.apply, focusColor)
+			}
+		}
 		v.text.BeginDraw()
 		v.drawNotificationButtonLabel(layout.dismiss, "DISMISS", color.RGBA{R: 235, G: 229, B: 240, A: 255})
 		v.drawNotificationButtonLabel(layout.apply, "APPLY", color.RGBA{R: 255, G: 255, B: 255, A: 255})
@@ -153,14 +173,7 @@ func (v *displayViewer) drawUpdateNotifications(backingWidth, backingHeight int,
 }
 
 func (v *displayViewer) drawNotificationButtonLabel(bounds image.Rectangle, label string, textColor color.RGBA) {
-	labelWidth := float32(v.text.GetAdvance(v.font, 11, label))
-	v.drawTextBold(
-		label,
-		float32(bounds.Min.X)+(float32(bounds.Dx())-labelWidth)/2,
-		float32(bounds.Min.Y+19),
-		11,
-		textColor,
-	)
+	v.drawCenteredTextBold(label, bounds, 14, textColor)
 }
 
 func (v *displayViewer) handleUpdateNotificationClick(x, y float32, now time.Time) bool {
@@ -174,11 +187,92 @@ func (v *displayViewer) handleUpdateNotificationClick(x, y float32, now time.Tim
 		}
 		switch {
 		case point.In(layout.dismiss):
+			v.updateFocusActive = false
 			v.dismissUpdateNotification(layout.notification.kind)
 		case point.In(layout.apply):
+			v.updateFocusActive = false
 			v.applyUpdateNotification(layout.notification.kind)
 		}
 		return true
+	}
+	return false
+}
+
+func (v *displayViewer) updateUpdateNotificationHover(x, y float32, now time.Time) {
+	scale := normalizedDisplayScale(v.window.Scale())
+	backingWidth, _ := v.window.BackingSize()
+	width := float32(backingWidth) / scale
+	point := image.Pt(int(x/scale), int(y/scale))
+	v.updateHoverActive = false
+	for index, layout := range updateNotificationLayouts(width, v.activeUpdateNotifications(now)) {
+		switch {
+		case point.In(layout.dismiss):
+			v.updateHover = index * 2
+			v.updateHoverActive = true
+			return
+		case point.In(layout.apply):
+			v.updateHover = index*2 + 1
+			v.updateHoverActive = true
+			return
+		}
+	}
+}
+
+func (v *displayViewer) handleUpdateNotificationKey(event window.InputEvent, now time.Time) bool {
+	if event.Type == window.InputEventKeyUp && v.updateConsumedKeys[event.Key] {
+		delete(v.updateConsumedKeys, event.Key)
+		return true
+	}
+	if event.Type == window.InputEventKeyDown && v.updateConsumedKeys[event.Key] {
+		return true
+	}
+	if event.Type != window.InputEventKeyDown || event.Repeat {
+		return false
+	}
+	consume := func() bool {
+		v.updateConsumedKeys[event.Key] = true
+		return true
+	}
+	notifications := v.activeUpdateNotifications(now)
+	if event.Key == window.KeyF6 {
+		if len(notifications) == 0 {
+			return false
+		}
+		v.updateFocusActive = true
+		v.updateFocus = 0
+		return consume()
+	}
+	if !v.updateFocusActive {
+		return false
+	}
+	if len(notifications) == 0 {
+		v.updateFocusActive = false
+		return false
+	}
+	targetCount := len(notifications) * 2
+	if v.updateFocus >= targetCount {
+		v.updateFocus = targetCount - 1
+	}
+	switch event.Key {
+	case window.KeyEscape:
+		v.updateFocusActive = false
+		return consume()
+	case window.KeyTab:
+		if event.Mods&window.ModShift != 0 {
+			v.updateFocus = (v.updateFocus - 1 + targetCount) % targetCount
+		} else {
+			v.updateFocus = (v.updateFocus + 1) % targetCount
+		}
+		return consume()
+	case window.KeyEnter, window.KeySpace:
+		notification := notifications[v.updateFocus/2]
+		if v.updateFocus%2 == 0 {
+			v.dismissUpdateNotification(notification.kind)
+		} else {
+			v.applyUpdateNotification(notification.kind)
+		}
+		v.updateFocusActive = false
+		return consume()
 	}
 	return false
 }

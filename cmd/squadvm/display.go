@@ -16,6 +16,8 @@ import (
 	"github.com/tinyrange/gowin/gl"
 	gowintext "github.com/tinyrange/gowin/text"
 	"github.com/tinyrange/gowin/window"
+	"golang.org/x/image/font/gofont/gobold"
+	"golang.org/x/image/font/gofont/goregular"
 	"j5.nz/cc/display"
 )
 
@@ -37,6 +39,53 @@ out vec4 color;
 void main() {
 	color = texture(framebuffer, uv);
 }`
+	roundedRectFragmentShader = `#version 150
+uniform vec4 shapeColor;
+uniform vec4 shapeGeometry;
+in vec2 uv;
+out vec4 color;
+void main() {
+	vec2 size = shapeGeometry.xy;
+	float radius = min(shapeGeometry.z, min(size.x, size.y) * 0.5);
+	vec2 point = uv * size - size * 0.5;
+	vec2 distanceToCorner = abs(point) - (size * 0.5 - vec2(radius));
+	float distanceToEdge = length(max(distanceToCorner, 0.0))
+		+ min(max(distanceToCorner.x, distanceToCorner.y), 0.0) - radius;
+	float coverage = smoothstep(0.0, shapeGeometry.w, -distanceToEdge);
+	color = vec4(shapeColor.rgb, shapeColor.a * coverage);
+}`
+	backgroundFragmentShader = `#version 150
+uniform vec4 backgroundGeometry;
+in vec2 uv;
+out vec4 color;
+void main() {
+	vec2 size = backgroundGeometry.xy;
+	vec2 point = uv * size;
+	vec2 glowCenter = vec2(size.x * 0.92, -size.y * 0.08);
+	float glowRadius = min(size.x, size.y) * 0.56;
+	float glow = (1.0 - smoothstep(0.0, glowRadius, length(point - glowCenter))) * 0.22;
+	vec3 base = vec3(23.0, 14.0, 31.0) / 255.0;
+	vec3 purple = vec3(101.0, 29.0, 241.0) / 255.0;
+	color = vec4(mix(base, purple, glow), 1.0);
+}`
+	checkmarkFragmentShader = `#version 150
+uniform vec4 iconColor;
+in vec2 uv;
+out vec4 color;
+float segmentDistance(vec2 point, vec2 start, vec2 end) {
+	vec2 relative = point - start;
+	vec2 segment = end - start;
+	float position = clamp(dot(relative, segment) / dot(segment, segment), 0.0, 1.0);
+	return length(relative - segment * position);
+}
+void main() {
+	float distanceToMark = min(
+		segmentDistance(uv, vec2(0.22, 0.52), vec2(0.43, 0.72)),
+		segmentDistance(uv, vec2(0.43, 0.72), vec2(0.79, 0.29))
+	);
+	float coverage = 1.0 - smoothstep(0.055, 0.085, distanceToMark);
+	color = vec4(iconColor.rgb, iconColor.a * coverage);
+}`
 )
 
 type displayViewer struct {
@@ -45,7 +94,15 @@ type displayViewer struct {
 	gl                  gl.OpenGL
 	text                *gowintext.Stash
 	font                int
+	fontBold            int
 	program             uint32
+	roundedRectProgram  uint32
+	roundedRectColor    int32
+	roundedRectGeometry int32
+	backgroundProgram   uint32
+	backgroundGeometry  int32
+	checkmarkProgram    uint32
+	checkmarkColor      int32
 	vertexArray         uint32
 	vertexBuffer        uint32
 	texture             uint32
@@ -67,6 +124,8 @@ type displayViewer struct {
 	pendingResize       image.Point
 	resizeChangedAt     time.Time
 	startup             startupProgress
+	startupChecklist    []startupChecklistItem
+	checklistChangedAt  time.Time
 	startupEvents       chan startupProgress
 	startDone           chan displayStartResult
 	cancelDone          chan struct{}
@@ -91,6 +150,14 @@ type displayViewer struct {
 	presentation        desktopPresentationGate
 	desktopVisible      bool
 	startErr            error
+	startupFocus        startupControl
+	startupFocusVisible bool
+	startupHover        startupControl
+	updateFocus         int
+	updateFocusActive   bool
+	updateHover         int
+	updateHoverActive   bool
+	updateConsumedKeys  map[window.Key]bool
 }
 
 type displayStartResult struct {
@@ -117,20 +184,22 @@ func openDisplayWindow(
 		return fmt.Errorf("open graphics window: %w", err)
 	}
 	viewer := &displayViewer{
-		window:            win,
-		keysDown:          make(map[window.Key]bool),
-		startup:           initialStartupProgress(),
-		startupEvents:     make(chan startupProgress, 16),
-		startDone:         make(chan displayStartResult, 1),
-		cancelDone:        make(chan struct{}, 1),
-		preflightDone:     make(chan displayPreflightResult, 1),
-		imageRestartReady: make(chan struct{}, 1),
-		settings:          settings,
-		firstRunComplete:  firstRunComplete,
-		showSettings:      !firstRunComplete,
-		parentContext:     ctx,
-		start:             start,
+		window:             win,
+		keysDown:           make(map[window.Key]bool),
+		startup:            initialStartupProgress(),
+		startupEvents:      make(chan startupProgress, 16),
+		startDone:          make(chan displayStartResult, 1),
+		cancelDone:         make(chan struct{}, 1),
+		preflightDone:      make(chan displayPreflightResult, 1),
+		imageRestartReady:  make(chan struct{}, 1),
+		settings:           settings,
+		firstRunComplete:   firstRunComplete,
+		showSettings:       !firstRunComplete,
+		updateConsumedKeys: make(map[window.Key]bool),
+		parentContext:      ctx,
+		start:              start,
 	}
+	viewer.setStartupProgress(initialStartupProgress())
 	if err := viewer.init(); err != nil {
 		win.Close()
 		return err
@@ -152,13 +221,18 @@ func (v *displayViewer) beginStart(refreshImage bool) {
 		return
 	}
 	v.settings.RefreshImage = refreshImage
+	backingWidth, backingHeight := v.window.BackingSize()
+	displaySize := guestDisplaySize(backingWidth, backingHeight, v.window.Scale())
+	v.settings.DisplayWidth = displaySize.X
+	v.settings.DisplayHeight = displaySize.Y
 	ctx, cancel := context.WithCancel(v.parentContext)
 	v.startCancel = cancel
 	v.starting = true
 	v.returnToSettings = false
 	v.showSettings = false
 	v.startErr = nil
-	v.startup = initialStartupProgress()
+	v.startupChecklist = nil
+	v.setStartupProgress(initialStartupProgress())
 	publish := func(progress startupProgress) {
 		select {
 		case v.startupEvents <- progress:
@@ -179,6 +253,15 @@ func (v *displayViewer) beginStart(refreshImage bool) {
 	}()
 }
 
+func (v *displayViewer) setStartupProgress(progress startupProgress) {
+	v.startup = progress
+	var appended bool
+	v.startupChecklist, appended = updateStartupChecklist(v.startupChecklist, progress)
+	if appended {
+		v.checklistChangedAt = time.Now()
+	}
+}
+
 func (v *displayViewer) init() error {
 	var err error
 	v.gl, err = v.window.GL()
@@ -193,6 +276,22 @@ func (v *displayViewer) init() error {
 	if err != nil {
 		return err
 	}
+	v.roundedRectProgram, err = compileGraphicsProgram(v.gl, roundedRectFragmentShader)
+	if err != nil {
+		return fmt.Errorf("compile rounded rectangle renderer: %w", err)
+	}
+	v.roundedRectColor = v.gl.GetUniformLocation(v.roundedRectProgram, "shapeColor")
+	v.roundedRectGeometry = v.gl.GetUniformLocation(v.roundedRectProgram, "shapeGeometry")
+	v.backgroundProgram, err = compileGraphicsProgram(v.gl, backgroundFragmentShader)
+	if err != nil {
+		return fmt.Errorf("compile interface background renderer: %w", err)
+	}
+	v.backgroundGeometry = v.gl.GetUniformLocation(v.backgroundProgram, "backgroundGeometry")
+	v.checkmarkProgram, err = compileGraphicsProgram(v.gl, checkmarkFragmentShader)
+	if err != nil {
+		return fmt.Errorf("compile checkmark renderer: %w", err)
+	}
+	v.checkmarkColor = v.gl.GetUniformLocation(v.checkmarkProgram, "iconColor")
 	vertices := []float32{
 		-1, 1, 0, 0,
 		-1, -1, 0, 1,
@@ -210,6 +309,18 @@ func (v *displayViewer) init() error {
 	texcoord := v.gl.GetAttribLocation(v.program, "texcoord")
 	if position < 0 || texcoord < 0 {
 		return fmt.Errorf("graphics shader attributes are unavailable")
+	}
+	for name, program := range map[string]uint32{
+		"rounded rectangle": v.roundedRectProgram,
+		"background":        v.backgroundProgram,
+		"checkmark":         v.checkmarkProgram,
+	} {
+		if candidate := v.gl.GetAttribLocation(program, "position"); candidate != position {
+			return fmt.Errorf("%s position attribute is incompatible", name)
+		}
+		if candidate := v.gl.GetAttribLocation(program, "texcoord"); candidate != texcoord {
+			return fmt.Errorf("%s texture coordinate attribute is incompatible", name)
+		}
 	}
 	v.gl.VertexAttribPointer(uint32(position), 2, gl.Float, false, 16, 0)
 	v.gl.EnableVertexAttribArray(uint32(position))
@@ -231,9 +342,13 @@ func (v *displayViewer) init() error {
 	v.text = gowintext.New(v.gl, 1024, 1024)
 	v.text.SetYInverted(true)
 	v.text.SetGraphicsShader(v.program)
-	v.font, err = v.text.AddFontFromMemory(gowintext.EMBEDDED_FONT)
+	v.font, err = v.text.AddFontFromMemory(goregular.TTF)
 	if err != nil {
-		return fmt.Errorf("load progress font: %w", err)
+		return fmt.Errorf("load interface font: %w", err)
+	}
+	v.fontBold, err = v.text.AddFontFromMemory(gobold.TTF)
+	if err != nil {
+		return fmt.Errorf("load bold interface font: %w", err)
 	}
 	return nil
 }
@@ -253,6 +368,15 @@ func (v *displayViewer) close() {
 	}
 	if v.program != 0 {
 		v.gl.DeleteProgram(v.program)
+	}
+	if v.roundedRectProgram != 0 {
+		v.gl.DeleteProgram(v.roundedRectProgram)
+	}
+	if v.backgroundProgram != 0 {
+		v.gl.DeleteProgram(v.backgroundProgram)
+	}
+	if v.checkmarkProgram != 0 {
+		v.gl.DeleteProgram(v.checkmarkProgram)
 	}
 	v.window.Close()
 }
@@ -274,7 +398,7 @@ func (v *displayViewer) loop(ctx context.Context) error {
 		for {
 			select {
 			case progress := <-v.startupEvents:
-				v.startup = progress
+				v.setStartupProgress(progress)
 				if progress.Failed {
 					v.desktopVisible = false
 					v.startErr = fmt.Errorf("%s", progress.Detail)
@@ -283,6 +407,7 @@ func (v *displayViewer) loop(ctx context.Context) error {
 				v.starting = false
 				if v.returnToSettings {
 					v.returnToSettings = false
+					v.showSettings = true
 					v.startCancel = nil
 					v.startErr = nil
 					continue
@@ -293,21 +418,26 @@ func (v *displayViewer) loop(ctx context.Context) error {
 						return nil
 					}
 					v.startErr = result.err
-					v.startup = failedStartupProgress(result.err)
+					v.setStartupProgress(failedStartupProgress(result.err))
 				} else if result.started.Session == nil {
 					v.startCancel = nil
-					v.startup = failedStartupProgress(fmt.Errorf("VM started without a native display session"))
+					v.setStartupProgress(failedStartupProgress(fmt.Errorf("VM started without a native display session")))
 				} else {
 					v.session = result.started.Session
+					v.lastResize = image.Pt(v.settings.DisplayWidth, v.settings.DisplayHeight)
 					v.attemptStopped = result.started.Stopped
 					v.session.SetClipboard(v.hostClipboard)
 					v.presentation.markGuestReady()
-					v.startup = desktopStartupProgress("Waiting for a complete desktop frame")
+					v.setStartupProgress(desktopStartupProgress("Waiting for a complete desktop frame"))
 				}
 			case <-v.cancelDone:
 				v.starting = false
 				v.startCancel = nil
 				v.attemptStopped = nil
+				if v.returnToSettings {
+					v.returnToSettings = false
+					v.showSettings = true
+				}
 			case result := <-v.preflightDone:
 				v.preflightErr = result.err
 				if result.err != nil {
@@ -390,43 +520,14 @@ func (v *displayViewer) loop(ctx context.Context) error {
 	return v.startErr
 }
 
-type startupControlLayout struct {
-	sshCheckbox    image.Rectangle
-	systemCheckbox image.Rectangle
-	skip           image.Rectangle
-	button         image.Rectangle
-}
-
-func settingsControlLayout(width, height float32) startupControlLayout {
-	panelWidth := max(float32(1), min(float32(680), width-64))
-	left := (width - panelWidth) / 2
-	contentTop := max(float32(24), (height-548)/2)
-	return startupControlLayout{
-		sshCheckbox:    image.Rect(int(left), int(contentTop+350), int(left+panelWidth), int(contentTop+400)),
-		systemCheckbox: image.Rect(int(left), int(contentTop+408), int(left+panelWidth), int(contentTop+458)),
-		skip: image.Rect(
-			int(left+max(float32(0), panelWidth-432)),
-			int(contentTop+486),
-			int(left+max(float32(0), panelWidth-228)),
-			int(contentTop+536),
-		),
-		button: image.Rect(
-			int(left+max(float32(0), panelWidth-216)),
-			int(contentTop+486),
-			int(left+panelWidth),
-			int(contentTop+536),
-		),
-	}
-}
-
 func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 	scale := normalizedDisplayScale(v.window.Scale())
 	for _, event := range events {
 		if event.Type == window.InputEventKeyDown && event.Key == window.KeyEscape && !event.Repeat {
 			if !v.showSettings {
-				v.showSettings = true
 				v.startErr = nil
 				if v.startCancel != nil {
+					v.showSettings = false
 					if v.starting {
 						v.returnToSettings = true
 					} else if v.attemptStopped != nil {
@@ -439,6 +540,13 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 					}
 					v.returnToSettings = true
 					v.startCancel()
+					v.setStartupProgress(startupProgress{
+						Phase:  startupDesktop,
+						Title:  "Stopping SquadVM",
+						Detail: "Waiting for the virtual machine to stop safely",
+					})
+				} else {
+					v.showSettings = true
 				}
 				v.session = nil
 				v.presentation = desktopPresentationGate{}
@@ -455,26 +563,66 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 				continue
 			}
 			switch event.Key {
+			case window.KeyTab:
+				v.startupFocus = nextStartupControl(
+					v.startupFocus,
+					event.Mods&window.ModShift != 0,
+					v.preflight.hasUpdate(),
+				)
+				v.startupFocusVisible = true
 			case window.KeySpace:
-				v.settings.SSHEnabled = !v.settings.SSHEnabled
+				if v.startupFocusVisible {
+					v.activateStartupControl(v.startupFocus)
+				} else {
+					v.settings.SSHEnabled = !v.settings.SSHEnabled
+				}
 			case window.KeyEnter:
-				v.beginSettingsStart(v.preflight.hasUpdate())
+				if v.startupFocusVisible {
+					v.activateStartupControl(v.startupFocus)
+				} else {
+					v.beginSettingsStart(v.preflight.hasUpdate())
+				}
 			}
-		case window.InputEventMouseDown:
+		case window.InputEventMouseMove, window.InputEventMouseDown:
 			backingWidth, backingHeight := v.window.BackingSize()
 			layout := settingsControlLayout(float32(backingWidth)/scale, float32(backingHeight)/scale)
 			point := image.Pt(int(event.MouseX/scale), int(event.MouseY/scale))
-			switch {
-			case point.In(layout.sshCheckbox):
+			control := startupControlAt(point, layout, v.preflight.hasUpdate())
+			v.startupHover = control
+			if event.Type != window.InputEventMouseDown {
+				continue
+			}
+			v.startupFocusVisible = false
+			switch control {
+			case startupControlSSH:
+				v.startupFocus = startupControlSSH
 				v.settings.SSHEnabled = !v.settings.SSHEnabled
-			case point.In(layout.systemCheckbox):
+			case startupControlSystem:
+				v.startupFocus = startupControlSystem
 				v.settings.SystemInstall = !v.settings.SystemInstall
-			case v.preflight.hasUpdate() && point.In(layout.skip):
+			case startupControlSkip:
+				v.startupFocus = startupControlSkip
 				v.beginSettingsStart(false)
-			case point.In(layout.button):
+			case startupControlPrimary:
+				v.startupFocus = startupControlPrimary
 				v.beginSettingsStart(v.preflight.hasUpdate())
 			}
 		}
+	}
+}
+
+func (v *displayViewer) activateStartupControl(control startupControl) {
+	switch control {
+	case startupControlSSH:
+		v.settings.SSHEnabled = !v.settings.SSHEnabled
+	case startupControlSystem:
+		v.settings.SystemInstall = !v.settings.SystemInstall
+	case startupControlSkip:
+		if v.preflight.hasUpdate() {
+			v.beginSettingsStart(false)
+		}
+	case startupControlPrimary:
+		v.beginSettingsStart(v.preflight.hasUpdate())
 	}
 }
 
@@ -512,100 +660,117 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 	width := float32(backingWidth) / scale
 	height := float32(backingHeight) / scale
 	v.gl.UseProgram(v.program)
-	v.drawRect(backingWidth, backingHeight, scale, 0, 0, width, height, color.RGBA{R: 23, G: 14, B: 31, A: 255})
+	v.drawBackground(backingWidth, backingHeight)
 
-	panelWidth := max(float32(1), min(float32(680), width-64))
-	left := (width - panelWidth) / 2
-	contentTop := max(float32(24), (height-548)/2)
-	brandWidth := min(float32(68), panelWidth)
-	brandHeight := brandWidth * float32(v.brandHeight) / float32(v.brandWidth)
-	v.drawTexture(v.brandTexture, backingWidth, backingHeight, scale, left, contentTop, brandWidth, brandHeight)
+	layout := settingsControlLayout(width, height)
+	panel := layout.panel
+	left := float32(panel.Min.X)
+	contentTop := float32(panel.Min.Y)
+	panelWidth := float32(panel.Dx())
+	brand := layout.brand
+	v.drawTexture(
+		v.brandTexture, backingWidth, backingHeight, scale,
+		float32(brand.Min.X), float32(brand.Min.Y), float32(brand.Dx()), float32(brand.Dy()),
+	)
 
 	v.text.SetViewport(int32(width), int32(height))
 	v.text.SetScale(scale)
 	title := "Checking your system"
-	detail := "One moment."
+	detail := "Confirming the host and desktop image are ready."
+	state := "CHECKING"
+	stateColor := color.RGBA{R: 199, G: 184, B: 210, A: 255}
+	stateBackground := color.RGBA{R: 51, G: 39, B: 61, A: 255}
 	titleColor := color.RGBA{R: 243, G: 245, B: 239, A: 255}
 	if v.preflightErr != nil {
 		title = "Checks failed"
 		detail = v.preflightErr.Error()
+		state = "ACTION NEEDED"
+		stateColor = color.RGBA{R: 255, G: 151, B: 151, A: 255}
+		stateBackground = color.RGBA{R: 75, G: 36, B: 47, A: 255}
 		titleColor = color.RGBA{R: 255, G: 137, B: 137, A: 255}
 	} else if v.preflightReady {
 		title = "Ready to start"
-		detail = "SquadVM is ready."
+		detail = "Your system and desktop image are ready."
+		state = "READY"
+		stateColor = color.RGBA{R: 143, G: 226, B: 156, A: 255}
+		stateBackground = color.RGBA{R: 31, G: 62, B: 45, A: 255}
 		if !v.preflight.Image.Installed {
 			title = "Set up SquadVM"
-			detail = "Download the image to get started."
+			detail = "Download the desktop image, then start automatically."
+			state = "DOWNLOAD NEEDED"
+			stateColor = color.RGBA{R: 255, G: 193, B: 111, A: 255}
+			stateBackground = color.RGBA{R: 72, G: 52, B: 31, A: 255}
 		} else if v.preflight.hasUpdate() && v.preflight.ReleaseUpdate != nil {
 			title = "Updates available"
-			detail = "Review the available updates below."
+			detail = "Update the desktop image and virtual machine manager."
+			state = "UPDATES"
+			stateColor = color.RGBA{R: 221, G: 202, B: 255, A: 255}
+			stateBackground = color.RGBA{R: 66, G: 39, B: 101, A: 255}
 		} else if v.preflight.hasUpdate() || v.preflight.ReleaseUpdate != nil {
 			title = "Update available"
-			detail = "Review the update below."
+			detail = "A newer SquadVM component is ready to install."
+			state = "UPDATE"
+			stateColor = color.RGBA{R: 221, G: 202, B: 255, A: 255}
+			stateBackground = color.RGBA{R: 66, G: 39, B: 101, A: 255}
 		}
 		if !v.preflight.canStart() {
 			title = "Can't start yet"
-			detail = "Fix the failed check."
+			detail = "Review the failed requirement before starting SquadVM."
+			state = "ACTION NEEDED"
+			stateColor = color.RGBA{R: 255, G: 193, B: 111, A: 255}
+			stateBackground = color.RGBA{R: 72, G: 52, B: 31, A: 255}
 			titleColor = color.RGBA{R: 255, G: 193, B: 111, A: 255}
 		}
 	}
+
+	stateBounds := layout.state
+	v.drawRoundedRect(backingWidth, backingHeight, scale, stateBounds, stateBounds.Dy()/2, stateBackground)
 	v.text.BeginDraw()
-	v.drawTextBold("SQUADVM", left+88, contentTop+20, 14, color.RGBA{R: 189, G: 151, B: 255, A: 255})
-	v.drawTextBold(fitStartupText(title, panelWidth-88, 32), left+88, contentTop+58, 32, titleColor)
-	v.drawText(fitStartupText(detail, panelWidth, 16), left, contentTop+94, 16, color.RGBA{R: 224, G: 216, B: 230, A: 255})
+	v.drawTextBold("SquadVM", left+60, contentTop+21, 19, color.RGBA{R: 243, G: 245, B: 239, A: 255})
+	v.drawText("UQ Cyber Squad", left+60, contentTop+43, 14, color.RGBA{R: 189, G: 151, B: 255, A: 255})
+	v.drawCenteredTextBold(state, stateBounds, 13, stateColor)
+	v.drawTextBold(fitStartupText(title, panelWidth, 34), left, contentTop+99, 34, titleColor)
+	for index, line := range wrapStartupText(detail, panelWidth, 18, 2) {
+		v.drawText(line, left, contentTop+129+float32(index*21), 18, color.RGBA{R: 224, G: 216, B: 230, A: 255})
+	}
 	v.text.EndDraw()
 
-	rowY := contentTop + 112
-	v.drawPreflightRow(backingWidth, backingHeight, scale, left, rowY, panelWidth,
+	v.drawPreflightCard(backingWidth, backingHeight, scale, layout.status[0],
 		preflightStatus(v.preflightReady, v.preflight.VirtualizationOK),
-		"VIRTUALIZATION",
+		"Virtualization",
 		preflightVirtualizationDetail(v.preflightReady, v.preflight),
 	)
-	v.drawPreflightRow(backingWidth, backingHeight, scale, left, rowY+60, panelWidth,
+	v.drawPreflightCard(backingWidth, backingHeight, scale, layout.status[1],
 		preflightStatus(v.preflightReady, v.preflight.DiskOK),
-		"DISK",
+		"Disk space",
 		preflightDiskDetail(v.preflightReady, v.preflight),
 	)
 	imageOK := v.preflightReady
-	v.drawPreflightRow(backingWidth, backingHeight, scale, left, rowY+120, panelWidth,
+	v.drawPreflightCard(backingWidth, backingHeight, scale, layout.status[2],
 		imagePreflightStatus(v.preflightReady, imageOK, v.preflight),
-		"IMAGE",
+		"Desktop image",
 		preflightImageDetail(v.preflightReady, v.preflight, v.settings.DownloadRate),
 	)
-	v.drawPreflightRow(backingWidth, backingHeight, scale, left, rowY+180, panelWidth,
+	v.drawPreflightCard(backingWidth, backingHeight, scale, layout.status[3],
 		releasePreflightStatus(v.preflightReady, v.preflight),
-		"VMM",
+		"Virtual machine manager",
 		preflightReleaseDetail(v.preflightReady, v.preflight),
 	)
 
-	layout := settingsControlLayout(width, height)
-	check := layout.sshCheckbox
-	v.drawRect(backingWidth, backingHeight, scale, float32(check.Min.X), float32(check.Min.Y),
-		float32(check.Dx()), float32(check.Dy()), color.RGBA{R: 40, G: 28, B: 51, A: 255})
-	boxX := float32(check.Min.X + 14)
-	boxY := float32(check.Min.Y + 15)
-	v.drawRect(backingWidth, backingHeight, scale, boxX, boxY, 20, 20, color.RGBA{R: 82, G: 63, B: 96, A: 255})
-	if v.settings.SSHEnabled {
-		v.drawRect(backingWidth, backingHeight, scale, boxX+4, boxY+4, 12, 12, color.RGBA{R: 250, G: 238, B: 52, A: 255})
-	}
-	v.text.BeginDraw()
-	v.drawTextBold("Enable SSH access", boxX+34, float32(check.Min.Y+21), 16, color.RGBA{R: 243, G: 245, B: 239, A: 255})
-	v.drawText("Adds \"ssh squadvm\" to ~/.ssh/config", boxX+34, float32(check.Min.Y+41), 13, color.RGBA{R: 205, G: 194, B: 213, A: 255})
-	v.text.EndDraw()
-
-	systemCheck := layout.systemCheckbox
-	v.drawRect(backingWidth, backingHeight, scale, float32(systemCheck.Min.X), float32(systemCheck.Min.Y),
-		float32(systemCheck.Dx()), float32(systemCheck.Dy()), color.RGBA{R: 40, G: 28, B: 51, A: 255})
-	systemBoxX := float32(systemCheck.Min.X + 14)
-	systemBoxY := float32(systemCheck.Min.Y + 15)
-	v.drawRect(backingWidth, backingHeight, scale, systemBoxX, systemBoxY, 20, 20, color.RGBA{R: 82, G: 63, B: 96, A: 255})
-	if v.settings.SystemInstall {
-		v.drawRect(backingWidth, backingHeight, scale, systemBoxX+4, systemBoxY+4, 12, 12, color.RGBA{R: 250, G: 238, B: 52, A: 255})
-	}
-	v.text.BeginDraw()
-	v.drawTextBold("System install", systemBoxX+34, float32(systemCheck.Min.Y+21), 16, color.RGBA{R: 243, G: 245, B: 239, A: 255})
-	v.drawText("Store data in your user cache", systemBoxX+34, float32(systemCheck.Min.Y+41), 13, color.RGBA{R: 205, G: 194, B: 213, A: 255})
-	v.text.EndDraw()
+	v.drawSettingsOption(
+		backingWidth, backingHeight, scale, layout.sshCheckbox,
+		"SSH access", "Adds \"ssh squadvm\" to SSH config",
+		v.settings.SSHEnabled,
+		v.startupFocusVisible && v.startupFocus == startupControlSSH,
+		v.startupHover == startupControlSSH,
+	)
+	v.drawSettingsOption(
+		backingWidth, backingHeight, scale, layout.systemCheckbox,
+		"System install", "Store data in your user cache",
+		v.settings.SystemInstall,
+		v.startupFocusVisible && v.startupFocus == startupControlSystem,
+		v.startupHover == startupControlSystem,
+	)
 
 	button := layout.button
 	buttonColor := color.RGBA{R: 69, G: 54, B: 80, A: 255}
@@ -613,45 +778,66 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 	if v.preflightReady && v.preflight.canStart() && !v.starting {
 		buttonColor = color.RGBA{R: 95, G: 23, B: 238, A: 255}
 		buttonText = color.RGBA{R: 255, G: 255, B: 255, A: 255}
+		if v.startupHover == startupControlPrimary {
+			buttonColor = color.RGBA{R: 117, G: 49, B: 255, A: 255}
+		}
 	}
-	v.drawRect(backingWidth, backingHeight, scale, float32(button.Min.X), float32(button.Min.Y),
-		float32(button.Dx()), float32(button.Dy()), buttonColor)
-	label := "START"
+	divider := layout.actionDivider
+	v.drawRect(backingWidth, backingHeight, scale,
+		float32(divider.Min.X), float32(divider.Min.Y), float32(divider.Dx()), float32(divider.Dy()),
+		color.RGBA{R: 57, G: 43, B: 67, A: 255})
+	v.drawRoundedRect(backingWidth, backingHeight, scale, button, 9, buttonColor)
+	label := "Start SquadVM"
 	if v.preflightReady && !v.preflight.Image.Installed {
-		label = "DOWNLOAD & START"
+		label = "Download & start"
 	}
 	if v.preflightReady && v.preflight.hasUpdate() {
-		label = "UPDATE & START"
+		label = "Update & start"
 		skip := layout.skip
 		skipColor := color.RGBA{R: 54, G: 41, B: 65, A: 255}
 		skipText := color.RGBA{R: 235, G: 229, B: 240, A: 255}
 		if v.starting {
 			skipText = color.RGBA{R: 153, G: 142, B: 163, A: 255}
+		} else if v.startupHover == startupControlSkip {
+			skipColor = color.RGBA{R: 68, G: 52, B: 80, A: 255}
 		}
-		v.drawRect(backingWidth, backingHeight, scale, float32(skip.Min.X), float32(skip.Min.Y),
-			float32(skip.Dx()), float32(skip.Dy()), skipColor)
+		v.drawPanel(backingWidth, backingHeight, scale, skip, 9,
+			color.RGBA{R: 76, G: 59, B: 89, A: 255}, skipColor)
+		if v.startupFocusVisible && v.startupFocus == startupControlSkip {
+			v.drawOutline(backingWidth, backingHeight, scale, skip, color.RGBA{R: 250, G: 238, B: 52, A: 255})
+		}
 		v.text.BeginDraw()
-		skipLabel := "SKIP UPDATE"
-		skipWidth := float32(v.text.GetAdvance(v.font, 14, skipLabel))
-		v.drawTextBold(skipLabel, float32(skip.Min.X)+(float32(skip.Dx())-skipWidth)/2, float32(skip.Min.Y+31), 14, skipText)
+		v.drawCenteredTextBold("Skip", skip, 15, skipText)
 		v.text.EndDraw()
 	}
 	if v.starting {
-		label = "STARTING…"
+		label = "Starting…"
+	}
+	if v.startupFocusVisible && v.startupFocus == startupControlPrimary {
+		v.drawOutline(backingWidth, backingHeight, scale, button, color.RGBA{R: 250, G: 238, B: 52, A: 255})
 	}
 	v.text.BeginDraw()
-	labelWidth := float32(v.text.GetAdvance(v.font, 14, label))
-	v.drawTextBold(label, float32(button.Min.X)+(float32(button.Dx())-labelWidth)/2, float32(button.Min.Y+31), 14, buttonText)
-	v.drawText("Space: SSH", left, float32(button.Min.Y+31), 13, color.RGBA{R: 205, G: 194, B: 213, A: 255})
+	v.drawCenteredTextBold(label, button, 15, buttonText)
+	shortcutWidth := float32(layout.skip.Min.X) - left - 12
+	if !v.preflight.hasUpdate() {
+		shortcutWidth = float32(button.Min.X) - left - 12
+	}
+	v.drawText(fitStartupText("Space  SSH   ·   Tab  move   ·   Enter  start", shortcutWidth, 15),
+		left, float32(button.Min.Y+33), 15, color.RGBA{R: 211, G: 202, B: 218, A: 255})
 	v.text.EndDraw()
 }
 
-func (v *displayViewer) drawPreflightRow(
+func (v *displayViewer) drawPreflightCard(
 	backingWidth, backingHeight int,
-	scale, left, top, width float32,
+	scale float32,
+	bounds image.Rectangle,
 	status, label, detail string,
 ) {
-	v.drawRect(backingWidth, backingHeight, scale, left, top, width, 52, color.RGBA{R: 40, G: 28, B: 51, A: 255})
+	left := float32(bounds.Min.X)
+	top := float32(bounds.Min.Y)
+	width := float32(bounds.Dx())
+	v.drawPanel(backingWidth, backingHeight, scale, bounds, 10,
+		color.RGBA{R: 55, G: 41, B: 64, A: 255}, color.RGBA{R: 33, G: 22, B: 41, A: 255})
 	statusColor := color.RGBA{R: 157, G: 144, B: 168, A: 255}
 	badgeColor := color.RGBA{R: 58, G: 45, B: 69, A: 255}
 	switch status {
@@ -665,12 +851,51 @@ func (v *displayViewer) drawPreflightRow(
 		statusColor = color.RGBA{R: 221, G: 202, B: 255, A: 255}
 		badgeColor = color.RGBA{R: 75, G: 45, B: 116, A: 255}
 	}
-	v.drawRect(backingWidth, backingHeight, scale, left+12, top+14, 64, 24, badgeColor)
+	badge := image.Rect(int(left+12), int(top+14), int(left+46), int(top+48))
+	v.drawRoundedRect(backingWidth, backingHeight, scale, badge, 9, badgeColor)
+	if status == "PASS" {
+		v.drawCheckmark(backingWidth, backingHeight, scale, badge, statusColor)
+	}
 	v.text.BeginDraw()
-	statusWidth := float32(v.text.GetAdvance(v.font, 11, status))
-	v.drawTextBold(status, left+12+(64-statusWidth)/2, top+30, 11, statusColor)
-	v.drawTextBold(label, left+92, top+22, 15, color.RGBA{R: 243, G: 245, B: 239, A: 255})
-	v.drawText(fitStartupText(detail, width-108, 13), left+92, top+42, 13, color.RGBA{R: 207, G: 197, B: 215, A: 255})
+	v.drawCenteredTextBold(statusSymbol(status), badge, 18, statusColor)
+	v.drawTextBold(label, left+58, top+25, 16, color.RGBA{R: 243, G: 245, B: 239, A: 255})
+	v.drawText(fitStartupText(detail, width-70, 15), left+58, top+49, 15, color.RGBA{R: 211, G: 202, B: 218, A: 255})
+	v.text.EndDraw()
+}
+
+func (v *displayViewer) drawSettingsOption(
+	backingWidth, backingHeight int,
+	scale float32,
+	bounds image.Rectangle,
+	title, detail string,
+	enabled, focused, hovered bool,
+) {
+	borderColor := color.RGBA{R: 68, G: 52, B: 79, A: 255}
+	fillColor := color.RGBA{R: 38, G: 27, B: 47, A: 255}
+	if hovered {
+		borderColor = color.RGBA{R: 101, G: 74, B: 121, A: 255}
+		fillColor = color.RGBA{R: 47, G: 33, B: 58, A: 255}
+	}
+	v.drawPanel(backingWidth, backingHeight, scale, bounds, 10,
+		borderColor, fillColor)
+	toggleX := float32(bounds.Min.X + 12)
+	toggleY := float32(bounds.Min.Y + 19)
+	toggleColor := color.RGBA{R: 75, G: 59, B: 87, A: 255}
+	knobX := toggleX + 3
+	if enabled {
+		toggleColor = color.RGBA{R: 95, G: 23, B: 238, A: 255}
+		knobX = toggleX + 19
+	}
+	v.drawRoundedRect(backingWidth, backingHeight, scale, image.Rect(int(toggleX), int(toggleY), int(toggleX+38), int(toggleY+22)), 11, toggleColor)
+	v.drawRoundedRect(backingWidth, backingHeight, scale, image.Rect(int(knobX), int(toggleY+3), int(knobX+16), int(toggleY+19)), 8, color.RGBA{R: 250, G: 249, B: 251, A: 255})
+	if focused {
+		v.drawOutline(backingWidth, backingHeight, scale, bounds, color.RGBA{R: 250, G: 238, B: 52, A: 255})
+	}
+	v.text.BeginDraw()
+	textX := float32(bounds.Min.X + 62)
+	textWidth := float32(bounds.Dx() - 74)
+	v.drawTextBold(title, textX, float32(bounds.Min.Y+24), 16, color.RGBA{R: 243, G: 245, B: 239, A: 255})
+	v.drawText(fitStartupText(detail, textWidth, 15), textX, float32(bounds.Min.Y+47), 15, color.RGBA{R: 211, G: 202, B: 218, A: 255})
 	v.text.EndDraw()
 }
 
@@ -756,37 +981,43 @@ func preflightReleaseDetail(ready bool, preflight startupPreflight) string {
 
 func (v *displayViewer) drawStartup(backingWidth, backingHeight int, now time.Time) {
 	v.gl.Enable(gl.Blend)
-	scale := v.window.Scale()
-	if scale <= 0 {
-		scale = 1
-	}
+	scale := normalizedDisplayScale(v.window.Scale())
 	width := float32(backingWidth) / scale
 	height := float32(backingHeight) / scale
 	v.gl.UseProgram(v.program)
-	v.drawRect(backingWidth, backingHeight, scale, 0, 0, width, height, color.RGBA{R: 23, G: 14, B: 31, A: 255})
+	v.drawBackground(backingWidth, backingHeight)
 
-	panelWidth := max(float32(1), min(float32(760), width-64))
-	left := (width - panelWidth) / 2
-	contentTop := max(float32(32), (height-450)/2)
-
-	brandWidth := min(float32(112), panelWidth)
-	brandHeight := brandWidth * float32(v.brandHeight) / float32(v.brandWidth)
-	v.drawTexture(v.brandTexture, backingWidth, backingHeight, scale, left, contentTop, brandWidth, brandHeight)
+	layout := calculateStartupScreenLayout(width, height)
+	panel := layout.panel
+	panelWidth := float32(panel.Dx())
+	left := float32(panel.Min.X)
+	contentTop := float32(panel.Min.Y)
+	brand := layout.brand
+	v.drawTexture(
+		v.brandTexture, backingWidth, backingHeight, scale,
+		float32(brand.Min.X), float32(brand.Min.Y), float32(brand.Dx()), float32(brand.Dy()),
+	)
 
 	v.text.SetViewport(int32(width), int32(height))
 	v.text.SetScale(scale)
 
-	v.text.BeginDraw()
-	titleColor := color.RGBA{R: 243, G: 245, B: 239, A: 255}
+	state := "IN PROGRESS"
+	stateColor := color.RGBA{R: 221, G: 202, B: 255, A: 255}
+	stateBackground := color.RGBA{R: 66, G: 39, B: 101, A: 255}
 	if v.startup.Failed {
-		titleColor = color.RGBA{R: 255, G: 137, B: 137, A: 255}
+		state = "INTERRUPTED"
+		stateColor = color.RGBA{R: 255, G: 151, B: 151, A: 255}
+		stateBackground = color.RGBA{R: 75, G: 36, B: 47, A: 255}
 	}
-	v.drawTextBold(startupEyebrow(v.startup), left, contentTop+136, 14, color.RGBA{R: 189, G: 151, B: 255, A: 255})
-	v.drawTextBold(fitStartupText(v.startup.Title, panelWidth, 34), left, contentTop+177, 34, titleColor)
-	v.drawText(fitStartupText(v.startup.Detail, panelWidth, 16), left, contentTop+216, 16, color.RGBA{R: 216, G: 207, B: 224, A: 255})
+	stateBounds := layout.state
+	v.drawRoundedRect(backingWidth, backingHeight, scale, stateBounds, stateBounds.Dy()/2, stateBackground)
+	v.text.BeginDraw()
+	v.drawTextBold("SquadVM", left+60, contentTop+21, 19, color.RGBA{R: 243, G: 245, B: 239, A: 255})
+	v.drawText(startupEyebrow(v.startup), left+60, contentTop+43, 14, color.RGBA{R: 189, G: 151, B: 255, A: 255})
+	v.drawCenteredTextBold(state, stateBounds, 13, stateColor)
 	v.text.EndDraw()
+	v.drawStartupChecklist(backingWidth, backingHeight, scale, left, contentTop+92, panelWidth, now)
 
-	barY := contentTop + 254
 	accent := color.RGBA{R: 95, G: 23, B: 238, A: 255}
 	drawBar := func(y, height, fraction float32, determinate bool, barColor color.RGBA) {
 		v.drawRect(backingWidth, backingHeight, scale, left, y, panelWidth, height, color.RGBA{R: 50, G: 35, B: 63, A: 255})
@@ -809,36 +1040,36 @@ func (v *displayViewer) drawStartup(backingWidth, backingHeight int, now time.Ti
 		downloadText := formatStartupDownload(v.startup)
 		indexText := formatStartupIndex(v.startup)
 		v.text.BeginDraw()
-		v.drawTextBold("DOWNLOAD", left, contentTop+252, 12, color.RGBA{R: 189, G: 151, B: 255, A: 255})
-		downloadWidth := float32(v.text.GetAdvance(v.font, 12, downloadText))
-		v.drawText(downloadText, left+panelWidth-downloadWidth, contentTop+252, 12, color.RGBA{R: 190, G: 177, B: 201, A: 255})
-		v.drawTextBold("INDEX", left, contentTop+291, 12, color.RGBA{R: 250, G: 238, B: 52, A: 255})
-		indexWidth := float32(v.text.GetAdvance(v.font, 12, indexText))
-		v.drawText(indexText, left+panelWidth-indexWidth, contentTop+291, 12, color.RGBA{R: 190, G: 177, B: 201, A: 255})
+		v.drawTextBold("DOWNLOAD", left, contentTop+169, 15, color.RGBA{R: 189, G: 151, B: 255, A: 255})
+		downloadWidth := float32(v.text.GetAdvance(v.font, 15, downloadText))
+		v.drawText(downloadText, left+panelWidth-downloadWidth, contentTop+169, 15, color.RGBA{R: 211, G: 202, B: 218, A: 255})
+		v.drawTextBold("INDEX", left, contentTop+207, 15, color.RGBA{R: 250, G: 238, B: 52, A: 255})
+		indexWidth := float32(v.text.GetAdvance(v.font, 15, indexText))
+		v.drawText(indexText, left+panelWidth-indexWidth, contentTop+207, 15, color.RGBA{R: 211, G: 202, B: 218, A: 255})
 		v.text.EndDraw()
-		drawBar(contentTop+261, 7, float32(v.startup.DownloadProgress), true, accent)
-		drawBar(contentTop+300, 7, float32(v.startup.IndexProgress), true, color.RGBA{R: 250, G: 238, B: 52, A: 255})
+		drawBar(contentTop+176, 9, float32(v.startup.DownloadProgress), true, accent)
+		drawBar(contentTop+214, 9, float32(v.startup.IndexProgress), true, color.RGBA{R: 250, G: 238, B: 52, A: 255})
 	} else {
 		if v.startup.Failed {
 			accent = color.RGBA{R: 224, G: 90, B: 90, A: 255}
 		}
-		drawBar(barY, 10, float32(v.startup.Progress), v.startup.Determinate || v.startup.Failed, accent)
+		drawBar(float32(layout.bar.Min.Y), float32(layout.bar.Dy()), float32(v.startup.Progress), v.startup.Determinate || v.startup.Failed, accent)
 		transfer := formatStartupTransfer(v.startup)
 		eta := formatStartupETA(v.startup.ETA)
 		v.text.BeginDraw()
-		v.drawText(transfer, left, contentTop+298, 14, color.RGBA{R: 190, G: 177, B: 201, A: 255})
+		v.drawText(transfer, left, contentTop+220, 15, color.RGBA{R: 211, G: 202, B: 218, A: 255})
 		if eta != "" {
-			etaWidth := float32(v.text.GetAdvance(v.font, 14, eta))
-			v.drawText(eta, left+panelWidth-etaWidth, contentTop+298, 14, color.RGBA{R: 190, G: 177, B: 201, A: 255})
+			etaWidth := float32(v.text.GetAdvance(v.font, 15, eta))
+			v.drawText(eta, left+panelWidth-etaWidth, contentTop+220, 15, color.RGBA{R: 211, G: 202, B: 218, A: 255})
 		}
 		v.text.EndDraw()
 	}
 
-	stepY := contentTop + 344
-	stepWidth := max(float32(1), (panelWidth-16)/3)
 	labels := []string{"IMAGE", "START VM", "DESKTOP"}
 	for index, label := range labels {
-		x := left + float32(index)*(stepWidth+8)
+		bounds := layout.steps[index]
+		x := float32(bounds.Min.X)
+		y := float32(bounds.Min.Y)
 		stepColor := color.RGBA{R: 57, G: 43, B: 68, A: 255}
 		textColor := color.RGBA{R: 157, G: 144, B: 168, A: 255}
 		if startupPhase(index) < v.startup.Phase {
@@ -848,9 +1079,9 @@ func (v *displayViewer) drawStartup(backingWidth, backingHeight int, now time.Ti
 			stepColor = color.RGBA{R: 250, G: 238, B: 52, A: 255}
 			textColor = color.RGBA{R: 243, G: 245, B: 239, A: 255}
 		}
-		v.drawRect(backingWidth, backingHeight, scale, x, stepY, stepWidth, 3, stepColor)
+		v.drawRect(backingWidth, backingHeight, scale, x, y, float32(bounds.Dx()), 3, stepColor)
 		v.text.BeginDraw()
-		v.drawTextBold(label, x, stepY+32, 14, textColor)
+		v.drawTextBold(fmt.Sprintf("%d · %s", index+1, label), x, y+31, 15, textColor)
 		v.text.EndDraw()
 	}
 
@@ -859,8 +1090,84 @@ func (v *displayViewer) drawStartup(backingWidth, backingHeight int, now time.Ti
 	if v.startup.Failed {
 		footer = "Close this window to stop"
 	}
-	v.drawText(footer, left, min(height-30, contentTop+429), 14, color.RGBA{R: 165, G: 151, B: 176, A: 255})
+	v.drawText(footer, left, contentTop+338, 15, color.RGBA{R: 190, G: 177, B: 201, A: 255})
 	v.text.EndDraw()
+}
+
+func (v *displayViewer) drawStartupChecklist(
+	backingWidth, backingHeight int,
+	scale, left, top, width float32,
+	now time.Time,
+) {
+	const (
+		visibleRows = 3
+		rowHeight   = float32(24)
+		listHeight  = rowHeight * visibleRows
+	)
+	if len(v.startupChecklist) == 0 {
+		return
+	}
+
+	finalFirst := max(0, len(v.startupChecklist)-visibleRows)
+	first := finalFirst
+	offset := float32(0)
+	const scrollDuration = 260 * time.Millisecond
+	if first > 0 {
+		elapsed := now.Sub(v.checklistChangedAt)
+		if elapsed >= 0 && elapsed < scrollDuration {
+			position := float32(elapsed) / float32(scrollDuration)
+			eased := 1 - float32(math.Pow(float64(1-position), 3))
+			offset = rowHeight * (1 - eased)
+			first--
+		}
+	}
+
+	scissorLeft := int32(math.Round(float64(left * scale)))
+	scissorBottom := int32(math.Round(float64(float32(backingHeight) - (top+listHeight)*scale)))
+	scissorWidth := int32(math.Ceil(float64(width * scale)))
+	scissorHeight := int32(math.Ceil(float64(listHeight * scale)))
+	v.gl.Enable(gl.ScissorTest)
+	v.gl.Scissor(scissorLeft, scissorBottom, scissorWidth, scissorHeight)
+
+	for index := first; index < len(v.startupChecklist); index++ {
+		row := index - finalFirst
+		y := top + float32(row)*rowHeight + offset
+		icon := image.Rect(int(left), int(y+3), int(left+18), int(y+21))
+		if index < len(v.startupChecklist)-1 {
+			v.drawRoundedRect(backingWidth, backingHeight, scale, icon, 9, color.RGBA{R: 95, G: 23, B: 238, A: 255})
+			v.drawCheckmark(backingWidth, backingHeight, scale, icon, color.RGBA{R: 243, G: 237, B: 255, A: 255})
+			continue
+		}
+		dotColor := color.RGBA{R: 250, G: 238, B: 52, A: 255}
+		if v.startupChecklist[index].Failed {
+			dotColor = color.RGBA{R: 255, G: 137, B: 137, A: 255}
+		}
+		dot := image.Rect(int(left+5), int(y+8), int(left+13), int(y+16))
+		v.drawRoundedRect(backingWidth, backingHeight, scale, dot, 4, dotColor)
+	}
+
+	v.text.BeginDraw()
+	for index := first; index < len(v.startupChecklist); index++ {
+		row := index - finalFirst
+		y := top + float32(row)*rowHeight + offset
+		item := v.startupChecklist[index]
+		line := item.Title
+		if item.Detail != "" {
+			line += "  ·  " + item.Detail
+		}
+		line = fitStartupText(line, width-32, 16)
+		if index == len(v.startupChecklist)-1 {
+			textColor := color.RGBA{R: 243, G: 245, B: 239, A: 255}
+			if item.Failed {
+				textColor = color.RGBA{R: 255, G: 151, B: 151, A: 255}
+			}
+			v.drawTextBold(line, left+30, y+18, 16, textColor)
+		} else {
+			v.drawText(line, left+30, y+18, 16, color.RGBA{R: 177, G: 163, B: 187, A: 255})
+		}
+	}
+	v.text.EndDraw()
+	v.gl.Disable(gl.ScissorTest)
 }
 
 func (v *displayViewer) loadBrandTexture() error {
@@ -935,6 +1242,94 @@ func (v *displayViewer) drawRect(backingWidth, backingHeight int, scale, x, y, w
 	v.gl.Disable(gl.ScissorTest)
 }
 
+func (v *displayViewer) drawBackground(backingWidth, backingHeight int) {
+	v.gl.Viewport(0, 0, int32(backingWidth), int32(backingHeight))
+	v.gl.UseProgram(v.backgroundProgram)
+	v.gl.Uniform4f(v.backgroundGeometry, float32(backingWidth), float32(backingHeight), 0, 0)
+	v.gl.BindVertexArray(v.vertexArray)
+	v.gl.DrawArrays(gl.Triangles, 0, 6)
+	v.gl.UseProgram(v.program)
+}
+
+func (v *displayViewer) drawCheckmark(
+	backingWidth, backingHeight int,
+	scale float32,
+	bounds image.Rectangle,
+	col color.RGBA,
+) {
+	left := int32(math.Round(float64(float32(bounds.Min.X) * scale)))
+	bottom := int32(math.Round(float64(float32(backingHeight) - float32(bounds.Max.Y)*scale)))
+	pixelWidth := int32(math.Ceil(float64(float32(bounds.Dx()) * scale)))
+	pixelHeight := int32(math.Ceil(float64(float32(bounds.Dy()) * scale)))
+	v.gl.Viewport(left, bottom, pixelWidth, pixelHeight)
+	v.gl.UseProgram(v.checkmarkProgram)
+	v.gl.Uniform4f(v.checkmarkColor,
+		float32(col.R)/255, float32(col.G)/255, float32(col.B)/255, float32(col.A)/255)
+	v.gl.BindVertexArray(v.vertexArray)
+	v.gl.DrawArrays(gl.Triangles, 0, 6)
+	v.gl.Viewport(0, 0, int32(backingWidth), int32(backingHeight))
+	v.gl.UseProgram(v.program)
+}
+
+func (v *displayViewer) drawRoundedRect(
+	backingWidth, backingHeight int,
+	scale float32,
+	bounds image.Rectangle,
+	radius int,
+	col color.RGBA,
+) {
+	radius = min(radius, min(bounds.Dx()/2, bounds.Dy()/2))
+	if radius <= 1 {
+		v.drawRect(backingWidth, backingHeight, scale, float32(bounds.Min.X), float32(bounds.Min.Y), float32(bounds.Dx()), float32(bounds.Dy()), col)
+		return
+	}
+	left := int32(math.Round(float64(float32(bounds.Min.X) * scale)))
+	bottom := int32(math.Round(float64(float32(backingHeight) - float32(bounds.Max.Y)*scale)))
+	pixelWidth := int32(math.Ceil(float64(float32(bounds.Dx()) * scale)))
+	pixelHeight := int32(math.Ceil(float64(float32(bounds.Dy()) * scale)))
+	if pixelWidth <= 0 || pixelHeight <= 0 {
+		return
+	}
+	v.gl.Viewport(left, bottom, pixelWidth, pixelHeight)
+	v.gl.UseProgram(v.roundedRectProgram)
+	v.gl.Uniform4f(v.roundedRectColor,
+		float32(col.R)/255, float32(col.G)/255, float32(col.B)/255, float32(col.A)/255)
+	v.gl.Uniform4f(v.roundedRectGeometry,
+		float32(pixelWidth), float32(pixelHeight), float32(radius)*scale, 1)
+	v.gl.BindVertexArray(v.vertexArray)
+	v.gl.DrawArrays(gl.Triangles, 0, 6)
+	v.gl.Viewport(0, 0, int32(backingWidth), int32(backingHeight))
+	v.gl.UseProgram(v.program)
+}
+
+func (v *displayViewer) drawPanel(
+	backingWidth, backingHeight int,
+	scale float32,
+	bounds image.Rectangle,
+	radius int,
+	border, fill color.RGBA,
+) {
+	v.drawRoundedRect(backingWidth, backingHeight, scale, bounds, radius, border)
+	v.drawRoundedRect(backingWidth, backingHeight, scale, bounds.Inset(1), max(1, radius-1), fill)
+}
+
+func (v *displayViewer) drawOutline(
+	backingWidth, backingHeight int,
+	scale float32,
+	bounds image.Rectangle,
+	col color.RGBA,
+) {
+	const thickness = float32(2)
+	x := float32(bounds.Min.X)
+	y := float32(bounds.Min.Y)
+	width := float32(bounds.Dx())
+	height := float32(bounds.Dy())
+	v.drawRect(backingWidth, backingHeight, scale, x, y, width, thickness, col)
+	v.drawRect(backingWidth, backingHeight, scale, x, y+height-thickness, width, thickness, col)
+	v.drawRect(backingWidth, backingHeight, scale, x, y, thickness, height, col)
+	v.drawRect(backingWidth, backingHeight, scale, x+width-thickness, y, thickness, height, col)
+}
+
 func (v *displayViewer) drawText(value string, x, y, size float32, col color.RGBA) {
 	if strings.TrimSpace(value) == "" {
 		return
@@ -949,12 +1344,33 @@ func (v *displayViewer) drawText(value string, x, y, size float32, col color.RGB
 }
 
 func (v *displayViewer) drawTextBold(value string, x, y, size float32, col color.RGBA) {
-	// Gowin embeds a variable Roboto Mono face but its current Fontstash API
-	// does not expose the weight axis. Overlapping the same glyph at a
-	// sub-pixel horizontal offset gives headings a stable, portable bold
-	// weight while body copy remains the untouched regular face.
-	v.drawText(value, x, y, size, col)
-	v.drawText(value, x+0.7, y, size, col)
+	if strings.TrimSpace(value) == "" {
+		return
+	}
+	rgba := [4]float32{float32(col.R) / 255, float32(col.G) / 255, float32(col.B) / 255, float32(col.A) / 255}
+	v.text.DrawText(v.fontBold, float64(size), float64(x), float64(y), value, rgba)
+}
+
+func (v *displayViewer) drawCenteredTextBold(value string, bounds image.Rectangle, size float32, col color.RGBA) {
+	textWidth := float32(v.text.GetAdvance(v.fontBold, float64(size), value))
+	x := float32(bounds.Min.X) + (float32(bounds.Dx())-textWidth)/2
+	y := float32(bounds.Min.Y) + (float32(bounds.Dy())+size)/2
+	v.drawTextBold(value, x, y, size, col)
+}
+
+func statusSymbol(status string) string {
+	switch status {
+	case "PASS":
+		return ""
+	case "FAIL":
+		return "!"
+	case "UPDATE":
+		return "UP"
+	case "SKIP":
+		return "--"
+	default:
+		return "..."
+	}
 }
 
 func fitStartupText(value string, width, size float32) string {
@@ -970,6 +1386,30 @@ func fitStartupText(value string, width, size float32) string {
 		return value
 	}
 	return string(runes[:max(1, limit-1)]) + "…"
+}
+
+func wrapStartupText(value string, width, size float32, maxLines int) []string {
+	value = strings.TrimSpace(value)
+	if value == "" || width <= 0 || size <= 0 || maxLines <= 0 {
+		return nil
+	}
+	limit := max(8, int(width/(size*0.62)))
+	words := strings.Fields(value)
+	lines := make([]string, 0, min(maxLines, len(words)))
+	for len(words) > 0 && len(lines) < maxLines {
+		line := words[0]
+		words = words[1:]
+		for len(words) > 0 && len([]rune(line))+1+len([]rune(words[0])) <= limit {
+			line += " " + words[0]
+			words = words[1:]
+		}
+		if len(lines) == maxLines-1 && len(words) > 0 {
+			line += " " + strings.Join(words, " ")
+			words = nil
+		}
+		lines = append(lines, fitStartupText(line, width, size))
+	}
+	return lines
 }
 
 func (v *displayViewer) handleResize() error {
@@ -997,10 +1437,11 @@ func (v *displayViewer) handleResize() error {
 
 func guestDisplaySize(backingWidth, backingHeight int, scale float32) image.Point {
 	scale = normalizedDisplayScale(scale)
-	return image.Pt(
-		max(1, int(math.Round(float64(float32(backingWidth)/scale)))),
-		max(1, int(math.Round(float64(float32(backingHeight)/scale)))),
-	)
+	width := max(1, int(math.Round(float64(float32(backingWidth)/scale))))
+	if aligned := width &^ 7; aligned > 0 {
+		width = aligned
+	}
+	return image.Pt(width, max(1, int(math.Round(float64(float32(backingHeight)/scale)))))
 }
 
 func normalizedDisplayScale(scale float32) float32 {
@@ -1012,8 +1453,14 @@ func normalizedDisplayScale(scale float32) float32 {
 
 func (v *displayViewer) handleInput() error {
 	for _, event := range v.window.DrainInputEvents() {
+		if event.Type == window.InputEventMouseMove {
+			v.updateUpdateNotificationHover(event.MouseX, event.MouseY, time.Now())
+		}
 		if event.Type == window.InputEventMouseDown &&
 			v.handleUpdateNotificationClick(event.MouseX, event.MouseY, time.Now()) {
+			continue
+		}
+		if v.handleUpdateNotificationKey(event, time.Now()) {
 			continue
 		}
 		switch event.Type {
@@ -1209,6 +1656,10 @@ func mouseButtonMask(button window.Button) uint8 {
 }
 
 func compileDisplayProgram(api gl.OpenGL) (uint32, error) {
+	return compileGraphicsProgram(api, displayFragmentShader)
+}
+
+func compileGraphicsProgram(api gl.OpenGL, fragmentSource string) (uint32, error) {
 	compile := func(kind uint32, source string) (uint32, error) {
 		shader := api.CreateShader(kind)
 		api.ShaderSource(shader, source)
@@ -1227,7 +1678,7 @@ func compileDisplayProgram(api gl.OpenGL) (uint32, error) {
 		return 0, err
 	}
 	defer api.DeleteShader(vertex)
-	fragment, err := compile(gl.FragmentShader, displayFragmentShader)
+	fragment, err := compile(gl.FragmentShader, fragmentSource)
 	if err != nil {
 		return 0, err
 	}

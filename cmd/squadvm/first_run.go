@@ -41,6 +41,8 @@ type startupOptions struct {
 	SystemInstall bool
 	RefreshImage  bool
 	DownloadRate  float64
+	DisplayWidth  int
+	DisplayHeight int
 }
 
 type startupPreflight struct {

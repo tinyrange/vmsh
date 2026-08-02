@@ -103,10 +103,27 @@ setsid setpriv --reuid="$uid" --regid="$gid" --clear-groups env \
             -p /panels/panel-2/autohide-behavior \
             -s 0
 
+        # The host can select the final display mode before XFCE starts. In
+        # that case xfdesktop misses the RandR change even though the panel
+        # and window manager use the new geometry. Reload it through the
+        # session bus now that it is ready so the wallpaper fills the screen.
+        xfdesktop --reload
+
         touch "$XDG_RUNTIME_DIR/squadvm-desktop-ready"
         wait "$session_pid"
     ' </dev/null &
 desktop_pid=$!
+
+# Xorg enables terminal-generated signals while opening its virtual terminal.
+# The virtio keyboard also feeds that VT, so an ordinary Ctrl-C in an X11
+# terminal would otherwise deliver SIGINT to Xorg and end the whole desktop.
+# Wait until Xorg and XFCE have finished initializing before disabling ISIG.
+while [ ! -f "$ready_file" ] && kill -0 "$desktop_pid" 2>/dev/null; do
+    sleep 0.05
+done
+for tty in /dev/tty[0-9]*; do
+    stty -F "$tty" -isig 2>/dev/null || true
+done
 
 while kill -0 "$desktop_pid" 2>/dev/null; do
     if wait "$desktop_pid"; then
