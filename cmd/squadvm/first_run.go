@@ -79,18 +79,23 @@ func loadSquadVMSettings() (squadVMSettings, string, error) {
 		return squadVMSettings{}, "", fmt.Errorf("resolve user configuration directory: %w", err)
 	}
 	dir := filepath.Join(configDir, "SquadVM")
+	settings, err := loadSquadVMSettingsFromDir(dir)
+	return settings, dir, err
+}
+
+func loadSquadVMSettingsFromDir(dir string) (squadVMSettings, error) {
 	data, err := os.ReadFile(filepath.Join(dir, "settings.json"))
 	if errors.Is(err, fs.ErrNotExist) {
-		return squadVMSettings{}, dir, nil
+		return squadVMSettings{}, nil
 	}
 	if err != nil {
-		return squadVMSettings{}, "", fmt.Errorf("read SquadVM settings: %w", err)
+		return squadVMSettings{}, fmt.Errorf("read SquadVM settings: %w", err)
 	}
 	var settings squadVMSettings
 	if err := json.Unmarshal(data, &settings); err != nil {
-		return squadVMSettings{}, "", fmt.Errorf("decode SquadVM settings: %w", err)
+		return squadVMSettings{}, fmt.Errorf("decode SquadVM settings: %w", err)
 	}
-	return settings, dir, nil
+	return settings, nil
 }
 
 func saveSquadVMSettings(dir string, settings squadVMSettings) error {

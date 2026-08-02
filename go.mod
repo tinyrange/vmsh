@@ -33,3 +33,5 @@ require (
 )
 
 replace j5.nz/cc => ./cc
+
+replace github.com/tinyrange/gowin => ./gowin

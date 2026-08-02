@@ -62,6 +62,7 @@ jobs:
           cache-dependency-path: |
             go.sum
             cc/go.sum
+            gowin/go.sum
 
       - name: Build release payload
         env:
@@ -175,6 +176,7 @@ jobs:
           cache-dependency-path: |
             go.sum
             cc/go.sum
+            gowin/go.sum
 
       - name: Check macOS signing and notarization secrets
         run: |

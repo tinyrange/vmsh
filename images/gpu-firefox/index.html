@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>vmsh Firefox WebGL</title>
+  <style>
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #050713; color: #fff; font-family: DejaVu Sans, sans-serif; }
+    canvas { display: block; width: 100%; height: 100%; }
+    #panel { position: fixed; top: 24px; left: 28px; min-width: 390px; padding: 17px 20px; border: 1px solid rgba(149, 198, 255, .42); border-radius: 12px; background: rgba(3, 7, 20, .78); box-shadow: 0 16px 55px rgba(0, 0, 0, .38); backdrop-filter: blur(10px); pointer-events: none; }
+    #eyebrow { color: #7fd8ff; font-size: 12px; font-weight: 700; letter-spacing: .2em; text-transform: uppercase; }
+    #title { margin-top: 7px; font-size: 27px; font-weight: 650; letter-spacing: -.03em; }
+    #metrics { margin-top: 12px; display: grid; grid-template-columns: 94px 1fr; gap: 4px 14px; color: #d8e8ff; font: 13px/1.45 monospace; }
+    #metrics .label { color: #8194ae; }
+    #progress { position: fixed; left: 0; bottom: 0; height: 4px; width: 100%; transform-origin: left; background: linear-gradient(90deg, #59d8ff, #a970ff, #ff5ea8); pointer-events: none; }
+    #error { display: none; position: fixed; inset: 0; place-items: center; padding: 10vw; color: #ffcfda; background: #16040a; font: 20px/1.5 monospace; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <canvas id="gl"></canvas>
+  <div id="panel">
+    <div id="eyebrow">Firefox ESR · guest WebGL</div>
+    <div id="title">Starting renderer…</div>
+    <div id="metrics"></div>
+  </div>
+  <div id="progress"></div>
+  <div id="error"></div>
+  <script src="demo.js"></script>
+</body>
+</html>
