@@ -2202,8 +2202,9 @@ type DisplayState struct {
           <ul>
             <li>The live ARM64 SquadVM corpus is <code>images/gpu-glmark2</code>: it runs glmark2's complete 33-scene built-in suite, including build, texture, shading, bump, effects, desktop, buffer updates, complex models, conditionals, functions, and loops.</li>
             <li>The representative application workload is <code>images/gpu-openarena</code>: stock OpenArena 0.8.8 runs as an ordinary GLX/OpenGL 2.0 application against Mesa VirGL. Its deterministic 1,200-message bot-match slice covers renderer and map initialization, GLSL compilation, model and texture loading, animated gameplay, and repeated dynamic-buffer updates.</li>
+            <li>The browser workload is <code>images/gpu-firefox</code>: Firefox ESR runs four local WebGL scenes covering indexed depth-tested geometry, render-to-texture with a post-processing pass, dynamic additive point sprites, and a procedural fragment shader. Structured telemetry and guest <code>gl.readPixels</code> captures prove that every scene rendered through VirGL rather than merely reaching the host window.</li>
             <li>The fixture builds on <code>astra-pi5</code>, boots under systemd, selects the host-preferred DRM mode, requires an XRGB/depth visual, identifies the guest renderer as <code>virgl</code>, and loops without an environment-variable gate.</li>
-            <li>Next add explicit blend/scissor pixel cases, resize and reattach cycles, and a second representative application trace with a materially different renderer profile.</li>
+            <li>Next add resize and reattach cycles, WebGL 2 coverage, and a second representative native application trace with a materially different renderer profile.</li>
             <li>Add Neurodesk visualization traces when the renderer moves from the host-sharing experiment into the neuroimaging product slice.</li>
             <li>Replay traces against the first-party renderer in CI using software host GL where necessary.</li>
             <li>Optionally replay the same traces through virglrenderer during development and compare output; do not require it for normal builds.</li>
@@ -2280,7 +2281,7 @@ type DisplayState struct {
 
           <article class="milestone">
             <div class="milestone-id">M3</div>
-            <h3>Bounded VirGL decoder <span class="status now">OpenArena profile live</span></h3>
+            <h3>Bounded VirGL decoder <span class="status now">Firefox WebGL profile live</span></h3>
             <p>
               Bounded framing, contexts, resource and object handle tables,
               vertex/rasterizer/framebuffer/shader state, sampler views and
@@ -2294,8 +2295,11 @@ type DisplayState struct {
               strict size and offset checks. Host resources remain alive while
               referenced by surfaces, sampler views, or draw bindings, and
               dynamic buffer uploads preserve their authoritative guest data.
+              Rasterizer point-size and sprite-coordinate state maps Gallium generic
+              inputs onto native point coordinates, and texture/buffer readback now
+              returns real host-rendered bytes across split virtio guest backing.
             </p>
-            <div class="gate">Current evidence: malformed framing and unsupported TGSI are rejected; standard kmscube renders continuously; all 33 stock OpenGL ES glmark2 benchmarks complete; and stock OpenArena loads 114 GLSL shaders, a full map, models, textures, HUD, and animated bot combat through Mesa VirGL without a rejected renderer operation.</div>
+            <div class="gate">Current evidence: malformed framing and unsupported TGSI are rejected; standard kmscube renders continuously; all 33 stock OpenGL ES glmark2 benchmarks complete; stock OpenArena loads 114 GLSL shaders, a full map, models, textures, HUD, and animated bot combat; and Firefox sustains four distinct WebGL workloads through Mesa VirGL without a rejected renderer operation.</div>
           </article>
 
           <article class="milestone">
@@ -2315,7 +2319,7 @@ type DisplayState struct {
 
           <article class="milestone">
             <div class="milestone-id">M5</div>
-            <h3>SquadVM application profile <span class="status now">OpenArena benchmark implemented</span></h3>
+            <h3>SquadVM application profile <span class="status now">Firefox WebGL implemented</span></h3>
             <p>
               The reproducible ARM64 <code>images/gpu-glmark2</code> guest
               expands the cube into a regular application corpus covering the
@@ -2331,8 +2335,12 @@ type DisplayState struct {
               a stock desktop game through Xorg, GLX, OpenGL 2.0, and the same
               owned VirGL decoder. Its build derives a deterministic benchmark
               from OpenArena's installed data rather than vendoring game assets.
+              The <code>images/gpu-firefox</code> fixture adds a regular browser and
+              WebGL 1 application, runs entirely from a loopback origin, refuses a
+              non-VirGL Xorg renderer, and records structured browser telemetry plus
+              one guest-rendered PNG for every scene.
             </p>
-            <div class="gate">Current evidence: the glmark2 guest reports Mesa/X.org, renderer “virgl”, OpenGL ES 2.0, and completes all 33 stock scenes. The OpenArena guest reports direct rendering, renderer “virgl”, OpenGL 2.0 and GLSL 1.20; its 1440×900 timedemo completes 1,201 rendered frames in 54.5 seconds (22.0 fps on the M4 Darwin/ARM64 development host, improved from the initial 15.1 fps baseline) and immediately begins the next visual-inspection cycle without a host renderer rejection.</div>
+            <div class="gate">Current evidence: the glmark2 guest reports Mesa/X.org, renderer “virgl”, OpenGL ES 2.0, and completes all 33 stock scenes. The OpenArena guest reports direct rendering, renderer “virgl”, OpenGL 2.0 and GLSL 1.20; its 1440×900 timedemo completes 1,201 rendered frames in 54.5 seconds (22.0 fps on the M4 Darwin/ARM64 development host, improved from the initial 15.1 fps baseline). Firefox ESR reports Mesa/X.org and WebGL 1.0, visits all four 1440×900 scenes at 60 fps in the final Darwin run, and produces distinct non-black guest readbacks for indexed cubes, framebuffer post-processing, dynamic point sprites, and a procedural shader.</div>
           </article>
 
           <article class="milestone">
