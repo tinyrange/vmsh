@@ -57,3 +57,22 @@ documented interface.
 When deciding whether to add a test, ask: "What user bug would this catch?" If
 the answer is mostly "it tells us the code changed," do not add the test. Prefer
 no test over a low-value test that makes future useful changes harder.
+
+## Tested Tutorials
+
+User-visible features should include a guided terminal demonstration. A
+demonstration consists of an automated vmsh session, a replayable terminal
+recording, and labeled Markdown sections that explain the workflow.
+
+Pull requests should create or update only the demonstrations relevant to their
+user-visible changes and link those demonstrations in the PR description.
+Unrelated demonstrations do not need to be regenerated or tested.
+
+Before publishing a release, regenerate and test every demonstration using the
+release commit. The website should publish those generated demonstrations as
+documentation for that specific released version.
+
+Treat demonstration scripts as behavioral tests. Assert meaningful outcomes
+such as context transitions, command results, files, protocol state, and exit
+status. Avoid making exact timing, incidental terminal output, or explanatory
+prose part of the behavioral contract.

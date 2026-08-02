@@ -18,6 +18,7 @@ type Options struct {
 	Command      []string
 	Dir          string
 	Env          []string
+	CleanEnv     bool
 	Size         Size
 	HistoryLimit int
 	Recorder     Recorder
@@ -75,7 +76,11 @@ func Start(ctx context.Context, opts Options) (*Session, error) {
 	cmd := exec.CommandContext(ctx, opts.Command[0], opts.Command[1:]...)
 	cmd.Dir = opts.Dir
 	if len(opts.Env) != 0 {
-		cmd.Env = append(os.Environ(), opts.Env...)
+		if opts.CleanEnv {
+			cmd.Env = append([]string(nil), opts.Env...)
+		} else {
+			cmd.Env = append(os.Environ(), opts.Env...)
+		}
 	}
 	proc, err := startPTY(cmd, size)
 	if err != nil {
@@ -117,6 +122,14 @@ func (s *Session) Write(data []byte) (int, error) {
 	}
 	n, err := s.pty.Write(data)
 	s.bytesStdin.Add(int64(n))
+	if n > 0 {
+		s.mu.Lock()
+		recorder := s.recorder
+		s.mu.Unlock()
+		if inputRecorder, ok := recorder.(interface{ Input([]byte) }); ok {
+			inputRecorder.Input(data[:n])
+		}
+	}
 	return n, err
 }
 

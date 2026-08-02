@@ -1,0 +1,38 @@
+tour_id = "replace-with-kebab-case-id"
+tour_title = "Describe the user outcome"
+tour_description = "Explain what this tested lesson teaches in one sentence."
+
+
+def main(ctx):
+    image = ctx.value("image", "alpine")
+
+    ctx.section(
+        "Name the first user goal",
+        """
+        Explain **why** the next interaction matters. Markdown is rendered beside
+        the terminal and becomes part of the accessible transcript.
+        """,
+    )
+    ctx.wait_prompt()
+    ctx.type("@lesson --from " + image + " --no-network")
+    ctx.enter()
+    ctx.wait_prompt()
+
+    ctx.section(
+        "Prove the behavior",
+        "Describe the observable result rather than incidental UI wording.",
+    )
+    ctx.type("printf 'tour-result=%s\\n' tested")
+    ctx.enter()
+    ctx.expect_line("tour-result=tested")
+    ctx.wait_prompt()
+
+    ctx.type("@host")
+    ctx.enter()
+    ctx.wait_prompt()
+    ctx.type("@stop lesson")
+    ctx.enter()
+    ctx.wait_prompt()
+    ctx.type("exit")
+    ctx.enter()
+    ctx.wait_exit()

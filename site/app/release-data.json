@@ -1,95 +1,96 @@
 {
-  "tag": "v0.6.1",
-  "releaseUrl": "https://github.com/tinyrange/vmsh/releases/tag/v0.6.1",
-  "checksums": "https://github.com/tinyrange/vmsh/releases/download/v0.6.1/checksums.txt",
+  "tag": "v0.7.0",
+  "releaseUrl": "https://github.com/tinyrange/vmsh/releases/tag/v0.7.0",
+  "checksums": "https://github.com/tinyrange/vmsh/releases/download/v0.7.0/checksums.txt",
+  "tours": [],
   "assets": [
     {
       "product": "NeurodeskAppX",
-      "name": "NeurodeskAppX_v0.6.1_darwin_arm64.zip",
+      "name": "NeurodeskAppX_v0.7.0_darwin_arm64.zip",
       "platform": "macOS",
       "arch": "Apple silicon",
-      "size": 28040465,
-      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.6.1/NeurodeskAppX_v0.6.1_darwin_arm64.zip"
+      "size": 28080809,
+      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.7.0/NeurodeskAppX_v0.7.0_darwin_arm64.zip"
     },
     {
       "product": "NeurodeskAppX",
-      "name": "NeurodeskAppX_v0.6.1_windows_amd64.exe",
+      "name": "NeurodeskAppX_v0.7.0_windows_amd64.exe",
       "platform": "Windows",
       "arch": "x64",
-      "size": 50891776,
-      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.6.1/NeurodeskAppX_v0.6.1_windows_amd64.exe"
+      "size": 51324416,
+      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.7.0/NeurodeskAppX_v0.7.0_windows_amd64.exe"
     },
     {
       "product": "NeurodeskAppX",
-      "name": "NeurodeskAppX_v0.6.1_linux_amd64",
+      "name": "NeurodeskAppX_v0.7.0_linux_amd64",
       "platform": "Linux",
       "arch": "x64",
-      "size": 50570146,
-      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.6.1/NeurodeskAppX_v0.6.1_linux_amd64"
+      "size": 51000119,
+      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.7.0/NeurodeskAppX_v0.7.0_linux_amd64"
     },
     {
       "product": "SquadVM",
-      "name": "SquadVM_v0.6.1_darwin_arm64.zip",
+      "name": "SquadVM_v0.7.0_darwin_arm64.zip",
       "platform": "macOS",
       "arch": "Apple silicon",
-      "size": 31569686,
-      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.6.1/SquadVM_v0.6.1_darwin_arm64.zip"
+      "size": 31655630,
+      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.7.0/SquadVM_v0.7.0_darwin_arm64.zip"
     },
     {
       "product": "SquadVM",
-      "name": "SquadVM_v0.6.1_windows_amd64.exe",
+      "name": "SquadVM_v0.7.0_windows_amd64.exe",
       "platform": "Windows",
       "arch": "x64",
-      "size": 53019136,
-      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.6.1/SquadVM_v0.6.1_windows_amd64.exe"
+      "size": 53532672,
+      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.7.0/SquadVM_v0.7.0_windows_amd64.exe"
     },
     {
       "product": "SquadVM",
-      "name": "SquadVM_v0.6.1_linux_amd64",
+      "name": "SquadVM_v0.7.0_linux_amd64",
       "platform": "Linux",
       "arch": "x64",
-      "size": 52619756,
-      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.6.1/SquadVM_v0.6.1_linux_amd64"
+      "size": 53129228,
+      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.7.0/SquadVM_v0.7.0_linux_amd64"
     },
     {
       "product": "vmsh",
-      "name": "vmsh_v0.6.1_darwin_arm64",
+      "name": "vmsh_v0.7.0_darwin_arm64",
       "platform": "macOS",
       "arch": "Apple silicon",
-      "size": 56103152,
-      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.6.1/vmsh_v0.6.1_darwin_arm64"
+      "size": 56173216,
+      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.7.0/vmsh_v0.7.0_darwin_arm64"
     },
     {
       "product": "vmsh",
-      "name": "vmsh_v0.6.1_windows_amd64.exe",
+      "name": "vmsh_v0.7.0_windows_amd64.exe",
       "platform": "Windows",
       "arch": "x64",
-      "size": 57016832,
-      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.6.1/vmsh_v0.6.1_windows_amd64.exe"
+      "size": 57383424,
+      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.7.0/vmsh_v0.7.0_windows_amd64.exe"
     },
     {
       "product": "vmsh",
-      "name": "vmsh_v0.6.1_windows_arm64.exe",
+      "name": "vmsh_v0.7.0_windows_arm64.exe",
       "platform": "Windows",
       "arch": "ARM64",
-      "size": 54011392,
-      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.6.1/vmsh_v0.6.1_windows_arm64.exe"
+      "size": 54344192,
+      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.7.0/vmsh_v0.7.0_windows_arm64.exe"
     },
     {
       "product": "vmsh",
-      "name": "vmsh_v0.6.1_linux_amd64",
+      "name": "vmsh_v0.7.0_linux_amd64",
       "platform": "Linux",
       "arch": "x64",
-      "size": 56777007,
-      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.6.1/vmsh_v0.6.1_linux_amd64"
+      "size": 57146270,
+      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.7.0/vmsh_v0.7.0_linux_amd64"
     },
     {
       "product": "vmsh",
-      "name": "vmsh_v0.6.1_linux_arm64",
+      "name": "vmsh_v0.7.0_linux_arm64",
       "platform": "Linux",
       "arch": "ARM64",
-      "size": 54118570,
-      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.6.1/vmsh_v0.6.1_linux_arm64"
+      "size": 54485859,
+      "url": "https://github.com/tinyrange/vmsh/releases/download/v0.7.0/vmsh_v0.7.0_linux_arm64"
     }
   ]
 }

@@ -3,54 +3,92 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ndappx Pull and Start Plan</title>
+  <meta name="description" content="Implementation plan for tested, replayable vmsh guided tours.">
+  <title>vmsh Tested Tours — Implementation Plan</title>
   <style>
     :root {
-      color-scheme: light;
-      --ink: #18211f;
-      --muted: #60706c;
-      --line: #d7dfdc;
-      --paper: #f5f7f6;
-      --panel: #ffffff;
-      --soft: #eaf2ef;
-      --brand: #167565;
-      --brand-dark: #0e574b;
-      --blue: #2d6cdf;
-      --warn: #b65b19;
-      --danger: #b73737;
-      --shadow: 0 18px 50px rgba(24, 33, 31, 0.12);
+      color-scheme: dark;
+      --bg: #08110f;
+      --panel: #0e1a17;
+      --panel-raised: #13221e;
+      --terminal: #07100e;
+      --ink: #edf8f3;
+      --muted: #9eb5ac;
+      --line: #294139;
+      --green: #72e0ad;
+      --green-strong: #3fcf91;
+      --blue: #7ab7ff;
+      --amber: #ffc66d;
+      --red: #ff8f8f;
+      --code: #b9f4d7;
+      --shadow: 0 28px 80px rgba(0, 0, 0, 0.35);
+      --radius: 18px;
     }
 
     * {
       box-sizing: border-box;
     }
 
+    html {
+      scroll-behavior: smooth;
+    }
+
     body {
       margin: 0;
       background:
-        radial-gradient(circle at 12% -10%, #dceee8 0, transparent 30rem),
-        var(--paper);
+        radial-gradient(circle at 15% -10%, rgba(63, 207, 145, 0.18), transparent 31rem),
+        radial-gradient(circle at 90% 15%, rgba(122, 183, 255, 0.1), transparent 27rem),
+        var(--bg);
       color: var(--ink);
-      font: 15px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    a {
+      color: var(--green);
+    }
+
+    a:hover {
+      color: #a4f0cb;
     }
 
     button,
-    summary {
+    code,
+    pre {
       font: inherit;
     }
 
-    main {
-      width: min(1120px, calc(100% - 32px));
-      margin: 0 auto;
-      padding: 46px 0 80px;
+    code,
+    pre,
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     }
 
-    header {
+    code {
+      color: var(--code);
+    }
+
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 58px 0 96px;
+    }
+
+    .hero {
       display: grid;
-      gap: 18px;
-      grid-template-columns: 1fr auto;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 32px;
       align-items: end;
-      margin-bottom: 30px;
+      padding-bottom: 34px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .eyebrow {
+      color: var(--green);
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      margin: 0 0 12px;
+      text-transform: uppercase;
     }
 
     h1,
@@ -61,944 +99,1160 @@
     }
 
     h1 {
-      font-size: clamp(2rem, 5vw, 3.5rem);
-      line-height: 1;
-      letter-spacing: -0.045em;
-      margin-bottom: 16px;
-      max-width: 760px;
+      max-width: 860px;
+      margin-bottom: 18px;
+      font-size: clamp(2.6rem, 7vw, 5.4rem);
+      line-height: 0.96;
+      letter-spacing: -0.055em;
     }
 
     h2 {
-      font-size: 1.45rem;
-      letter-spacing: -0.02em;
-      margin-bottom: 12px;
+      margin-bottom: 10px;
+      font-size: clamp(1.55rem, 3vw, 2.25rem);
+      line-height: 1.15;
+      letter-spacing: -0.03em;
     }
 
     h3 {
-      font-size: 1rem;
-      margin-bottom: 8px;
+      margin-bottom: 7px;
+      font-size: 1.02rem;
     }
 
     .lede {
-      color: var(--muted);
-      font-size: 1.08rem;
-      max-width: 760px;
+      max-width: 780px;
       margin-bottom: 0;
+      color: var(--muted);
+      font-size: 1.14rem;
     }
 
-    .tag {
-      background: var(--ink);
-      border-radius: 999px;
-      color: white;
-      font-size: 0.75rem;
-      font-weight: 750;
-      letter-spacing: 0.08em;
-      padding: 8px 12px;
-      text-transform: uppercase;
-      white-space: nowrap;
-    }
-
-    .card {
-      background: rgba(255, 255, 255, 0.94);
+    .issue-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 13px;
       border: 1px solid var(--line);
-      border-radius: 18px;
-      box-shadow: 0 1px 2px rgba(24, 33, 31, 0.03);
-      padding: 24px;
-    }
-
-    .decision {
-      background: var(--soft);
-      border-left: 4px solid var(--brand);
-      box-shadow: none;
-      margin-bottom: 24px;
-    }
-
-    .decision strong {
-      color: var(--brand-dark);
-    }
-
-    .demo {
-      overflow: hidden;
-      padding: 0;
-      box-shadow: var(--shadow);
-      margin-bottom: 36px;
-    }
-
-    .demo-toolbar {
-      align-items: center;
-      background: #edf1f0;
-      border-bottom: 1px solid var(--line);
-      display: flex;
-      gap: 12px;
-      justify-content: space-between;
-      padding: 12px 14px;
-    }
-
-    .window-title {
-      align-items: center;
-      display: flex;
-      font-weight: 700;
-      gap: 9px;
-      min-width: 0;
-    }
-
-    .app-mark {
-      background: var(--brand);
-      border-radius: 6px;
-      display: inline-block;
-      height: 20px;
-      position: relative;
-      width: 20px;
-    }
-
-    .app-mark::after {
-      background: white;
-      border-radius: 1px;
-      content: "";
-      height: 2px;
-      left: 5px;
-      position: absolute;
-      top: 9px;
-      width: 10px;
-    }
-
-    .scenarios {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      justify-content: flex-end;
-    }
-
-    button {
-      background: white;
-      border: 1px solid #bac7c3;
-      border-radius: 8px;
-      color: var(--ink);
-      cursor: pointer;
-      font-size: 0.82rem;
-      font-weight: 650;
-      padding: 7px 10px;
-    }
-
-    button:hover {
-      border-color: var(--brand);
-      color: var(--brand-dark);
-    }
-
-    button:focus-visible,
-    summary:focus-visible {
-      outline: 3px solid rgba(45, 108, 223, 0.32);
-      outline-offset: 2px;
-    }
-
-    button[aria-pressed="true"],
-    .primary {
-      background: var(--brand);
-      border-color: var(--brand);
-      color: white;
-    }
-
-    .primary:hover {
-      background: var(--brand-dark);
-      color: white;
-    }
-
-    .stage {
-      min-height: 465px;
-      position: relative;
-    }
-
-    .waiting-view {
-      align-content: center;
-      background:
-        linear-gradient(135deg, rgba(22, 117, 101, 0.07), transparent 42%),
-        #fbfcfc;
-      display: grid;
-      min-height: 465px;
-      padding: clamp(24px, 5vw, 56px);
-    }
-
-    .progress-panel {
-      margin: 0 auto;
-      max-width: 700px;
-      width: 100%;
-    }
-
-    .eyebrow {
-      color: var(--brand);
-      font-size: 0.75rem;
-      font-weight: 800;
-      letter-spacing: 0.1em;
-      margin-bottom: 8px;
-      text-transform: uppercase;
-    }
-
-    .status-title {
-      font-size: clamp(1.45rem, 4vw, 2.15rem);
-      line-height: 1.15;
-      margin-bottom: 8px;
-    }
-
-    .status-copy {
-      color: var(--muted);
-      margin-bottom: 24px;
-    }
-
-    .bar {
-      background: #dfe7e4;
       border-radius: 999px;
-      height: 10px;
-      overflow: hidden;
-      position: relative;
-    }
-
-    .bar-fill {
-      background: linear-gradient(90deg, var(--brand), #35a38f);
-      border-radius: inherit;
-      height: 100%;
-      transition: width 300ms ease;
-      width: 0;
-    }
-
-    .bar.indeterminate .bar-fill {
-      animation: sweep 1.4s ease-in-out infinite;
-      position: absolute;
-      width: 35%;
-    }
-
-    @keyframes sweep {
-      from { left: -35%; }
-      to { left: 100%; }
-    }
-
-    .progress-meta {
-      color: var(--muted);
-      display: flex;
-      font-size: 0.82rem;
-      justify-content: space-between;
-      margin-top: 8px;
-      min-height: 1.3em;
-    }
-
-    .steps {
-      display: grid;
-      gap: 8px;
-      grid-template-columns: repeat(4, 1fr);
-      list-style: none;
-      margin: 28px 0 0;
-      padding: 0;
-    }
-
-    .step {
-      border-top: 3px solid #d9e1de;
-      color: #7a8884;
-      font-size: 0.78rem;
-      padding-top: 8px;
-    }
-
-    .step.done {
-      border-color: var(--brand);
-      color: var(--brand-dark);
-    }
-
-    .step.active {
-      border-color: var(--blue);
-      color: var(--ink);
+      background: rgba(14, 26, 23, 0.72);
       font-weight: 750;
-    }
-
-    .actions {
-      align-items: center;
-      display: flex;
-      gap: 10px;
-      margin-top: 25px;
-    }
-
-    details {
-      border-top: 1px solid var(--line);
-      margin-top: 24px;
-      padding-top: 14px;
-    }
-
-    summary {
-      color: var(--muted);
-      cursor: pointer;
-      font-weight: 650;
-    }
-
-    .layers {
-      display: grid;
-      gap: 8px;
-      margin-top: 12px;
-    }
-
-    .layer {
-      align-items: center;
-      display: grid;
-      font: 0.78rem ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      gap: 12px;
-      grid-template-columns: minmax(100px, 1fr) 92px 86px;
-    }
-
-    .layer > span:first-child {
-      overflow: hidden;
-      text-overflow: ellipsis;
+      text-decoration: none;
       white-space: nowrap;
     }
 
-    .layer-state {
-      color: var(--brand);
-      text-align: right;
-    }
-
-    .desktop-view {
-      background: #2c7778;
-      display: none;
-      min-height: 465px;
-      opacity: 0;
-      overflow: hidden;
-      position: relative;
-      transition: opacity 220ms ease;
-    }
-
-    .desktop-view.ready {
-      display: block;
-      opacity: 1;
-    }
-
-    .desktop-wallpaper {
-      background:
-        radial-gradient(circle at 76% 34%, rgba(255, 255, 255, 0.22), transparent 14rem),
-        linear-gradient(140deg, #204f62, #2d9180 58%, #8fc6a4);
-      inset: 0;
-      position: absolute;
-    }
-
-    .desktop-window {
-      background: #f8f9fa;
-      border: 1px solid rgba(0, 0, 0, 0.2);
-      border-radius: 7px;
-      box-shadow: 0 18px 45px rgba(0, 0, 0, 0.28);
-      left: 10%;
-      overflow: hidden;
-      position: absolute;
-      top: 12%;
-      width: min(620px, 80%);
-    }
-
-    .desktop-titlebar {
-      align-items: center;
-      background: #e9ecee;
-      border-bottom: 1px solid #cbd1d3;
-      display: flex;
-      font-size: 0.8rem;
-      font-weight: 700;
-      justify-content: space-between;
-      padding: 7px 10px;
-    }
-
-    .desktop-content {
-      display: grid;
-      gap: 16px;
-      grid-template-columns: 140px 1fr;
-      min-height: 275px;
-      padding: 18px;
-    }
-
-    .desktop-nav {
-      border-right: 1px solid #dfe3e5;
-      color: #59666c;
-      line-height: 2.1;
-    }
-
-    .desktop-welcome {
-      align-content: center;
-      display: grid;
-    }
-
-    .desktop-welcome h3 {
-      font-size: 1.35rem;
-    }
-
-    .desktop-welcome p {
-      color: #667278;
-      max-width: 380px;
-    }
-
-    .desktop-panel {
-      align-items: center;
-      background: rgba(25, 31, 34, 0.94);
-      bottom: 0;
-      color: white;
-      display: flex;
-      font-size: 0.76rem;
-      gap: 12px;
-      height: 34px;
-      justify-content: space-between;
-      padding: 0 12px;
-      position: absolute;
-      width: 100%;
-    }
-
-    .hidden {
-      display: none !important;
+    .issue-link::before {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      content: "";
+      box-shadow: 0 0 16px var(--green);
     }
 
     .section {
-      margin-top: 36px;
+      margin-top: 54px;
     }
 
-    .grid {
+    .section-intro {
+      max-width: 760px;
+      margin-bottom: 22px;
+      color: var(--muted);
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: linear-gradient(150deg, rgba(19, 34, 30, 0.96), rgba(11, 22, 19, 0.96));
+      box-shadow: 0 1px 0 rgba(255, 255, 255, 0.025);
+    }
+
+    .decision {
       display: grid;
-      gap: 16px;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 20px;
+      align-items: start;
+      margin-top: 28px;
+      padding: 24px;
+      border-color: rgba(114, 224, 173, 0.45);
+      background:
+        linear-gradient(120deg, rgba(63, 207, 145, 0.13), transparent 48%),
+        var(--panel);
     }
 
-    .card ul,
-    .card ol {
-      margin: 10px 0 0;
-      padding-left: 20px;
+    .decision-mark {
+      display: grid;
+      width: 44px;
+      height: 44px;
+      place-items: center;
+      border-radius: 13px;
+      background: var(--green);
+      color: #062016;
+      font-size: 1.4rem;
+      font-weight: 950;
     }
 
-    .card li {
-      margin: 7px 0;
+    .decision p {
+      margin-bottom: 0;
+      color: var(--muted);
     }
 
     .flow {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      list-style: none;
-      margin: 16px 0 0;
-      padding: 0;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
     }
 
-    .flow li {
-      align-items: center;
-      display: flex;
-      gap: 8px;
+    .flow-step {
+      position: relative;
+      min-height: 170px;
+      padding: 22px;
+      overflow: hidden;
     }
 
-    .flow li:not(:last-child)::after {
-      color: #8a9692;
+    .flow-step:not(:last-child)::after {
+      position: absolute;
+      z-index: 2;
+      top: 50%;
+      right: -18px;
+      width: 24px;
+      height: 24px;
+      border: 1px solid var(--line);
+      border-radius: 50%;
+      background: var(--panel);
+      color: var(--green);
       content: "→";
+      display: grid;
+      place-items: center;
+      transform: translateY(-50%);
     }
 
-    .state {
-      background: var(--soft);
-      border: 1px solid #cbdcd6;
-      border-radius: 999px;
-      color: var(--brand-dark);
-      font: 0.79rem ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      padding: 6px 9px;
+    .step-number {
+      color: var(--green);
+      font-size: 0.76rem;
+      font-weight: 850;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
     }
 
-    pre {
-      background: #17221f;
-      border-radius: 10px;
-      color: #eaf5f1;
-      font: 0.8rem/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      overflow-x: auto;
-      padding: 16px;
+    .flow-step h3 {
+      margin-top: 24px;
     }
 
-    code {
-      background: #eaf0ee;
-      border-radius: 4px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 0.9em;
-      padding: 0.1rem 0.28rem;
+    .flow-step p {
+      margin-bottom: 0;
+      color: var(--muted);
+      font-size: 0.92rem;
     }
 
-    pre code {
+    .prototype {
+      display: grid;
+      grid-template-columns: minmax(0, 1.55fr) minmax(280px, 0.85fr);
+      min-height: 510px;
+      overflow: hidden;
+      box-shadow: var(--shadow);
+    }
+
+    .terminal-pane {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      background: var(--terminal);
+      border-right: 1px solid var(--line);
+    }
+
+    .terminal-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 48px;
+      padding: 0 16px;
+      border-bottom: 1px solid var(--line);
+      background: #101c19;
+    }
+
+    .dots {
+      display: flex;
+      gap: 7px;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #426057;
+    }
+
+    .dot:first-child {
+      background: var(--red);
+    }
+
+    .dot:nth-child(2) {
+      background: var(--amber);
+    }
+
+    .dot:last-child {
+      background: var(--green);
+    }
+
+    .terminal-title {
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+
+    .screen {
+      flex: 1;
+      min-height: 340px;
+      margin: 0;
+      padding: 24px;
+      overflow: auto;
+      color: #d8e8e1;
+      font-size: clamp(0.78rem, 1.6vw, 0.93rem);
+      line-height: 1.65;
+      white-space: pre-wrap;
+    }
+
+    .prompt {
+      color: var(--green);
+    }
+
+    .system {
+      color: var(--blue);
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 13px;
+      align-items: center;
+      min-height: 64px;
+      padding: 11px 16px;
+      border-top: 1px solid var(--line);
+      background: #101c19;
+    }
+
+    button {
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: #182923;
+      color: var(--ink);
+      cursor: pointer;
+      padding: 8px 11px;
+      font-weight: 750;
+    }
+
+    button:hover,
+    button:focus-visible {
+      border-color: var(--green);
+    }
+
+    button:focus-visible,
+    a:focus-visible {
+      outline: 3px solid rgba(122, 183, 255, 0.38);
+      outline-offset: 3px;
+    }
+
+    .play {
+      min-width: 44px;
+      color: #062016;
+      background: var(--green);
+      border-color: var(--green);
+    }
+
+    .timeline {
+      width: 100%;
+      accent-color: var(--green-strong);
+    }
+
+    .time {
+      min-width: 72px;
+      color: var(--muted);
+      text-align: right;
+      font-size: 0.78rem;
+    }
+
+    .guide-pane {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      background: var(--panel);
+    }
+
+    .guide-header {
+      padding: 20px 22px 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .guide-header p {
+      margin-bottom: 0;
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    .chapters {
+      display: grid;
+      gap: 7px;
+      padding: 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .chapter {
+      display: grid;
+      grid-template-columns: 32px minmax(0, 1fr);
+      gap: 9px;
+      align-items: center;
+      width: 100%;
+      padding: 10px;
+      color: var(--muted);
+      text-align: left;
       background: transparent;
-      padding: 0;
+      border-color: transparent;
     }
 
-    .note {
+    .chapter[aria-pressed="true"] {
+      color: var(--ink);
+      background: rgba(63, 207, 145, 0.12);
+      border-color: rgba(63, 207, 145, 0.3);
+    }
+
+    .chapter-index {
+      display: grid;
+      width: 28px;
+      height: 28px;
+      place-items: center;
+      border-radius: 8px;
+      background: #1d302a;
+      color: var(--green);
+      font-size: 0.76rem;
+    }
+
+    .guide-copy {
+      padding: 22px;
+    }
+
+    .guide-copy p,
+    .guide-copy li {
+      color: var(--muted);
+    }
+
+    .guide-copy pre {
+      padding: 12px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #08130f;
+      color: var(--code);
+    }
+
+    .grid-2,
+    .grid-3 {
+      display: grid;
+      gap: 14px;
+    }
+
+    .grid-2 {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .grid-3 {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .compact-card {
+      padding: 22px;
+    }
+
+    .compact-card p:last-child,
+    .compact-card ul:last-child {
+      margin-bottom: 0;
+    }
+
+    .compact-card p,
+    .compact-card li {
+      color: var(--muted);
+    }
+
+    ul,
+    ol {
+      padding-left: 20px;
+    }
+
+    li + li {
+      margin-top: 7px;
+    }
+
+    .badge {
+      display: inline-block;
+      margin-bottom: 12px;
+      padding: 4px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--green);
+      font-size: 0.72rem;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .phase-list {
+      position: relative;
+      display: grid;
+      gap: 14px;
+    }
+
+    .phase {
+      display: grid;
+      grid-template-columns: 76px minmax(0, 1fr) minmax(260px, 0.7fr);
+      gap: 22px;
+      padding: 24px;
+    }
+
+    .phase-id {
+      color: var(--green);
+      font-size: 1.35rem;
+      font-weight: 900;
+    }
+
+    .phase p {
+      margin-bottom: 0;
+      color: var(--muted);
+    }
+
+    .exit {
+      align-self: start;
+      padding-left: 18px;
+      border-left: 2px solid var(--line);
       color: var(--muted);
       font-size: 0.9rem;
     }
 
+    .exit strong {
+      display: block;
+      margin-bottom: 3px;
+      color: var(--ink);
+    }
+
+    .code-card {
+      overflow: hidden;
+    }
+
+    .code-title {
+      padding: 10px 15px;
+      border-bottom: 1px solid var(--line);
+      background: #15251f;
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+
+    .code-card pre {
+      margin: 0;
+      padding: 20px;
+      overflow: auto;
+      color: var(--code);
+      background: #07100e;
+      font-size: 0.85rem;
+      line-height: 1.65;
+    }
+
+    .policy {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      overflow: hidden;
+    }
+
+    .policy > div {
+      padding: 26px;
+    }
+
+    .policy > div + div {
+      border-left: 1px solid var(--line);
+    }
+
+    .policy .label {
+      color: var(--green);
+      font-size: 0.76rem;
+      font-weight: 850;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .policy p:last-child {
+      margin-bottom: 0;
+      color: var(--muted);
+    }
+
+    .definition {
+      border-color: rgba(114, 224, 173, 0.42);
+      padding: 28px;
+    }
+
     .checks {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px 24px;
+      margin: 20px 0 0;
+      padding: 0;
       list-style: none;
-      padding-left: 0 !important;
     }
 
     .checks li {
-      padding-left: 24px;
       position: relative;
+      margin: 0;
+      padding-left: 28px;
+      color: var(--muted);
     }
 
     .checks li::before {
-      color: var(--brand);
+      position: absolute;
+      top: 0;
+      left: 0;
+      color: var(--green);
       content: "✓";
       font-weight: 900;
-      left: 2px;
-      position: absolute;
     }
 
-    @media (max-width: 760px) {
-      header,
-      .grid {
+    .notes {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+
+    .note {
+      padding: 20px;
+      border-left: 3px solid var(--amber);
+    }
+
+    .note:nth-child(2) {
+      border-left-color: var(--blue);
+    }
+
+    .note p {
+      margin-bottom: 0;
+      color: var(--muted);
+    }
+
+    footer {
+      margin-top: 60px;
+      padding-top: 22px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.86rem;
+    }
+
+    @media (max-width: 900px) {
+      .flow {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .flow-step:nth-child(2)::after {
+        display: none;
+      }
+
+      .prototype,
+      .policy {
         grid-template-columns: 1fr;
       }
 
-      header {
+      .terminal-pane {
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .policy > div + div {
+        border-top: 1px solid var(--line);
+        border-left: 0;
+      }
+
+      .phase {
+        grid-template-columns: 60px minmax(0, 1fr);
+      }
+
+      .exit {
+        grid-column: 2;
+      }
+    }
+
+    @media (max-width: 640px) {
+      main {
+        width: min(100% - 22px, 1180px);
+        padding-top: 34px;
+      }
+
+      .hero,
+      .grid-2,
+      .grid-3,
+      .checks,
+      .notes,
+      .flow {
+        grid-template-columns: 1fr;
+      }
+
+      .hero {
         align-items: start;
       }
 
-      .tag {
+      .issue-link {
         justify-self: start;
       }
 
-      .demo-toolbar {
-        align-items: flex-start;
-        flex-direction: column;
-      }
-
-      .scenarios {
-        justify-content: flex-start;
-      }
-
-      .steps {
-        grid-template-columns: repeat(2, 1fr);
-      }
-
-      .desktop-content {
-        grid-template-columns: 1fr;
-      }
-
-      .desktop-nav {
+      .flow-step::after {
         display: none;
+      }
+
+      .phase {
+        grid-template-columns: 1fr;
+        gap: 10px;
+      }
+
+      .exit {
+        grid-column: 1;
+      }
+
+      .decision {
+        grid-template-columns: 1fr;
       }
     }
 
     @media (prefers-reduced-motion: reduce) {
-      *,
-      *::before,
-      *::after {
-        animation-duration: 0.01ms !important;
-        scroll-behavior: auto !important;
-        transition-duration: 0.01ms !important;
+      html {
+        scroll-behavior: auto;
       }
     }
   </style>
 </head>
 <body>
   <main>
-    <header>
+    <header class="hero">
       <div>
-        <h1>Pull quietly. Start clearly. Reveal when ready.</h1>
+        <p class="eyebrow">Implementation plan · July 2026</p>
+        <h1>Every feature should teach itself.</h1>
         <p class="lede">
-          A proposed pull and startup experience for <code>ndappx</code>. Users
-          see truthful progress while the image and VM are prepared, then the
-          completed desktop replaces the readiness view in one clean transition.
+          A plan for executable vmsh tutorials that drive a real interactive session,
+          verify user-visible behavior, record the terminal, and pair playback with
+          labeled Markdown guidance on the website.
         </p>
       </div>
-      <span class="tag">Interaction plan</span>
+      <a class="issue-link" href="https://github.com/tinyrange/vmsh/issues/242">Issue #242</a>
     </header>
 
-    <aside class="card decision">
-      <strong>Presentation rule:</strong> the graphical surface stays hidden
-      until the guest session has declared itself ready and a complete, stable
-      desktop frame is available. Boot consoles, TTY output, greeter transitions,
-      and partially painted desktop frames are never presented to the user.
-    </aside>
-
-    <section class="card demo" aria-labelledby="demo-title">
-      <div class="demo-toolbar">
-        <div class="window-title" id="demo-title">
-          <span class="app-mark" aria-hidden="true"></span>
-          Neurodesktop
-        </div>
-        <div class="scenarios" aria-label="Demo scenarios">
-          <button data-scenario="first" aria-pressed="true">First pull</button>
-          <button data-scenario="cached" aria-pressed="false">Cached image</button>
-          <button data-scenario="resume" aria-pressed="false">Resume pull</button>
-        </div>
+    <section class="card decision" aria-labelledby="decision-title">
+      <div class="decision-mark" aria-hidden="true">✓</div>
+      <div>
+        <h2 id="decision-title">Decision</h2>
+        <p>
+          Build one small vertical slice first. Keep contribution and release policy as
+          guidance in <code>AGENTS.md</code>: pull requests exercise only relevant tours,
+          while every release regenerates and tests the complete tour catalog from the
+          release commit. Add automation only after real tours show where it is useful.
+        </p>
       </div>
+    </section>
 
-      <div class="stage">
-        <div class="waiting-view" id="waiting-view">
-          <div class="progress-panel">
-            <div class="eyebrow" id="phase-label">Preparing</div>
-            <h2 class="status-title" id="status-title">Ready to start</h2>
-            <p class="status-copy" id="status-copy" aria-live="polite">
-              Run the demo to preview the pull and startup experience.
+    <section class="section" aria-labelledby="model-title">
+      <p class="eyebrow">The model</p>
+      <h2 id="model-title">One story, four representations</h2>
+      <p class="section-intro">
+        The executable story is the source of truth. The test result, recording, and
+        published lesson are products of the same successful session rather than
+        separately maintained documentation.
+      </p>
+      <div class="flow">
+        <article class="card flow-step">
+          <span class="step-number">01 · Author</span>
+          <h3>Write the story</h3>
+          <p>A Starlark script drives vmsh through a PTY and labels teaching moments with Markdown.</p>
+        </article>
+        <article class="card flow-step">
+          <span class="step-number">02 · Execute</span>
+          <h3>Use a real session</h3>
+          <p>Start vmsh, select systems, type commands, send keys, resize, wait, and assert outcomes.</p>
+        </article>
+        <article class="card flow-step">
+          <span class="step-number">03 · Record</span>
+          <h3>Produce one tour</h3>
+          <p>Package asciinema-compatible terminal events and timed Markdown sections into one artifact.</p>
+        </article>
+        <article class="card flow-step">
+          <span class="step-number">04 · Publish</span>
+          <h3>Teach the release</h3>
+          <p>The website replays the terminal beside a navigable guide tied to an exact vmsh version.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="experience-title">
+      <p class="eyebrow">Target experience</p>
+      <h2 id="experience-title">A terminal replay that behaves like a lesson</h2>
+      <p class="section-intro">
+        This prototype illustrates the contract, not final visual design. Select a section
+        to see how playback and explanatory Markdown stay synchronized.
+      </p>
+      <div class="card prototype">
+        <div class="terminal-pane">
+          <div class="terminal-bar">
+            <div class="dots" aria-hidden="true">
+              <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+            </div>
+            <span class="terminal-title mono">vmsh · context-switching.cast</span>
+          </div>
+          <pre class="screen" id="terminal-screen" aria-live="polite"><span class="prompt">host ~/work ❯</span> @alpine
+<span class="system">Starting alpine… ready</span>
+<span class="prompt">alpine /host/work ❯</span> uname -s
+Linux
+<span class="prompt">alpine /host/work ❯</span> @host
+<span class="prompt">host ~/work ❯</span> </pre>
+          <div class="controls">
+            <button class="play" id="play-button" type="button" aria-label="Play tour">▶</button>
+            <input class="timeline" id="timeline" type="range" min="0" max="28" value="19" aria-label="Tour position">
+            <span class="time mono" id="time-label">0:19 / 0:28</span>
+          </div>
+        </div>
+        <aside class="guide-pane" aria-label="Tour guide">
+          <div class="guide-header">
+            <p class="eyebrow">Guided tour</p>
+            <h3>Move between host and VM contexts</h3>
+            <p>vmsh v0.x · verified during release</p>
+          </div>
+          <nav class="chapters" aria-label="Tour sections">
+            <button class="chapter" type="button" data-section="0" aria-pressed="false">
+              <span class="chapter-index">1</span><span>Select Alpine</span>
+            </button>
+            <button class="chapter" type="button" data-section="1" aria-pressed="false">
+              <span class="chapter-index">2</span><span>Run ordinary commands</span>
+            </button>
+            <button class="chapter" type="button" data-section="2" aria-pressed="true">
+              <span class="chapter-index">3</span><span>Return to the host</span>
+            </button>
+          </nav>
+          <div class="guide-copy" id="guide-copy">
+            <p class="eyebrow">Section 3 · 0:19</p>
+            <h3>Return without ending the session</h3>
+            <p>
+              <code>@host</code> changes the selected system context. The Alpine VM stays
+              warm, so selecting it again resumes the same long-lived session.
             </p>
-
-            <div class="bar" id="progress-bar" role="progressbar"
-              aria-label="Startup progress" aria-valuemin="0" aria-valuemax="100"
-              aria-valuenow="0">
-              <div class="bar-fill" id="bar-fill"></div>
-            </div>
-            <div class="progress-meta">
-              <span id="progress-detail">No work started</span>
-              <span id="progress-eta"></span>
-            </div>
-
-            <ol class="steps" aria-label="Startup phases">
-              <li class="step" data-step="pull">Pull image</li>
-              <li class="step" data-step="prepare">Prepare</li>
-              <li class="step" data-step="boot">Start VM</li>
-              <li class="step" data-step="desktop">Open desktop</li>
-            </ol>
-
-            <div class="actions">
-              <button class="primary" id="run-demo">Run demo</button>
-              <button id="reset-demo">Reset</button>
-            </div>
-
-            <details id="pull-details">
-              <summary>Image details</summary>
-              <div class="layers">
-                <div class="layer">
-                  <span>sha256:71b2…e910</span>
-                  <span>1.42 GB</span>
-                  <span class="layer-state">waiting</span>
-                </div>
-                <div class="layer">
-                  <span>sha256:a83c…17f2</span>
-                  <span>824 MB</span>
-                  <span class="layer-state">waiting</span>
-                </div>
-                <div class="layer">
-                  <span>sha256:092e…b422</span>
-                  <span>318 MB</span>
-                  <span class="layer-state">waiting</span>
-                </div>
-              </div>
-            </details>
+            <pre>@host</pre>
           </div>
-        </div>
-
-        <div class="desktop-view" id="desktop-view" aria-label="Ready Neurodesktop session">
-          <div class="desktop-wallpaper"></div>
-          <div class="desktop-window">
-            <div class="desktop-titlebar">
-              <span>Neurodesktop</span>
-              <span aria-hidden="true">—　□　×</span>
-            </div>
-            <div class="desktop-content">
-              <nav class="desktop-nav" aria-label="Application categories">
-                Favorites<br>
-                Neuroimaging<br>
-                Terminal<br>
-                Files
-              </nav>
-              <div class="desktop-welcome">
-                <h3>Your desktop is ready</h3>
-                <p>
-                  Applications, shared storage, clipboard, keyboard, mouse, and
-                  resize handling are ready before this surface becomes visible.
-                </p>
-                <div><button>Browse applications</button></div>
-              </div>
-            </div>
-          </div>
-          <div class="desktop-panel">
-            <span>Applications　▣ Neurodesktop</span>
-            <span>100%　14:32</span>
-          </div>
-        </div>
+        </aside>
       </div>
     </section>
 
-    <section class="section" aria-labelledby="behavior-heading">
-      <h2 id="behavior-heading">Behavioral contract</h2>
-      <div class="grid">
-        <article class="card">
-          <h3>Pull flow</h3>
-          <ol>
-            <li>Resolve the image tag to a digest and fetch the manifest.</li>
-            <li>Check the content-addressed cache before requesting any layer.</li>
-            <li>Download missing layers concurrently with resumable transfers.</li>
-            <li>Report actual bytes, transfer rate, and ETA while totals are known.</li>
-            <li>Verify every digest, then atomically commit the usable image.</li>
-          </ol>
-          <p class="note">
-            A cached image skips straight to validation. An interrupted pull
-            resumes verified partial content rather than starting over.
-          </p>
+    <section class="section" aria-labelledby="scope-title">
+      <p class="eyebrow">Scope</p>
+      <h2 id="scope-title">Build the useful core, defer the machinery</h2>
+      <div class="grid-2">
+        <article class="card compact-card">
+          <span class="badge">In the first version</span>
+          <ul>
+            <li>A Starlark runner controlling a genuine vmsh PTY session.</li>
+            <li>Actions for typing, special keys, terminal resize, waiting, and behavioral assertions.</li>
+            <li>An enhanced cast containing terminal events and timed Markdown sections.</li>
+            <li>A website player with playback, seeking, section navigation, and accessible prose.</li>
+            <li>One end-to-end tour demonstrating host and VM context switching.</li>
+            <li>Repository guidance covering PR and release expectations.</li>
+          </ul>
         </article>
-
-        <article class="card">
-          <h3>Start flow</h3>
-          <ol>
-            <li>Prepare the writable image state, home, and shared storage.</li>
-            <li>Start the VM and establish the guest control channel.</li>
-            <li>Attach the graphics transport to an off-screen surface.</li>
-            <li>Apply the current host window size and wait for desktop readiness.</li>
-            <li>Present the first stable frame, then enable normal interaction.</li>
-          </ol>
-          <p class="note">
-            The progress view owns the window until the final presentation gate
-            passes. There is no interval where the framebuffer leaks through.
-          </p>
+        <article class="card compact-card">
+          <span class="badge">Explicitly deferred</span>
+          <ul>
+            <li>Automatic dependency graphs that decide which tours a PR must run.</li>
+            <li>Mandatory PR-form validation or labels for exemptions.</li>
+            <li>A hosted authoring environment or visual tour editor.</li>
+            <li>Voice-over, raster video export, analytics, or user progress tracking.</li>
+            <li>Large-scale conversion of all existing documentation before the format settles.</li>
+            <li>A bespoke terminal emulator if an established browser renderer is sufficient.</li>
+          </ul>
         </article>
       </div>
-
-      <ul class="flow" aria-label="State machine">
-        <li><span class="state">idle</span></li>
-        <li><span class="state">resolving</span></li>
-        <li><span class="state">pulling</span></li>
-        <li><span class="state">verifying</span></li>
-        <li><span class="state">preparing</span></li>
-        <li><span class="state">booting</span></li>
-        <li><span class="state">guest-ready</span></li>
-        <li><span class="state">display-ready</span></li>
-        <li><span class="state">presented</span></li>
-      </ul>
     </section>
 
-    <section class="section grid">
-      <article class="card">
-        <h2>Progress semantics</h2>
-        <ul>
-          <li>
-            Use determinate progress only when <code>current</code> and
-            <code>total</code> are real measurements.
-          </li>
-          <li>
-            Switch to an indeterminate bar for validation, boot, and guest
-            readiness instead of inventing a percentage.
-          </li>
-          <li>
-            Keep the primary label stable by phase; put changing detail in the
-            secondary line so the UI does not visually jump.
-          </li>
-          <li>
-            Show layer-level detail on demand. Normal operation remains simple.
-          </li>
-          <li>
-            Cancellation stops new work safely; verified cached layers remain
-            reusable. Failures keep a concise reason and offer retry.
-          </li>
-        </ul>
-      </article>
+    <section class="section" aria-labelledby="artifact-title">
+      <p class="eyebrow">Artifact contract</p>
+      <h2 id="artifact-title">Portable terminal data plus vmsh teaching metadata</h2>
+      <p class="section-intro">
+        Preserve ordinary cast events. Add a versioned vmsh namespace for identity,
+        provenance, and sections so generic players can ignore the teaching layer while
+        the vmsh website can render it.
+      </p>
+      <div class="grid-2">
+        <article class="card code-card">
+          <div class="code-title mono">tours/context-switching/tour.star</div>
+          <pre>def main(ctx):
+    ctx.section(
+        "Select Alpine",
+        """
+        Select the **Alpine** system context.
+        vmsh waits until it is ready.
+        """,
+    )
+    ctx.type("@alpine")
+    ctx.enter()
+    ctx.wait_prompt(system = "alpine")
 
-      <article class="card">
-        <h2>Desktop readiness gate</h2>
-        <p>All conditions must be true before the surface is presented:</p>
-        <ul class="checks">
-          <li>The guest control channel reports the desktop session started.</li>
-          <li>The graphics connection has received a full framebuffer update.</li>
-          <li>The requested display size has been acknowledged and painted.</li>
-          <li>Keyboard, pointer, clipboard, and resize handlers are attached.</li>
-          <li>The frame has remained valid through one compositor paint cycle.</li>
-        </ul>
-        <p class="note">
-          Readiness is a guest/display protocol event, not a timer and not a
-          search for particular console text.
-        </p>
-      </article>
+    ctx.section(
+        "Run ordinary commands",
+        "Commands now run inside the selected VM.",
+    )
+    ctx.type("uname -s")
+    ctx.enter()
+    ctx.expect_line("Linux")
+
+    ctx.section(
+        "Return to the host",
+        "Use `@host` without ending the session.",
+    )
+    ctx.type("@host")
+    ctx.enter()
+    ctx.wait_prompt(system = "host")</pre>
+        </article>
+        <article class="card code-card">
+          <div class="code-title mono">context-switching.cast · header sketch</div>
+          <pre>{
+  "version": 2,
+  "width": 100,
+  "height": 30,
+  "timestamp": 1785465600,
+  "vmsh_tour": {
+    "schema": 1,
+    "id": "context-switching",
+    "title": "Move between host and VM contexts",
+    "vmsh_version": "v0.x.0",
+    "commit": "&lt;release commit&gt;"
+  }
+}
+[0.14, "o", "host ~/work ❯ "]
+[0.80, "m", "Select Alpine"]
+[0.80, "vmsh", {
+  "name": "vmsh.tour.section",
+  "fields": {
+    "index": 1,
+    "title": "Select Alpine",
+    "markdown": "Select the **Alpine** system context."
+  }
+}]
+[1.02, "i", "@alpine\\r"]</pre>
+        </article>
+      </div>
     </section>
 
-    <section class="section grid">
-      <article class="card">
-        <h2>Event shape</h2>
-        <p>
-          The puller and VM session should emit structured events. Frontends
-          choose wording without parsing logs.
-        </p>
-        <pre><code>{
-  "phase": "pulling",
-  "message": "Downloading image",
-  "current": 1702887424,
-  "total": 2751463424,
-  "unit": "bytes",
-  "rate": 84934656,
-  "eta_seconds": 12,
-  "detail": "3 of 5 layers"
-}</code></pre>
-        <p>
-          Terminal output remains available behind a diagnostic/debug option,
-          but it is not used as the graphical startup surface.
-        </p>
-      </article>
-
-      <article class="card">
-        <h2>Implementation slices</h2>
-        <ol>
-          <li>Add typed pull and boot progress events to the backend API.</li>
-          <li>Make the image cache resumable, verified, and atomic.</li>
-          <li>Render the readiness view in the native graphics window.</li>
-          <li>Add the guest and full-frame readiness handshake.</li>
-          <li>Swap the hidden graphics surface into the window on readiness.</li>
-          <li>Add recovery UI for offline, auth, disk-full, and guest failures.</li>
-        </ol>
-      </article>
+    <section class="section" aria-labelledby="policy-title">
+      <p class="eyebrow">Operating policy</p>
+      <h2 id="policy-title">Fast during development, complete at release</h2>
+      <div class="card policy">
+        <div>
+          <p class="label">Pull requests</p>
+          <h3>Run only relevant tours</h3>
+          <p>
+            A user-visible change creates or updates the demonstrations it affects and
+            links them in the PR description. Unrelated tours do not need regeneration.
+            Relevance is a contributor and reviewer judgment documented in
+            <code>AGENTS.md</code>, not an inferred dependency system.
+          </p>
+        </div>
+        <div>
+          <p class="label">Releases</p>
+          <h3>Regenerate the whole catalog</h3>
+          <p>
+            From the tagged release commit, run every tour against the release binary.
+            Publication fails if any tour fails. The successful casts become immutable
+            documentation for that version; “latest” points to the newest stable set.
+          </p>
+        </div>
+      </div>
     </section>
 
-    <section class="section card">
-      <h2>Acceptance criteria</h2>
-      <div class="grid">
+    <section class="section" aria-labelledby="phases-title">
+      <p class="eyebrow">Delivery sequence</p>
+      <h2 id="phases-title">Five small phases with observable exits</h2>
+      <p class="section-intro">
+        Each phase leaves something testable behind. Avoid designing the complete catalog
+        or enforcement model before one real tour works end to end.
+      </p>
+      <div class="phase-list">
+        <article class="card phase">
+          <div class="phase-id mono">01</div>
+          <div>
+            <h3>Define the tour source and cast extension</h3>
+            <p>
+              Specify the smallest Starlark API, Markdown rules, section timing semantics,
+              provenance fields, and schema-version behavior. Include a hand-authored
+              fixture before building the runner.
+            </p>
+          </div>
+          <div class="exit">
+            <strong>Exit</strong>
+            A fixture validates and renders without network access.
+          </div>
+        </article>
+        <article class="card phase">
+          <div class="phase-id mono">02</div>
+          <div>
+            <h3>Drive vmsh through the PTY</h3>
+            <p>
+              Reuse the existing PTY driver and asciicast recorder. Add stable primitives
+              for terminal input, special keys, prompt readiness, resize, and structured
+              behavioral assertions.
+            </p>
+          </div>
+          <div class="exit">
+            <strong>Exit</strong>
+            The context-switching story passes and emits a valid enhanced cast.
+          </div>
+        </article>
+        <article class="card phase">
+          <div class="phase-id mono">03</div>
+          <div>
+            <h3>Build the website player</h3>
+            <p>
+              Load a local or release-hosted cast, replay terminal events, synchronize the
+              active section, render sanitized Markdown, and support keyboard and reduced-
+              motion preferences.
+            </p>
+          </div>
+          <div class="exit">
+            <strong>Exit</strong>
+            The example tour is usable on desktop and mobile without an external embed.
+          </div>
+        </article>
+        <article class="card phase">
+          <div class="phase-id mono">04</div>
+          <div>
+            <h3>Add repository guidance and author documentation</h3>
+            <p>
+              Add the agreed policy to <code>AGENTS.md</code>, document how to run and
+              preview one tour, and provide a small template authors can copy.
+            </p>
+          </div>
+          <div class="exit">
+            <strong>Exit</strong>
+            A contributor can add a second tour without reading runner internals.
+          </div>
+        </article>
+        <article class="card phase">
+          <div class="phase-id mono">05</div>
+          <div>
+            <h3>Wire release publication</h3>
+            <p>
+              Run all tours against the tagged binary, validate every artifact, publish
+              the versioned catalog with the website, and update the latest-stable pointer
+              only after the full set succeeds.
+            </p>
+          </div>
+          <div class="exit">
+            <strong>Exit</strong>
+            A release has a complete, immutable, tested set of guided tours.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="testing-title">
+      <p class="eyebrow">Test strategy</p>
+      <h2 id="testing-title">Assert the user contract, not the recording’s shape</h2>
+      <div class="grid-3">
+        <article class="card compact-card">
+          <span class="badge">Runner</span>
+          <h3>Behavior</h3>
+          <p>
+            Verify system selection, command routing, exit status, files, protocol state,
+            and prompt readiness. Exercise a long-lived interactive session.
+          </p>
+        </article>
+        <article class="card compact-card">
+          <span class="badge">Artifact</span>
+          <h3>Compatibility</h3>
+          <p>
+            Validate the header, monotonic events, legal terminal sizes, section bounds,
+            schema version, and absence of prohibited secrets.
+          </p>
+        </article>
+        <article class="card compact-card">
+          <span class="badge">Website</span>
+          <h3>Playback</h3>
+          <p>
+            Test loading, seeking, section synchronization, Markdown sanitization,
+            keyboard operation, and an accessible transcript.
+          </p>
+        </article>
+      </div>
+      <div class="notes" style="margin-top: 14px">
+        <article class="card note">
+          <h3>Avoid brittle checks</h3>
+          <p>
+            Do not assert wall-clock timing, ANSI decoration, incidental progress text,
+            or exact explanatory prose. Normalize terminal size, locale, and color.
+          </p>
+        </article>
+        <article class="card note">
+          <h3>Keep publication safe</h3>
+          <p>
+            Run with a minimal environment, redact known sensitive values, reject unsafe
+            Markdown, and never record credentials or private host paths.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="guidance-title">
+      <p class="eyebrow">Repository guidance</p>
+      <h2 id="guidance-title">The initial policy belongs in AGENTS.md</h2>
+      <div class="card code-card">
+        <div class="code-title mono">AGENTS.md · proposed addition</div>
+        <pre>## Tested Tutorials
+
+User-visible features should include a guided terminal demonstration. A
+demonstration consists of an automated vmsh session, a replayable terminal
+recording, and labeled Markdown sections that explain the workflow.
+
+Pull requests should create or update only the demonstrations relevant to their
+user-visible changes and link those demonstrations in the PR description.
+Unrelated demonstrations do not need to be regenerated or tested.
+
+Before publishing a release, regenerate and test every demonstration using the
+release commit. The website should publish those generated demonstrations as
+documentation for that specific released version.
+
+Treat demonstration scripts as behavioral tests. Assert meaningful outcomes
+such as context transitions, command results, files, protocol state, and exit
+status. Avoid making exact timing, incidental terminal output, or explanatory
+prose part of the behavioral contract.</pre>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="done-title">
+      <p class="eyebrow">Definition of done</p>
+      <div class="card definition">
+        <h2 id="done-title">The vertical slice is complete when…</h2>
         <ul class="checks">
-          <li>A first pull exposes real byte progress, rate, and ETA.</li>
-          <li>A cached start does not flash a redundant download phase.</li>
-          <li>An interrupted pull resumes without redownloading valid layers.</li>
-          <li>Cancel leaves the cache and image selection in a valid state.</li>
-        </ul>
-        <ul class="checks">
-          <li>No boot console or terminal content is visible by default.</li>
-          <li>No partial desktop frame is visible during startup or resize.</li>
-          <li>The first visible desktop accepts input immediately.</li>
-          <li>A startup failure stays in the progress view with retry details.</li>
+          <li>A checked-in Starlark story drives an actual interactive vmsh session.</li>
+          <li>The story proves host → VM → host context transitions behaviorally.</li>
+          <li>A passing run generates one schema-validated enhanced cast.</li>
+          <li>The cast remains usable as ordinary terminal replay data.</li>
+          <li>The website renders synchronized Markdown sections beside playback.</li>
+          <li>The player works with keyboard navigation and on a narrow viewport.</li>
+          <li>The artifact records the vmsh version and source commit.</li>
+          <li>AGENTS.md explains relevant-tour PRs and complete release regeneration.</li>
+          <li>Author documentation makes a second tour straightforward to create.</li>
+          <li>No release artifact can publish unless every release tour passes.</li>
         </ul>
       </div>
     </section>
+
+    <footer>
+      <strong>Plan status:</strong> implemented. The context-switching vertical slice,
+      portable enhanced cast, data-driven website player, author guidance, privacy
+      redaction, and release gate are complete; the GitHub-hosted release job remains
+      to be exercised when the implementation branch is published.
+    </footer>
   </main>
 
   <script>
-    (() => {
-      const scenarios = {
-        first: {
-          phases: [
-            ["Resolving", "Finding the requested image", "Reading manifest and cache index", "", "pull", null, 650],
-            ["Pulling image", "Downloading Neurodesktop", "1.66 GB of 2.56 GB · 81 MB/s", "about 12 sec", "pull", 65, 1600],
-            ["Verifying", "Checking downloaded content", "Verifying layer digests", "", "prepare", null, 850],
-            ["Preparing", "Preparing your workspace", "Attaching home and shared storage", "", "prepare", null, 750],
-            ["Starting", "Starting the virtual machine", "Waiting for the guest control channel", "", "boot", null, 1100],
-            ["Starting desktop", "Getting the desktop ready", "Applying display size and waiting for a complete frame", "", "desktop", null, 1200]
-          ]
-        },
-        cached: {
-          phases: [
-            ["Resolving", "Checking the local image", "Image already available · digest verified", "", "pull", null, 600],
-            ["Preparing", "Preparing your workspace", "Attaching home and shared storage", "", "prepare", null, 700],
-            ["Starting", "Starting the virtual machine", "Waiting for the guest control channel", "", "boot", null, 1000],
-            ["Starting desktop", "Getting the desktop ready", "Waiting for a complete frame", "", "desktop", null, 1100]
-          ]
-        },
-        resume: {
-          phases: [
-            ["Resolving", "Resuming the image pull", "1.84 GB already verified in the cache", "", "pull", null, 650],
-            ["Pulling image", "Downloading remaining content", "2.31 GB of 2.56 GB · 76 MB/s", "about 4 sec", "pull", 90, 1300],
-            ["Verifying", "Checking downloaded content", "Verifying remaining layer digests", "", "prepare", null, 800],
-            ["Preparing", "Preparing your workspace", "Attaching home and shared storage", "", "prepare", null, 700],
-            ["Starting", "Starting the virtual machine", "Waiting for the guest control channel", "", "boot", null, 1000],
-            ["Starting desktop", "Getting the desktop ready", "Applying display size and waiting for a complete frame", "", "desktop", null, 1100]
-          ]
-        }
-      };
-
-      const phaseLabel = document.querySelector("#phase-label");
-      const title = document.querySelector("#status-title");
-      const copy = document.querySelector("#status-copy");
-      const detail = document.querySelector("#progress-detail");
-      const eta = document.querySelector("#progress-eta");
-      const bar = document.querySelector("#progress-bar");
-      const fill = document.querySelector("#bar-fill");
-      const waiting = document.querySelector("#waiting-view");
-      const desktop = document.querySelector("#desktop-view");
-      const runButton = document.querySelector("#run-demo");
-      const resetButton = document.querySelector("#reset-demo");
-      const scenarioButtons = [...document.querySelectorAll("[data-scenario]")];
-      const steps = [...document.querySelectorAll(".step")];
-      const layerStates = [...document.querySelectorAll(".layer-state")];
-      let scenario = "first";
-      let timer = null;
-
-      function setStep(active) {
-        const order = ["pull", "prepare", "boot", "desktop"];
-        const activeIndex = order.indexOf(active);
-        steps.forEach((step) => {
-          const index = order.indexOf(step.dataset.step);
-          step.classList.toggle("done", index < activeIndex);
-          step.classList.toggle("active", index === activeIndex);
-        });
+    const sections = [
+      {
+        at: 0,
+        label: "0:00",
+        kicker: "Section 1 · 0:00",
+        title: "Select Alpine",
+        body: "Typing <code>@alpine</code> changes the selected system. vmsh starts the VM and waits until the guest is ready before returning the prompt.",
+        command: "@alpine",
+        terminal: '<span class="prompt">host ~/work ❯</span> @alpine\\n<span class="system">Starting alpine… ready</span>\\n<span class="prompt">alpine /host/work ❯</span> '
+      },
+      {
+        at: 9,
+        label: "0:09",
+        kicker: "Section 2 · 0:09",
+        title: "Run ordinary commands",
+        body: "The selected system is now part of the shell context. Ordinary command lines run inside Alpine without repeating an image selector.",
+        command: "uname -s",
+        terminal: '<span class="prompt">host ~/work ❯</span> @alpine\\n<span class="system">Starting alpine… ready</span>\\n<span class="prompt">alpine /host/work ❯</span> uname -s\\nLinux\\n<span class="prompt">alpine /host/work ❯</span> '
+      },
+      {
+        at: 19,
+        label: "0:19",
+        kicker: "Section 3 · 0:19",
+        title: "Return without ending the session",
+        body: "<code>@host</code> changes the selected system context. The Alpine VM stays warm, so selecting it again resumes the same long-lived session.",
+        command: "@host",
+        terminal: '<span class="prompt">host ~/work ❯</span> @alpine\\n<span class="system">Starting alpine… ready</span>\\n<span class="prompt">alpine /host/work ❯</span> uname -s\\nLinux\\n<span class="prompt">alpine /host/work ❯</span> @host\\n<span class="prompt">host ~/work ❯</span> '
       }
+    ];
 
-      function setProgress(value) {
-        const determinate = typeof value === "number";
-        bar.classList.toggle("indeterminate", !determinate);
-        fill.style.width = determinate ? `${value}%` : "";
-        if (determinate) {
-          bar.setAttribute("aria-valuenow", String(value));
-        } else {
-          bar.removeAttribute("aria-valuenow");
-        }
+    const chapterButtons = [...document.querySelectorAll(".chapter")];
+    const guideCopy = document.getElementById("guide-copy");
+    const terminalScreen = document.getElementById("terminal-screen");
+    const timeline = document.getElementById("timeline");
+    const timeLabel = document.getElementById("time-label");
+    const playButton = document.getElementById("play-button");
+    let playing = false;
+    let timer = null;
+
+    function formatTime(value) {
+      return `0:${String(value).padStart(2, "0")}`;
+    }
+
+    function activeIndexForTime(value) {
+      if (value >= sections[2].at) return 2;
+      if (value >= sections[1].at) return 1;
+      return 0;
+    }
+
+    function renderSection(index, moveTimeline = true) {
+      const section = sections[index];
+      chapterButtons.forEach((button, buttonIndex) => {
+        button.setAttribute("aria-pressed", String(buttonIndex === index));
+      });
+      guideCopy.innerHTML = `
+        <p class="eyebrow">${section.kicker}</p>
+        <h3>${section.title}</h3>
+        <p>${section.body}</p>
+        <pre>${section.command}</pre>
+      `;
+      terminalScreen.innerHTML = section.terminal;
+      if (moveTimeline) {
+        timeline.value = String(section.at);
       }
+      timeLabel.textContent = `${formatTime(Number(timeline.value))} / 0:28`;
+    }
 
-      function reset() {
-        window.clearTimeout(timer);
+    chapterButtons.forEach((button, index) => {
+      button.addEventListener("click", () => {
+        stopPlayback();
+        renderSection(index);
+      });
+    });
+
+    timeline.addEventListener("input", () => {
+      const value = Number(timeline.value);
+      renderSection(activeIndexForTime(value), false);
+      timeLabel.textContent = `${formatTime(value)} / 0:28`;
+    });
+
+    function stopPlayback() {
+      playing = false;
+      playButton.textContent = "▶";
+      playButton.setAttribute("aria-label", "Play tour");
+      if (timer !== null) {
+        window.clearInterval(timer);
         timer = null;
-        desktop.classList.remove("ready");
-        waiting.classList.remove("hidden");
-        phaseLabel.textContent = "Preparing";
-        title.textContent = "Ready to start";
-        copy.textContent = "Run the demo to preview the pull and startup experience.";
-        detail.textContent = "No work started";
-        eta.textContent = "";
-        bar.classList.remove("indeterminate");
-        fill.style.width = "0";
-        bar.setAttribute("aria-valuenow", "0");
-        steps.forEach((step) => step.classList.remove("done", "active"));
-        layerStates.forEach((state) => state.textContent = "waiting");
-        runButton.disabled = false;
-        runButton.textContent = "Run demo";
       }
+    }
 
-      function revealDesktop() {
-        steps.forEach((step) => {
-          step.classList.remove("active");
-          step.classList.add("done");
-        });
-        layerStates.forEach((state) => state.textContent = "verified");
-        waiting.classList.add("hidden");
-        desktop.classList.add("ready");
-        runButton.disabled = false;
-        runButton.textContent = "Run again";
+    playButton.addEventListener("click", () => {
+      if (playing) {
+        stopPlayback();
+        return;
       }
-
-      function play(index = 0) {
-        const phases = scenarios[scenario].phases;
-        if (index >= phases.length) {
-          revealDesktop();
-          return;
-        }
-
-        const [label, heading, message, remaining, step, progress, duration] = phases[index];
-        phaseLabel.textContent = label;
-        title.textContent = heading;
-        copy.textContent = message;
-        detail.textContent = progress === null ? "Working…" : `${progress}% downloaded`;
-        eta.textContent = remaining;
-        setStep(step);
-        setProgress(progress);
-
-        if (label === "Pulling image") {
-          layerStates[0].textContent = "verified";
-          layerStates[1].textContent = "downloading";
-        } else if (label === "Verifying") {
-          layerStates.forEach((state) => state.textContent = "verifying");
-        } else if (index > 1) {
-          layerStates.forEach((state) => state.textContent = "verified");
-        }
-
-        timer = window.setTimeout(() => play(index + 1), duration);
+      if (Number(timeline.value) >= 28) {
+        timeline.value = "0";
       }
-
-      runButton.addEventListener("click", () => {
-        reset();
-        runButton.disabled = true;
-        runButton.textContent = "Starting…";
-        play();
-      });
-
-      resetButton.addEventListener("click", reset);
-
-      scenarioButtons.forEach((button) => {
-        button.addEventListener("click", () => {
-          scenario = button.dataset.scenario;
-          scenarioButtons.forEach((candidate) => {
-            candidate.setAttribute("aria-pressed", String(candidate === button));
-          });
-          reset();
-        });
-      });
-    })();
+      playing = true;
+      playButton.textContent = "Ⅱ";
+      playButton.setAttribute("aria-label", "Pause tour");
+      timer = window.setInterval(() => {
+        const next = Number(timeline.value) + 1;
+        timeline.value = String(next);
+        renderSection(activeIndexForTime(next), false);
+        timeLabel.textContent = `${formatTime(next)} / 0:28`;
+        if (next >= 28) stopPlayback();
+      }, 500);
+    });
   </script>
 </body>
 </html>

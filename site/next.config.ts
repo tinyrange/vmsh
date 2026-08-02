@@ -6,6 +6,9 @@ const nextConfig: NextConfig = {
   output: "export",
   trailingSlash: true,
   basePath: onGitHubPages ? "/vmsh" : "",
+  env: {
+    NEXT_PUBLIC_VMSH_BASE_PATH: onGitHubPages ? "/vmsh" : "",
+  },
   images: {
     unoptimized: true,
   },

@@ -2,6 +2,7 @@ package asciicast
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -22,9 +23,25 @@ type Header struct {
 	Timestamp int64             `json:"timestamp"`
 	Env       map[string]string `json:"env,omitempty"`
 	Termui    map[string]any    `json:"termui,omitempty"`
+	VMSHTour  *TourHeader       `json:"vmsh_tour,omitempty"`
+}
+
+// TourHeader identifies an enhanced vmsh tutorial cast. Section content is
+// emitted as an extension event alongside a standard asciinema marker.
+type TourHeader struct {
+	Schema      int    `json:"schema"`
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description,omitempty"`
+	VMSHVersion string `json:"vmsh_version,omitempty"`
+	Commit      string `json:"commit,omitempty"`
 }
 
 func Create(path string, width, height int) (*Recorder, error) {
+	return CreateTour(path, width, height, nil)
+}
+
+func CreateTour(path string, width, height int, tour *TourHeader) (*Recorder, error) {
 	file, err := os.Create(path)
 	if err != nil {
 		return nil, err
@@ -42,12 +59,20 @@ func Create(path string, width, height int) (*Recorder, error) {
 		Termui: map[string]any{
 			"metadata_events": true,
 		},
+		VMSHTour: tour,
 	}
 	if err := json.NewEncoder(file).Encode(header); err != nil {
 		_ = file.Close()
 		return nil, err
 	}
 	return &Recorder{file: file, started: now}, nil
+}
+
+func (r *Recorder) Input(data []byte) {
+	if r == nil || len(data) == 0 {
+		return
+	}
+	r.event("i", string(data))
 }
 
 func (r *Recorder) Writer(dst io.Writer) io.Writer {
@@ -65,11 +90,37 @@ func (r *Recorder) Metadata(name string, fields map[string]any) {
 	if r == nil {
 		return
 	}
+	if name == "ptyterm.resize" {
+		cols, colsOK := integerField(fields["cols"])
+		rows, rowsOK := integerField(fields["rows"])
+		if colsOK && rowsOK {
+			r.event("r", fmt.Sprintf("%dx%d", cols, rows))
+			return
+		}
+	}
+	if name == "vmsh.tour.section" {
+		if title, ok := fields["title"].(string); ok {
+			r.event("m", title)
+		}
+	}
 	payload := map[string]any{
 		"name":   name,
 		"fields": fields,
 	}
-	r.event("m", payload)
+	r.event("vmsh", payload)
+}
+
+func integerField(value any) (int, bool) {
+	switch value := value.(type) {
+	case int:
+		return value, true
+	case int32:
+		return int(value), true
+	case int64:
+		return int(value), true
+	default:
+		return 0, false
+	}
 }
 
 func (r *Recorder) Close() error {
