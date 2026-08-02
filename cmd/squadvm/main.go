@@ -256,6 +256,12 @@ func run(args []string) (retErr error) {
 			var sshPublicKey []byte
 			var sshIdentity string
 			startRequest := request
+			if options.DisplayWidth > 0 && options.DisplayHeight > 0 {
+				displayCopy := *request.Display
+				displayCopy.Width = uint32(options.DisplayWidth)
+				displayCopy.Height = uint32(options.DisplayHeight)
+				startRequest.Display = &displayCopy
+			}
 			if request.Network != nil {
 				networkCopy := *request.Network
 				networkCopy.PortForwards = append([]client.PortForward(nil), request.Network.PortForwards...)
@@ -573,6 +579,29 @@ while [ "$attempt" -lt 900 ]; do
              [ ! -x /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 ] ||
              [ ! -r /proc/sys/fs/binfmt_misc/qemu-x86_64 ]; }; then
             exit 1
+        fi
+        # Xorg enables terminal-generated signals on its VT during startup.
+        # Disable them after the desktop is ready so guest Ctrl shortcuts do
+        # not signal and terminate the X server itself.
+        for tty in /dev/tty[0-9]*; do
+            stty -F "$tty" -isig 2>/dev/null || true
+        done
+        # Older desktop images can apply the requested mode before xfdesktop
+        # connects to RandR. Refresh it through its session bus once startup
+        # is complete so the wallpaper adopts the current screen geometry.
+        desktop_pid=$(pgrep -xo xfdesktop 2>/dev/null || true)
+        if [ -n "$desktop_pid" ]; then
+            session_bus=$(tr '\0' '\n' < "/proc/$desktop_pid/environ" |
+                sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p')
+            if [ -n "$session_bus" ]; then
+                setpriv --reuid=1000 --regid=1000 --clear-groups env \
+                    DISPLAY=:0 \
+                    HOME=/home/squad \
+                    USER=squad \
+                    XDG_RUNTIME_DIR=/run/user/1000 \
+                    DBUS_SESSION_BUS_ADDRESS="$session_bus" \
+                    xfdesktop --reload >/dev/null 2>&1 || true
+            fi
         fi
         exit 0
     fi

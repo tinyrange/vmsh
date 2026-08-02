@@ -38,6 +38,34 @@ type startupProgress struct {
 	Failed           bool
 }
 
+type startupChecklistItem struct {
+	Title  string
+	Detail string
+	Failed bool
+}
+
+func updateStartupChecklist(items []startupChecklistItem, progress startupProgress) ([]startupChecklistItem, bool) {
+	title := strings.TrimSpace(progress.Title)
+	if title == "" {
+		title = "Starting SquadVM"
+	}
+	item := startupChecklistItem{
+		Title:  title,
+		Detail: strings.TrimSpace(progress.Detail),
+		Failed: progress.Failed,
+	}
+	if len(items) != 0 && items[len(items)-1].Title == item.Title {
+		items[len(items)-1] = item
+		return items, false
+	}
+	items = append(items, item)
+	const historyLimit = 24
+	if len(items) > historyLimit {
+		items = append([]startupChecklistItem(nil), items[len(items)-historyLimit:]...)
+	}
+	return items, true
+}
+
 type displayPreflight func(context.Context) (startupPreflight, error)
 
 type displayStarted struct {

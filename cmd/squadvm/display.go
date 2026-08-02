@@ -124,6 +124,8 @@ type displayViewer struct {
 	pendingResize       image.Point
 	resizeChangedAt     time.Time
 	startup             startupProgress
+	startupChecklist    []startupChecklistItem
+	checklistChangedAt  time.Time
 	startupEvents       chan startupProgress
 	startDone           chan displayStartResult
 	cancelDone          chan struct{}
@@ -197,6 +199,7 @@ func openDisplayWindow(
 		parentContext:      ctx,
 		start:              start,
 	}
+	viewer.setStartupProgress(initialStartupProgress())
 	if err := viewer.init(); err != nil {
 		win.Close()
 		return err
@@ -218,13 +221,18 @@ func (v *displayViewer) beginStart(refreshImage bool) {
 		return
 	}
 	v.settings.RefreshImage = refreshImage
+	backingWidth, backingHeight := v.window.BackingSize()
+	displaySize := guestDisplaySize(backingWidth, backingHeight, v.window.Scale())
+	v.settings.DisplayWidth = displaySize.X
+	v.settings.DisplayHeight = displaySize.Y
 	ctx, cancel := context.WithCancel(v.parentContext)
 	v.startCancel = cancel
 	v.starting = true
 	v.returnToSettings = false
 	v.showSettings = false
 	v.startErr = nil
-	v.startup = initialStartupProgress()
+	v.startupChecklist = nil
+	v.setStartupProgress(initialStartupProgress())
 	publish := func(progress startupProgress) {
 		select {
 		case v.startupEvents <- progress:
@@ -243,6 +251,15 @@ func (v *displayViewer) beginStart(refreshImage bool) {
 		started, err := v.start(ctx, v.settings, publish)
 		v.startDone <- displayStartResult{started: started, err: err}
 	}()
+}
+
+func (v *displayViewer) setStartupProgress(progress startupProgress) {
+	v.startup = progress
+	var appended bool
+	v.startupChecklist, appended = updateStartupChecklist(v.startupChecklist, progress)
+	if appended {
+		v.checklistChangedAt = time.Now()
+	}
 }
 
 func (v *displayViewer) init() error {
@@ -381,7 +398,7 @@ func (v *displayViewer) loop(ctx context.Context) error {
 		for {
 			select {
 			case progress := <-v.startupEvents:
-				v.startup = progress
+				v.setStartupProgress(progress)
 				if progress.Failed {
 					v.desktopVisible = false
 					v.startErr = fmt.Errorf("%s", progress.Detail)
@@ -401,16 +418,17 @@ func (v *displayViewer) loop(ctx context.Context) error {
 						return nil
 					}
 					v.startErr = result.err
-					v.startup = failedStartupProgress(result.err)
+					v.setStartupProgress(failedStartupProgress(result.err))
 				} else if result.started.Session == nil {
 					v.startCancel = nil
-					v.startup = failedStartupProgress(fmt.Errorf("VM started without a native display session"))
+					v.setStartupProgress(failedStartupProgress(fmt.Errorf("VM started without a native display session")))
 				} else {
 					v.session = result.started.Session
+					v.lastResize = image.Pt(v.settings.DisplayWidth, v.settings.DisplayHeight)
 					v.attemptStopped = result.started.Stopped
 					v.session.SetClipboard(v.hostClipboard)
 					v.presentation.markGuestReady()
-					v.startup = desktopStartupProgress("Waiting for a complete desktop frame")
+					v.setStartupProgress(desktopStartupProgress("Waiting for a complete desktop frame"))
 				}
 			case <-v.cancelDone:
 				v.starting = false
@@ -522,11 +540,11 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 					}
 					v.returnToSettings = true
 					v.startCancel()
-					v.startup = startupProgress{
+					v.setStartupProgress(startupProgress{
 						Phase:  startupDesktop,
 						Title:  "Stopping SquadVM",
 						Detail: "Waiting for the virtual machine to stop safely",
-					}
+					})
 				} else {
 					v.showSettings = true
 				}
@@ -986,9 +1004,7 @@ func (v *displayViewer) drawStartup(backingWidth, backingHeight int, now time.Ti
 	state := "IN PROGRESS"
 	stateColor := color.RGBA{R: 221, G: 202, B: 255, A: 255}
 	stateBackground := color.RGBA{R: 66, G: 39, B: 101, A: 255}
-	titleColor := color.RGBA{R: 243, G: 245, B: 239, A: 255}
 	if v.startup.Failed {
-		titleColor = color.RGBA{R: 255, G: 137, B: 137, A: 255}
 		state = "INTERRUPTED"
 		stateColor = color.RGBA{R: 255, G: 151, B: 151, A: 255}
 		stateBackground = color.RGBA{R: 75, G: 36, B: 47, A: 255}
@@ -999,15 +1015,8 @@ func (v *displayViewer) drawStartup(backingWidth, backingHeight int, now time.Ti
 	v.drawTextBold("SquadVM", left+60, contentTop+21, 19, color.RGBA{R: 243, G: 245, B: 239, A: 255})
 	v.drawText(startupEyebrow(v.startup), left+60, contentTop+43, 14, color.RGBA{R: 189, G: 151, B: 255, A: 255})
 	v.drawCenteredTextBold(state, stateBounds, 13, stateColor)
-	v.drawTextBold(fitStartupText(v.startup.Title, panelWidth, 34), left, contentTop+105, 34, titleColor)
-	detailLines := 2
-	if v.startup.ImagePipeline {
-		detailLines = 1
-	}
-	for index, line := range wrapStartupText(v.startup.Detail, panelWidth, 18, detailLines) {
-		v.drawText(line, left, contentTop+137+float32(index*21), 18, color.RGBA{R: 224, G: 216, B: 230, A: 255})
-	}
 	v.text.EndDraw()
+	v.drawStartupChecklist(backingWidth, backingHeight, scale, left, contentTop+92, panelWidth, now)
 
 	accent := color.RGBA{R: 95, G: 23, B: 238, A: 255}
 	drawBar := func(y, height, fraction float32, determinate bool, barColor color.RGBA) {
@@ -1083,6 +1092,82 @@ func (v *displayViewer) drawStartup(backingWidth, backingHeight int, now time.Ti
 	}
 	v.drawText(footer, left, contentTop+338, 15, color.RGBA{R: 190, G: 177, B: 201, A: 255})
 	v.text.EndDraw()
+}
+
+func (v *displayViewer) drawStartupChecklist(
+	backingWidth, backingHeight int,
+	scale, left, top, width float32,
+	now time.Time,
+) {
+	const (
+		visibleRows = 3
+		rowHeight   = float32(24)
+		listHeight  = rowHeight * visibleRows
+	)
+	if len(v.startupChecklist) == 0 {
+		return
+	}
+
+	finalFirst := max(0, len(v.startupChecklist)-visibleRows)
+	first := finalFirst
+	offset := float32(0)
+	const scrollDuration = 260 * time.Millisecond
+	if first > 0 {
+		elapsed := now.Sub(v.checklistChangedAt)
+		if elapsed >= 0 && elapsed < scrollDuration {
+			position := float32(elapsed) / float32(scrollDuration)
+			eased := 1 - float32(math.Pow(float64(1-position), 3))
+			offset = rowHeight * (1 - eased)
+			first--
+		}
+	}
+
+	scissorLeft := int32(math.Round(float64(left * scale)))
+	scissorBottom := int32(math.Round(float64(float32(backingHeight) - (top+listHeight)*scale)))
+	scissorWidth := int32(math.Ceil(float64(width * scale)))
+	scissorHeight := int32(math.Ceil(float64(listHeight * scale)))
+	v.gl.Enable(gl.ScissorTest)
+	v.gl.Scissor(scissorLeft, scissorBottom, scissorWidth, scissorHeight)
+
+	for index := first; index < len(v.startupChecklist); index++ {
+		row := index - finalFirst
+		y := top + float32(row)*rowHeight + offset
+		icon := image.Rect(int(left), int(y+3), int(left+18), int(y+21))
+		if index < len(v.startupChecklist)-1 {
+			v.drawRoundedRect(backingWidth, backingHeight, scale, icon, 9, color.RGBA{R: 95, G: 23, B: 238, A: 255})
+			v.drawCheckmark(backingWidth, backingHeight, scale, icon, color.RGBA{R: 243, G: 237, B: 255, A: 255})
+			continue
+		}
+		dotColor := color.RGBA{R: 250, G: 238, B: 52, A: 255}
+		if v.startupChecklist[index].Failed {
+			dotColor = color.RGBA{R: 255, G: 137, B: 137, A: 255}
+		}
+		dot := image.Rect(int(left+5), int(y+8), int(left+13), int(y+16))
+		v.drawRoundedRect(backingWidth, backingHeight, scale, dot, 4, dotColor)
+	}
+
+	v.text.BeginDraw()
+	for index := first; index < len(v.startupChecklist); index++ {
+		row := index - finalFirst
+		y := top + float32(row)*rowHeight + offset
+		item := v.startupChecklist[index]
+		line := item.Title
+		if item.Detail != "" {
+			line += "  ·  " + item.Detail
+		}
+		line = fitStartupText(line, width-32, 16)
+		if index == len(v.startupChecklist)-1 {
+			textColor := color.RGBA{R: 243, G: 245, B: 239, A: 255}
+			if item.Failed {
+				textColor = color.RGBA{R: 255, G: 151, B: 151, A: 255}
+			}
+			v.drawTextBold(line, left+30, y+18, 16, textColor)
+		} else {
+			v.drawText(line, left+30, y+18, 16, color.RGBA{R: 177, G: 163, B: 187, A: 255})
+		}
+	}
+	v.text.EndDraw()
+	v.gl.Disable(gl.ScissorTest)
 }
 
 func (v *displayViewer) loadBrandTexture() error {
@@ -1352,10 +1437,11 @@ func (v *displayViewer) handleResize() error {
 
 func guestDisplaySize(backingWidth, backingHeight int, scale float32) image.Point {
 	scale = normalizedDisplayScale(scale)
-	return image.Pt(
-		max(1, int(math.Round(float64(float32(backingWidth)/scale)))),
-		max(1, int(math.Round(float64(float32(backingHeight)/scale)))),
-	)
+	width := max(1, int(math.Round(float64(float32(backingWidth)/scale))))
+	if aligned := width &^ 7; aligned > 0 {
+		width = aligned
+	}
+	return image.Pt(width, max(1, int(math.Round(float64(float32(backingHeight)/scale)))))
 }
 
 func normalizedDisplayScale(scale float32) float32 {
