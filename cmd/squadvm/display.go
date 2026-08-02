@@ -185,6 +185,7 @@ func (v *displayViewer) init() error {
 	if err != nil {
 		return fmt.Errorf("initialize graphics: %w", err)
 	}
+	enableDisplayVSync()
 	// The low-level display path does not pass through gowin/graphics, which
 	// normally establishes alpha blending for Fontstash glyph textures.
 	v.gl.Enable(gl.Blend)
