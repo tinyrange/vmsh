@@ -51,6 +51,61 @@ func TestPreflightRetainsVMMUpdateDetailAfterNotificationDismissal(t *testing.T)
 	}
 }
 
+func TestUpdateNotificationKeyboardControlsDoNotLeakToGuest(t *testing.T) {
+	now := time.Unix(100, 0)
+	viewer := &displayViewer{
+		updateShownAt:      now,
+		updateConsumedKeys: make(map[window.Key]bool),
+		preflight: startupPreflight{
+			ReleaseUpdate: &squadVMReleaseUpdate{Version: "v0.7.0"},
+		},
+	}
+
+	if !viewer.handleUpdateNotificationKey(window.InputEvent{
+		Type: window.InputEventKeyDown,
+		Key:  window.KeyF6,
+	}, now) || !viewer.updateFocusActive || viewer.updateFocus != 0 {
+		t.Fatal("F6 did not focus the first update action")
+	}
+	if !viewer.handleUpdateNotificationKey(window.InputEvent{
+		Type: window.InputEventKeyUp,
+		Key:  window.KeyF6,
+	}, now) {
+		t.Fatal("captured F6 release would leak to the guest")
+	}
+	if !viewer.handleUpdateNotificationKey(window.InputEvent{
+		Type: window.InputEventKeyDown,
+		Key:  window.KeyTab,
+	}, now) || viewer.updateFocus != 1 {
+		t.Fatal("Tab did not move to the apply action")
+	}
+	if !viewer.handleUpdateNotificationKey(window.InputEvent{
+		Type: window.InputEventKeyUp,
+		Key:  window.KeyTab,
+	}, now) {
+		t.Fatal("captured Tab release would leak to the guest")
+	}
+	if !viewer.handleUpdateNotificationKey(window.InputEvent{
+		Type: window.InputEventKeyDown,
+		Key:  window.KeyTab,
+		Mods: window.ModShift,
+	}, now) || viewer.updateFocus != 0 {
+		t.Fatal("Shift-Tab did not return to the dismiss action")
+	}
+	if !viewer.handleUpdateNotificationKey(window.InputEvent{
+		Type: window.InputEventKeyUp,
+		Key:  window.KeyTab,
+	}, now) {
+		t.Fatal("captured Shift-Tab release would leak to the guest")
+	}
+	if !viewer.handleUpdateNotificationKey(window.InputEvent{
+		Type: window.InputEventKeyDown,
+		Key:  window.KeyEnter,
+	}, now) || !viewer.releaseDismissed || viewer.updateFocusActive {
+		t.Fatal("Enter did not activate the focused dismiss action")
+	}
+}
+
 func TestApplyingImageUpdateStopsActiveSessionBeforeRestart(t *testing.T) {
 	stopped := make(chan struct{})
 	close(stopped)

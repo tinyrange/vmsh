@@ -257,16 +257,11 @@
     }
 
     .mark {
-      display: grid;
-      place-items: center;
       width: 38px;
       height: 38px;
       flex: 0 0 auto;
       border-radius: 10px;
-      background: var(--purple-deep);
-      color: var(--yellow);
-      font-weight: 900;
-      letter-spacing: -0.08em;
+      object-fit: contain;
     }
 
     .brand-name { font-size: 17px; font-weight: 800; line-height: 1.1; }
@@ -525,7 +520,7 @@
             <div class="app">
               <div class="setup-view">
                 <div class="app-header">
-                  <div class="brand"><div class="mark">S</div><div><div class="brand-name">SquadVM</div><div class="brand-sub">Local development machine</div></div></div>
+                  <div class="brand"><img class="mark" src="cmd/squadvm/assets/squadvm-brand.png" alt=""><div><div class="brand-name">SquadVM</div><div class="brand-sub">UQ Cyber Squad</div></div></div>
                   <div class="state-pill" id="state-label">Ready</div>
                 </div>
                 <div class="hero-row">
@@ -549,7 +544,7 @@
 
               <div class="progress-view">
                 <div class="app-header">
-                  <div class="brand"><div class="mark">S</div><div><div class="brand-name">SquadVM</div><div class="brand-sub">Starting local machine</div></div></div>
+                  <div class="brand"><img class="mark" src="cmd/squadvm/assets/squadvm-brand.png" alt=""><div><div class="brand-name">SquadVM</div><div class="brand-sub">UQ Cyber Squad · Starting local machine</div></div></div>
                   <div class="state-pill">In progress</div>
                 </div>
                 <h3>Preparing the desktop image</h3>

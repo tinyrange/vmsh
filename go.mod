@@ -8,6 +8,7 @@ require (
 	github.com/modelcontextprotocol/go-sdk v1.6.1
 	github.com/tinyrange/gowin v0.0.0-20260802065815-e7b09f245e78
 	golang.org/x/crypto v0.50.0
+	golang.org/x/image v0.39.0
 	golang.org/x/net v0.53.0
 	golang.org/x/sys v0.43.0
 	golang.org/x/term v0.42.0
