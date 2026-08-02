@@ -361,6 +361,9 @@ func (v *displayViewer) loop(ctx context.Context) error {
 				v.desktopVisible = true
 			}
 		}
+		if capture, ok := v.window.(window.SystemKeyCaptureSupport); ok {
+			capture.SetSystemKeyCaptured(v.desktopVisible)
+		}
 		backingWidth, backingHeight := v.window.BackingSize()
 		v.gl.Viewport(0, 0, int32(backingWidth), int32(backingHeight))
 		if v.desktopVisible && v.textureWidth > 0 && v.textureHeight > 0 {
@@ -549,7 +552,7 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 	v.text.BeginDraw()
 	v.drawTextBold("SQUADVM", left+88, contentTop+20, 14, color.RGBA{R: 189, G: 151, B: 255, A: 255})
 	v.drawTextBold(fitStartupText(title, panelWidth-88, 32), left+88, contentTop+58, 32, titleColor)
-	v.drawText(fitStartupText(detail, panelWidth, 15), left, contentTop+94, 15, color.RGBA{R: 216, G: 207, B: 224, A: 255})
+	v.drawText(fitStartupText(detail, panelWidth, 16), left, contentTop+94, 16, color.RGBA{R: 224, G: 216, B: 230, A: 255})
 	v.text.EndDraw()
 
 	rowY := contentTop + 112
@@ -586,8 +589,8 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 		v.drawRect(backingWidth, backingHeight, scale, boxX+4, boxY+4, 12, 12, color.RGBA{R: 250, G: 238, B: 52, A: 255})
 	}
 	v.text.BeginDraw()
-	v.drawTextBold("Enable SSH access", boxX+34, float32(check.Min.Y+21), 15, color.RGBA{R: 243, G: 245, B: 239, A: 255})
-	v.drawText("Adds \"ssh squadvm\" to ~/.ssh/config", boxX+34, float32(check.Min.Y+41), 12, color.RGBA{R: 190, G: 177, B: 201, A: 255})
+	v.drawTextBold("Enable SSH access", boxX+34, float32(check.Min.Y+21), 16, color.RGBA{R: 243, G: 245, B: 239, A: 255})
+	v.drawText("Adds \"ssh squadvm\" to ~/.ssh/config", boxX+34, float32(check.Min.Y+41), 13, color.RGBA{R: 205, G: 194, B: 213, A: 255})
 	v.text.EndDraw()
 
 	systemCheck := layout.systemCheckbox
@@ -600,8 +603,8 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 		v.drawRect(backingWidth, backingHeight, scale, systemBoxX+4, systemBoxY+4, 12, 12, color.RGBA{R: 250, G: 238, B: 52, A: 255})
 	}
 	v.text.BeginDraw()
-	v.drawTextBold("System install", systemBoxX+34, float32(systemCheck.Min.Y+21), 15, color.RGBA{R: 243, G: 245, B: 239, A: 255})
-	v.drawText("Store data in your user cache", systemBoxX+34, float32(systemCheck.Min.Y+41), 12, color.RGBA{R: 190, G: 177, B: 201, A: 255})
+	v.drawTextBold("System install", systemBoxX+34, float32(systemCheck.Min.Y+21), 16, color.RGBA{R: 243, G: 245, B: 239, A: 255})
+	v.drawText("Store data in your user cache", systemBoxX+34, float32(systemCheck.Min.Y+41), 13, color.RGBA{R: 205, G: 194, B: 213, A: 255})
 	v.text.EndDraw()
 
 	button := layout.button
@@ -639,7 +642,7 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 	v.text.BeginDraw()
 	labelWidth := float32(v.text.GetAdvance(v.font, 14, label))
 	v.drawTextBold(label, float32(button.Min.X)+(float32(button.Dx())-labelWidth)/2, float32(button.Min.Y+31), 14, buttonText)
-	v.drawText("Space: SSH", left, float32(button.Min.Y+31), 12, color.RGBA{R: 190, G: 177, B: 201, A: 255})
+	v.drawText("Space: SSH", left, float32(button.Min.Y+31), 13, color.RGBA{R: 205, G: 194, B: 213, A: 255})
 	v.text.EndDraw()
 }
 
@@ -666,8 +669,8 @@ func (v *displayViewer) drawPreflightRow(
 	v.text.BeginDraw()
 	statusWidth := float32(v.text.GetAdvance(v.font, 11, status))
 	v.drawTextBold(status, left+12+(64-statusWidth)/2, top+30, 11, statusColor)
-	v.drawTextBold(label, left+92, top+22, 14, color.RGBA{R: 243, G: 245, B: 239, A: 255})
-	v.drawText(fitStartupText(detail, width-108, 12), left+92, top+42, 12, color.RGBA{R: 195, G: 183, B: 204, A: 255})
+	v.drawTextBold(label, left+92, top+22, 15, color.RGBA{R: 243, G: 245, B: 239, A: 255})
+	v.drawText(fitStartupText(detail, width-108, 13), left+92, top+42, 13, color.RGBA{R: 207, G: 197, B: 215, A: 255})
 	v.text.EndDraw()
 }
 
