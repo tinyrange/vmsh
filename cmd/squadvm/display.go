@@ -95,6 +95,7 @@ void main() {
 type displayViewer struct {
 	session             display.Session
 	window              window.Window
+	guestCursor         guestCursorHost
 	gl                  gl.OpenGL
 	text                *gowintext.Stash
 	font                int
@@ -197,6 +198,7 @@ func openDisplayWindow(
 	}
 	viewer := &displayViewer{
 		window:             win,
+		guestCursor:        newGuestCursorHost(),
 		keysDown:           make(map[window.Key]bool),
 		startup:            initialStartupProgress(),
 		startupEvents:      make(chan startupProgress, 16),
@@ -427,6 +429,9 @@ func (v *displayViewer) init() error {
 }
 
 func (v *displayViewer) close() {
+	if v.guestCursor != nil {
+		v.guestCursor.Close()
+	}
 	if v.brandTexture != 0 {
 		v.gl.DeleteTextures(1, &v.brandTexture)
 	}
@@ -567,6 +572,9 @@ func (v *displayViewer) loop(ctx context.Context) error {
 		}
 		if capture, ok := v.window.(window.SystemKeyCaptureSupport); ok {
 			capture.SetSystemKeyCaptured(v.desktopVisible)
+		}
+		if err := v.updateGuestCursor(); err != nil {
+			return err
 		}
 		backingWidth, backingHeight := v.window.BackingSize()
 		v.gl.Viewport(0, 0, int32(backingWidth), int32(backingHeight))
@@ -1794,12 +1802,27 @@ func (v *displayViewer) handleResize() error {
 }
 
 func guestDisplaySize(backingWidth, backingHeight int, scale float32) image.Point {
-	scale = normalizedDisplayScale(scale)
-	width := max(1, int(math.Round(float64(float32(backingWidth)/scale))))
+	// BackingSize is already expressed in device pixels. Match the guest mode
+	// to it directly so the desktop texture is presented 1:1 on HiDPI hosts.
+	// Dividing by the UI scale here renders a smaller guest mode and then asks
+	// OpenGL to enlarge it again, visibly resampling text and fine lines.
+	_ = scale
+	width := max(1, backingWidth)
 	if aligned := width &^ 7; aligned > 0 {
 		width = aligned
 	}
-	return image.Pt(width, max(1, int(math.Round(float64(float32(backingHeight)/scale)))))
+	return image.Pt(width, max(1, backingHeight))
+}
+
+func (v *displayViewer) updateGuestCursor() error {
+	if v.guestCursor == nil {
+		return nil
+	}
+	provider, ok := v.session.(display.CursorProvider)
+	if !v.desktopVisible || !ok {
+		return v.guestCursor.Apply(display.CursorUpdate{}, false)
+	}
+	return v.guestCursor.Apply(provider.Cursor(), true)
 }
 
 func normalizedDisplayScale(scale float32) float32 {
