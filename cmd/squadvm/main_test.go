@@ -304,11 +304,14 @@ func TestResolveSquadVMPortableCacheBesideExecutable(t *testing.T) {
 	}
 	previousExecutable := squadVMExecutable
 	previousUserCacheDir := squadVMUserCacheDir
+	previousGOOS := squadVMGOOS
 	squadVMExecutable = func() (string, error) { return executable, nil }
 	squadVMUserCacheDir = func() (string, error) { return userCache, nil }
+	squadVMGOOS = "linux"
 	defer func() {
 		squadVMExecutable = previousExecutable
 		squadVMUserCacheDir = previousUserCacheDir
+		squadVMGOOS = previousGOOS
 	}()
 
 	got, err := resolveSquadVMCacheDir("", false)
@@ -325,7 +328,7 @@ func TestResolveSquadVMPortableCacheBesideExecutable(t *testing.T) {
 	}
 }
 
-func TestResolveSquadVMPortableCacheBesideMacApp(t *testing.T) {
+func TestResolveSquadVMPortableCacheForMacAppIsUserWritable(t *testing.T) {
 	root := t.TempDir()
 	userCache := t.TempDir()
 	executable := filepath.Join(root, "SquadVM.app", "Contents", "MacOS", "SquadVM")
@@ -337,24 +340,23 @@ func TestResolveSquadVMPortableCacheBesideMacApp(t *testing.T) {
 	}
 	previousExecutable := squadVMExecutable
 	previousUserCacheDir := squadVMUserCacheDir
+	previousGOOS := squadVMGOOS
 	squadVMExecutable = func() (string, error) { return executable, nil }
 	squadVMUserCacheDir = func() (string, error) { return userCache, nil }
+	squadVMGOOS = "darwin"
 	defer func() {
 		squadVMExecutable = previousExecutable
 		squadVMUserCacheDir = previousUserCacheDir
+		squadVMGOOS = previousGOOS
 	}()
 
 	got, err := resolveSquadVMCacheDir("", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolvedRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := filepath.Join(resolvedRoot, "SquadVM-data", "cache")
+	want := filepath.Join(userCache, "SquadVM", "ccx3")
 	if got != want {
-		t.Fatalf("portable app cache = %q, want %q", got, want)
+		t.Fatalf("portable macOS app cache = %q, want %q", got, want)
 	}
 }
 

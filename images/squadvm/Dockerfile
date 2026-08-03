@@ -122,6 +122,7 @@ COPY squadvm-session /usr/local/sbin/squadvm-session
 COPY squadvm-sshd-prepare /usr/local/sbin/squadvm-sshd-prepare
 COPY squadvm-binfmt.service /etc/systemd/system/squadvm-binfmt.service
 COPY squadvm-desktop.service /etc/systemd/system/squadvm-desktop.service
+COPY squadvm-systemd.conf /etc/systemd/system.conf.d/squadvm-console.conf
 COPY squadvm-sshd.service /etc/systemd/system/squadvm-sshd.service
 COPY squadvm-sshd_config /etc/ssh/squadvm-sshd_config
 COPY squadvm.target /etc/systemd/system/squadvm.target

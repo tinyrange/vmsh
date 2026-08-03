@@ -104,6 +104,42 @@ func TestLongStartupDetailWrapsWithinTwoReadableLines(t *testing.T) {
 	}
 }
 
+func TestErrorWrappingPreservesCompleteMessage(t *testing.T) {
+	message := "boot failed: Hypervisor.framework/could-not-create-a-required-interrupt-controller because the configured machine is unsupported"
+	lines := wrapStartupTextAll(message, 180, 15)
+	if len(lines) < 2 {
+		t.Fatalf("long error wrapped to %d lines, want multiple lines", len(lines))
+	}
+	if got, want := strings.Join(strings.Fields(strings.Join(lines, "")), ""), strings.Join(strings.Fields(message), ""); got != want {
+		t.Fatalf("wrapped error = %q, want complete message %q", got, want)
+	}
+}
+
+func TestSerialTextIsSafeForStartupDisplay(t *testing.T) {
+	viewer := displayViewer{}
+	viewer.appendStartupSerial("\x1b[1;31mFAILED\x1b[0m normal \xff\nnext")
+	snapshot := viewer.startupTerminal.Snapshot()
+	if got := snapshot.Cells[0][0]; got.R != 'F' || !got.Attr.Bold || got.Attr.FG != 1 {
+		t.Fatalf("highlighted serial cell = %+v", got)
+	}
+	if got := startupTerminalRune(snapshot.Cells[0][14].R); got != '?' {
+		t.Fatalf("invalid serial rune = %q, want safe replacement", got)
+	}
+	if got := snapshot.Cells[1][0].R; got != 'n' {
+		t.Fatalf("text after bare LF starts at column zero with %q, want n", got)
+	}
+}
+
+func TestSerialCRLFAcrossChunksIsNotDoubled(t *testing.T) {
+	viewer := displayViewer{}
+	viewer.appendStartupSerial("first\r")
+	viewer.appendStartupSerial("\nsecond")
+	snapshot := viewer.startupTerminal.Snapshot()
+	if got := snapshot.Cells[1][0].R; got != 's' {
+		t.Fatalf("text after split CRLF starts at column zero with %q, want s", got)
+	}
+}
+
 func TestStartupLayoutFitsSupportedWindows(t *testing.T) {
 	for _, viewport := range []image.Point{image.Pt(1024, 640), image.Pt(760, 520)} {
 		layout := calculateStartupScreenLayout(float32(viewport.X), float32(viewport.Y))

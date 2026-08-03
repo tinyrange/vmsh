@@ -10,13 +10,17 @@ import (
 	"image/png"
 	"math"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
 	"github.com/tinyrange/gowin/gl"
 	gowintext "github.com/tinyrange/gowin/text"
 	"github.com/tinyrange/gowin/window"
+	"github.com/tinyrange/vmsh/internal/ptyterm"
 	"golang.org/x/image/font/gofont/gobold"
+	"golang.org/x/image/font/gofont/gomono"
+	"golang.org/x/image/font/gofont/gomonobold"
 	"golang.org/x/image/font/gofont/goregular"
 	"j5.nz/cc/display"
 )
@@ -95,6 +99,8 @@ type displayViewer struct {
 	text                *gowintext.Stash
 	font                int
 	fontBold            int
+	fontMono            int
+	fontMonoBold        int
 	program             uint32
 	roundedRectProgram  uint32
 	roundedRectColor    int32
@@ -126,6 +132,11 @@ type displayViewer struct {
 	startup             startupProgress
 	startupChecklist    []startupChecklistItem
 	checklistChangedAt  time.Time
+	startupTerminal     *ptyterm.Emulator
+	serialMu            sync.Mutex
+	serialPending       []byte
+	serialLastCR        bool
+	startupDetailScroll int
 	startupEvents       chan startupProgress
 	startDone           chan displayStartResult
 	cancelDone          chan struct{}
@@ -232,8 +243,18 @@ func (v *displayViewer) beginStart(refreshImage bool) {
 	v.showSettings = false
 	v.startErr = nil
 	v.startupChecklist = nil
+	v.startupTerminal = ptyterm.NewEmulator(ptyterm.Size{Cols: 120, Rows: 12}, 256)
+	v.serialMu.Lock()
+	v.serialPending = nil
+	v.serialMu.Unlock()
+	v.serialLastCR = false
+	v.startupDetailScroll = 0
 	v.setStartupProgress(initialStartupProgress())
 	publish := func(progress startupProgress) {
+		if progress.Serial != "" {
+			v.queueStartupSerial(progress.Serial)
+			return
+		}
 		select {
 		case v.startupEvents <- progress:
 		default:
@@ -253,13 +274,56 @@ func (v *displayViewer) beginStart(refreshImage bool) {
 	}()
 }
 
+func (v *displayViewer) queueStartupSerial(data string) {
+	if data == "" {
+		return
+	}
+	v.serialMu.Lock()
+	v.serialPending = append(v.serialPending, data...)
+	v.serialMu.Unlock()
+}
+
+func (v *displayViewer) drainStartupSerial() {
+	v.serialMu.Lock()
+	pending := v.serialPending
+	v.serialPending = nil
+	v.serialMu.Unlock()
+	if len(pending) != 0 {
+		v.appendStartupSerial(string(pending))
+	}
+}
+
 func (v *displayViewer) setStartupProgress(progress startupProgress) {
+	if progress.Serial != "" {
+		v.appendStartupSerial(progress.Serial)
+		return
+	}
 	v.startup = progress
+	v.startupDetailScroll = 0
 	var appended bool
 	v.startupChecklist, appended = updateStartupChecklist(v.startupChecklist, progress)
 	if appended {
 		v.checklistChangedAt = time.Now()
 	}
+}
+
+func (v *displayViewer) appendStartupSerial(data string) {
+	if data == "" {
+		return
+	}
+	if v.startupTerminal == nil {
+		v.startupTerminal = ptyterm.NewEmulator(ptyterm.Size{Cols: 120, Rows: 12}, 256)
+	}
+	raw := []byte(data)
+	normalized := make([]byte, 0, len(raw)+8)
+	for _, b := range raw {
+		if b == '\n' && !v.serialLastCR {
+			normalized = append(normalized, '\r')
+		}
+		normalized = append(normalized, b)
+		v.serialLastCR = b == '\r'
+	}
+	_, _ = v.startupTerminal.Write(normalized)
 }
 
 func (v *displayViewer) init() error {
@@ -350,6 +414,14 @@ func (v *displayViewer) init() error {
 	if err != nil {
 		return fmt.Errorf("load bold interface font: %w", err)
 	}
+	v.fontMono, err = v.text.AddFontFromMemory(gomono.TTF)
+	if err != nil {
+		return fmt.Errorf("load console font: %w", err)
+	}
+	v.fontMonoBold, err = v.text.AddFontFromMemory(gomonobold.TTF)
+	if err != nil {
+		return fmt.Errorf("load bold console font: %w", err)
+	}
 	return nil
 }
 
@@ -386,6 +458,7 @@ func (v *displayViewer) loop(ctx context.Context) error {
 	v.hostClipboard = clipboard.GetText()
 	nextClipboardCheck := time.Now()
 	for v.window.Poll() {
+		v.drainStartupSerial()
 		select {
 		case <-ctx.Done():
 			if v.startErr != nil {
@@ -523,6 +596,31 @@ func (v *displayViewer) loop(ctx context.Context) error {
 func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 	scale := normalizedDisplayScale(v.window.Scale())
 	for _, event := range events {
+		if (!v.showSettings && v.startup.Failed) || (v.showSettings && v.settingsFailureDetail() != "") {
+			switch event.Type {
+			case window.InputEventScroll:
+				if event.ScrollY > 0 {
+					v.startupDetailScroll = max(0, v.startupDetailScroll-2)
+				} else if event.ScrollY < 0 {
+					v.startupDetailScroll += 2
+				}
+			case window.InputEventKeyDown:
+				switch event.Key {
+				case window.KeyUp:
+					v.startupDetailScroll = max(0, v.startupDetailScroll-1)
+				case window.KeyDown:
+					v.startupDetailScroll++
+				case window.KeyPageUp:
+					v.startupDetailScroll = max(0, v.startupDetailScroll-8)
+				case window.KeyPageDown:
+					v.startupDetailScroll += 8
+				case window.KeyHome:
+					v.startupDetailScroll = 0
+				case window.KeyEnd:
+					v.startupDetailScroll = int(^uint(0) >> 1)
+				}
+			}
+		}
 		if event.Type == window.InputEventKeyDown && event.Key == window.KeyEscape && !event.Repeat {
 			if !v.showSettings {
 				v.startErr = nil
@@ -683,7 +781,7 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 	titleColor := color.RGBA{R: 243, G: 245, B: 239, A: 255}
 	if v.preflightErr != nil {
 		title = "Checks failed"
-		detail = v.preflightErr.Error()
+		detail = "See the complete error below."
 		state = "ACTION NEEDED"
 		stateColor = color.RGBA{R: 255, G: 151, B: 151, A: 255}
 		stateBackground = color.RGBA{R: 75, G: 36, B: 47, A: 255}
@@ -734,6 +832,10 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 		v.drawText(line, left, contentTop+129+float32(index*21), 18, color.RGBA{R: 224, G: 216, B: 230, A: 255})
 	}
 	v.text.EndDraw()
+	if failure := v.settingsFailureDetail(); failure != "" {
+		v.drawSettingsFailure(backingWidth, backingHeight, scale, left, contentTop+158, panelWidth, failure)
+		return
+	}
 
 	v.drawPreflightCard(backingWidth, backingHeight, scale, layout.status[0],
 		preflightStatus(v.preflightReady, v.preflight.VirtualizationOK),
@@ -824,6 +926,51 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 	}
 	v.drawText(fitStartupText("Space  SSH   ·   Tab  move   ·   Enter  start", shortcutWidth, 15),
 		left, float32(button.Min.Y+33), 15, color.RGBA{R: 211, G: 202, B: 218, A: 255})
+	v.text.EndDraw()
+}
+
+func (v *displayViewer) settingsFailureDetail() string {
+	if v.preflightErr != nil {
+		return v.preflightErr.Error()
+	}
+	if !v.preflightReady {
+		return ""
+	}
+	var failures []string
+	if !v.preflight.VirtualizationOK {
+		detail := strings.TrimSpace(v.preflight.VirtualizationDetail)
+		if detail == "" {
+			detail = "Hardware virtualization is unavailable."
+		}
+		failures = append(failures, detail)
+	}
+	if !v.preflight.DiskOK {
+		failures = append(failures, fmt.Sprintf("Not enough disk space: %s is free and %s is required.",
+			formatBytes(v.preflight.FreeBytes), formatBytes(v.preflight.RequiredBytes)))
+	}
+	return strings.Join(failures, "\n")
+}
+
+func (v *displayViewer) drawSettingsFailure(backingWidth, backingHeight int, scale, left, top, width float32, detail string) {
+	const lineHeight = float32(19)
+	const visibleLines = 10
+	lines := wrapStartupTextAll(detail, width-28, 15)
+	maxScroll := max(0, len(lines)-visibleLines)
+	v.startupDetailScroll = min(maxScroll, max(0, v.startupDetailScroll))
+	bounds := image.Rect(int(left), int(top), int(left+width), int(top+230))
+	v.drawPanel(backingWidth, backingHeight, scale, bounds, 10,
+		color.RGBA{R: 92, G: 43, B: 56, A: 255}, color.RGBA{R: 39, G: 24, B: 32, A: 255})
+	v.text.BeginDraw()
+	v.drawTextBold("STARTUP CHECK DETAILS", left+14, top+24, 13, color.RGBA{R: 255, G: 151, B: 151, A: 255})
+	for index, line := range lines[v.startupDetailScroll:min(len(lines), v.startupDetailScroll+visibleLines)] {
+		v.drawText(line, left+14, top+49+float32(index)*lineHeight, 15, color.RGBA{R: 243, G: 229, B: 234, A: 255})
+	}
+	footer := "Close this window after reviewing the error"
+	if maxScroll > 0 {
+		footer = fmt.Sprintf("Scroll or use arrow keys for the full error  ·  lines %d–%d of %d",
+			v.startupDetailScroll+1, min(len(lines), v.startupDetailScroll+visibleLines), len(lines))
+	}
+	v.drawText(footer, left, top+260, 15, color.RGBA{R: 211, G: 190, B: 199, A: 255})
 	v.text.EndDraw()
 }
 
@@ -1016,6 +1163,14 @@ func (v *displayViewer) drawStartup(backingWidth, backingHeight int, now time.Ti
 	v.drawText(startupEyebrow(v.startup), left+60, contentTop+43, 14, color.RGBA{R: 189, G: 151, B: 255, A: 255})
 	v.drawCenteredTextBold(state, stateBounds, 13, stateColor)
 	v.text.EndDraw()
+	if v.startup.Failed {
+		v.drawStartupFailure(backingWidth, backingHeight, scale, left, contentTop+82, panelWidth)
+		return
+	}
+	if v.startupTerminal != nil && v.startupTerminal.Snapshot().BytesRead != 0 {
+		v.drawStartupSerial(backingWidth, backingHeight, scale, left, contentTop+82, panelWidth)
+		return
+	}
 	v.drawStartupChecklist(backingWidth, backingHeight, scale, left, contentTop+92, panelWidth, now)
 
 	accent := color.RGBA{R: 95, G: 23, B: 238, A: 255}
@@ -1092,6 +1247,173 @@ func (v *displayViewer) drawStartup(backingWidth, backingHeight int, now time.Ti
 	}
 	v.drawText(footer, left, contentTop+338, 15, color.RGBA{R: 190, G: 177, B: 201, A: 255})
 	v.text.EndDraw()
+}
+
+func (v *displayViewer) drawStartupFailure(backingWidth, backingHeight int, scale, left, top, width float32) {
+	const lineHeight = float32(19)
+	const visibleLines = 9
+	lines := wrapStartupTextAll(v.startup.Detail, width-28, 15)
+	if len(lines) == 0 {
+		lines = []string{"An unexpected error occurred"}
+	}
+	maxScroll := max(0, len(lines)-visibleLines)
+	v.startupDetailScroll = min(maxScroll, max(0, v.startupDetailScroll))
+	bounds := image.Rect(int(left), int(top), int(left+width), int(top+226))
+	v.drawPanel(backingWidth, backingHeight, scale, bounds, 10,
+		color.RGBA{R: 92, G: 43, B: 56, A: 255}, color.RGBA{R: 39, G: 24, B: 32, A: 255})
+
+	v.text.BeginDraw()
+	v.drawTextBold(v.startup.Title, left+14, top+25, 16, color.RGBA{R: 255, G: 151, B: 151, A: 255})
+	for index, line := range lines[v.startupDetailScroll:min(len(lines), v.startupDetailScroll+visibleLines)] {
+		v.drawText(line, left+14, top+49+float32(index)*lineHeight, 15, color.RGBA{R: 243, G: 229, B: 234, A: 255})
+	}
+	footer := "Esc for settings  ·  Close this window to stop"
+	if maxScroll > 0 {
+		footer = fmt.Sprintf("Scroll or use arrow keys for the full error  ·  lines %d–%d of %d",
+			v.startupDetailScroll+1, min(len(lines), v.startupDetailScroll+visibleLines), len(lines))
+	}
+	v.drawText(footer, left, top+256, 15, color.RGBA{R: 211, G: 190, B: 199, A: 255})
+	v.text.EndDraw()
+}
+
+func (v *displayViewer) drawStartupSerial(backingWidth, backingHeight int, scale, left, top, width float32) {
+	const (
+		fontSize    = float32(13)
+		lineHeight  = float32(17)
+		visibleRows = 12
+	)
+	cellWidth := float32(v.text.GetAdvance(v.fontMono, float64(fontSize), "M"))
+	cols := max(20, int((width-24)/cellWidth))
+	v.startupTerminal.Resize(ptyterm.Size{Cols: cols, Rows: visibleRows})
+	snapshot := v.startupTerminal.Snapshot()
+	bounds := image.Rect(int(left), int(top), int(left+width), int(top+246))
+	v.drawPanel(backingWidth, backingHeight, scale, bounds, 8,
+		color.RGBA{R: 79, G: 59, B: 91, A: 255}, color.RGBA{R: 14, G: 11, B: 17, A: 255})
+	textLeft := left + 12
+	textTop := top + 37
+	for row, cells := range snapshot.Cells {
+		for column := 0; column < len(cells); {
+			_, bg := startupTerminalCellColors(cells[column].Attr)
+			end := column + 1
+			for end < len(cells) {
+				_, nextBG := startupTerminalCellColors(cells[end].Attr)
+				if nextBG != bg {
+					break
+				}
+				end++
+			}
+			if bg.A != 0 {
+				v.drawRect(backingWidth, backingHeight, scale,
+					textLeft+float32(column)*cellWidth, textTop+float32(row)*lineHeight-13,
+					float32(end-column)*cellWidth, lineHeight, bg)
+			}
+			column = end
+		}
+		for column := 0; column < len(cells); {
+			if !cells[column].Attr.Underline {
+				column++
+				continue
+			}
+			fg, _ := startupTerminalCellColors(cells[column].Attr)
+			end := column + 1
+			for end < len(cells) && cells[end].Attr == cells[column].Attr && cells[end].Attr.Underline {
+				end++
+			}
+			v.drawRect(backingWidth, backingHeight, scale,
+				textLeft+float32(column)*cellWidth, textTop+float32(row)*lineHeight+2,
+				float32(end-column)*cellWidth, 1, fg)
+			column = end
+		}
+	}
+	v.text.BeginDraw()
+	v.drawTextBold("BOOT CONSOLE", textLeft, top+19, 12, color.RGBA{R: 189, G: 151, B: 255, A: 255})
+	for row, cells := range snapshot.Cells {
+		for column := 0; column < len(cells); {
+			attr := cells[column].Attr
+			end := column + 1
+			for end < len(cells) && cells[end].Attr == attr {
+				end++
+			}
+			var text strings.Builder
+			for _, cell := range cells[column:end] {
+				text.WriteRune(startupTerminalRune(cell.R))
+			}
+			fg, _ := startupTerminalCellColors(attr)
+			font := v.fontMono
+			if attr.Bold {
+				font = v.fontMonoBold
+			}
+			value := strings.TrimRight(text.String(), " ")
+			if value != "" {
+				v.drawTextFont(font, value, textLeft+float32(column)*cellWidth,
+					textTop+float32(row)*lineHeight, fontSize, fg)
+			}
+			column = end
+		}
+	}
+	v.drawText("Esc for settings  ·  Console follows the latest boot output", left, top+276, 15,
+		color.RGBA{R: 190, G: 177, B: 201, A: 255})
+	v.text.EndDraw()
+}
+
+func startupTerminalRune(r rune) rune {
+	if r == 0 || r == ' ' {
+		return ' '
+	}
+	if r < ' ' || r > '~' {
+		return '?'
+	}
+	return r
+}
+
+func startupTerminalCellColors(attr ptyterm.Attr) (color.RGBA, color.RGBA) {
+	fg := startupTerminalColor(attr.FG, color.RGBA{R: 218, G: 211, B: 222, A: 255}, attr.Bold)
+	bg := startupTerminalColor(attr.BG, color.RGBA{}, false)
+	if attr.Inverse {
+		originalFG := fg
+		if bg.A == 0 {
+			fg = color.RGBA{R: 14, G: 11, B: 17, A: 255}
+		} else {
+			fg = bg
+		}
+		bg = originalFG
+	}
+	return fg, bg
+}
+
+func startupTerminalColor(value int, fallback color.RGBA, bold bool) color.RGBA {
+	if value < 0 {
+		return fallback
+	}
+	if value >= 1<<24 {
+		return color.RGBA{R: uint8(value >> 16), G: uint8(value >> 8), B: uint8(value), A: 255}
+	}
+	palette := [...]color.RGBA{
+		{R: 24, G: 20, B: 27, A: 255}, {R: 224, G: 90, B: 90, A: 255},
+		{R: 108, G: 190, B: 124, A: 255}, {R: 224, G: 190, B: 83, A: 255},
+		{R: 102, G: 153, B: 235, A: 255}, {R: 189, G: 121, B: 224, A: 255},
+		{R: 91, G: 190, B: 202, A: 255}, {R: 218, G: 211, B: 222, A: 255},
+		{R: 104, G: 94, B: 110, A: 255}, {R: 255, G: 126, B: 126, A: 255},
+		{R: 143, G: 226, B: 156, A: 255}, {R: 250, G: 238, B: 82, A: 255},
+		{R: 135, G: 180, B: 255, A: 255}, {R: 221, G: 170, B: 255, A: 255},
+		{R: 117, G: 222, B: 229, A: 255}, {R: 250, G: 247, B: 251, A: 255},
+	}
+	if bold && value < 8 {
+		value += 8
+	}
+	if value < len(palette) {
+		return palette[value]
+	}
+	if value >= 16 && value <= 231 {
+		cube := value - 16
+		steps := [...]uint8{0, 95, 135, 175, 215, 255}
+		return color.RGBA{R: steps[(cube/36)%6], G: steps[(cube/6)%6], B: steps[cube%6], A: 255}
+	}
+	if value >= 232 && value <= 255 {
+		shade := uint8(8 + (value-232)*10)
+		return color.RGBA{R: shade, G: shade, B: shade, A: 255}
+	}
+	return fallback
 }
 
 func (v *displayViewer) drawStartupChecklist(
@@ -1331,6 +1653,10 @@ func (v *displayViewer) drawOutline(
 }
 
 func (v *displayViewer) drawText(value string, x, y, size float32, col color.RGBA) {
+	v.drawTextFont(v.font, value, x, y, size, col)
+}
+
+func (v *displayViewer) drawTextFont(font int, value string, x, y, size float32, col color.RGBA) {
 	if strings.TrimSpace(value) == "" {
 		return
 	}
@@ -1340,7 +1666,7 @@ func (v *displayViewer) drawText(value string, x, y, size float32, col color.RGB
 		float32(col.B) / 255,
 		float32(col.A) / 255,
 	}
-	v.text.DrawText(v.font, float64(size), float64(x), float64(y), value, rgba)
+	v.text.DrawText(font, float64(size), float64(x), float64(y), value, rgba)
 }
 
 func (v *displayViewer) drawTextBold(value string, x, y, size float32, col color.RGBA) {
@@ -1389,25 +1715,43 @@ func fitStartupText(value string, width, size float32) string {
 }
 
 func wrapStartupText(value string, width, size float32, maxLines int) []string {
+	lines := wrapStartupTextAll(value, width, size)
+	if len(lines) <= maxLines {
+		return lines
+	}
+	lines = lines[:maxLines]
+	lines[maxLines-1] = fitStartupText(lines[maxLines-1]+" …", width, size)
+	return lines
+}
+
+func wrapStartupTextAll(value string, width, size float32) []string {
 	value = strings.TrimSpace(value)
-	if value == "" || width <= 0 || size <= 0 || maxLines <= 0 {
+	if value == "" || width <= 0 || size <= 0 {
 		return nil
 	}
 	limit := max(8, int(width/(size*0.62)))
 	words := strings.Fields(value)
-	lines := make([]string, 0, min(maxLines, len(words)))
-	for len(words) > 0 && len(lines) < maxLines {
+	var expanded []string
+	for _, word := range words {
+		runes := []rune(word)
+		for len(runes) > limit {
+			expanded = append(expanded, string(runes[:limit]))
+			runes = runes[limit:]
+		}
+		if len(runes) != 0 {
+			expanded = append(expanded, string(runes))
+		}
+	}
+	words = expanded
+	lines := make([]string, 0, len(words))
+	for len(words) > 0 {
 		line := words[0]
 		words = words[1:]
 		for len(words) > 0 && len([]rune(line))+1+len([]rune(words[0])) <= limit {
 			line += " " + words[0]
 			words = words[1:]
 		}
-		if len(lines) == maxLines-1 && len(words) > 0 {
-			line += " " + strings.Join(words, " ")
-			words = nil
-		}
-		lines = append(lines, fitStartupText(line, width, size))
+		lines = append(lines, line)
 	}
 	return lines
 }
