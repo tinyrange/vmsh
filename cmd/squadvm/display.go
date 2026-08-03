@@ -1907,18 +1907,13 @@ func (v *displayViewer) handleInput() error {
 		case window.InputEventKeyDown, window.InputEventKeyUp, window.InputEventFlagsChanged:
 			code, ok := linuxKeycode(event.Key)
 			if ok {
-				down := event.Type == window.InputEventKeyDown
-				if event.Type == window.InputEventFlagsChanged {
-					if modifierDown, ok := modifierTransitionDown(event.Key, event.Mods, v.keysDown[event.Key]); ok {
-						down = modifierDown
-					} else {
-						down = v.window.GetKeyState(event.Key).IsDown()
+				transitions := keyboardTransitions(event, v.keysDown[event.Key], v.window.GetKeyState(event.Key).IsDown())
+				for _, down := range transitions {
+					if err := v.session.Key(code, down); err != nil {
+						return fmt.Errorf("send keyboard input: %w", err)
 					}
+					v.keysDown[event.Key] = down
 				}
-				if err := v.session.Key(code, down); err != nil {
-					return fmt.Errorf("send keyboard input: %w", err)
-				}
-				v.keysDown[event.Key] = down
 			}
 		case window.InputEventMouseDown:
 			v.buttons |= mouseButtonMask(event.Button)
@@ -1963,6 +1958,28 @@ func (v *displayViewer) handleInput() error {
 		v.keysDown[key] = false
 	}
 	return nil
+}
+
+func keyboardTransitions(event window.InputEvent, wasDown, platformDown bool) []bool {
+	switch event.Type {
+	case window.InputEventKeyDown:
+		return []bool{true}
+	case window.InputEventKeyUp:
+		return []bool{false}
+	case window.InputEventFlagsChanged:
+		// Cocoa reports Caps Lock as one flagsChanged event per toggle rather
+		// than a physical key-down/key-up pair. Linux toggles the lock on a key
+		// press, so forward a complete press for every macOS toggle.
+		if event.Key == window.KeyCapsLock {
+			return []bool{true, false}
+		}
+		if down, ok := modifierTransitionDown(event.Key, event.Mods, wasDown); ok {
+			return []bool{down}
+		}
+		return []bool{platformDown}
+	default:
+		return nil
+	}
 }
 
 func (v *displayViewer) sendScroll(deltaX120, deltaY120 int32) error {
