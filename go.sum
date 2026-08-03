@@ -46,6 +46,8 @@ github.com/stretchr/testify v1.9.0 h1:HtqpIVDClZ4nwg75+f6Lvsy/wHu+3BoSGCbBAcpTsT
 github.com/stretchr/testify v1.9.0/go.mod h1:r2ic/lqez/lEtzL7wO/rwa5dbSLXVDPFyf8C91i36aY=
 github.com/tinyrange/gowin v0.0.0-20260802104407-d68bda83ab85 h1:/3vIWQKSIoAyeTh8POMU5i4z5RMs0ip6L/e2G43clRQ=
 github.com/tinyrange/gowin v0.0.0-20260802104407-d68bda83ab85/go.mod h1:SCECczSGPwH3/pZhm1dNuuUYh/vtu6YLV9Rj/L67MB4=
+github.com/tinyrange/gowin v0.0.0-20260803070720-862309a6acaa h1:YzCVHkLexPAqBOMvsI3xzkSWHWJkwdONfWDaHBFT82E=
+github.com/tinyrange/gowin v0.0.0-20260803070720-862309a6acaa/go.mod h1:SCECczSGPwH3/pZhm1dNuuUYh/vtu6YLV9Rj/L67MB4=
 github.com/ulikunitz/xz v0.5.15 h1:9DNdB5s+SgV3bQ2ApL10xRc35ck0DuIX/isZvIk+ubY=
 github.com/ulikunitz/xz v0.5.15/go.mod h1:nbz6k7qbPmH4IRqmfOplQw/tblSgqTqBwxkY0oWt/14=
 github.com/yosida95/uritemplate/v3 v3.0.2 h1:Ed3Oyj9yrmi9087+NczuL5BwkIc4wvTb5zIM+UJPGz4=

@@ -95,6 +95,7 @@ void main() {
 type displayViewer struct {
 	session             display.Session
 	window              window.Window
+	guestCursor         guestCursorHost
 	gl                  gl.OpenGL
 	text                *gowintext.Stash
 	font                int
@@ -129,6 +130,7 @@ type displayViewer struct {
 	lastResize          image.Point
 	pendingResize       image.Point
 	resizeChangedAt     time.Time
+	windowMinimized     bool
 	startup             startupProgress
 	startupChecklist    []startupChecklistItem
 	checklistChangedAt  time.Time
@@ -145,7 +147,7 @@ type displayViewer struct {
 	preflightReady      bool
 	preflightErr        error
 	settings            startupOptions
-	firstRunComplete    bool
+	folderSelectionErr  string
 	showSettings        bool
 	updateShownAt       time.Time
 	releaseDismissed    bool
@@ -186,7 +188,6 @@ func openDisplayWindow(
 	title string,
 	width, height int,
 	settings startupOptions,
-	firstRunComplete bool,
 	preflight displayPreflight,
 	start displayStart,
 ) error {
@@ -196,6 +197,7 @@ func openDisplayWindow(
 	}
 	viewer := &displayViewer{
 		window:             win,
+		guestCursor:        newGuestCursorHost(),
 		keysDown:           make(map[window.Key]bool),
 		startup:            initialStartupProgress(),
 		startupEvents:      make(chan startupProgress, 16),
@@ -204,8 +206,7 @@ func openDisplayWindow(
 		preflightDone:      make(chan displayPreflightResult, 1),
 		imageRestartReady:  make(chan struct{}, 1),
 		settings:           settings,
-		firstRunComplete:   firstRunComplete,
-		showSettings:       !firstRunComplete,
+		showSettings:       true,
 		updateConsumedKeys: make(map[window.Key]bool),
 		parentContext:      ctx,
 		start:              start,
@@ -426,6 +427,9 @@ func (v *displayViewer) init() error {
 }
 
 func (v *displayViewer) close() {
+	if v.guestCursor != nil {
+		v.guestCursor.Close()
+	}
 	if v.brandTexture != 0 {
 		v.gl.DeleteTextures(1, &v.brandTexture)
 	}
@@ -519,11 +523,7 @@ func (v *displayViewer) loop(ctx context.Context) error {
 				}
 				v.preflight = result.preflight
 				v.preflightReady = true
-				if !v.firstRunComplete || !v.preflight.canStart() {
-					v.showSettings = true
-				} else {
-					v.beginStart(false)
-				}
+				v.showSettings = true
 			case <-v.imageRestartReady:
 				v.starting = false
 				v.startCancel = nil
@@ -566,6 +566,9 @@ func (v *displayViewer) loop(ctx context.Context) error {
 		}
 		if capture, ok := v.window.(window.SystemKeyCaptureSupport); ok {
 			capture.SetSystemKeyCaptured(v.desktopVisible)
+		}
+		if err := v.updateGuestCursor(); err != nil {
+			return err
 		}
 		backingWidth, backingHeight := v.window.BackingSize()
 		v.gl.Viewport(0, 0, int32(backingWidth), int32(backingHeight))
@@ -698,6 +701,9 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 			case startupControlSystem:
 				v.startupFocus = startupControlSystem
 				v.settings.SystemInstall = !v.settings.SystemInstall
+			case startupControlSharedFolder:
+				v.startupFocus = startupControlSharedFolder
+				v.chooseSharedFolder()
 			case startupControlSkip:
 				v.startupFocus = startupControlSkip
 				v.beginSettingsStart(false)
@@ -715,6 +721,8 @@ func (v *displayViewer) activateStartupControl(control startupControl) {
 		v.settings.SSHEnabled = !v.settings.SSHEnabled
 	case startupControlSystem:
 		v.settings.SystemInstall = !v.settings.SystemInstall
+	case startupControlSharedFolder:
+		v.chooseSharedFolder()
 	case startupControlSkip:
 		if v.preflight.hasUpdate() {
 			v.beginSettingsStart(false)
@@ -725,10 +733,36 @@ func (v *displayViewer) activateStartupControl(control startupControl) {
 }
 
 func (v *displayViewer) beginSettingsStart(refreshImage bool) {
+	share, err := squadvmStorageShare(v.settings.SharedFolder)
+	if err != nil {
+		v.folderSelectionErr = err.Error()
+		return
+	}
+	v.settings.SharedFolder = share.Source
+	v.folderSelectionErr = ""
 	if v.preflight.hasUpdate() {
 		v.imageDismissed = true
 	}
 	v.beginStart(refreshImage)
+}
+
+func (v *displayViewer) chooseSharedFolder() {
+	dialog, ok := v.window.(window.FileDialogSupport)
+	if !ok {
+		v.folderSelectionErr = "Folder selection is unavailable on this desktop."
+		return
+	}
+	selected := strings.TrimSpace(dialog.ShowOpenPanel(window.FileDialogTypeDirectory, nil))
+	if selected == "" {
+		return
+	}
+	share, err := squadvmStorageShare(selected)
+	if err != nil {
+		v.folderSelectionErr = err.Error()
+		return
+	}
+	v.settings.SharedFolder = share.Source
+	v.folderSelectionErr = ""
 }
 
 func (v *displayViewer) updateTexture() (display.FramebufferUpdate, error) {
@@ -873,6 +907,7 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 		v.startupFocusVisible && v.startupFocus == startupControlSystem,
 		v.startupHover == startupControlSystem,
 	)
+	v.drawSharedFolderOption(backingWidth, backingHeight, scale, layout)
 
 	button := layout.button
 	buttonColor := color.RGBA{R: 69, G: 54, B: 80, A: 255}
@@ -924,7 +959,7 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 	if !v.preflight.hasUpdate() {
 		shortcutWidth = float32(button.Min.X) - left - 12
 	}
-	v.drawText(fitStartupText("Space  SSH   ·   Tab  move   ·   Enter  start", shortcutWidth, 15),
+	v.drawText(fitStartupText("Space  select   ·   Tab  move   ·   Enter  start", shortcutWidth, 15),
 		left, float32(button.Min.Y+33), 15, color.RGBA{R: 211, G: 202, B: 218, A: 255})
 	v.text.EndDraw()
 }
@@ -1043,6 +1078,39 @@ func (v *displayViewer) drawSettingsOption(
 	textWidth := float32(bounds.Dx() - 74)
 	v.drawTextBold(title, textX, float32(bounds.Min.Y+24), 16, color.RGBA{R: 243, G: 245, B: 239, A: 255})
 	v.drawText(fitStartupText(detail, textWidth, 15), textX, float32(bounds.Min.Y+47), 15, color.RGBA{R: 211, G: 202, B: 218, A: 255})
+	v.text.EndDraw()
+}
+
+func (v *displayViewer) drawSharedFolderOption(
+	backingWidth, backingHeight int,
+	scale float32,
+	layout startupControlLayout,
+) {
+	bounds := layout.sharedFolder
+	browse := layout.sharedBrowse
+	v.drawPanel(backingWidth, backingHeight, scale, bounds, 10,
+		color.RGBA{R: 68, G: 52, B: 79, A: 255}, color.RGBA{R: 38, G: 27, B: 47, A: 255})
+	browseColor := color.RGBA{R: 63, G: 47, B: 75, A: 255}
+	if v.startupHover == startupControlSharedFolder {
+		browseColor = color.RGBA{R: 82, G: 59, B: 98, A: 255}
+	}
+	v.drawPanel(backingWidth, backingHeight, scale, browse, 8,
+		color.RGBA{R: 91, G: 67, B: 108, A: 255}, browseColor)
+	if v.startupFocusVisible && v.startupFocus == startupControlSharedFolder {
+		v.drawOutline(backingWidth, backingHeight, scale, browse, color.RGBA{R: 250, G: 238, B: 52, A: 255})
+	}
+	detail := v.settings.SharedFolder
+	detailColor := color.RGBA{R: 211, G: 202, B: 218, A: 255}
+	if v.folderSelectionErr != "" {
+		detail = v.folderSelectionErr
+		detailColor = color.RGBA{R: 255, G: 151, B: 151, A: 255}
+	}
+	textX := float32(bounds.Min.X + 14)
+	textWidth := float32(browse.Min.X-bounds.Min.X) - 26
+	v.text.BeginDraw()
+	v.drawTextBold("Shared folder", textX, float32(bounds.Min.Y+21), 16, color.RGBA{R: 243, G: 245, B: 239, A: 255})
+	v.drawText(fitStartupText(detail, textWidth, 14), textX, float32(bounds.Min.Y+43), 14, detailColor)
+	v.drawCenteredTextBold("Choose folder", browse, 14, color.RGBA{R: 243, G: 245, B: 239, A: 255})
 	v.text.EndDraw()
 }
 
@@ -1758,6 +1826,19 @@ func wrapStartupTextAll(value string, width, size float32) []string {
 
 func (v *displayViewer) handleResize() error {
 	backingWidth, backingHeight := v.window.BackingSize()
+	if backingWidth <= 0 || backingHeight <= 0 {
+		// A minimized native window has no drawable client area. Keep the guest
+		// at its usable resolution instead of briefly resizing it to 1x1.
+		v.pendingResize = image.Point{}
+		v.windowMinimized = true
+		return nil
+	}
+	if v.windowMinimized {
+		// Some OpenGL drivers discard the visible backing contents while a
+		// window is minimized. Request a complete guest frame on restoration.
+		v.windowMinimized = false
+		v.generation = 0
+	}
 	size := guestDisplaySize(backingWidth, backingHeight, v.window.Scale())
 	if size == v.lastResize {
 		v.pendingResize = image.Point{}
@@ -1780,12 +1861,27 @@ func (v *displayViewer) handleResize() error {
 }
 
 func guestDisplaySize(backingWidth, backingHeight int, scale float32) image.Point {
-	scale = normalizedDisplayScale(scale)
-	width := max(1, int(math.Round(float64(float32(backingWidth)/scale))))
+	// BackingSize is already expressed in device pixels. Match the guest mode
+	// to it directly so the desktop texture is presented 1:1 on HiDPI hosts.
+	// Dividing by the UI scale here renders a smaller guest mode and then asks
+	// OpenGL to enlarge it again, visibly resampling text and fine lines.
+	_ = scale
+	width := max(1, backingWidth)
 	if aligned := width &^ 7; aligned > 0 {
 		width = aligned
 	}
-	return image.Pt(width, max(1, int(math.Round(float64(float32(backingHeight)/scale)))))
+	return image.Pt(width, max(1, backingHeight))
+}
+
+func (v *displayViewer) updateGuestCursor() error {
+	if v.guestCursor == nil {
+		return nil
+	}
+	provider, ok := v.session.(display.CursorProvider)
+	if !v.desktopVisible || !ok {
+		return v.guestCursor.Apply(display.CursorUpdate{}, false)
+	}
+	return v.guestCursor.Apply(provider.Cursor(), true)
 }
 
 func normalizedDisplayScale(scale float32) float32 {

@@ -70,6 +70,18 @@ setsid setpriv --reuid="$uid" --regid="$gid" --clear-groups env \
     XDG_RUNTIME_DIR="/run/user/$uid" \
     dbus-run-session -- sh -eu -c '
         xfconf-query -c xfce4-session -p /general/SaveOnExit -n -t bool -s false || true
+        # Xfwm treats workspace wrapping and edge tiling as mutually
+        # exclusive. Prefer the familiar Windows/Fedora behavior where
+        # dragging a window to an edge tiles it on the current desktop.
+        xfconf-query -c xfwm4 -p /general/wrap_windows -n -t bool -s false 2>/dev/null ||
+            xfconf-query -c xfwm4 -p /general/wrap_windows -s false || true
+        xfconf-query -c xfwm4 -p /general/tile_on_move -n -t bool -s true 2>/dev/null ||
+            xfconf-query -c xfwm4 -p /general/tile_on_move -s true || true
+        # The default Kali XFCE session does not consistently assign the Super
+        # key. Give the captured host Windows key a useful guest action.
+        xfconf-query -c xfce4-keyboard-shortcuts \
+            -p /commands/custom/Super_L \
+            -n -t string -s xfce4-popup-applicationsmenu || true
         gsettings set org.gnome.desktop.interface color-scheme prefer-dark || true
         gsettings set org.gnome.desktop.interface gtk-theme Adwaita-dark || true
         xsetroot -solid "#170e1f"

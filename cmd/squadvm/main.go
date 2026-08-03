@@ -72,9 +72,13 @@ func run(args []string) (retErr error) {
 		return fmt.Errorf("CPU count must be greater than zero")
 	}
 	var vncOptionSet bool
+	var storageOptionSet bool
 	fs.Visit(func(item *flag.Flag) {
 		if item.Name == "vnc-listen" || item.Name == "vnc-password" {
 			vncOptionSet = true
+		}
+		if item.Name == "storage" {
+			storageOptionSet = true
 		}
 	})
 	if !*vnc && vncOptionSet {
@@ -94,10 +98,6 @@ func run(args []string) (retErr error) {
 	if err != nil {
 		return err
 	}
-	storageShare, err := squadvmStorageShare(*storage)
-	if err != nil {
-		return err
-	}
 	width, height, err := parseDisplaySize(*displaySize)
 	if err != nil {
 		return err
@@ -106,6 +106,15 @@ func run(args []string) (retErr error) {
 	if err != nil {
 		return err
 	}
+	storageValue := *storage
+	if !storageOptionSet && strings.TrimSpace(settings.SharedFolder) != "" {
+		storageValue = settings.SharedFolder
+	}
+	storageShare, err := squadvmStorageShare(storageValue)
+	if err != nil {
+		return err
+	}
+	settings.SharedFolder = storageShare.Source
 
 	displayReady := make(chan ccdisplay.Session, 1)
 	systemInstall := settings.systemInstall()
@@ -238,8 +247,13 @@ func run(args []string) (retErr error) {
 					stopVM()
 				}
 			}()
+			selectedShare, err := squadvmStorageShare(options.SharedFolder)
+			if err != nil {
+				return displayStarted{}, err
+			}
 			settings.FirstRunComplete = true
 			settings.SSHEnabled = options.SSHEnabled
+			settings.SharedFolder = selectedShare.Source
 			if options.SystemInstall {
 				settings.InstallMode = squadVMInstallSystem
 			} else {
@@ -256,6 +270,7 @@ func run(args []string) (retErr error) {
 			var sshPublicKey []byte
 			var sshIdentity string
 			startRequest := request
+			startRequest.Shares = []client.ShareMount{selectedShare}
 			// The native startup view owns the window until the graphical session
 			// is ready, so keep the VM serial stream enabled and show it there.
 			startRequest.Dmesg = true
@@ -371,8 +386,8 @@ func run(args []string) (retErr error) {
 				SSHEnabled:    settings.SSHEnabled,
 				SystemInstall: systemInstall,
 				DownloadRate:  settings.DownloadRate,
+				SharedFolder:  settings.SharedFolder,
 			},
-			settings.FirstRunComplete,
 			preflight,
 			start,
 		)

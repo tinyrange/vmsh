@@ -34,6 +34,7 @@ type squadVMSettings struct {
 	SSHEnabled       bool    `json:"ssh_enabled"`
 	InstallMode      string  `json:"install_mode,omitempty"`
 	DownloadRate     float64 `json:"download_rate_bytes_per_second,omitempty"`
+	SharedFolder     string  `json:"shared_folder,omitempty"`
 }
 
 type startupOptions struct {
@@ -41,6 +42,7 @@ type startupOptions struct {
 	SystemInstall bool
 	RefreshImage  bool
 	DownloadRate  float64
+	SharedFolder  string
 	DisplayWidth  int
 	DisplayHeight int
 }
