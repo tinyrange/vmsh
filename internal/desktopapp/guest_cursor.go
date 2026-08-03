@@ -1,4 +1,4 @@
-package main
+package desktopapp
 
 import "j5.nz/cc/display"
 

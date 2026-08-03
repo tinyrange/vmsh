@@ -1,4 +1,4 @@
-package main
+package desktopapp
 
 import (
 	"image"
@@ -51,7 +51,7 @@ func (v *displayViewer) activeUpdateNotifications(now time.Time) []updateNotific
 		}
 		notifications = append(notifications, updateNotification{
 			kind:   releaseUpdateNotification,
-			title:  "SquadVM " + update.Version,
+			title:  productName() + " " + update.Version,
 			detail: detail,
 		})
 	}
@@ -112,21 +112,21 @@ func (v *displayViewer) drawUpdateNotifications(backingWidth, backingHeight int,
 	for index, layout := range updateNotificationLayouts(width, notifications) {
 		bounds := layout.bounds
 		v.drawPanel(backingWidth, backingHeight, scale, bounds, 10,
-			color.RGBA{R: 76, G: 59, B: 89, A: 255}, color.RGBA{R: 31, G: 22, B: 40, A: 255})
+			uiBorderStrong, uiSurface)
 		v.drawRect(
 			backingWidth, backingHeight, scale,
 			float32(bounds.Min.X), float32(bounds.Min.Y), 4, float32(bounds.Dy()),
-			color.RGBA{R: 141, G: 92, B: 255, A: 255},
+			uiPrimary,
 		)
 		v.text.BeginDraw()
 		v.drawTextBold(
 			fitStartupText(layout.notification.title, float32(bounds.Dx()-32), 16),
 			float32(bounds.Min.X+16), float32(bounds.Min.Y+27), 16,
-			color.RGBA{R: 243, G: 245, B: 239, A: 255},
+			uiText,
 		)
-		detailColor := color.RGBA{R: 211, G: 202, B: 218, A: 255}
+		detailColor := uiAccentSoft
 		if layout.notification.kind == releaseUpdateNotification && v.releaseUpdateErr != nil {
-			detailColor = color.RGBA{R: 255, G: 137, B: 137, A: 255}
+			detailColor = uiErrorStrong
 		}
 		v.drawText(
 			fitStartupText(layout.notification.detail, float32(bounds.Dx()-152), 14),
@@ -138,26 +138,26 @@ func (v *displayViewer) drawUpdateNotifications(backingWidth, backingHeight int,
 		v.drawTextBold(
 			focusHint,
 			float32(bounds.Max.X-16)-focusHintWidth, float32(bounds.Min.Y+53), 14,
-			color.RGBA{R: 189, G: 151, B: 255, A: 255},
+			uiAccent,
 		)
 		v.text.EndDraw()
 
-		dismissBorder := color.RGBA{R: 76, G: 59, B: 89, A: 255}
-		dismissFill := color.RGBA{R: 54, G: 41, B: 65, A: 255}
-		applyFill := color.RGBA{R: 95, G: 23, B: 238, A: 255}
+		dismissBorder := uiBorderStrong
+		dismissFill := uiSurface
+		applyFill := uiPrimary
 		if v.updateHoverActive {
 			switch v.updateHover {
 			case index * 2:
-				dismissBorder = color.RGBA{R: 111, G: 84, B: 130, A: 255}
-				dismissFill = color.RGBA{R: 67, G: 50, B: 79, A: 255}
+				dismissBorder = uiBorderStrong
+				dismissFill = uiSurfaceHover
 			case index*2 + 1:
-				applyFill = color.RGBA{R: 117, G: 49, B: 255, A: 255}
+				applyFill = uiPrimaryHover
 			}
 		}
 		v.drawPanel(backingWidth, backingHeight, scale, layout.dismiss, 8, dismissBorder, dismissFill)
 		v.drawRoundedRect(backingWidth, backingHeight, scale, layout.apply, 8, applyFill)
 		if v.updateFocusActive {
-			focusColor := color.RGBA{R: 250, G: 238, B: 52, A: 255}
+			focusColor := uiAccent
 			switch v.updateFocus {
 			case index * 2:
 				v.drawOutline(backingWidth, backingHeight, scale, layout.dismiss, focusColor)
@@ -166,8 +166,8 @@ func (v *displayViewer) drawUpdateNotifications(backingWidth, backingHeight int,
 			}
 		}
 		v.text.BeginDraw()
-		v.drawNotificationButtonLabel(layout.dismiss, "DISMISS", color.RGBA{R: 235, G: 229, B: 240, A: 255})
-		v.drawNotificationButtonLabel(layout.apply, "APPLY", color.RGBA{R: 255, G: 255, B: 255, A: 255})
+		v.drawNotificationButtonLabel(layout.dismiss, "DISMISS", uiText)
+		v.drawNotificationButtonLabel(layout.apply, "APPLY", uiWhite)
 		v.text.EndDraw()
 	}
 }
@@ -291,7 +291,7 @@ func (v *displayViewer) applyUpdateNotification(kind updateNotificationKind) {
 	switch kind {
 	case releaseUpdateNotification:
 		if update := v.preflight.ReleaseUpdate; update != nil {
-			if err := squadVMOpenReleaseURL(update.DownloadURL); err != nil {
+			if err := openReleaseURL(update.DownloadURL); err != nil {
 				v.releaseUpdateErr = err
 				return
 			}

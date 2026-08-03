@@ -1,4 +1,4 @@
-package main
+package desktopapp
 
 import (
 	"context"
@@ -12,19 +12,19 @@ import (
 	"j5.nz/cc/display"
 )
 
-type embeddedSquadVMBackend struct {
+type embeddedBackend struct {
 	api      *client.Client
 	done     chan error
 	finished bool
 }
 
-func startEmbeddedSquadVMBackend(cacheDir, name string, displayReady chan<- display.Session) (*embeddedSquadVMBackend, error) {
+func startEmbeddedBackend(cacheDir, name string, displayReady chan<- display.Session) (*embeddedBackend, error) {
 	ready := make(chan client.ServerHello, 1)
 	done := make(chan error, 1)
 	serverArgs := []string{"-addr", "127.0.0.1:0", "-cache-dir", cacheDir}
 	go func() {
 		_, err := ccvmd.RunServer(serverArgs, ccvmd.ServerOptions{
-			Kind:          "squadvm",
+			Kind:          appConfig.Kind,
 			StartupWriter: io.Discard,
 			OnStartup: func(hello client.ServerHello) error {
 				ready <- hello
@@ -59,13 +59,13 @@ func startEmbeddedSquadVMBackend(cacheDir, name string, displayReady chan<- disp
 	if scheme == "" {
 		scheme = "http"
 	}
-	return &embeddedSquadVMBackend{
+	return &embeddedBackend{
 		api:  client.NewClient(scheme+"://"+hello.Addr, nil),
 		done: done,
 	}, nil
 }
 
-func (b *embeddedSquadVMBackend) stop() error {
+func (b *embeddedBackend) stop() error {
 	if b == nil || b.finished {
 		return nil
 	}

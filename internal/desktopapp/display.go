@@ -1,4 +1,4 @@
-package main
+package desktopapp
 
 import (
 	"bytes"
@@ -58,7 +58,7 @@ void main() {
 	float coverage = smoothstep(0.0, shapeGeometry.w, -distanceToEdge);
 	color = vec4(shapeColor.rgb, shapeColor.a * coverage);
 }`
-	backgroundFragmentShader = `#version 150
+	backgroundFragmentShaderTemplate = `#version 150
 uniform vec4 backgroundGeometry;
 in vec2 uv;
 out vec4 color;
@@ -68,9 +68,9 @@ void main() {
 	vec2 glowCenter = vec2(size.x * 0.92, -size.y * 0.08);
 	float glowRadius = min(size.x, size.y) * 0.56;
 	float glow = (1.0 - smoothstep(0.0, glowRadius, length(point - glowCenter))) * 0.22;
-	vec3 base = vec3(23.0, 14.0, 31.0) / 255.0;
-	vec3 purple = vec3(101.0, 29.0, 241.0) / 255.0;
-	color = vec4(mix(base, purple, glow), 1.0);
+	vec3 base = vec3(%d.0, %d.0, %d.0) / 255.0;
+	vec3 accent = vec3(%d.0, %d.0, %d.0) / 255.0;
+	color = vec4(mix(base, accent, glow), 1.0);
 }`
 	checkmarkFragmentShader = `#version 150
 uniform vec4 iconColor;
@@ -347,7 +347,7 @@ func (v *displayViewer) init() error {
 	}
 	v.roundedRectColor = v.gl.GetUniformLocation(v.roundedRectProgram, "shapeColor")
 	v.roundedRectGeometry = v.gl.GetUniformLocation(v.roundedRectProgram, "shapeGeometry")
-	v.backgroundProgram, err = compileGraphicsProgram(v.gl, backgroundFragmentShader)
+	v.backgroundProgram, err = compileGraphicsProgram(v.gl, backgroundFragmentShader())
 	if err != nil {
 		return fmt.Errorf("compile interface background renderer: %w", err)
 	}
@@ -643,7 +643,7 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 					v.startCancel()
 					v.setStartupProgress(startupProgress{
 						Phase:  startupDesktop,
-						Title:  "Stopping SquadVM",
+						Title:  "Stopping " + productName(),
 						Detail: "Waiting for the virtual machine to stop safely",
 					})
 				} else {
@@ -733,7 +733,7 @@ func (v *displayViewer) activateStartupControl(control startupControl) {
 }
 
 func (v *displayViewer) beginSettingsStart(refreshImage bool) {
-	share, err := squadvmStorageShare(v.settings.SharedFolder)
+	share, err := createStorageShare(v.settings.SharedFolder)
 	if err != nil {
 		v.folderSelectionErr = err.Error()
 		return
@@ -756,7 +756,7 @@ func (v *displayViewer) chooseSharedFolder() {
 	if selected == "" {
 		return
 	}
-	share, err := squadvmStorageShare(selected)
+	share, err := createStorageShare(selected)
 	if err != nil {
 		v.folderSelectionErr = err.Error()
 		return
@@ -810,60 +810,60 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 	title := "Checking your system"
 	detail := "Confirming the host and desktop image are ready."
 	state := "CHECKING"
-	stateColor := color.RGBA{R: 199, G: 184, B: 210, A: 255}
-	stateBackground := color.RGBA{R: 51, G: 39, B: 61, A: 255}
-	titleColor := color.RGBA{R: 243, G: 245, B: 239, A: 255}
+	stateColor := uiTextSecondary
+	stateBackground := uiSurfaceRaised
+	titleColor := uiText
 	if v.preflightErr != nil {
 		title = "Checks failed"
 		detail = "See the complete error below."
 		state = "ACTION NEEDED"
-		stateColor = color.RGBA{R: 255, G: 151, B: 151, A: 255}
-		stateBackground = color.RGBA{R: 75, G: 36, B: 47, A: 255}
-		titleColor = color.RGBA{R: 255, G: 137, B: 137, A: 255}
+		stateColor = uiError
+		stateBackground = uiErrorSurface
+		titleColor = uiErrorStrong
 	} else if v.preflightReady {
 		title = "Ready to start"
 		detail = "Your system and desktop image are ready."
 		state = "READY"
-		stateColor = color.RGBA{R: 143, G: 226, B: 156, A: 255}
-		stateBackground = color.RGBA{R: 31, G: 62, B: 45, A: 255}
+		stateColor = uiSuccess
+		stateBackground = uiSuccessSurface
 		if !v.preflight.Image.Installed {
-			title = "Set up SquadVM"
+			title = "Set up " + productName()
 			detail = "Download the desktop image, then start automatically."
 			state = "DOWNLOAD NEEDED"
-			stateColor = color.RGBA{R: 255, G: 193, B: 111, A: 255}
-			stateBackground = color.RGBA{R: 72, G: 52, B: 31, A: 255}
+			stateColor = uiWarning
+			stateBackground = uiWarningSurface
 		} else if v.preflight.hasUpdate() && v.preflight.ReleaseUpdate != nil {
 			title = "Updates available"
 			detail = "Update the desktop image and virtual machine manager."
 			state = "UPDATES"
-			stateColor = color.RGBA{R: 221, G: 202, B: 255, A: 255}
-			stateBackground = color.RGBA{R: 66, G: 39, B: 101, A: 255}
+			stateColor = uiAccentSoft
+			stateBackground = uiSurfaceHover
 		} else if v.preflight.hasUpdate() || v.preflight.ReleaseUpdate != nil {
 			title = "Update available"
-			detail = "A newer SquadVM component is ready to install."
+			detail = "A newer " + productName() + " component is ready to install."
 			state = "UPDATE"
-			stateColor = color.RGBA{R: 221, G: 202, B: 255, A: 255}
-			stateBackground = color.RGBA{R: 66, G: 39, B: 101, A: 255}
+			stateColor = uiAccentSoft
+			stateBackground = uiSurfaceHover
 		}
 		if !v.preflight.canStart() {
 			title = "Can't start yet"
-			detail = "Review the failed requirement before starting SquadVM."
+			detail = "Review the failed requirement before starting " + productName() + "."
 			state = "ACTION NEEDED"
-			stateColor = color.RGBA{R: 255, G: 193, B: 111, A: 255}
-			stateBackground = color.RGBA{R: 72, G: 52, B: 31, A: 255}
-			titleColor = color.RGBA{R: 255, G: 193, B: 111, A: 255}
+			stateColor = uiWarning
+			stateBackground = uiWarningSurface
+			titleColor = uiWarning
 		}
 	}
 
 	stateBounds := layout.state
 	v.drawRoundedRect(backingWidth, backingHeight, scale, stateBounds, stateBounds.Dy()/2, stateBackground)
 	v.text.BeginDraw()
-	v.drawTextBold("SquadVM", left+60, contentTop+21, 19, color.RGBA{R: 243, G: 245, B: 239, A: 255})
-	v.drawText("UQ Cyber Squad", left+60, contentTop+43, 14, color.RGBA{R: 189, G: 151, B: 255, A: 255})
+	v.drawTextBold(productName(), left+60, contentTop+21, 19, uiText)
+	v.drawText(productSubtitle(), left+60, contentTop+43, 14, uiAccent)
 	v.drawCenteredTextBold(state, stateBounds, 13, stateColor)
 	v.drawTextBold(fitStartupText(title, panelWidth, 34), left, contentTop+99, 34, titleColor)
 	for index, line := range wrapStartupText(detail, panelWidth, 18, 2) {
-		v.drawText(line, left, contentTop+129+float32(index*21), 18, color.RGBA{R: 224, G: 216, B: 230, A: 255})
+		v.drawText(line, left, contentTop+129+float32(index*21), 18, uiTextSecondary)
 	}
 	v.text.EndDraw()
 	if failure := v.settingsFailureDetail(); failure != "" {
@@ -895,7 +895,7 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 
 	v.drawSettingsOption(
 		backingWidth, backingHeight, scale, layout.sshCheckbox,
-		"SSH access", "Adds \"ssh squadvm\" to SSH config",
+		"SSH access", "Adds \"ssh "+appConfig.SSHHost+"\" to SSH config",
 		v.settings.SSHEnabled,
 		v.startupFocusVisible && v.startupFocus == startupControlSSH,
 		v.startupHover == startupControlSSH,
@@ -910,38 +910,38 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 	v.drawSharedFolderOption(backingWidth, backingHeight, scale, layout)
 
 	button := layout.button
-	buttonColor := color.RGBA{R: 69, G: 54, B: 80, A: 255}
-	buttonText := color.RGBA{R: 153, G: 142, B: 163, A: 255}
+	buttonColor := uiDisabled
+	buttonText := uiDisabled
 	if v.preflightReady && v.preflight.canStart() && !v.starting {
-		buttonColor = color.RGBA{R: 95, G: 23, B: 238, A: 255}
-		buttonText = color.RGBA{R: 255, G: 255, B: 255, A: 255}
+		buttonColor = uiPrimary
+		buttonText = uiWhite
 		if v.startupHover == startupControlPrimary {
-			buttonColor = color.RGBA{R: 117, G: 49, B: 255, A: 255}
+			buttonColor = uiPrimaryHover
 		}
 	}
 	divider := layout.actionDivider
 	v.drawRect(backingWidth, backingHeight, scale,
 		float32(divider.Min.X), float32(divider.Min.Y), float32(divider.Dx()), float32(divider.Dy()),
-		color.RGBA{R: 57, G: 43, B: 67, A: 255})
+		uiSurfaceRaised)
 	v.drawRoundedRect(backingWidth, backingHeight, scale, button, 9, buttonColor)
-	label := "Start SquadVM"
+	label := "Start " + productName()
 	if v.preflightReady && !v.preflight.Image.Installed {
 		label = "Download & start"
 	}
 	if v.preflightReady && v.preflight.hasUpdate() {
 		label = "Update & start"
 		skip := layout.skip
-		skipColor := color.RGBA{R: 54, G: 41, B: 65, A: 255}
-		skipText := color.RGBA{R: 235, G: 229, B: 240, A: 255}
+		skipColor := uiSurface
+		skipText := uiText
 		if v.starting {
-			skipText = color.RGBA{R: 153, G: 142, B: 163, A: 255}
+			skipText = uiDisabled
 		} else if v.startupHover == startupControlSkip {
-			skipColor = color.RGBA{R: 68, G: 52, B: 80, A: 255}
+			skipColor = uiSurfaceHover
 		}
 		v.drawPanel(backingWidth, backingHeight, scale, skip, 9,
-			color.RGBA{R: 76, G: 59, B: 89, A: 255}, skipColor)
+			uiBorderStrong, skipColor)
 		if v.startupFocusVisible && v.startupFocus == startupControlSkip {
-			v.drawOutline(backingWidth, backingHeight, scale, skip, color.RGBA{R: 250, G: 238, B: 52, A: 255})
+			v.drawOutline(backingWidth, backingHeight, scale, skip, uiAccent)
 		}
 		v.text.BeginDraw()
 		v.drawCenteredTextBold("Skip", skip, 15, skipText)
@@ -951,7 +951,7 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 		label = "Starting…"
 	}
 	if v.startupFocusVisible && v.startupFocus == startupControlPrimary {
-		v.drawOutline(backingWidth, backingHeight, scale, button, color.RGBA{R: 250, G: 238, B: 52, A: 255})
+		v.drawOutline(backingWidth, backingHeight, scale, button, uiAccent)
 	}
 	v.text.BeginDraw()
 	v.drawCenteredTextBold(label, button, 15, buttonText)
@@ -960,7 +960,7 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 		shortcutWidth = float32(button.Min.X) - left - 12
 	}
 	v.drawText(fitStartupText("Space  select   ·   Tab  move   ·   Enter  start", shortcutWidth, 15),
-		left, float32(button.Min.Y+33), 15, color.RGBA{R: 211, G: 202, B: 218, A: 255})
+		left, float32(button.Min.Y+33), 15, uiAccentSoft)
 	v.text.EndDraw()
 }
 
@@ -994,18 +994,18 @@ func (v *displayViewer) drawSettingsFailure(backingWidth, backingHeight int, sca
 	v.startupDetailScroll = min(maxScroll, max(0, v.startupDetailScroll))
 	bounds := image.Rect(int(left), int(top), int(left+width), int(top+230))
 	v.drawPanel(backingWidth, backingHeight, scale, bounds, 10,
-		color.RGBA{R: 92, G: 43, B: 56, A: 255}, color.RGBA{R: 39, G: 24, B: 32, A: 255})
+		uiErrorBorder, uiErrorSurface)
 	v.text.BeginDraw()
-	v.drawTextBold("STARTUP CHECK DETAILS", left+14, top+24, 13, color.RGBA{R: 255, G: 151, B: 151, A: 255})
+	v.drawTextBold("STARTUP CHECK DETAILS", left+14, top+24, 13, uiError)
 	for index, line := range lines[v.startupDetailScroll:min(len(lines), v.startupDetailScroll+visibleLines)] {
-		v.drawText(line, left+14, top+49+float32(index)*lineHeight, 15, color.RGBA{R: 243, G: 229, B: 234, A: 255})
+		v.drawText(line, left+14, top+49+float32(index)*lineHeight, 15, uiText)
 	}
 	footer := "Close this window after reviewing the error"
 	if maxScroll > 0 {
 		footer = fmt.Sprintf("Scroll or use arrow keys for the full error  ·  lines %d–%d of %d",
 			v.startupDetailScroll+1, min(len(lines), v.startupDetailScroll+visibleLines), len(lines))
 	}
-	v.drawText(footer, left, top+260, 15, color.RGBA{R: 211, G: 190, B: 199, A: 255})
+	v.drawText(footer, left, top+260, 15, uiTextSecondary)
 	v.text.EndDraw()
 }
 
@@ -1019,19 +1019,19 @@ func (v *displayViewer) drawPreflightCard(
 	top := float32(bounds.Min.Y)
 	width := float32(bounds.Dx())
 	v.drawPanel(backingWidth, backingHeight, scale, bounds, 10,
-		color.RGBA{R: 55, G: 41, B: 64, A: 255}, color.RGBA{R: 33, G: 22, B: 41, A: 255})
-	statusColor := color.RGBA{R: 157, G: 144, B: 168, A: 255}
-	badgeColor := color.RGBA{R: 58, G: 45, B: 69, A: 255}
+		uiSurfaceRaised, uiCanvas)
+	statusColor := uiTextMuted
+	badgeColor := uiSurfaceRaised
 	switch status {
 	case "PASS":
-		statusColor = color.RGBA{R: 143, G: 226, B: 156, A: 255}
-		badgeColor = color.RGBA{R: 35, G: 69, B: 52, A: 255}
+		statusColor = uiSuccess
+		badgeColor = uiSuccessSurface
 	case "FAIL":
-		statusColor = color.RGBA{R: 255, G: 137, B: 137, A: 255}
-		badgeColor = color.RGBA{R: 81, G: 42, B: 54, A: 255}
+		statusColor = uiErrorStrong
+		badgeColor = uiErrorSurface
 	case "UPDATE":
-		statusColor = color.RGBA{R: 221, G: 202, B: 255, A: 255}
-		badgeColor = color.RGBA{R: 75, G: 45, B: 116, A: 255}
+		statusColor = uiAccentSoft
+		badgeColor = uiPrimary
 	}
 	badge := image.Rect(int(left+12), int(top+14), int(left+46), int(top+48))
 	v.drawRoundedRect(backingWidth, backingHeight, scale, badge, 9, badgeColor)
@@ -1040,8 +1040,8 @@ func (v *displayViewer) drawPreflightCard(
 	}
 	v.text.BeginDraw()
 	v.drawCenteredTextBold(statusSymbol(status), badge, 18, statusColor)
-	v.drawTextBold(label, left+58, top+25, 16, color.RGBA{R: 243, G: 245, B: 239, A: 255})
-	v.drawText(fitStartupText(detail, width-70, 15), left+58, top+49, 15, color.RGBA{R: 211, G: 202, B: 218, A: 255})
+	v.drawTextBold(label, left+58, top+25, 16, uiText)
+	v.drawText(fitStartupText(detail, width-70, 15), left+58, top+49, 15, uiAccentSoft)
 	v.text.EndDraw()
 }
 
@@ -1052,32 +1052,32 @@ func (v *displayViewer) drawSettingsOption(
 	title, detail string,
 	enabled, focused, hovered bool,
 ) {
-	borderColor := color.RGBA{R: 68, G: 52, B: 79, A: 255}
-	fillColor := color.RGBA{R: 38, G: 27, B: 47, A: 255}
+	borderColor := uiBorder
+	fillColor := uiSurface
 	if hovered {
-		borderColor = color.RGBA{R: 101, G: 74, B: 121, A: 255}
-		fillColor = color.RGBA{R: 47, G: 33, B: 58, A: 255}
+		borderColor = uiBorderStrong
+		fillColor = uiSurfaceHover
 	}
 	v.drawPanel(backingWidth, backingHeight, scale, bounds, 10,
 		borderColor, fillColor)
 	toggleX := float32(bounds.Min.X + 12)
 	toggleY := float32(bounds.Min.Y + 19)
-	toggleColor := color.RGBA{R: 75, G: 59, B: 87, A: 255}
+	toggleColor := uiSurfaceRaised
 	knobX := toggleX + 3
 	if enabled {
-		toggleColor = color.RGBA{R: 95, G: 23, B: 238, A: 255}
+		toggleColor = uiPrimary
 		knobX = toggleX + 19
 	}
 	v.drawRoundedRect(backingWidth, backingHeight, scale, image.Rect(int(toggleX), int(toggleY), int(toggleX+38), int(toggleY+22)), 11, toggleColor)
-	v.drawRoundedRect(backingWidth, backingHeight, scale, image.Rect(int(knobX), int(toggleY+3), int(knobX+16), int(toggleY+19)), 8, color.RGBA{R: 250, G: 249, B: 251, A: 255})
+	v.drawRoundedRect(backingWidth, backingHeight, scale, image.Rect(int(knobX), int(toggleY+3), int(knobX+16), int(toggleY+19)), 8, uiText)
 	if focused {
-		v.drawOutline(backingWidth, backingHeight, scale, bounds, color.RGBA{R: 250, G: 238, B: 52, A: 255})
+		v.drawOutline(backingWidth, backingHeight, scale, bounds, uiAccent)
 	}
 	v.text.BeginDraw()
 	textX := float32(bounds.Min.X + 62)
 	textWidth := float32(bounds.Dx() - 74)
-	v.drawTextBold(title, textX, float32(bounds.Min.Y+24), 16, color.RGBA{R: 243, G: 245, B: 239, A: 255})
-	v.drawText(fitStartupText(detail, textWidth, 15), textX, float32(bounds.Min.Y+47), 15, color.RGBA{R: 211, G: 202, B: 218, A: 255})
+	v.drawTextBold(title, textX, float32(bounds.Min.Y+24), 16, uiText)
+	v.drawText(fitStartupText(detail, textWidth, 15), textX, float32(bounds.Min.Y+47), 15, uiAccentSoft)
 	v.text.EndDraw()
 }
 
@@ -1089,28 +1089,28 @@ func (v *displayViewer) drawSharedFolderOption(
 	bounds := layout.sharedFolder
 	browse := layout.sharedBrowse
 	v.drawPanel(backingWidth, backingHeight, scale, bounds, 10,
-		color.RGBA{R: 68, G: 52, B: 79, A: 255}, color.RGBA{R: 38, G: 27, B: 47, A: 255})
-	browseColor := color.RGBA{R: 63, G: 47, B: 75, A: 255}
+		uiBorder, uiSurface)
+	browseColor := uiSurfaceRaised
 	if v.startupHover == startupControlSharedFolder {
-		browseColor = color.RGBA{R: 82, G: 59, B: 98, A: 255}
+		browseColor = uiSurfaceHover
 	}
 	v.drawPanel(backingWidth, backingHeight, scale, browse, 8,
-		color.RGBA{R: 91, G: 67, B: 108, A: 255}, browseColor)
+		uiBorderStrong, browseColor)
 	if v.startupFocusVisible && v.startupFocus == startupControlSharedFolder {
-		v.drawOutline(backingWidth, backingHeight, scale, browse, color.RGBA{R: 250, G: 238, B: 52, A: 255})
+		v.drawOutline(backingWidth, backingHeight, scale, browse, uiAccent)
 	}
 	detail := v.settings.SharedFolder
-	detailColor := color.RGBA{R: 211, G: 202, B: 218, A: 255}
+	detailColor := uiAccentSoft
 	if v.folderSelectionErr != "" {
 		detail = v.folderSelectionErr
-		detailColor = color.RGBA{R: 255, G: 151, B: 151, A: 255}
+		detailColor = uiError
 	}
 	textX := float32(bounds.Min.X + 14)
 	textWidth := float32(browse.Min.X-bounds.Min.X) - 26
 	v.text.BeginDraw()
-	v.drawTextBold("Shared folder", textX, float32(bounds.Min.Y+21), 16, color.RGBA{R: 243, G: 245, B: 239, A: 255})
+	v.drawTextBold("Shared folder", textX, float32(bounds.Min.Y+21), 16, uiText)
 	v.drawText(fitStartupText(detail, textWidth, 14), textX, float32(bounds.Min.Y+43), 14, detailColor)
-	v.drawCenteredTextBold("Choose folder", browse, 14, color.RGBA{R: 243, G: 245, B: 239, A: 255})
+	v.drawCenteredTextBold("Choose folder", browse, 14, uiText)
 	v.text.EndDraw()
 }
 
@@ -1217,18 +1217,18 @@ func (v *displayViewer) drawStartup(backingWidth, backingHeight int, now time.Ti
 	v.text.SetScale(scale)
 
 	state := "IN PROGRESS"
-	stateColor := color.RGBA{R: 221, G: 202, B: 255, A: 255}
-	stateBackground := color.RGBA{R: 66, G: 39, B: 101, A: 255}
+	stateColor := uiAccentSoft
+	stateBackground := uiSurfaceHover
 	if v.startup.Failed {
 		state = "INTERRUPTED"
-		stateColor = color.RGBA{R: 255, G: 151, B: 151, A: 255}
-		stateBackground = color.RGBA{R: 75, G: 36, B: 47, A: 255}
+		stateColor = uiError
+		stateBackground = uiErrorSurface
 	}
 	stateBounds := layout.state
 	v.drawRoundedRect(backingWidth, backingHeight, scale, stateBounds, stateBounds.Dy()/2, stateBackground)
 	v.text.BeginDraw()
-	v.drawTextBold("SquadVM", left+60, contentTop+21, 19, color.RGBA{R: 243, G: 245, B: 239, A: 255})
-	v.drawText(startupEyebrow(v.startup), left+60, contentTop+43, 14, color.RGBA{R: 189, G: 151, B: 255, A: 255})
+	v.drawTextBold(productName(), left+60, contentTop+21, 19, uiText)
+	v.drawText(startupEyebrow(v.startup), left+60, contentTop+43, 14, uiAccent)
 	v.drawCenteredTextBold(state, stateBounds, 13, stateColor)
 	v.text.EndDraw()
 	if v.startup.Failed {
@@ -1239,11 +1239,11 @@ func (v *displayViewer) drawStartup(backingWidth, backingHeight int, now time.Ti
 		v.drawStartupSerial(backingWidth, backingHeight, scale, left, contentTop+82, panelWidth)
 		return
 	}
-	v.drawStartupChecklist(backingWidth, backingHeight, scale, left, contentTop+92, panelWidth, now)
+	v.drawStartupChecklist(backingWidth, backingHeight, scale, left, contentTop+84, panelWidth, now)
 
-	accent := color.RGBA{R: 95, G: 23, B: 238, A: 255}
+	accent := uiPrimary
 	drawBar := func(y, height, fraction float32, determinate bool, barColor color.RGBA) {
-		v.drawRect(backingWidth, backingHeight, scale, left, y, panelWidth, height, color.RGBA{R: 50, G: 35, B: 63, A: 255})
+		v.drawRect(backingWidth, backingHeight, scale, left, y, panelWidth, height, uiSurfaceRaised)
 		if determinate {
 			fraction = min(float32(1), max(float32(0), fraction))
 			v.drawRect(backingWidth, backingHeight, scale, left, y, panelWidth*fraction, height, barColor)
@@ -1263,27 +1263,26 @@ func (v *displayViewer) drawStartup(backingWidth, backingHeight int, now time.Ti
 		downloadText := formatStartupDownload(v.startup)
 		indexText := formatStartupIndex(v.startup)
 		v.text.BeginDraw()
-		v.drawTextBold("DOWNLOAD", left, contentTop+169, 15, color.RGBA{R: 189, G: 151, B: 255, A: 255})
+		v.drawTextBold("DOWNLOAD", left, contentTop+174, 15, uiAccent)
 		downloadWidth := float32(v.text.GetAdvance(v.font, 15, downloadText))
-		v.drawText(downloadText, left+panelWidth-downloadWidth, contentTop+169, 15, color.RGBA{R: 211, G: 202, B: 218, A: 255})
-		v.drawTextBold("INDEX", left, contentTop+207, 15, color.RGBA{R: 250, G: 238, B: 52, A: 255})
+		v.drawText(downloadText, left+panelWidth-downloadWidth, contentTop+174, 15, uiTextSecondary)
+		v.drawText("Indexing concurrently", left, contentTop+215, 15, uiTextMuted)
 		indexWidth := float32(v.text.GetAdvance(v.font, 15, indexText))
-		v.drawText(indexText, left+panelWidth-indexWidth, contentTop+207, 15, color.RGBA{R: 211, G: 202, B: 218, A: 255})
+		v.drawText(indexText, left+panelWidth-indexWidth, contentTop+215, 15, uiTextMuted)
 		v.text.EndDraw()
-		drawBar(contentTop+176, 9, float32(v.startup.DownloadProgress), true, accent)
-		drawBar(contentTop+214, 9, float32(v.startup.IndexProgress), true, color.RGBA{R: 250, G: 238, B: 52, A: 255})
+		drawBar(contentTop+181, 9, float32(v.startup.DownloadProgress), true, accent)
 	} else {
 		if v.startup.Failed {
-			accent = color.RGBA{R: 224, G: 90, B: 90, A: 255}
+			accent = uiErrorStrong
 		}
 		drawBar(float32(layout.bar.Min.Y), float32(layout.bar.Dy()), float32(v.startup.Progress), v.startup.Determinate || v.startup.Failed, accent)
 		transfer := formatStartupTransfer(v.startup)
 		eta := formatStartupETA(v.startup.ETA)
 		v.text.BeginDraw()
-		v.drawText(transfer, left, contentTop+220, 15, color.RGBA{R: 211, G: 202, B: 218, A: 255})
+		v.drawText(transfer, left, contentTop+220, 15, uiAccentSoft)
 		if eta != "" {
 			etaWidth := float32(v.text.GetAdvance(v.font, 15, eta))
-			v.drawText(eta, left+panelWidth-etaWidth, contentTop+220, 15, color.RGBA{R: 211, G: 202, B: 218, A: 255})
+			v.drawText(eta, left+panelWidth-etaWidth, contentTop+220, 15, uiAccentSoft)
 		}
 		v.text.EndDraw()
 	}
@@ -1293,14 +1292,14 @@ func (v *displayViewer) drawStartup(backingWidth, backingHeight int, now time.Ti
 		bounds := layout.steps[index]
 		x := float32(bounds.Min.X)
 		y := float32(bounds.Min.Y)
-		stepColor := color.RGBA{R: 57, G: 43, B: 68, A: 255}
-		textColor := color.RGBA{R: 157, G: 144, B: 168, A: 255}
+		stepColor := uiBorder
+		textColor := uiTextSecondary
 		if startupPhase(index) < v.startup.Phase {
-			stepColor = color.RGBA{R: 95, G: 23, B: 238, A: 255}
-			textColor = color.RGBA{R: 189, G: 151, B: 255, A: 255}
+			stepColor = uiPrimary
+			textColor = uiAccent
 		} else if startupPhase(index) == v.startup.Phase {
-			stepColor = color.RGBA{R: 250, G: 238, B: 52, A: 255}
-			textColor = color.RGBA{R: 243, G: 245, B: 239, A: 255}
+			stepColor = uiAccent
+			textColor = uiText
 		}
 		v.drawRect(backingWidth, backingHeight, scale, x, y, float32(bounds.Dx()), 3, stepColor)
 		v.text.BeginDraw()
@@ -1313,7 +1312,7 @@ func (v *displayViewer) drawStartup(backingWidth, backingHeight int, now time.Ti
 	if v.startup.Failed {
 		footer = "Close this window to stop"
 	}
-	v.drawText(footer, left, contentTop+338, 15, color.RGBA{R: 190, G: 177, B: 201, A: 255})
+	v.drawText(footer, left, contentTop+338, 15, uiTextSecondary)
 	v.text.EndDraw()
 }
 
@@ -1328,19 +1327,19 @@ func (v *displayViewer) drawStartupFailure(backingWidth, backingHeight int, scal
 	v.startupDetailScroll = min(maxScroll, max(0, v.startupDetailScroll))
 	bounds := image.Rect(int(left), int(top), int(left+width), int(top+226))
 	v.drawPanel(backingWidth, backingHeight, scale, bounds, 10,
-		color.RGBA{R: 92, G: 43, B: 56, A: 255}, color.RGBA{R: 39, G: 24, B: 32, A: 255})
+		uiErrorBorder, uiErrorSurface)
 
 	v.text.BeginDraw()
-	v.drawTextBold(v.startup.Title, left+14, top+25, 16, color.RGBA{R: 255, G: 151, B: 151, A: 255})
+	v.drawTextBold(v.startup.Title, left+14, top+25, 16, uiError)
 	for index, line := range lines[v.startupDetailScroll:min(len(lines), v.startupDetailScroll+visibleLines)] {
-		v.drawText(line, left+14, top+49+float32(index)*lineHeight, 15, color.RGBA{R: 243, G: 229, B: 234, A: 255})
+		v.drawText(line, left+14, top+49+float32(index)*lineHeight, 15, uiText)
 	}
 	footer := "Esc for settings  ·  Close this window to stop"
 	if maxScroll > 0 {
 		footer = fmt.Sprintf("Scroll or use arrow keys for the full error  ·  lines %d–%d of %d",
 			v.startupDetailScroll+1, min(len(lines), v.startupDetailScroll+visibleLines), len(lines))
 	}
-	v.drawText(footer, left, top+256, 15, color.RGBA{R: 211, G: 190, B: 199, A: 255})
+	v.drawText(footer, left, top+256, 15, uiTextSecondary)
 	v.text.EndDraw()
 }
 
@@ -1356,7 +1355,7 @@ func (v *displayViewer) drawStartupSerial(backingWidth, backingHeight int, scale
 	snapshot := v.startupTerminal.Snapshot()
 	bounds := image.Rect(int(left), int(top), int(left+width), int(top+246))
 	v.drawPanel(backingWidth, backingHeight, scale, bounds, 8,
-		color.RGBA{R: 79, G: 59, B: 91, A: 255}, color.RGBA{R: 14, G: 11, B: 17, A: 255})
+		uiSurfaceRaised, uiCanvas)
 	textLeft := left + 12
 	textTop := top + 37
 	for row, cells := range snapshot.Cells {
@@ -1394,7 +1393,7 @@ func (v *displayViewer) drawStartupSerial(backingWidth, backingHeight int, scale
 		}
 	}
 	v.text.BeginDraw()
-	v.drawTextBold("BOOT CONSOLE", textLeft, top+19, 12, color.RGBA{R: 189, G: 151, B: 255, A: 255})
+	v.drawTextBold("BOOT CONSOLE", textLeft, top+19, 12, uiAccent)
 	for row, cells := range snapshot.Cells {
 		for column := 0; column < len(cells); {
 			attr := cells[column].Attr
@@ -1420,7 +1419,7 @@ func (v *displayViewer) drawStartupSerial(backingWidth, backingHeight int, scale
 		}
 	}
 	v.drawText("Esc for settings  ·  Console follows the latest boot output", left, top+276, 15,
-		color.RGBA{R: 190, G: 177, B: 201, A: 255})
+		uiTextSecondary)
 	v.text.EndDraw()
 }
 
@@ -1435,12 +1434,12 @@ func startupTerminalRune(r rune) rune {
 }
 
 func startupTerminalCellColors(attr ptyterm.Attr) (color.RGBA, color.RGBA) {
-	fg := startupTerminalColor(attr.FG, color.RGBA{R: 218, G: 211, B: 222, A: 255}, attr.Bold)
+	fg := startupTerminalColor(attr.FG, uiTextSecondary, attr.Bold)
 	bg := startupTerminalColor(attr.BG, color.RGBA{}, false)
 	if attr.Inverse {
 		originalFG := fg
 		if bg.A == 0 {
-			fg = color.RGBA{R: 14, G: 11, B: 17, A: 255}
+			fg = uiCanvas
 		} else {
 			fg = bg
 		}
@@ -1524,13 +1523,13 @@ func (v *displayViewer) drawStartupChecklist(
 		y := top + float32(row)*rowHeight + offset
 		icon := image.Rect(int(left), int(y+3), int(left+18), int(y+21))
 		if index < len(v.startupChecklist)-1 {
-			v.drawRoundedRect(backingWidth, backingHeight, scale, icon, 9, color.RGBA{R: 95, G: 23, B: 238, A: 255})
-			v.drawCheckmark(backingWidth, backingHeight, scale, icon, color.RGBA{R: 243, G: 237, B: 255, A: 255})
+			v.drawRoundedRect(backingWidth, backingHeight, scale, icon, 9, uiPrimary)
+			v.drawCheckmark(backingWidth, backingHeight, scale, icon, uiAccentSoft)
 			continue
 		}
-		dotColor := color.RGBA{R: 250, G: 238, B: 52, A: 255}
+		dotColor := uiAccent
 		if v.startupChecklist[index].Failed {
-			dotColor = color.RGBA{R: 255, G: 137, B: 137, A: 255}
+			dotColor = uiErrorStrong
 		}
 		dot := image.Rect(int(left+5), int(y+8), int(left+13), int(y+16))
 		v.drawRoundedRect(backingWidth, backingHeight, scale, dot, 4, dotColor)
@@ -1547,13 +1546,13 @@ func (v *displayViewer) drawStartupChecklist(
 		}
 		line = fitStartupText(line, width-32, 16)
 		if index == len(v.startupChecklist)-1 {
-			textColor := color.RGBA{R: 243, G: 245, B: 239, A: 255}
+			textColor := uiText
 			if item.Failed {
-				textColor = color.RGBA{R: 255, G: 151, B: 151, A: 255}
+				textColor = uiError
 			}
 			v.drawTextBold(line, left+30, y+18, 16, textColor)
 		} else {
-			v.drawText(line, left+30, y+18, 16, color.RGBA{R: 177, G: 163, B: 187, A: 255})
+			v.drawText(line, left+30, y+18, 16, uiTextSecondary)
 		}
 	}
 	v.text.EndDraw()
@@ -1561,15 +1560,15 @@ func (v *displayViewer) drawStartupChecklist(
 }
 
 func (v *displayViewer) loadBrandTexture() error {
-	decoded, err := png.Decode(bytes.NewReader(squadvmBrandPNG))
+	decoded, err := png.Decode(bytes.NewReader(appConfig.BrandPNG))
 	if err != nil {
-		return fmt.Errorf("decode embedded SquadVM artwork: %w", err)
+		return fmt.Errorf("decode embedded %s artwork: %w", productName(), err)
 	}
 	bounds := decoded.Bounds()
 	rgba := image.NewNRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
 	imagedraw.Draw(rgba, rgba.Bounds(), decoded, bounds.Min, imagedraw.Src)
 	if len(rgba.Pix) == 0 {
-		return fmt.Errorf("embedded SquadVM artwork is empty")
+		return fmt.Errorf("embedded %s artwork is empty", productName())
 	}
 
 	v.brandWidth, v.brandHeight = bounds.Dx(), bounds.Dy()
@@ -1609,11 +1608,11 @@ func startupEyebrow(progress startupProgress) string {
 	}
 	switch progress.Phase {
 	case startupImage:
-		return "SQUADVM IMAGE"
+		return "PREPARING IMAGE"
 	case startupBoot:
 		return "STARTING VIRTUAL MACHINE"
 	default:
-		return "STARTING SQUADVM"
+		return "STARTING " + strings.ToUpper(productName())
 	}
 }
 
@@ -1861,16 +1860,17 @@ func (v *displayViewer) handleResize() error {
 }
 
 func guestDisplaySize(backingWidth, backingHeight int, scale float32) image.Point {
-	// BackingSize is already expressed in device pixels. Match the guest mode
-	// to it directly so the desktop texture is presented 1:1 on HiDPI hosts.
-	// Dividing by the UI scale here renders a smaller guest mode and then asks
-	// OpenGL to enlarge it again, visibly resampling text and fine lines.
-	_ = scale
-	width := max(1, backingWidth)
+	// The guest desktop does not inherit the host's DPI scale. Give it the
+	// window's logical size so controls and text keep their intended physical
+	// size on Retina and other HiDPI displays. The native UI still renders into
+	// the full backing buffer, and pointer input is mapped between the two sizes.
+	scale = normalizedDisplayScale(scale)
+	width := max(1, int(math.Round(float64(float32(backingWidth)/scale))))
 	if aligned := width &^ 7; aligned > 0 {
 		width = aligned
 	}
-	return image.Pt(width, max(1, backingHeight))
+	height := max(1, int(math.Round(float64(float32(backingHeight)/scale))))
+	return image.Pt(width, height)
 }
 
 func (v *displayViewer) updateGuestCursor() error {
@@ -2084,19 +2084,56 @@ func (v *displayViewer) sendPointer(x, y float32, buttons uint8) error {
 }
 
 func (v *displayViewer) syncClipboard(clipboard window.Clipboard) error {
-	if text := clipboard.GetText(); text != v.hostClipboard {
-		v.hostClipboard = text
-		v.session.SetClipboard(text)
+	hostText := clipboard.GetText()
+	guestText, guestGeneration := v.session.GuestClipboard()
+	decision := reconcileClipboard(
+		v.hostClipboard,
+		v.guestClipboardGen,
+		hostText,
+		guestText,
+		guestGeneration,
+	)
+	v.hostClipboard = decision.text
+	v.guestClipboardGen = decision.guestGeneration
+	if decision.sendToGuest {
+		v.session.SetClipboard(decision.text)
 	}
-	text, generation := v.session.GuestClipboard()
-	if generation != 0 && generation != v.guestClipboardGen {
-		v.guestClipboardGen = generation
-		v.hostClipboard = text
-		if err := clipboard.SetText(text); err != nil {
+	if decision.writeToHost {
+		if err := clipboard.SetText(decision.text); err != nil {
 			return fmt.Errorf("update host clipboard: %w", err)
 		}
 	}
 	return nil
+}
+
+type clipboardDecision struct {
+	text            string
+	guestGeneration uint64
+	sendToGuest     bool
+	writeToHost     bool
+}
+
+func reconcileClipboard(cachedText string, cachedGuestGeneration uint64, hostText, guestText string, guestGeneration uint64) clipboardDecision {
+	hostChanged := hostText != cachedText
+	guestChanged := guestGeneration != 0 && guestGeneration != cachedGuestGeneration
+	if hostChanged {
+		// A pasteboard edit and a guest update can arrive in the same polling
+		// interval. Prefer the host edit and acknowledge the observed guest
+		// generation so stale guest text cannot immediately overwrite it.
+		return clipboardDecision{
+			text:            hostText,
+			guestGeneration: guestGeneration,
+			sendToGuest:     true,
+		}
+	}
+	if guestChanged {
+		return clipboardDecision{
+			text:            guestText,
+			guestGeneration: guestGeneration,
+			writeToHost:     guestText != hostText,
+		}
+	}
+	return clipboardDecision{text: cachedText, guestGeneration: cachedGuestGeneration}
 }
 
 func mouseButtonMask(button window.Button) uint8 {

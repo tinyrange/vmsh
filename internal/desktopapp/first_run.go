@@ -1,4 +1,4 @@
-package main
+package desktopapp
 
 import (
 	"bytes"
@@ -23,13 +23,19 @@ import (
 )
 
 const (
-	squadVMSSHConfigBegin  = "# BEGIN SQUADVM MANAGED CONFIG"
-	squadVMSSHConfigEnd    = "# END SQUADVM MANAGED CONFIG"
-	squadVMInstallPortable = "portable"
-	squadVMInstallSystem   = "system"
+	appInstallPortable = "portable"
+	appInstallSystem   = "system"
 )
 
-type squadVMSettings struct {
+func managedSSHConfigBegin() string {
+	return "# BEGIN " + strings.ToUpper(appConfig.DefaultVMName) + " MANAGED CONFIG"
+}
+
+func managedSSHConfigEnd() string {
+	return "# END " + strings.ToUpper(appConfig.DefaultVMName) + " MANAGED CONFIG"
+}
+
+type appSettings struct {
 	FirstRunComplete bool    `json:"first_run_complete"`
 	SSHEnabled       bool    `json:"ssh_enabled"`
 	InstallMode      string  `json:"install_mode,omitempty"`
@@ -54,7 +60,7 @@ type startupPreflight struct {
 	FreeBytes            int64
 	RequiredBytes        int64
 	Image                client.ImagePullPlan
-	ReleaseUpdate        *squadVMReleaseUpdate
+	ReleaseUpdate        *releaseUpdate
 	ReleaseChecked       bool
 	ReleaseCheckDetail   string
 }
@@ -77,43 +83,43 @@ func (p startupPreflight) downloadETA(rate float64) time.Duration {
 	return time.Duration(float64(p.Image.BytesToDownload) / rate * float64(time.Second))
 }
 
-func loadSquadVMSettings() (squadVMSettings, string, error) {
+func loadAppSettings() (appSettings, string, error) {
 	configDir, err := os.UserConfigDir()
 	if err != nil {
-		return squadVMSettings{}, "", fmt.Errorf("resolve user configuration directory: %w", err)
+		return appSettings{}, "", fmt.Errorf("resolve user configuration directory: %w", err)
 	}
-	dir := filepath.Join(configDir, "SquadVM")
+	dir := filepath.Join(configDir, appConfig.ConfigDirName)
 	data, err := os.ReadFile(filepath.Join(dir, "settings.json"))
 	if errors.Is(err, fs.ErrNotExist) {
-		return squadVMSettings{}, dir, nil
+		return appSettings{}, dir, nil
 	}
 	if err != nil {
-		return squadVMSettings{}, "", fmt.Errorf("read SquadVM settings: %w", err)
+		return appSettings{}, "", fmt.Errorf("read %s settings: %w", productName(), err)
 	}
-	var settings squadVMSettings
+	var settings appSettings
 	if err := json.Unmarshal(data, &settings); err != nil {
-		return squadVMSettings{}, "", fmt.Errorf("decode SquadVM settings: %w", err)
+		return appSettings{}, "", fmt.Errorf("decode %s settings: %w", productName(), err)
 	}
 	return settings, dir, nil
 }
 
-func saveSquadVMSettings(dir string, settings squadVMSettings) error {
+func saveAppSettings(dir string, settings appSettings) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create SquadVM settings directory: %w", err)
+		return fmt.Errorf("create %s settings directory: %w", productName(), err)
 	}
 	data, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encode SquadVM settings: %w", err)
+		return fmt.Errorf("encode %s settings: %w", productName(), err)
 	}
 	data = append(data, '\n')
 	return writeFileAtomically(filepath.Join(dir, "settings.json"), data, 0o600)
 }
 
-func (s squadVMSettings) systemInstall() bool {
+func (s appSettings) systemInstall() bool {
 	switch s.InstallMode {
-	case squadVMInstallSystem:
+	case appInstallSystem:
 		return true
-	case squadVMInstallPortable:
+	case appInstallPortable:
 		return false
 	default:
 		// Settings written before install modes existed used the system cache.
@@ -124,50 +130,50 @@ func (s squadVMSettings) systemInstall() bool {
 }
 
 var (
-	squadVMExecutable   = os.Executable
-	squadVMUserCacheDir = os.UserCacheDir
-	squadVMGOOS         = runtime.GOOS
+	appExecutable   = os.Executable
+	appUserCacheDir = os.UserCacheDir
+	appGOOS         = runtime.GOOS
 )
 
-func resolveSquadVMCacheDir(explicit string, systemInstall bool) (string, error) {
+func resolveAppCacheDir(explicit string, systemInstall bool) (string, error) {
 	if dir := strings.TrimSpace(explicit); dir != "" {
 		return filepath.Abs(dir)
 	}
 	if systemInstall {
-		userCache, err := squadVMUserCacheDir()
+		userCache, err := appUserCacheDir()
 		if err != nil {
 			return "", fmt.Errorf("resolve user cache directory: %w", err)
 		}
 		return filepath.Join(userCache, "ccx3"), nil
 	}
-	// Releases before portable mode stored SquadVM in the regular ccx3 cache.
+	// Releases before portable mode stored desktop images in the regular ccx3 cache.
 	// Reuse that complete installation before looking beside the executable;
 	// otherwise an upgrade can appear to lose the image and download it again.
-	regularCache, err := resolveSquadVMCacheDir("", true)
-	if err == nil && squadVMCacheContainsImage(regularCache) {
+	regularCache, err := resolveAppCacheDir("", true)
+	if err == nil && appCacheContainsImage(regularCache) {
 		return regularCache, nil
 	}
-	if squadVMGOOS == "darwin" {
-		userCache, err := squadVMUserCacheDir()
+	if appGOOS == "darwin" {
+		userCache, err := appUserCacheDir()
 		if err != nil {
 			return "", fmt.Errorf("resolve user cache directory: %w", err)
 		}
 		// App bundles may be read-only, installed in /Applications, or launched
 		// from an App Translocation mount. An app-specific user cache keeps the
 		// non-system mode writable without sharing the system-install cache.
-		return filepath.Join(userCache, "SquadVM", "ccx3"), nil
+		return filepath.Join(userCache, appConfig.ConfigDirName, "ccx3"), nil
 	}
-	executable, err := squadVMExecutable()
+	executable, err := appExecutable()
 	if err != nil {
-		return "", fmt.Errorf("resolve SquadVM executable: %w", err)
+		return "", fmt.Errorf("resolve %s executable: %w", productName(), err)
 	}
 	executable, err = filepath.EvalSymlinks(executable)
 	if err != nil {
-		return "", fmt.Errorf("resolve SquadVM executable path: %w", err)
+		return "", fmt.Errorf("resolve %s executable path: %w", productName(), err)
 	}
 	executable, err = filepath.Abs(executable)
 	if err != nil {
-		return "", fmt.Errorf("resolve absolute SquadVM executable path: %w", err)
+		return "", fmt.Errorf("resolve absolute %s executable path: %w", productName(), err)
 	}
 	parent := filepath.Dir(executable)
 	appMarker := ".app" + string(filepath.Separator) + "Contents" + string(filepath.Separator) + "MacOS"
@@ -175,28 +181,28 @@ func resolveSquadVMCacheDir(explicit string, systemInstall bool) (string, error)
 		bundle := executable[:index+len(".app")]
 		parent = filepath.Dir(bundle)
 	}
-	return filepath.Join(parent, "SquadVM-data", "cache"), nil
+	return filepath.Join(parent, appConfig.DataDirName, "cache"), nil
 }
 
-func squadVMCacheContainsImage(dir string) bool {
-	info, err := os.Stat(filepath.Join(dir, "images", "squadvm"))
+func appCacheContainsImage(dir string) bool {
+	info, err := os.Stat(filepath.Join(dir, "images", appConfig.CacheImageDir))
 	return err == nil && info.IsDir()
 }
 
-func runSquadVMPreflight(ctx context.Context, api *client.Client, source, cacheDir string) (startupPreflight, error) {
+func runAppPreflight(ctx context.Context, api *client.Client, source, cacheDir string) (startupPreflight, error) {
 	type releaseCheckResult struct {
-		update *squadVMReleaseUpdate
+		update *releaseUpdate
 		err    error
 	}
 	releaseContext, cancelRelease := context.WithTimeout(ctx, 2*time.Second)
 	defer cancelRelease()
 	releaseDone := make(chan releaseCheckResult, 1)
 	go func() {
-		update, err := checkLatestSquadVMRelease(
+		update, err := checkLatestRelease(
 			releaseContext,
-			squadVMReleaseHTTPClient,
-			squadVMLatestReleaseURL,
-			currentSquadVMVersion(),
+			releaseHTTPClient,
+			latestReleaseURL,
+			currentAppVersion(),
 			runtime.GOOS,
 			runtime.GOARCH,
 		)
@@ -220,13 +226,13 @@ func runSquadVMPreflight(ctx context.Context, api *client.Client, source, cacheD
 	}
 
 	if isRegistryImageReference(source) {
-		localName := squadvmPulledImageName(source, runtimeArchitecture())
+		localName := pulledImageName(source, runtimeArchitecture())
 		result.Image, err = api.PlanImagePullContext(ctx, localName, client.PullImageRequest{
 			Source:       source,
 			Architecture: runtimeArchitecture(),
 		})
 		if err != nil {
-			return startupPreflight{}, fmt.Errorf("resolve SquadVM image manifest: %w", err)
+			return startupPreflight{}, fmt.Errorf("resolve %s image manifest: %w", productName(), err)
 		}
 	} else {
 		result.Image = client.ImagePullPlan{Name: source, Source: source, Installed: true, Available: true}
@@ -244,7 +250,7 @@ func runSquadVMPreflight(ctx context.Context, api *client.Client, source, cacheD
 		return startupPreflight{}, fmt.Errorf("check free disk space: %w", err)
 	}
 	result.FreeBytes = free
-	result.RequiredBytes = estimatedSquadVMDiskRequirement(result.Image.BytesToDownload)
+	result.RequiredBytes = estimatedDiskRequirement(result.Image.BytesToDownload)
 	result.DiskOK = result.FreeBytes >= result.RequiredBytes
 	select {
 	case release := <-releaseDone:
@@ -261,7 +267,7 @@ func runSquadVMPreflight(ctx context.Context, api *client.Client, source, cacheD
 	return result, nil
 }
 
-func estimatedSquadVMDiskRequirement(downloadBytes int64) int64 {
+func estimatedDiskRequirement(downloadBytes int64) int64 {
 	const workspaceHeadroom = int64(2 << 30)
 	if downloadBytes <= 0 {
 		return workspaceHeadroom
@@ -276,7 +282,7 @@ func runtimeArchitecture() string {
 	return runtimeGOARCH
 }
 
-func squadVMKernelModules(architecture string) []string {
+func appKernelModules(architecture string) []string {
 	if architecture == "arm64" {
 		return []string{"CONFIG_BINFMT_MISC"}
 	}
@@ -289,57 +295,57 @@ func runtimeArch() string {
 	return runtime.GOARCH
 }
 
-func reserveSquadVMSSHPort() (int, error) {
+func reserveSSHPort() (int, error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return 0, fmt.Errorf("reserve SquadVM SSH port: %w", err)
+		return 0, fmt.Errorf("reserve %s SSH port: %w", productName(), err)
 	}
 	defer listener.Close()
 	port := listener.Addr().(*net.TCPAddr).Port
 	if port <= 0 {
-		return 0, fmt.Errorf("reserve SquadVM SSH port: invalid port %d", port)
+		return 0, fmt.Errorf("reserve %s SSH port: invalid port %d", productName(), port)
 	}
 	return port, nil
 }
 
-func ensureSquadVMSSHIdentity(configDir string) (string, []byte, error) {
+func ensureSSHIdentity(configDir string) (string, []byte, error) {
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
-		return "", nil, fmt.Errorf("create SquadVM settings directory: %w", err)
+		return "", nil, fmt.Errorf("create %s settings directory: %w", productName(), err)
 	}
-	privatePath := filepath.Join(configDir, "squadvm_ed25519")
+	privatePath := filepath.Join(configDir, appConfig.DefaultVMName+"_ed25519")
 	privateData, err := os.ReadFile(privatePath)
 	if err == nil {
 		signer, parseErr := ssh.ParsePrivateKey(privateData)
 		if parseErr != nil {
-			return "", nil, fmt.Errorf("parse SquadVM SSH identity: %w", parseErr)
+			return "", nil, fmt.Errorf("parse %s SSH identity: %w", productName(), parseErr)
 		}
 		return privatePath, ssh.MarshalAuthorizedKey(signer.PublicKey()), nil
 	}
 	if !errors.Is(err, fs.ErrNotExist) {
-		return "", nil, fmt.Errorf("read SquadVM SSH identity: %w", err)
+		return "", nil, fmt.Errorf("read %s SSH identity: %w", productName(), err)
 	}
 
 	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		return "", nil, fmt.Errorf("generate SquadVM SSH identity: %w", err)
+		return "", nil, fmt.Errorf("generate %s SSH identity: %w", productName(), err)
 	}
-	privateBlock, err := ssh.MarshalPrivateKey(privateKey, "SquadVM")
+	privateBlock, err := ssh.MarshalPrivateKey(privateKey, productName())
 	if err != nil {
-		return "", nil, fmt.Errorf("encode SquadVM SSH identity: %w", err)
+		return "", nil, fmt.Errorf("encode %s SSH identity: %w", productName(), err)
 	}
 	if err := writeFileAtomically(privatePath, pem.EncodeToMemory(privateBlock), 0o600); err != nil {
 		return "", nil, err
 	}
 	publicKey, err := ssh.NewPublicKey(privateKey.Public())
 	if err != nil {
-		return "", nil, fmt.Errorf("encode SquadVM SSH public key: %w", err)
+		return "", nil, fmt.Errorf("encode %s SSH public key: %w", productName(), err)
 	}
 	return privatePath, ssh.MarshalAuthorizedKey(publicKey), nil
 }
 
-func configureSquadVMSSHHost(homeDir, identityPath string, port int) error {
+func configureSSHHost(homeDir, identityPath string, port int) error {
 	if port <= 0 || port > 65535 {
-		return fmt.Errorf("invalid SquadVM SSH port %d", port)
+		return fmt.Errorf("invalid %s SSH port %d", productName(), port)
 	}
 	sshDir := filepath.Join(homeDir, ".ssh")
 	if err := os.MkdirAll(sshDir, 0o700); err != nil {
@@ -352,12 +358,14 @@ func configureSquadVMSSHHost(homeDir, identityPath string, port int) error {
 	}
 	cleaned := removeManagedSSHBlock(string(existing))
 	block := fmt.Sprintf(
-		"%s\nHost squadvm\n    HostName 127.0.0.1\n    Port %d\n    User squad\n    IdentityFile %s\n    IdentitiesOnly yes\n    StrictHostKeyChecking accept-new\n    UserKnownHostsFile %s\n%s\n",
-		squadVMSSHConfigBegin,
+		"%s\nHost %s\n    HostName 127.0.0.1\n    Port %d\n    User %s\n    IdentityFile %s\n    IdentitiesOnly yes\n    StrictHostKeyChecking accept-new\n    UserKnownHostsFile %s\n%s\n",
+		managedSSHConfigBegin(),
+		appConfig.SSHHost,
 		port,
+		appConfig.SSHUser,
 		strconv.Quote(identityPath),
-		strconv.Quote(filepath.Join(sshDir, "squadvm_known_hosts")),
-		squadVMSSHConfigEnd,
+		strconv.Quote(filepath.Join(sshDir, appConfig.DefaultVMName+"_known_hosts")),
+		managedSSHConfigEnd(),
 	)
 	if cleaned != "" && !strings.HasSuffix(cleaned, "\n") {
 		cleaned += "\n"
@@ -368,7 +376,7 @@ func configureSquadVMSSHHost(homeDir, identityPath string, port int) error {
 	return writeFileAtomically(configPath, []byte(cleaned+block), 0o600)
 }
 
-func removeSquadVMSSHHost(homeDir string) error {
+func removeSSHHost(homeDir string) error {
 	configPath := filepath.Join(homeDir, ".ssh", "config")
 	existing, err := os.ReadFile(configPath)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -385,15 +393,17 @@ func removeSquadVMSSHHost(homeDir string) error {
 }
 
 func removeManagedSSHBlock(value string) string {
-	start := strings.Index(value, squadVMSSHConfigBegin)
+	begin := managedSSHConfigBegin()
+	endMarker := managedSSHConfigEnd()
+	start := strings.Index(value, begin)
 	if start < 0 {
 		return strings.TrimRight(value, "\n")
 	}
-	endOffset := strings.Index(value[start:], squadVMSSHConfigEnd)
+	endOffset := strings.Index(value[start:], endMarker)
 	if endOffset < 0 {
 		return strings.TrimRight(value[:start], "\n")
 	}
-	end := start + endOffset + len(squadVMSSHConfigEnd)
+	end := start + endOffset + len(endMarker)
 	for end < len(value) && (value[end] == '\r' || value[end] == '\n') {
 		end++
 	}
@@ -433,28 +443,54 @@ func writeFileAtomically(path string, data []byte, mode fs.FileMode) error {
 	return nil
 }
 
-func configureSquadVMGuestSSH(ctx context.Context, api *client.Client, name string, publicKey []byte) error {
+func configureGuestSSH(ctx context.Context, api *client.Client, name string, publicKey []byte) error {
 	const script = `set -eu
-install -d -o squad -g squad -m 0700 /home/squad/.ssh
+user=$1
+home=$2
+group=$(id -gn "$user")
+install -d -o "$user" -g "$group" -m 0700 "$home/.ssh"
 key=$(cat)
-touch /home/squad/.ssh/authorized_keys
-if ! grep -qxF "$key" /home/squad/.ssh/authorized_keys; then
-    printf '%s\n' "$key" >> /home/squad/.ssh/authorized_keys
+touch "$home/.ssh/authorized_keys"
+if ! grep -qxF "$key" "$home/.ssh/authorized_keys"; then
+    printf '%s\n' "$key" >> "$home/.ssh/authorized_keys"
 fi
-chown squad:squad /home/squad/.ssh/authorized_keys
-chmod 0600 /home/squad/.ssh/authorized_keys
+chown "$user:$group" "$home/.ssh/authorized_keys"
+chmod 0600 "$home/.ssh/authorized_keys"
 `
-	response, err := api.RunInContext(ctx, name, client.RunRequest{
-		Command:        []string{"/bin/sh", "-c", script},
+	exitCode := -1
+	var output strings.Builder
+	err := api.RunStreamInContext(ctx, name, client.RunRequest{
+		Command:        []string{"/bin/sh", "-c", script, "ssh-setup", appConfig.SSHUser, appConfig.SSHHome},
 		User:           "root",
 		Stdin:          bytes.TrimSpace(publicKey),
 		TimeoutSeconds: 30,
+	}, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "stdout", "stderr", "output":
+			if event.Output != "" {
+				output.WriteString(event.Output)
+			} else if len(event.Data) != 0 {
+				output.Write(event.Data)
+			}
+		case "error":
+			if event.Error != "" {
+				return fmt.Errorf("%s", event.Error)
+			}
+			return fmt.Errorf("guest SSH setup failed")
+		case "exit":
+			exitCode = event.ExitCode
+		}
+		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("configure SquadVM SSH server: %w", err)
+		return fmt.Errorf("configure %s SSH server: %w", productName(), err)
 	}
-	if response.ExitCode != 0 {
-		return fmt.Errorf("configure SquadVM SSH server: guest command exited %d: %s", response.ExitCode, strings.TrimSpace(response.Output))
+	if exitCode != 0 {
+		detail := strings.TrimSpace(output.String())
+		if detail == "" {
+			detail = "no error detail was reported"
+		}
+		return fmt.Errorf("configure %s SSH server: guest command exited %d: %s", productName(), exitCode, detail)
 	}
 	return nil
 }
