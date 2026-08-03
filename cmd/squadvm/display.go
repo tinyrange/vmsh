@@ -129,6 +129,7 @@ type displayViewer struct {
 	lastResize          image.Point
 	pendingResize       image.Point
 	resizeChangedAt     time.Time
+	windowMinimized     bool
 	startup             startupProgress
 	startupChecklist    []startupChecklistItem
 	checklistChangedAt  time.Time
@@ -1758,6 +1759,19 @@ func wrapStartupTextAll(value string, width, size float32) []string {
 
 func (v *displayViewer) handleResize() error {
 	backingWidth, backingHeight := v.window.BackingSize()
+	if backingWidth <= 0 || backingHeight <= 0 {
+		// A minimized native window has no drawable client area. Keep the guest
+		// at its usable resolution instead of briefly resizing it to 1x1.
+		v.pendingResize = image.Point{}
+		v.windowMinimized = true
+		return nil
+	}
+	if v.windowMinimized {
+		// Some OpenGL drivers discard the visible backing contents while a
+		// window is minimized. Request a complete guest frame on restoration.
+		v.windowMinimized = false
+		v.generation = 0
+	}
 	size := guestDisplaySize(backingWidth, backingHeight, v.window.Scale())
 	if size == v.lastResize {
 		v.pendingResize = image.Point{}
