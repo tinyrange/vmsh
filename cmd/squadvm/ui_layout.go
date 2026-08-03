@@ -8,11 +8,11 @@ const (
 	uiSettingsTopInset  = 12
 	uiPanelMaxWidth     = 1080
 	uiPanelWidthRatio   = 0.75
-	uiSettingsHeight    = 452
+	uiSettingsHeight    = 468
 	uiBrandSize         = 48
-	uiCardGap           = 10
-	uiStatusCardHeight  = 64
-	uiOptionCardHeight  = 60
+	uiCardGap           = 8
+	uiStatusCardHeight  = 54
+	uiOptionCardHeight  = 54
 	uiPrimaryButtonSize = 220
 	uiSkipButtonSize    = 156
 	uiButtonHeight      = 50
@@ -24,6 +24,7 @@ const (
 	startupControlNone startupControl = iota
 	startupControlSSH
 	startupControlSystem
+	startupControlSharedFolder
 	startupControlSkip
 	startupControlPrimary
 )
@@ -35,6 +36,8 @@ type startupControlLayout struct {
 	status         [4]image.Rectangle
 	sshCheckbox    image.Rectangle
 	systemCheckbox image.Rectangle
+	sharedFolder   image.Rectangle
+	sharedBrowse   image.Rectangle
 	actionDivider  image.Rectangle
 	skip           image.Rectangle
 	button         image.Rectangle
@@ -56,7 +59,7 @@ func settingsControlLayout(width, height float32) startupControlLayout {
 		state: image.Rect(int(right-144), int(top+5), int(right), int(top+39)),
 	}
 
-	statusTop := top + 164
+	statusTop := top + 154
 	statusWidth := (panelWidth - uiCardGap) / 2
 	for index := range layout.status {
 		column := index % 2
@@ -76,8 +79,14 @@ func settingsControlLayout(width, height float32) startupControlLayout {
 	layout.systemCheckbox = image.Rect(
 		int(left+optionWidth+uiCardGap), int(optionTop), int(right), int(optionTop+uiOptionCardHeight),
 	)
+	sharedTop := optionTop + uiOptionCardHeight + 10
+	layout.sharedFolder = image.Rect(int(left), int(sharedTop), int(right), int(sharedTop+uiOptionCardHeight))
+	browseWidth := min(float32(148), panelWidth*0.34)
+	layout.sharedBrowse = image.Rect(
+		int(right-browseWidth-5), int(sharedTop+5), int(right-5), int(sharedTop+uiOptionCardHeight-5),
+	)
 
-	actionTop := optionTop + uiOptionCardHeight + 28
+	actionTop := sharedTop + uiOptionCardHeight + 20
 	layout.actionDivider = image.Rect(int(left), int(actionTop-14), int(right), int(actionTop-13))
 	primaryWidth := min(float32(uiPrimaryButtonSize), panelWidth)
 	skipWidth := min(float32(uiSkipButtonSize), max(float32(1), panelWidth-primaryWidth-uiCardGap))
@@ -97,6 +106,8 @@ func startupControlAt(point image.Point, layout startupControlLayout, showSkip b
 		return startupControlSSH
 	case point.In(layout.systemCheckbox):
 		return startupControlSystem
+	case point.In(layout.sharedBrowse):
+		return startupControlSharedFolder
 	case showSkip && point.In(layout.skip):
 		return startupControlSkip
 	case point.In(layout.button):
@@ -141,7 +152,7 @@ func calculateStartupScreenLayout(width, height float32) startupScreenLayout {
 }
 
 func startupControlOrder(showSkip bool) []startupControl {
-	controls := []startupControl{startupControlSSH, startupControlSystem}
+	controls := []startupControl{startupControlSSH, startupControlSystem, startupControlSharedFolder}
 	if showSkip {
 		controls = append(controls, startupControlSkip)
 	}

@@ -31,6 +31,8 @@ func TestSettingsLayoutFitsSupportedWindows(t *testing.T) {
 				layout.state,
 				layout.sshCheckbox,
 				layout.systemCheckbox,
+				layout.sharedFolder,
+				layout.sharedBrowse,
 				layout.actionDivider,
 				layout.skip,
 				layout.button,
@@ -44,6 +46,7 @@ func TestSettingsLayoutFitsSupportedWindows(t *testing.T) {
 			for _, bounds := range []image.Rectangle{
 				layout.sshCheckbox,
 				layout.systemCheckbox,
+				layout.sharedBrowse,
 				layout.skip,
 				layout.button,
 			} {
@@ -60,8 +63,8 @@ func TestSettingsLayoutFitsSupportedWindows(t *testing.T) {
 			if layout.button.Max.X != layout.panel.Max.X || layout.button.Max.Y != layout.panel.Max.Y {
 				t.Fatalf("primary action %v is not aligned to panel %v", layout.button, layout.panel)
 			}
-			if got := layout.actionDivider.Min.Y - layout.sshCheckbox.Max.Y; got != 14 {
-				t.Fatalf("footer divider gap = %d, want 14", got)
+			if got := layout.actionDivider.Min.Y - layout.sharedFolder.Max.Y; got != 6 {
+				t.Fatalf("footer divider gap = %d, want 6", got)
 			}
 			for index, first := range layout.status {
 				for _, second := range layout.status[index+1:] {
@@ -160,6 +163,7 @@ func TestStartupKeyboardTraversalIncludesOnlyVisibleActions(t *testing.T) {
 	want := []startupControl{
 		startupControlSSH,
 		startupControlSystem,
+		startupControlSharedFolder,
 		startupControlPrimary,
 		startupControlSSH,
 	}
@@ -188,6 +192,7 @@ func TestStartupPointerTargetsUseDrawnControlBounds(t *testing.T) {
 	}{
 		{point: layout.sshCheckbox.Min.Add(image.Pt(2, 2)), want: startupControlSSH},
 		{point: layout.systemCheckbox.Min.Add(image.Pt(2, 2)), want: startupControlSystem},
+		{point: layout.sharedBrowse.Min.Add(image.Pt(2, 2)), want: startupControlSharedFolder},
 		{point: layout.skip.Min.Add(image.Pt(2, 2)), want: startupControlSkip},
 		{point: layout.button.Min.Add(image.Pt(2, 2)), want: startupControlPrimary},
 		{point: layout.panel.Min, want: startupControlNone},
