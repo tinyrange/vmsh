@@ -184,6 +184,16 @@ func TestModifierTransitionsPreserveFastControlShortcut(t *testing.T) {
 	}
 }
 
+func TestMacOSCapsLockToggleForwardsCompleteGuestPress(t *testing.T) {
+	event := window.InputEvent{Type: window.InputEventFlagsChanged, Key: window.KeyCapsLock}
+	for _, platformDown := range []bool{false, true} {
+		transitions := keyboardTransitions(event, false, platformDown)
+		if len(transitions) != 2 || !transitions[0] || transitions[1] {
+			t.Fatalf("Caps Lock transitions = %v, want [down up]", transitions)
+		}
+	}
+}
+
 func TestDesktopPresentationWaitsForReadyCompleteSettledFrame(t *testing.T) {
 	now := time.Now()
 	full := display.FramebufferUpdate{
