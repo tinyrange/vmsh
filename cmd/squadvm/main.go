@@ -256,6 +256,9 @@ func run(args []string) (retErr error) {
 			var sshPublicKey []byte
 			var sshIdentity string
 			startRequest := request
+			// The native startup view owns the window until the graphical session
+			// is ready, so keep the VM serial stream enabled and show it there.
+			startRequest.Dmesg = true
 			if options.DisplayWidth > 0 && options.DisplayHeight > 0 {
 				displayCopy := *request.Display
 				displayCopy.Width = uint32(options.DisplayWidth)
@@ -310,7 +313,9 @@ func run(args []string) (retErr error) {
 				if *dmesg && event.Kind == "serial" && event.Data != "" {
 					_, _ = io.WriteString(os.Stderr, event.Data)
 				}
-				if event.Kind != "serial" {
+				if event.Kind == "serial" {
+					publish(startupProgress{Serial: event.Data})
+				} else {
 					publish(bootStartupProgress(event))
 				}
 				return nil

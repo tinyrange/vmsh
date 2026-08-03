@@ -124,6 +124,7 @@ func (s squadVMSettings) systemInstall() bool {
 var (
 	squadVMExecutable   = os.Executable
 	squadVMUserCacheDir = os.UserCacheDir
+	squadVMGOOS         = runtime.GOOS
 )
 
 func resolveSquadVMCacheDir(explicit string, systemInstall bool) (string, error) {
@@ -143,6 +144,16 @@ func resolveSquadVMCacheDir(explicit string, systemInstall bool) (string, error)
 	regularCache, err := resolveSquadVMCacheDir("", true)
 	if err == nil && squadVMCacheContainsImage(regularCache) {
 		return regularCache, nil
+	}
+	if squadVMGOOS == "darwin" {
+		userCache, err := squadVMUserCacheDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve user cache directory: %w", err)
+		}
+		// App bundles may be read-only, installed in /Applications, or launched
+		// from an App Translocation mount. An app-specific user cache keeps the
+		// non-system mode writable without sharing the system-install cache.
+		return filepath.Join(userCache, "SquadVM", "ccx3"), nil
 	}
 	executable, err := squadVMExecutable()
 	if err != nil {

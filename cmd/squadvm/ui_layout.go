@@ -121,7 +121,7 @@ func calculateStartupScreenLayout(width, height float32) startupScreenLayout {
 	}
 	panelWidth := max(float32(1), min(float32(960), min(width*uiPanelWidthRatio, width-margin*2)))
 	left := (width - panelWidth) / 2
-	contentHeight := float32(348)
+	contentHeight := float32(370)
 	top := max(margin, float32(46))
 	right := left + panelWidth
 

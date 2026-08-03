@@ -36,6 +36,7 @@ type startupProgress struct {
 	Rate             float64
 	ETA              time.Duration
 	Failed           bool
+	Serial           string
 }
 
 type startupChecklistItem struct {
