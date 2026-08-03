@@ -1,4 +1,4 @@
-package main
+package desktopapp
 
 import (
 	"testing"
@@ -18,7 +18,7 @@ func TestUpdateNotificationsIncludeImageAndVMMThenExpire(t *testing.T) {
 				Available:       false,
 				BytesToDownload: 1024,
 			},
-			ReleaseUpdate: &squadVMReleaseUpdate{
+			ReleaseUpdate: &releaseUpdate{
 				Version: "v0.7.0",
 				Size:    2048,
 			},
@@ -39,7 +39,7 @@ func TestUpdateNotificationsIncludeImageAndVMMThenExpire(t *testing.T) {
 func TestPreflightRetainsVMMUpdateDetailAfterNotificationDismissal(t *testing.T) {
 	preflight := startupPreflight{
 		ReleaseChecked: true,
-		ReleaseUpdate: &squadVMReleaseUpdate{
+		ReleaseUpdate: &releaseUpdate{
 			Version: "v0.7.0",
 			Size:    2048,
 		},
@@ -57,7 +57,7 @@ func TestUpdateNotificationKeyboardControlsDoNotLeakToGuest(t *testing.T) {
 		updateShownAt:      now,
 		updateConsumedKeys: make(map[window.Key]bool),
 		preflight: startupPreflight{
-			ReleaseUpdate: &squadVMReleaseUpdate{Version: "v0.7.0"},
+			ReleaseUpdate: &releaseUpdate{Version: "v0.7.0"},
 		},
 	}
 

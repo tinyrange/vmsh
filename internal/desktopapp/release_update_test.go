@@ -1,4 +1,4 @@
-package main
+package desktopapp
 
 import (
 	"context"
@@ -24,7 +24,7 @@ func TestLatestSquadVMReleaseSelectsCompatibleNewerAsset(t *testing.T) {
 	}))
 	defer server.Close()
 
-	update, err := checkLatestSquadVMRelease(
+	update, err := checkLatestRelease(
 		context.Background(),
 		server.Client(),
 		server.URL,
@@ -84,7 +84,7 @@ func TestLatestSquadVMReleaseDoesNotOfferDowngradeOrWrongPlatform(t *testing.T) 
 			}))
 			defer server.Close()
 
-			update, err := checkLatestSquadVMRelease(
+			update, err := checkLatestRelease(
 				context.Background(),
 				server.Client(),
 				server.URL,
@@ -119,8 +119,8 @@ func TestNewerSquadVMReleaseUsesSemanticVersionOrder(t *testing.T) {
 		{current: "devel", candidate: "v99.0.0", newer: false},
 	}
 	for _, test := range tests {
-		if got := newerSquadVMRelease(test.current, test.candidate); got != test.newer {
-			t.Errorf("newerSquadVMRelease(%q, %q) = %t, want %t",
+		if got := newerRelease(test.current, test.candidate); got != test.newer {
+			t.Errorf("newerRelease(%q, %q) = %t, want %t",
 				test.current, test.candidate, got, test.newer)
 		}
 	}
@@ -130,18 +130,18 @@ func TestReleaseUpdateApplyOpensSelectedAsset(t *testing.T) {
 	const downloadURL = "https://github.com/tinyrange/vmsh/releases/download/v0.7.0/SquadVM_v0.7.0_linux_amd64"
 	viewer := &displayViewer{
 		preflight: startupPreflight{
-			ReleaseUpdate: &squadVMReleaseUpdate{
+			ReleaseUpdate: &releaseUpdate{
 				Version:     "v0.7.0",
 				DownloadURL: downloadURL,
 			},
 		},
 	}
-	previousOpen := squadVMOpenReleaseURL
+	previousOpen := openReleaseURL
 	defer func() {
-		squadVMOpenReleaseURL = previousOpen
+		openReleaseURL = previousOpen
 	}()
 	var opened string
-	squadVMOpenReleaseURL = func(value string) error {
+	openReleaseURL = func(value string) error {
 		opened = value
 		return nil
 	}

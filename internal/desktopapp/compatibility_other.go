@@ -1,6 +1,6 @@
 //go:build !darwin
 
-package main
+package desktopapp
 
 func platformCompatibilityError() error {
 	return nil
