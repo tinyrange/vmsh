@@ -1,34 +1,31 @@
-# vmsh v0.7.1
+# vmsh v0.7.2
 
 ## Highlights
 
-- Redesigned SquadVM's native setup and startup experience for clearer,
-  denser, responsive presentation across display sizes.
-- Fixed Windows keyboard capture, scaling, pre-start resizing, and desktop
-  wallpaper refresh behavior in SquadVM.
-- Added shared-memory domains for long-lived Linux KVM system contexts.
+- Added a complete SquadVM boot console and actionable, scrollable startup
+  diagnostics.
+- Improved Windows display fidelity and desktop integration with guest cursors,
+  native-resolution rendering, and reliable minimize/restore behavior.
+- Made the shared host folder selectable from the startup screen with native
+  directory pickers on Windows, macOS, and Linux.
 
 ## SquadVM
 
-- Added a smoothly scrolling startup checklist, readable proportional text,
-  supplied SquadVM branding, hover and keyboard states, vector checkmarks, and
-  a shader-rendered background.
-- Forwarded Windows and Alt system-key chords without duplicating ordinary
-  typing or leaving modifiers stuck, and prevented Ctrl+C from terminating the
-  guest X server.
-- Started the guest framebuffer at the resized window dimensions and refreshed
-  XFCE through its live session bus so the wallpaper fills the desktop.
-- Made Escape wait for orderly VM teardown, avoiding the previous device and
-  guest-memory shutdown race.
-- Declared macOS 15 as the minimum for SquadVM and NeurodeskAppX and added an
-  actionable message for direct launches on older macOS versions.
-
-## vmsh
-
-- Added `--shmem domain,physaddr` for selecting multiple persistent Linux KVM
-  systems into the same shared-memory domain.
-- Preserved shared-memory configuration through status, context selection, and
-  restart flows while rejecting incompatible reuse of a running system.
+- Showed complete preflight and startup failures instead of truncating them,
+  and added a full boot console with ANSI colors and terminal control handling.
+- Kept serial capture off the VM's boot path, retained the console until a
+  complete desktop frame arrives, and removed duplicated serial lines.
+- Routed systemd manager and service status to the boot console for more useful
+  failure diagnostics.
+- Rendered the guest directly at the Windows client area's physical resolution
+  and adopted the guest-provided cursor image and hotspot as the native cursor.
+- Preserved the display mode while minimized and requested a complete
+  framebuffer after restoration, avoiding a blank desktop until manual resize.
+- Enabled XFCE window tiling at the screen edges and bound the captured
+  Windows/Super key to the applications menu.
+- Added a persistent shared-folder setting and modern directory picker so any
+  host folder can be selected before boot.
+- Used a writable application-specific cache for portable macOS installations.
 
 ## Release artifacts
 
