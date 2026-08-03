@@ -1,31 +1,38 @@
-# vmsh v0.7.2
+# vmsh v0.7.3
 
 ## Highlights
 
-- Added a complete SquadVM boot console and actionable, scrollable startup
-  diagnostics.
-- Improved Windows display fidelity and desktop integration with guest cursors,
-  native-resolution rendering, and reliable minimize/restore behavior.
-- Made the shared host folder selectable from the startup screen with native
-  directory pickers on Windows, macOS, and Linux.
+- Unified SquadVM and NeurodeskAppX on one shared desktop runtime so display,
+  input, clipboard, folder sharing, startup, and update fixes reach both apps.
+- Fixed shared-folder rename and directory-refresh behavior that could leave
+  moved files visible in their original location.
+- Improved macOS input and HiDPI behavior with working Caps Lock and
+  normal-sized guest desktops on Retina displays.
 
-## SquadVM
+## Desktop applications
 
-- Showed complete preflight and startup failures instead of truncating them,
-  and added a full boot console with ANSI colors and terminal control handling.
-- Kept serial capture off the VM's boot path, retained the console until a
-  complete desktop frame arrives, and removed duplicated serial lines.
-- Routed systemd manager and service status to the boot console for more useful
-  failure diagnostics.
-- Rendered the guest directly at the Windows client area's physical resolution
-  and adopted the guest-provided cursor image and hotspot as the native cursor.
-- Preserved the display mode while minimized and requested a complete
-  framebuffer after restoration, avoiding a blank desktop until manual resize.
-- Enabled XFCE window tiling at the screen edges and bound the captured
-  Windows/Super key to the applications menu.
-- Added a persistent shared-folder setting and modern directory picker so any
-  host folder can be selected before boot.
-- Used a writable application-specific cache for portable macOS installations.
+- Brought NeurodeskAppX onto SquadVM's complete native desktop behavior,
+  including configurable shared folders, guest cursors, startup diagnostics,
+  minimize/restore recovery, and release notifications.
+- Kept product configuration independent, including VM images, storage paths,
+  SSH identities, update assets, branding, and distinct SquadVM purple and
+  Neurodesk green themes.
+- Sized guest desktops in logical display points while keeping the native UI at
+  full backing resolution, avoiding tiny controls and text on HiDPI hosts.
+- Reconciled host and guest clipboard generations to prevent concurrent
+  pasteboard updates from overwriting newer content.
+- Resolved each guest SSH user's actual primary group and surfaced clean guest
+  errors instead of internal command-stream framing.
+- Simplified image startup to one download progress bar with indexing shown as
+  concurrent status.
+
+## Reliability
+
+- Forwarded a complete Caps Lock press to guests from macOS modifier-change
+  events.
+- Restarted shared-folder directory enumeration from a fresh cursor and
+  hardened rename replacement semantics, preventing stale entries and
+  duplicate-looking files after moves.
 
 ## Release artifacts
 
