@@ -54,7 +54,7 @@ jobs:
           IMAGE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [[ ! "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+          if [[ ! "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,113}$ ]]; then
             echo "::error::Invalid container tag: $IMAGE_TAG"
             exit 1
           fi
@@ -83,6 +83,13 @@ jobs:
           ref: ${{ inputs.neurocontainers_ref }}
           path: neurocontainers
           persist-credentials: false
+
+      - name: Checkout vmsh image tools
+        uses: actions/checkout@v6
+        with:
+          path: vmsh
+          persist-credentials: false
+          submodules: recursive
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -114,12 +121,14 @@ jobs:
             --option glass=true \
             --recreate \
             --download
-          dockerfile="$(find build/neurodesktop-lite -maxdepth 1 -iname '*.dockerfile' -print -quit)"
+          dockerfile="$(find build -mindepth 2 -maxdepth 2 -type f -path '*/neurodesktop-lite*/*' -iname '*.dockerfile' -print -quit)"
           if [[ -z "$dockerfile" ]]; then
             echo "::error::Neurocontainers did not generate a Dockerfile"
             exit 1
           fi
+          context="$(dirname "$dockerfile")"
           echo "dockerfile=neurocontainers/$dockerfile" >> "$GITHUB_OUTPUT"
+          echo "context=neurocontainers/$context" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -131,13 +140,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push architecture image
+      - name: Build and push backwards-compatible architecture image
         uses: docker/build-push-action@v6
         with:
-          context: neurocontainers/build/neurodesktop-lite
+          context: ${{ steps.context.outputs.context }}
           file: ${{ steps.context.outputs.dockerfile }}
           build-contexts: |
-            neurocontainer-cache=neurocontainers/build/neurodesktop-lite/cache
+            neurocontainer-cache=${{ steps.context.outputs.context }}/cache
           platforms: ${{ matrix.platform }}
           push: true
           tags: ${{ env.IMAGE }}:${{ inputs.tag }}-${{ matrix.suffix }}
@@ -147,6 +156,42 @@ jobs:
             org.opencontainers.image.title=Neurodesktop Glass
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.suffix }}
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.suffix }},mode=max,ignore-error=true
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: vmsh/cc/go.mod
+          cache-dependency-path: vmsh/cc/go.sum
+
+      - name: Install OCI publishing tool
+        working-directory: vmsh/cc
+        run: |
+          set -euo pipefail
+          go install github.com/google/go-containerregistry/cmd/crane@v0.21.8
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Repack and push enhanced eStargz architecture image
+        working-directory: vmsh/cc
+        env:
+          IMAGE_TAG: ${{ inputs.tag }}
+          ARCH_SUFFIX: ${{ matrix.suffix }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          work_dir="$(mktemp -d "$RUNNER_TEMP/estargz.XXXXXX")"
+          crane pull \
+            --platform "$PLATFORM" \
+            --format=oci \
+            "$IMAGE:${IMAGE_TAG}-${ARCH_SUFFIX}" \
+            "$work_dir/source"
+          go run ./cmd/estargz-repack-image \
+            "$work_dir/source" \
+            "$work_dir/enhanced"
+          crane push \
+            "$work_dir/enhanced" \
+            "$IMAGE:${IMAGE_TAG}-estargz-${ARCH_SUFFIX}"
+          crane validate --remote "$IMAGE:${IMAGE_TAG}-estargz-${ARCH_SUFFIX}"
+          df -h /
 
   manifest:
     name: Publish multi-architecture manifest
@@ -174,12 +219,23 @@ jobs:
             "$IMAGE:${IMAGE_TAG}-amd64"
             "$IMAGE:${IMAGE_TAG}-arm64"
           )
+          enhanced_sources=(
+            "$IMAGE:${IMAGE_TAG}-estargz-amd64"
+            "$IMAGE:${IMAGE_TAG}-estargz-arm64"
+          )
           docker buildx imagetools create \
             --tag "$IMAGE:$IMAGE_TAG" \
             "${sources[@]}"
+          docker buildx imagetools create \
+            --tag "$IMAGE:${IMAGE_TAG}-estargz" \
+            "${enhanced_sources[@]}"
           if [[ "$PUBLISH_LATEST" == "true" ]]; then
             docker buildx imagetools create \
               --tag "$IMAGE:latest" \
               "${sources[@]}"
+            docker buildx imagetools create \
+              --tag "$IMAGE:latest-estargz" \
+              "${enhanced_sources[@]}"
           fi
           docker buildx imagetools inspect "$IMAGE:$IMAGE_TAG"
+          docker buildx imagetools inspect "$IMAGE:${IMAGE_TAG}-estargz"

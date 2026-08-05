@@ -292,8 +292,9 @@ func runAppPreflight(ctx context.Context, api *client.Client, source, cacheDir s
 	if isRegistryImageReference(source) {
 		localName := pulledImageName(source, runtimeArchitecture())
 		result.Image, err = api.PlanImagePullContext(ctx, localName, client.PullImageRequest{
-			Source:       source,
-			Architecture: runtimeArchitecture(),
+			Source:         source,
+			Architecture:   runtimeArchitecture(),
+			KeepCompressed: appConfig.ExperimentalCompressedOCI,
 		})
 		if err != nil {
 			return startupPreflight{}, fmt.Errorf("resolve %s image manifest: %w", productName(), err)
@@ -314,7 +315,7 @@ func runAppPreflight(ctx context.Context, api *client.Client, source, cacheDir s
 		return startupPreflight{}, fmt.Errorf("check free disk space: %w", err)
 	}
 	result.FreeBytes = free
-	result.RequiredBytes = estimatedDiskRequirement(result.Image.BytesToDownload)
+	result.RequiredBytes = estimatedDiskRequirement(result.Image, appConfig.ExperimentalCompressedOCI)
 	result.DiskOK = result.FreeBytes >= result.RequiredBytes
 	select {
 	case release := <-releaseDone:
@@ -331,15 +332,28 @@ func runAppPreflight(ctx context.Context, api *client.Client, source, cacheDir s
 	return result, nil
 }
 
-func estimatedDiskRequirement(downloadBytes int64) int64 {
+func estimatedDiskRequirement(plan client.ImagePullPlan, keepCompressed bool) int64 {
 	const workspaceHeadroom = int64(2 << 30)
-	if downloadBytes <= 0 {
-		return workspaceHeadroom
+	if !keepCompressed {
+		if plan.BytesToDownload <= 0 {
+			return workspaceHeadroom
+		}
+		// Conventional OCI layers are retained while their seekable contents are
+		// built. Their exact expanded size is not available from the manifest.
+		return plan.BytesToDownload*2 + workspaceHeadroom
 	}
-	// OCI layers remain compressed in the shared cache and are also expanded
-	// into seekable layer tar files. Reserve both representations plus a small
-	// writable-home allowance.
-	return downloadBytes*2 + workspaceHeadroom
+
+	// Enhanced layers remain compressed and the finalized image hard-links the
+	// cache blobs, so each missing layer consumes disk only once. Allow for the
+	// root filesystem index (which covers the complete image), per-layer eStargz
+	// indexes, the VM kernel, and atomic metadata without doubling blob storage.
+	const compressedRuntimeHeadroom = int64(128 << 20)
+	if plan.BytesToDownload <= 0 {
+		return compressedRuntimeHeadroom
+	}
+	rootIndexAllowance := max(int64(0), plan.BytesTotal) / 50
+	layerIndexAllowance := plan.BytesToDownload / 100
+	return plan.BytesToDownload + rootIndexAllowance + layerIndexAllowance + compressedRuntimeHeadroom
 }
 
 func runtimeArchitecture() string {
