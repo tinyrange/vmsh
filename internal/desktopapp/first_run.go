@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -41,6 +42,8 @@ type appSettings struct {
 	InstallMode      string  `json:"install_mode,omitempty"`
 	DownloadRate     float64 `json:"download_rate_bytes_per_second,omitempty"`
 	SharedFolder     string  `json:"shared_folder,omitempty"`
+	MemoryMB         uint64  `json:"memory_mb,omitempty"`
+	CPUs             int     `json:"cpus,omitempty"`
 }
 
 type startupOptions struct {
@@ -51,6 +54,67 @@ type startupOptions struct {
 	SharedFolder  string
 	DisplayWidth  int
 	DisplayHeight int
+	MemoryMB      uint64
+	CPUs          int
+	MaxMemoryMB   uint64
+	MaxCPUs       int
+}
+
+const minimumGuestMemoryMB = uint64(1024)
+
+func normalizeResourceOptions(options startupOptions) startupOptions {
+	options.MaxMemoryMB = max(minimumGuestMemoryMB, options.MaxMemoryMB)
+	options.MaxCPUs = max(1, options.MaxCPUs)
+	options.MemoryMB = min(options.MaxMemoryMB, max(minimumGuestMemoryMB, options.MemoryMB))
+	options.CPUs = min(options.MaxCPUs, max(1, options.CPUs))
+	return options
+}
+
+func applyResourceOptions(request client.CreateInstanceRequest, options startupOptions) client.CreateInstanceRequest {
+	options = normalizeResourceOptions(options)
+	request.MemoryMB = options.MemoryMB
+	request.CPUs = options.CPUs
+	return request
+}
+
+func sliderValue(position float32, minimum, maximum int) int {
+	if maximum <= minimum {
+		return minimum
+	}
+	position = min(float32(1), max(float32(0), position))
+	return minimum + int(math.Round(float64(position*float32(maximum-minimum))))
+}
+
+func sliderPosition(value, minimum, maximum int) float32 {
+	if maximum <= minimum {
+		return 0
+	}
+	value = min(maximum, max(minimum, value))
+	return float32(value-minimum) / float32(maximum-minimum)
+}
+
+func memorySliderSteps(maximumMB uint64) int {
+	if maximumMB <= minimumGuestMemoryMB {
+		return 0
+	}
+	return int((maximumMB - minimumGuestMemoryMB + 1023) / 1024)
+}
+
+func memoryForSliderStep(step int, maximumMB uint64) uint64 {
+	steps := memorySliderSteps(maximumMB)
+	step = min(steps, max(0, step))
+	if step == steps {
+		return maximumMB
+	}
+	return minimumGuestMemoryMB + uint64(step)*1024
+}
+
+func memorySliderStep(memoryMB, maximumMB uint64) int {
+	steps := memorySliderSteps(maximumMB)
+	if memoryMB >= maximumMB {
+		return steps
+	}
+	return min(steps, int((max(minimumGuestMemoryMB, memoryMB)-minimumGuestMemoryMB+512)/1024))
 }
 
 type startupPreflight struct {

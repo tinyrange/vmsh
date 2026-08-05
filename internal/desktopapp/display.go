@@ -149,6 +149,8 @@ type displayViewer struct {
 	settings            startupOptions
 	folderSelectionErr  string
 	showSettings        bool
+	showAdvanced        bool
+	resourceDrag        startupControl
 	updateShownAt       time.Time
 	releaseDismissed    bool
 	imageDismissed      bool
@@ -625,6 +627,12 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 			}
 		}
 		if event.Type == window.InputEventKeyDown && event.Key == window.KeyEscape && !event.Repeat {
+			if v.showSettings && v.showAdvanced {
+				v.showAdvanced = false
+				v.startupFocus = startupControlAdvanced
+				v.startupFocusVisible = true
+				continue
+			}
 			if !v.showSettings {
 				v.startErr = nil
 				if v.startCancel != nil {
@@ -658,9 +666,12 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 		if !v.showSettings {
 			continue
 		}
+		backingWidth, backingHeight := v.window.BackingSize()
+		layout := settingsControlLayoutForState(float32(backingWidth)/scale, float32(backingHeight)/scale, v.showAdvanced)
+		point := image.Pt(int(event.MouseX/scale), int(event.MouseY/scale))
 		switch event.Type {
 		case window.InputEventKeyDown:
-			if event.Repeat {
+			if event.Repeat && event.Key != window.KeyLeft && event.Key != window.KeyRight {
 				continue
 			}
 			switch event.Key {
@@ -669,8 +680,13 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 					v.startupFocus,
 					event.Mods&window.ModShift != 0,
 					v.preflight.hasUpdate(),
+					v.showAdvanced,
 				)
 				v.startupFocusVisible = true
+			case window.KeyLeft:
+				v.adjustResource(v.startupFocus, -1)
+			case window.KeyRight:
+				v.adjustResource(v.startupFocus, 1)
 			case window.KeySpace:
 				if v.startupFocusVisible {
 					v.activateStartupControl(v.startupFocus)
@@ -685,11 +701,14 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 				}
 			}
 		case window.InputEventMouseMove, window.InputEventMouseDown:
-			backingWidth, backingHeight := v.window.BackingSize()
-			layout := settingsControlLayout(float32(backingWidth)/scale, float32(backingHeight)/scale)
-			point := image.Pt(int(event.MouseX/scale), int(event.MouseY/scale))
-			control := startupControlAt(point, layout, v.preflight.hasUpdate())
+			control := advancedControlAt(point, layout)
+			if control == startupControlNone {
+				control = startupControlAt(point, layout, v.preflight.hasUpdate())
+			}
 			v.startupHover = control
+			if event.Type == window.InputEventMouseMove && v.resourceDrag != startupControlNone && v.window.GetButtonState(window.ButtonLeft).IsDown() {
+				v.setResourceFromPointer(v.resourceDrag, point.X, layout)
+			}
 			if event.Type != window.InputEventMouseDown {
 				continue
 			}
@@ -701,6 +720,13 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 			case startupControlSystem:
 				v.startupFocus = startupControlSystem
 				v.settings.SystemInstall = !v.settings.SystemInstall
+			case startupControlAdvanced:
+				v.startupFocus = startupControlAdvanced
+				v.showAdvanced = !v.showAdvanced
+			case startupControlMemory, startupControlCPUs:
+				v.startupFocus = control
+				v.resourceDrag = control
+				v.setResourceFromPointer(control, point.X, layout)
 			case startupControlSharedFolder:
 				v.startupFocus = startupControlSharedFolder
 				v.chooseSharedFolder()
@@ -711,6 +737,8 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 				v.startupFocus = startupControlPrimary
 				v.beginSettingsStart(v.preflight.hasUpdate())
 			}
+		case window.InputEventMouseUp:
+			v.resourceDrag = startupControlNone
 		}
 	}
 }
@@ -721,6 +749,8 @@ func (v *displayViewer) activateStartupControl(control startupControl) {
 		v.settings.SSHEnabled = !v.settings.SSHEnabled
 	case startupControlSystem:
 		v.settings.SystemInstall = !v.settings.SystemInstall
+	case startupControlAdvanced:
+		v.showAdvanced = !v.showAdvanced
 	case startupControlSharedFolder:
 		v.chooseSharedFolder()
 	case startupControlSkip:
@@ -729,6 +759,35 @@ func (v *displayViewer) activateStartupControl(control startupControl) {
 		}
 	case startupControlPrimary:
 		v.beginSettingsStart(v.preflight.hasUpdate())
+	}
+}
+
+func (v *displayViewer) adjustResource(control startupControl, delta int) {
+	switch control {
+	case startupControlMemory:
+		step := memorySliderStep(v.settings.MemoryMB, v.settings.MaxMemoryMB)
+		v.settings.MemoryMB = memoryForSliderStep(step+delta, v.settings.MaxMemoryMB)
+	case startupControlCPUs:
+		v.settings.CPUs = min(v.settings.MaxCPUs, max(1, v.settings.CPUs+delta))
+	}
+}
+
+func (v *displayViewer) setResourceFromPointer(control startupControl, x int, layout startupControlLayout) {
+	var bounds image.Rectangle
+	switch control {
+	case startupControlMemory:
+		bounds = layout.memorySlider
+	case startupControlCPUs:
+		bounds = layout.cpuSlider
+	default:
+		return
+	}
+	position := float32(x-bounds.Min.X) / float32(max(1, bounds.Dx()))
+	if control == startupControlMemory {
+		step := sliderValue(position, 0, memorySliderSteps(v.settings.MaxMemoryMB))
+		v.settings.MemoryMB = memoryForSliderStep(step, v.settings.MaxMemoryMB)
+	} else {
+		v.settings.CPUs = sliderValue(position, 1, v.settings.MaxCPUs)
 	}
 }
 
@@ -794,7 +853,7 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 	v.gl.UseProgram(v.program)
 	v.drawBackground(backingWidth, backingHeight)
 
-	layout := settingsControlLayout(width, height)
+	layout := settingsControlLayoutForState(width, height, v.showAdvanced)
 	panel := layout.panel
 	left := float32(panel.Min.X)
 	contentTop := float32(panel.Min.Y)
@@ -870,32 +929,33 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 		v.drawSettingsFailure(backingWidth, backingHeight, scale, left, contentTop+158, panelWidth, failure)
 		return
 	}
-
-	v.drawPreflightCard(backingWidth, backingHeight, scale, layout.status[0],
-		preflightStatus(v.preflightReady, v.preflight.VirtualizationOK),
-		"Virtualization",
-		preflightVirtualizationDetail(v.preflightReady, v.preflight),
-	)
-	v.drawPreflightCard(backingWidth, backingHeight, scale, layout.status[1],
-		preflightStatus(v.preflightReady, v.preflight.DiskOK),
-		"Disk space",
-		preflightDiskDetail(v.preflightReady, v.preflight),
-	)
-	imageOK := v.preflightReady
-	v.drawPreflightCard(backingWidth, backingHeight, scale, layout.status[2],
-		imagePreflightStatus(v.preflightReady, imageOK, v.preflight),
-		"Desktop image",
-		preflightImageDetail(v.preflightReady, v.preflight, v.settings.DownloadRate),
-	)
-	v.drawPreflightCard(backingWidth, backingHeight, scale, layout.status[3],
-		releasePreflightStatus(v.preflightReady, v.preflight),
-		"Virtual machine manager",
-		preflightReleaseDetail(v.preflightReady, v.preflight),
-	)
+	if !layout.status[0].Empty() {
+		v.drawPreflightCard(backingWidth, backingHeight, scale, layout.status[0],
+			preflightStatus(v.preflightReady, v.preflight.VirtualizationOK),
+			"Virtualization",
+			preflightVirtualizationDetail(v.preflightReady, v.preflight),
+		)
+		v.drawPreflightCard(backingWidth, backingHeight, scale, layout.status[1],
+			preflightStatus(v.preflightReady, v.preflight.DiskOK),
+			"Disk space",
+			preflightDiskDetail(v.preflightReady, v.preflight),
+		)
+		imageOK := v.preflightReady
+		v.drawPreflightCard(backingWidth, backingHeight, scale, layout.status[2],
+			imagePreflightStatus(v.preflightReady, imageOK, v.preflight),
+			"Desktop image",
+			preflightImageDetail(v.preflightReady, v.preflight, v.settings.DownloadRate),
+		)
+		v.drawPreflightCard(backingWidth, backingHeight, scale, layout.status[3],
+			releasePreflightStatus(v.preflightReady, v.preflight),
+			"Virtual machine manager",
+			preflightReleaseDetail(v.preflightReady, v.preflight),
+		)
+	}
 
 	v.drawSettingsOption(
 		backingWidth, backingHeight, scale, layout.sshCheckbox,
-		"SSH access", "Adds \"ssh "+appConfig.SSHHost+"\" to SSH config",
+		"SSH access · ssh "+appConfig.SSHHost, "Modifies ~/.ssh/config",
 		v.settings.SSHEnabled,
 		v.startupFocusVisible && v.startupFocus == startupControlSSH,
 		v.startupHover == startupControlSSH,
@@ -907,6 +967,10 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 		v.startupFocusVisible && v.startupFocus == startupControlSystem,
 		v.startupHover == startupControlSystem,
 	)
+	v.drawAdvancedOption(backingWidth, backingHeight, scale, layout.advanced)
+	if v.showAdvanced {
+		v.drawAdvancedSettings(backingWidth, backingHeight, scale, layout)
+	}
 	v.drawSharedFolderOption(backingWidth, backingHeight, scale, layout)
 
 	button := layout.button
@@ -962,6 +1026,79 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 	v.drawText(fitStartupText("Space  select   ·   Tab  move   ·   Enter  start", shortcutWidth, 15),
 		left, float32(button.Min.Y+33), 15, uiAccentSoft)
 	v.text.EndDraw()
+}
+
+func (v *displayViewer) drawAdvancedOption(backingWidth, backingHeight int, scale float32, bounds image.Rectangle) {
+	borderColor := uiBorder
+	fillColor := uiSurface
+	if v.startupHover == startupControlAdvanced {
+		borderColor = uiBorderStrong
+		fillColor = uiSurfaceHover
+	}
+	v.drawPanel(backingWidth, backingHeight, scale, bounds, 10, borderColor, fillColor)
+	if v.startupFocusVisible && v.startupFocus == startupControlAdvanced {
+		v.drawOutline(backingWidth, backingHeight, scale, bounds, uiAccent)
+	}
+	v.text.BeginDraw()
+	v.drawTextBold("Advanced", float32(bounds.Min.X+14), float32(bounds.Min.Y+24), 16, uiText)
+	v.drawText(fitStartupText(fmt.Sprintf("%s · %d vCPU", formatMemoryAmount(v.settings.MemoryMB), v.settings.CPUs), float32(bounds.Dx()-48), 14),
+		float32(bounds.Min.X+14), float32(bounds.Min.Y+47), 14, uiAccentSoft)
+	indicator := "+"
+	if v.showAdvanced {
+		indicator = "-"
+	}
+	v.drawTextBold(indicator, float32(bounds.Max.X-24), float32(bounds.Min.Y+32), 18, uiAccent)
+	v.text.EndDraw()
+}
+
+func (v *displayViewer) drawAdvancedSettings(backingWidth, backingHeight int, scale float32, layout startupControlLayout) {
+	bounds := layout.advancedPanel
+	v.drawPanel(backingWidth, backingHeight, scale, bounds, 10, uiBorder, uiSurface)
+	memoryValue := image.Rect(layout.memorySlider.Max.X-72, layout.memorySlider.Min.Y-34, layout.memorySlider.Max.X, layout.memorySlider.Min.Y-6)
+	cpuValue := image.Rect(layout.cpuSlider.Max.X-52, layout.cpuSlider.Min.Y-34, layout.cpuSlider.Max.X, layout.cpuSlider.Min.Y-6)
+	v.drawPanel(backingWidth, backingHeight, scale, memoryValue, 7, uiBorderStrong, uiSurfaceRaised)
+	v.drawPanel(backingWidth, backingHeight, scale, cpuValue, 7, uiBorderStrong, uiSurfaceRaised)
+	v.text.BeginDraw()
+	v.drawText("Host maximums can leave the host unresponsive.", float32(layout.memorySlider.Min.X), float32(bounds.Min.Y+27), 14, uiTextSecondary)
+	v.drawTextBold("Memory", float32(layout.memorySlider.Min.X), float32(layout.memorySlider.Min.Y-13), 15, uiText)
+	v.drawCenteredTextBold(formatMemoryAmount(v.settings.MemoryMB), memoryValue, 14, uiAccent)
+	v.drawText("1 GB", float32(layout.memorySlider.Min.X), float32(layout.memorySlider.Max.Y+18), 13, uiTextMuted)
+	v.drawText(formatMemoryAmount(v.settings.MaxMemoryMB), float32(layout.memorySlider.Max.X-42), float32(layout.memorySlider.Max.Y+18), 13, uiTextMuted)
+	v.drawTextBold("Virtual CPUs", float32(layout.cpuSlider.Min.X), float32(layout.cpuSlider.Min.Y-13), 15, uiText)
+	v.drawCenteredTextBold(fmt.Sprintf("%d", v.settings.CPUs), cpuValue, 14, uiAccent)
+	v.drawText("1 vCPU", float32(layout.cpuSlider.Min.X), float32(layout.cpuSlider.Max.Y+18), 13, uiTextMuted)
+	v.drawText(fmt.Sprintf("%d vCPU", v.settings.MaxCPUs), float32(layout.cpuSlider.Max.X-50), float32(layout.cpuSlider.Max.Y+18), 13, uiTextMuted)
+	v.text.EndDraw()
+	v.drawResourceSlider(backingWidth, backingHeight, scale, layout.memorySlider,
+		sliderPosition(memorySliderStep(v.settings.MemoryMB, v.settings.MaxMemoryMB), 0, memorySliderSteps(v.settings.MaxMemoryMB)),
+		v.startupFocusVisible && v.startupFocus == startupControlMemory)
+	v.drawResourceSlider(backingWidth, backingHeight, scale, layout.cpuSlider,
+		sliderPosition(v.settings.CPUs, 1, v.settings.MaxCPUs),
+		v.startupFocusVisible && v.startupFocus == startupControlCPUs)
+}
+
+func (v *displayViewer) drawResourceSlider(backingWidth, backingHeight int, scale float32, bounds image.Rectangle, position float32, focused bool) {
+	position = min(float32(1), max(float32(0), position))
+	centerY := bounds.Min.Y + bounds.Dy()/2
+	track := image.Rect(bounds.Min.X, centerY-3, bounds.Max.X, centerY+3)
+	v.drawRoundedRect(backingWidth, backingHeight, scale, track, 3, uiSurfaceRaised)
+	knobX := bounds.Min.X + int(float32(bounds.Dx())*position)
+	if knobX > bounds.Min.X {
+		v.drawRoundedRect(backingWidth, backingHeight, scale,
+			image.Rect(bounds.Min.X, centerY-3, knobX, centerY+3), 3, uiPrimary)
+	}
+	knob := image.Rect(knobX-9, centerY-9, knobX+9, centerY+9)
+	v.drawRoundedRect(backingWidth, backingHeight, scale, knob, 9, uiText)
+	if focused {
+		v.drawOutline(backingWidth, backingHeight, scale, bounds, uiAccent)
+	}
+}
+
+func formatMemoryAmount(memoryMB uint64) string {
+	if memoryMB%1024 == 0 {
+		return fmt.Sprintf("%d GB", memoryMB/1024)
+	}
+	return fmt.Sprintf("%.1f GB", float64(memoryMB)/1024)
 }
 
 func (v *displayViewer) settingsFailureDetail() string {
