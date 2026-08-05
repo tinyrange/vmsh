@@ -4,6 +4,8 @@ import (
 	"image"
 	"strings"
 	"testing"
+
+	"j5.nz/cc/client"
 )
 
 func TestSettingsLayoutFitsSupportedWindows(t *testing.T) {
@@ -31,6 +33,7 @@ func TestSettingsLayoutFitsSupportedWindows(t *testing.T) {
 				layout.state,
 				layout.sshCheckbox,
 				layout.systemCheckbox,
+				layout.advanced,
 				layout.sharedFolder,
 				layout.sharedBrowse,
 				layout.actionDivider,
@@ -46,6 +49,7 @@ func TestSettingsLayoutFitsSupportedWindows(t *testing.T) {
 			for _, bounds := range []image.Rectangle{
 				layout.sshCheckbox,
 				layout.systemCheckbox,
+				layout.advanced,
 				layout.sharedBrowse,
 				layout.skip,
 				layout.button,
@@ -56,6 +60,9 @@ func TestSettingsLayoutFitsSupportedWindows(t *testing.T) {
 			}
 			if layout.sshCheckbox.Overlaps(layout.systemCheckbox) {
 				t.Fatal("settings options overlap")
+			}
+			if layout.systemCheckbox.Overlaps(layout.advanced) {
+				t.Fatal("advanced option overlaps another setting")
 			}
 			if layout.skip.Overlaps(layout.button) {
 				t.Fatal("start actions overlap")
@@ -72,6 +79,43 @@ func TestSettingsLayoutFitsSupportedWindows(t *testing.T) {
 						t.Fatalf("status cards overlap: %v and %v", first, second)
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestExpandedAdvancedLayoutFitsSupportedWindows(t *testing.T) {
+	for _, viewport := range []image.Point{
+		image.Pt(1440, 900),
+		image.Pt(1024, 640),
+		image.Pt(760, 520),
+	} {
+		t.Run(viewport.String(), func(t *testing.T) {
+			layout := settingsControlLayoutForState(float32(viewport.X), float32(viewport.Y), true)
+			windowBounds := image.Rect(0, 0, viewport.X, viewport.Y)
+			if !layout.panel.In(windowBounds) {
+				t.Fatalf("expanded panel %v is outside viewport %v", layout.panel, windowBounds)
+			}
+			for _, bounds := range []image.Rectangle{
+				layout.advancedPanel,
+				layout.memorySlider,
+				layout.cpuSlider,
+				layout.sharedFolder,
+				layout.sharedBrowse,
+				layout.button,
+			} {
+				if !bounds.In(layout.panel) {
+					t.Errorf("expanded control %v is outside panel %v", bounds, layout.panel)
+				}
+			}
+			if layout.memorySlider.Overlaps(layout.cpuSlider) {
+				t.Fatal("resource sliders overlap")
+			}
+			if layout.advancedPanel.Overlaps(layout.sharedFolder) {
+				t.Fatal("advanced section overlaps shared folder")
+			}
+			if viewport.Y < 700 && !layout.status[0].Empty() {
+				t.Fatal("short expanded layout did not compact readiness details")
 			}
 		})
 	}
@@ -163,35 +207,47 @@ func TestStartupKeyboardTraversalIncludesOnlyVisibleActions(t *testing.T) {
 	want := []startupControl{
 		startupControlSSH,
 		startupControlSystem,
+		startupControlAdvanced,
 		startupControlSharedFolder,
 		startupControlPrimary,
 		startupControlSSH,
 	}
 	for index, expected := range want {
-		control = nextStartupControl(control, false, false)
+		control = nextStartupControl(control, false, false, false)
 		if control != expected {
 			t.Fatalf("forward control %d = %v, want %v", index, control, expected)
 		}
 	}
 
-	control = nextStartupControl(startupControlNone, true, true)
+	control = nextStartupControl(startupControlNone, true, true, false)
 	if control != startupControlPrimary {
 		t.Fatalf("reverse traversal starts at %v, want primary action", control)
 	}
-	control = nextStartupControl(control, true, true)
+	control = nextStartupControl(control, true, true, false)
 	if control != startupControlSkip {
 		t.Fatalf("reverse traversal reached %v, want visible skip action", control)
+	}
+
+	control = startupControlAdvanced
+	control = nextStartupControl(control, false, false, true)
+	if control != startupControlMemory {
+		t.Fatalf("expanded traversal reached %v after advanced toggle, want memory slider", control)
+	}
+	control = nextStartupControl(control, false, false, true)
+	if control != startupControlCPUs {
+		t.Fatalf("expanded traversal reached %v after memory, want CPU slider", control)
 	}
 }
 
 func TestStartupPointerTargetsUseDrawnControlBounds(t *testing.T) {
-	layout := settingsControlLayout(1024, 640)
+	layout := settingsControlLayoutForState(1024, 640, true)
 	tests := []struct {
 		point image.Point
 		want  startupControl
 	}{
 		{point: layout.sshCheckbox.Min.Add(image.Pt(2, 2)), want: startupControlSSH},
 		{point: layout.systemCheckbox.Min.Add(image.Pt(2, 2)), want: startupControlSystem},
+		{point: layout.advanced.Min.Add(image.Pt(2, 2)), want: startupControlAdvanced},
 		{point: layout.sharedBrowse.Min.Add(image.Pt(2, 2)), want: startupControlSharedFolder},
 		{point: layout.skip.Min.Add(image.Pt(2, 2)), want: startupControlSkip},
 		{point: layout.button.Min.Add(image.Pt(2, 2)), want: startupControlPrimary},
@@ -204,5 +260,35 @@ func TestStartupPointerTargetsUseDrawnControlBounds(t *testing.T) {
 	}
 	if got := startupControlAt(layout.skip.Min.Add(image.Pt(2, 2)), layout, false); got != startupControlNone {
 		t.Fatalf("hidden skip target is still interactive: %v", got)
+	}
+}
+
+func TestAdvancedResourceControlsCoverHostRange(t *testing.T) {
+	options := normalizeResourceOptions(startupOptions{
+		MemoryMB: 8192, CPUs: 4, MaxMemoryMB: 32768, MaxCPUs: 12,
+	})
+	viewer := displayViewer{settings: options}
+	layout := settingsControlLayoutForState(1024, 640, true)
+
+	viewer.setResourceFromPointer(startupControlMemory, layout.memorySlider.Min.X, layout)
+	viewer.setResourceFromPointer(startupControlCPUs, layout.cpuSlider.Min.X, layout)
+	if viewer.settings.MemoryMB != 1024 || viewer.settings.CPUs != 1 {
+		t.Fatalf("left endpoints = %d MiB/%d CPUs, want 1024 MiB/1 CPU", viewer.settings.MemoryMB, viewer.settings.CPUs)
+	}
+
+	viewer.setResourceFromPointer(startupControlMemory, layout.memorySlider.Max.X, layout)
+	viewer.setResourceFromPointer(startupControlCPUs, layout.cpuSlider.Max.X, layout)
+	if viewer.settings.MemoryMB != options.MaxMemoryMB || viewer.settings.CPUs != options.MaxCPUs {
+		t.Fatalf("right endpoints = %d MiB/%d CPUs, want %d MiB/%d CPUs",
+			viewer.settings.MemoryMB, viewer.settings.CPUs, options.MaxMemoryMB, options.MaxCPUs)
+	}
+}
+
+func TestSelectedResourcesAreAppliedToVMCreation(t *testing.T) {
+	request := applyResourceOptions(client.CreateInstanceRequest{}, startupOptions{
+		MemoryMB: 12288, CPUs: 6, MaxMemoryMB: 32768, MaxCPUs: 12,
+	})
+	if request.MemoryMB != 12288 || request.CPUs != 6 {
+		t.Fatalf("VM resources = %d MiB/%d CPUs, want 12288 MiB/6 CPUs", request.MemoryMB, request.CPUs)
 	}
 }

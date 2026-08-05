@@ -71,12 +71,20 @@ func Run(config Config, args []string) (retErr error) {
 	}
 	var vncOptionSet bool
 	var storageOptionSet bool
+	var memoryOptionSet bool
+	var cpuOptionSet bool
 	fs.Visit(func(item *flag.Flag) {
 		if item.Name == "vnc-listen" || item.Name == "vnc-password" {
 			vncOptionSet = true
 		}
 		if item.Name == "storage" {
 			storageOptionSet = true
+		}
+		if item.Name == "memory-mb" {
+			memoryOptionSet = true
+		}
+		if item.Name == "cpus" {
+			cpuOptionSet = true
 		}
 	})
 	if !*vnc && vncOptionSet {
@@ -113,6 +121,24 @@ func Run(config Config, args []string) (retErr error) {
 		return err
 	}
 	settings.SharedFolder = storageShare.Source
+	selectedMemoryMB := *memoryMB
+	if !memoryOptionSet && settings.MemoryMB != 0 {
+		selectedMemoryMB = settings.MemoryMB
+	}
+	selectedCPUs := *cpus
+	if !cpuOptionSet && settings.CPUs > 0 {
+		selectedCPUs = settings.CPUs
+	}
+	maximumMemoryMB := hostMemoryMB()
+	if maximumMemoryMB == 0 {
+		maximumMemoryMB = selectedMemoryMB
+	}
+	resourceOptions := normalizeResourceOptions(startupOptions{
+		MemoryMB:    selectedMemoryMB,
+		CPUs:        selectedCPUs,
+		MaxMemoryMB: maximumMemoryMB,
+		MaxCPUs:     runtime.NumCPU(),
+	})
 
 	displayReady := make(chan ccdisplay.Session, 1)
 	systemInstall := settings.systemInstall()
@@ -207,6 +233,7 @@ func Run(config Config, args []string) (retErr error) {
 			return runAppPreflight(ctx, api, fs.Arg(0), activeCacheDir)
 		}
 		start := func(ctx context.Context, options startupOptions, publish func(startupProgress)) (started displayStarted, retErr error) {
+			options = normalizeResourceOptions(options)
 			desiredCacheDir, err := resolveAppCacheDir(*cacheDir, options.SystemInstall)
 			if err != nil {
 				return displayStarted{}, err
@@ -252,6 +279,8 @@ func Run(config Config, args []string) (retErr error) {
 			settings.FirstRunComplete = true
 			settings.SSHEnabled = options.SSHEnabled
 			settings.SharedFolder = selectedShare.Source
+			settings.MemoryMB = options.MemoryMB
+			settings.CPUs = options.CPUs
 			if options.SystemInstall {
 				settings.InstallMode = appInstallSystem
 			} else {
@@ -267,7 +296,7 @@ func Run(config Config, args []string) (retErr error) {
 			var sshPort int
 			var sshPublicKey []byte
 			var sshIdentity string
-			startRequest := request
+			startRequest := applyResourceOptions(request, options)
 			startRequest.Shares = []client.ShareMount{selectedShare}
 			// The native startup view owns the window until the graphical session
 			// is ready, so keep the VM serial stream enabled and show it there.
@@ -385,6 +414,10 @@ func Run(config Config, args []string) (retErr error) {
 				SystemInstall: systemInstall,
 				DownloadRate:  settings.DownloadRate,
 				SharedFolder:  settings.SharedFolder,
+				MemoryMB:      resourceOptions.MemoryMB,
+				CPUs:          resourceOptions.CPUs,
+				MaxMemoryMB:   resourceOptions.MaxMemoryMB,
+				MaxCPUs:       resourceOptions.MaxCPUs,
 			},
 			preflight,
 			start,
