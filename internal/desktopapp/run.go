@@ -256,7 +256,7 @@ func Run(config Config, args []string) (retErr error) {
 				if err != nil {
 					return displayStarted{}, err
 				}
-				if !preflightCanStartWithMirror(selectedPreflight, options.CVMFSMirror) {
+				if !selectedPreflight.canPrepareImage() {
 					return displayStarted{}, fmt.Errorf("selected install location did not pass startup checks")
 				}
 				options.CVMFSAutoMirror = selectedPreflight.CVMFSMirror
@@ -279,18 +279,6 @@ func Run(config Config, args []string) (retErr error) {
 			selectedShare, err := createStorageShare(options.SharedFolder)
 			if err != nil {
 				return displayStarted{}, err
-			}
-			if config := appConfig.CVMFSHostMount; config != nil {
-				selectedMirror := strings.TrimSpace(options.CVMFSMirror)
-				if selectedMirror == "" {
-					selectedMirror = strings.TrimSpace(options.CVMFSAutoMirror)
-				}
-				if selectedMirror == "" {
-					return displayStarted{}, fmt.Errorf("CVMFS mirror selection is unavailable")
-				}
-				if err := api.SelectCVMFSMirrorContext(ctx, client.CVMFSMirrorSelectionRequest{Repo: config.Repo, Mirror: selectedMirror}); err != nil {
-					return displayStarted{}, fmt.Errorf("select CVMFS mirror: %w", err)
-				}
 			}
 			settings.FirstRunComplete = true
 			settings.SSHEnabled = options.SSHEnabled
@@ -368,6 +356,27 @@ func Run(config Config, args []string) (retErr error) {
 				}
 			}
 			startRequest.Image = imageName
+			if config := appConfig.CVMFSHostMount; config != nil {
+				selectedMirror := strings.TrimSpace(options.CVMFSMirror)
+				if selectedMirror == "" {
+					selectedMirror = strings.TrimSpace(options.CVMFSAutoMirror)
+				}
+				if selectedMirror == "" {
+					publish(startupProgress{Phase: startupBoot, Title: "Connecting CVMFS", Detail: "Detecting the nearest mirror"})
+					probe, probeErr := probeConfiguredCVMFS(ctx, api, config)
+					if probeErr != nil {
+						return displayStarted{}, fmt.Errorf("connect CVMFS before VM start: %w", probeErr)
+					}
+					selectedMirror = strings.TrimSpace(probe.SelectedMirror)
+				}
+				if selectedMirror == "" {
+					return displayStarted{}, fmt.Errorf("connect CVMFS before VM start: no mirror is available")
+				}
+				publish(startupProgress{Phase: startupBoot, Title: "Connecting CVMFS", Detail: mirrorDisplayName(selectedMirror)})
+				if err := api.SelectCVMFSMirrorContext(ctx, client.CVMFSMirrorSelectionRequest{Repo: config.Repo, Mirror: selectedMirror}); err != nil {
+					return displayStarted{}, fmt.Errorf("connect CVMFS before VM start: %w", err)
+				}
+			}
 			state, err := api.CreateInstanceStreamWithIDContext(ctx, *name, startRequest, func(event client.BootEvent) error {
 				if *dmesg && event.Kind == "serial" && event.Data != "" {
 					_, _ = io.WriteString(os.Stderr, event.Data)

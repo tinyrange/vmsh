@@ -38,6 +38,7 @@ type startupControlLayout struct {
 	brand          image.Rectangle
 	state          image.Rectangle
 	status         [4]image.Rectangle
+	cvmfsStatus    image.Rectangle
 	sshCheckbox    image.Rectangle
 	systemCheckbox image.Rectangle
 	advanced       image.Rectangle
@@ -94,6 +95,12 @@ func settingsControlLayoutForOptions(width, height float32, advancedExpanded, cv
 	optionTop := statusTop
 	if !compactExpanded {
 		optionTop += 2*(uiStatusCardHeight+uiCardGap) + 2
+		if cvmfs {
+			layout.cvmfsStatus = image.Rect(
+				int(left), int(optionTop), int(right), int(optionTop+uiStatusCardHeight),
+			)
+			optionTop += uiStatusCardHeight + uiCardGap
+		}
 	}
 	optionWidth := (panelWidth - 2*uiCardGap) / 3
 	layout.sshCheckbox = image.Rect(

@@ -4,6 +4,7 @@ go 1.25.5
 
 require (
 	github.com/creack/pty v1.1.24
+	github.com/ebitengine/purego v0.10.0
 	github.com/getkin/kin-openapi v0.140.0
 	github.com/modelcontextprotocol/go-sdk v1.6.1
 	github.com/tinyrange/gowin v0.0.0-20260805041817-e8029455312a
@@ -16,7 +17,6 @@ require (
 )
 
 require (
-	github.com/ebitengine/purego v0.10.0 // indirect
 	github.com/go-openapi/jsonpointer v0.22.5 // indirect
 	github.com/go-openapi/swag/jsonname v0.25.5 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect

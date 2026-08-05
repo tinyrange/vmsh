@@ -4,6 +4,7 @@ import (
 	"image"
 	"strings"
 	"testing"
+	"time"
 
 	"j5.nz/cc/client"
 )
@@ -241,11 +242,62 @@ func TestStartupKeyboardTraversalIncludesOnlyVisibleActions(t *testing.T) {
 
 func TestAdvancedCVMFSMirrorControlFitsBeforeSharedFolder(t *testing.T) {
 	layout := settingsControlLayoutForOptions(1024, 900, true, true)
+	if layout.cvmfsStatus.Empty() || layout.cvmfsStatus.Min.Y <= layout.status[3].Max.Y {
+		t.Fatalf("CVMFS readiness card %v is not below host checks %v", layout.cvmfsStatus, layout.status)
+	}
+	if layout.sshCheckbox.Min.Y <= layout.cvmfsStatus.Max.Y {
+		t.Fatalf("settings %v overlap CVMFS readiness card %v", layout.sshCheckbox, layout.cvmfsStatus)
+	}
 	if layout.cvmfsMirror.Empty() || !layout.cvmfsMirror.In(layout.advancedPanel) {
 		t.Fatalf("CVMFS mirror control %v is outside advanced panel %v", layout.cvmfsMirror, layout.advancedPanel)
 	}
 	if layout.sharedFolder.Min.Y <= layout.advancedPanel.Max.Y {
 		t.Fatalf("shared folder %v overlaps advanced panel %v", layout.sharedFolder, layout.advancedPanel)
+	}
+}
+
+func TestCVMFSChromeSummaryReportsDownloadsAndSpeed(t *testing.T) {
+	now := time.Date(2026, 8, 5, 10, 0, 2, 0, time.UTC)
+	status := client.CVMFSStatusResponse{State: "downloading", ActiveTransfers: []client.CVMFSTransferState{
+		{Bytes: 2 << 20, StartedAt: now.Add(-2 * time.Second).Format(time.RFC3339Nano)},
+		{Bytes: 4 << 20, StartedAt: now.Add(-2 * time.Second).Format(time.RFC3339Nano)},
+	}}
+	if got := cvmfsChromeLabel(status, now); got != "CVMFS · 2 downloads · 3.0 MB/s" {
+		t.Fatalf("CVMFS chrome summary = %q", got)
+	}
+}
+
+func TestCVMFSActivityPresentationBridgesShortDemandReadGaps(t *testing.T) {
+	now := time.Date(2026, 8, 5, 10, 0, 0, 0, time.UTC)
+	active := client.CVMFSStatusResponse{
+		State:           "downloading",
+		ActiveTransfers: []client.CVMFSTransferState{{ID: 7, Path: "/cvmfs/example/tool"}},
+	}
+	idle := client.CVMFSStatusResponse{State: "idle", ActiveTransfers: []client.CVMFSTransferState{}}
+
+	presentation := cvmfsActivityPresentation{}
+	if got := presentation.observe(active, now); len(got.ActiveTransfers) != 1 {
+		t.Fatalf("active transfer was not presented: %+v", got)
+	}
+	if got := presentation.observe(idle, now.Add(200*time.Millisecond)); len(got.ActiveTransfers) != 1 {
+		t.Fatalf("short read gap cleared transfer activity: %+v", got)
+	}
+	if got := presentation.observe(idle, now.Add(cvmfsActivityHold)); got.State != "idle" || len(got.ActiveTransfers) != 0 {
+		t.Fatalf("expired transfer activity was retained: %+v", got)
+	}
+}
+
+func TestTitleBarDoubleClickTogglesOnlyNearbyRapidClicks(t *testing.T) {
+	viewer := displayViewer{}
+	start := time.Date(2026, 8, 5, 10, 0, 0, 0, time.UTC)
+	if viewer.isTitleBarDoubleClick(image.Pt(200, 14), start) {
+		t.Fatal("first title-bar click was treated as a double click")
+	}
+	if !viewer.isTitleBarDoubleClick(image.Pt(202, 15), start.Add(250*time.Millisecond)) {
+		t.Fatal("nearby rapid title-bar clicks were not treated as a double click")
+	}
+	if viewer.isTitleBarDoubleClick(image.Pt(200, 14), start.Add(time.Second)) {
+		t.Fatal("isolated title-bar click was treated as a double click")
 	}
 }
 
@@ -260,10 +312,13 @@ func TestCVMFSMirrorMenuStaysInCompactViewport(t *testing.T) {
 	}
 }
 
-func TestCVMFSMirrorOverrideCanStartAfterAutomaticProbeFailure(t *testing.T) {
+func TestCVMFSConnectsAfterImagePreparationAndBeforeVMStart(t *testing.T) {
 	preflight := startupPreflight{VirtualizationOK: true, DiskOK: true, CVMFSRequired: true}
+	if !preflight.canPrepareImage() {
+		t.Fatal("CVMFS probe failure blocked desktop image preparation")
+	}
 	if preflightCanStartWithMirror(preflight, "") {
-		t.Fatal("automatic CVMFS failure allowed startup without an override")
+		t.Fatal("automatic CVMFS failure allowed VM startup without a mirror")
 	}
 	if !preflightCanStartWithMirror(preflight, "http://mirror.example") {
 		t.Fatal("explicit CVMFS mirror did not override automatic detection")

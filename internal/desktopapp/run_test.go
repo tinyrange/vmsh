@@ -144,7 +144,7 @@ func TestGuestDisplayUsesLogicalResolution(t *testing.T) {
 	if got := guestDisplaySize(2880, 1800, 2); got != image.Pt(1440, 900) {
 		t.Fatalf("guest display size = %v, want logical window resolution", got)
 	}
-	if got := guestDisplaySizeWithChrome(2880, 1800, 2, true); got != image.Pt(1440, 858) {
+	if got := guestDisplaySizeWithChrome(2880, 1800, 2, true); got != image.Pt(1440, 900-int(appChromeHeight)) {
 		t.Fatalf("guest display size with app chrome = %v, want chrome excluded", got)
 	}
 }

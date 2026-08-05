@@ -142,6 +142,10 @@ func (p startupPreflight) canStart() bool {
 	return p.VirtualizationOK && p.DiskOK && (!p.CVMFSRequired || p.CVMFSOK)
 }
 
+func (p startupPreflight) canPrepareImage() bool {
+	return p.VirtualizationOK && p.DiskOK
+}
+
 func preflightCanStartWithMirror(p startupPreflight, mirrorOverride string) bool {
 	return p.VirtualizationOK && p.DiskOK && (!p.CVMFSRequired || p.CVMFSOK || strings.TrimSpace(mirrorOverride) != "")
 }
