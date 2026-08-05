@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -142,6 +143,19 @@ func TestParseDisplaySizeRejectsUnusableFramebuffers(t *testing.T) {
 func TestGuestDisplayUsesLogicalResolution(t *testing.T) {
 	if got := guestDisplaySize(2880, 1800, 2); got != image.Pt(1440, 900) {
 		t.Fatalf("guest display size = %v, want logical window resolution", got)
+	}
+	if got := guestDisplaySizeWithChrome(2880, 1800, 2, true); got != image.Pt(1440, 858) {
+		t.Fatalf("guest display size with app chrome = %v, want chrome excluded", got)
+	}
+}
+
+func TestConfiguredCVMFSMirrorsIncludePrimaryWithoutDuplicates(t *testing.T) {
+	config := &CVMFSHostMountConfig{Mirror: "http://primary.example", Mirrors: []string{"http://primary.example", "http://fallback.example"}}
+	if got := cvmfsConfigMirrors(config); !reflect.DeepEqual(got, []string{"http://primary.example", "http://fallback.example"}) {
+		t.Fatalf("CVMFS mirrors = %v", got)
+	}
+	if got := configuredCVMFSMirror("http://fallback.example", config); got != "http://fallback.example" {
+		t.Fatalf("saved CVMFS mirror = %q", got)
 	}
 }
 

@@ -6,7 +6,7 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/getkin/kin-openapi v0.140.0
 	github.com/modelcontextprotocol/go-sdk v1.6.1
-	github.com/tinyrange/gowin v0.0.0-20260803070720-862309a6acaa
+	github.com/tinyrange/gowin v0.0.0-20260805041817-e8029455312a
 	golang.org/x/crypto v0.50.0
 	golang.org/x/image v0.39.0
 	golang.org/x/net v0.53.0

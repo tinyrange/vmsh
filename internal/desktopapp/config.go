@@ -32,6 +32,16 @@ type Config struct {
 	SSHUser              string
 	SSHHome              string
 	ReleaseAssetPrefix   string
+	CVMFSHostMount       *CVMFSHostMountConfig
+}
+
+type CVMFSHostMountConfig struct {
+	Mount           string
+	Mirror          string
+	Mirrors         []string
+	Repo            string
+	Path            string
+	CacheLimitBytes int64
 }
 
 var appConfig Config

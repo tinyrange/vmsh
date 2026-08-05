@@ -239,6 +239,45 @@ func TestStartupKeyboardTraversalIncludesOnlyVisibleActions(t *testing.T) {
 	}
 }
 
+func TestAdvancedCVMFSMirrorControlFitsBeforeSharedFolder(t *testing.T) {
+	layout := settingsControlLayoutForOptions(1024, 900, true, true)
+	if layout.cvmfsMirror.Empty() || !layout.cvmfsMirror.In(layout.advancedPanel) {
+		t.Fatalf("CVMFS mirror control %v is outside advanced panel %v", layout.cvmfsMirror, layout.advancedPanel)
+	}
+	if layout.sharedFolder.Min.Y <= layout.advancedPanel.Max.Y {
+		t.Fatalf("shared folder %v overlaps advanced panel %v", layout.sharedFolder, layout.advancedPanel)
+	}
+}
+
+func TestCVMFSMirrorMenuStaysInCompactViewport(t *testing.T) {
+	field := image.Rect(40, 350, 720, 398)
+	bounds, rows := cvmfsMirrorMenuLayout(field, 520, 20, 0)
+	if len(rows) != cvmfsMirrorMenuVisibleRows {
+		t.Fatalf("visible mirror rows = %d", len(rows))
+	}
+	if bounds.Min.Y < 0 || bounds.Max.Y > 520 || bounds.Max.Y > field.Min.Y {
+		t.Fatalf("compact mirror menu = %v, want it above %v within viewport", bounds, field)
+	}
+}
+
+func TestCVMFSMirrorOverrideCanStartAfterAutomaticProbeFailure(t *testing.T) {
+	preflight := startupPreflight{VirtualizationOK: true, DiskOK: true, CVMFSRequired: true}
+	if preflightCanStartWithMirror(preflight, "") {
+		t.Fatal("automatic CVMFS failure allowed startup without an override")
+	}
+	if !preflightCanStartWithMirror(preflight, "http://mirror.example") {
+		t.Fatal("explicit CVMFS mirror did not override automatic detection")
+	}
+}
+
+func TestSettingsLayoutClearsIntegratedTitleBar(t *testing.T) {
+	viewer := displayViewer{chromeEnabled: true}
+	layout := viewer.settingsLayout(1024, 900)
+	if layout.panel.Min.Y < int(appChromeHeight) {
+		t.Fatalf("settings panel starts at %d under %dpx app chrome", layout.panel.Min.Y, int(appChromeHeight))
+	}
+}
+
 func TestStartupPointerTargetsUseDrawnControlBounds(t *testing.T) {
 	layout := settingsControlLayoutForState(1024, 640, true)
 	tests := []struct {
