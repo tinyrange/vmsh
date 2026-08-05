@@ -2696,7 +2696,7 @@ func (v *displayViewer) handleChromeInput(event window.InputEvent) bool {
 			}
 			v.chromeControlHover = button.control
 			if event.Type == window.InputEventMouseDown && event.Button == window.ButtonLeft {
-				activatePlatformWindowControl(button.control)
+				_ = activatePlatformWindowControl(button.control)
 			}
 			return true
 		}
