@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tinyrange/gowin/window"
 	"j5.nz/cc/client"
 )
 
@@ -298,6 +299,18 @@ func TestTitleBarDoubleClickTogglesOnlyNearbyRapidClicks(t *testing.T) {
 	}
 	if viewer.isTitleBarDoubleClick(image.Pt(200, 14), start.Add(time.Second)) {
 		t.Fatal("isolated title-bar click was treated as a double click")
+	}
+}
+
+func TestWindowsChromeControlsReserveTheStatusArea(t *testing.T) {
+	const width = float32(1200)
+	buttons := chromeWindowControlButtons(width, true)
+	if len(buttons) != 3 {
+		t.Fatalf("caption buttons = %d, want 3", len(buttons))
+	}
+	status := cvmfsChromeStatusBounds(width, window.TitleBarInsets{Left: 12, Right: 138, Height: 28})
+	if status.Max.X > buttons[0].bounds.Min.X {
+		t.Fatalf("CVMFS status %v overlaps caption buttons %v", status, buttons)
 	}
 }
 

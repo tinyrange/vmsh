@@ -185,6 +185,21 @@ type displayViewer struct {
 	cvmfsMirrorOffset   int
 	lastChromeClickAt   time.Time
 	lastChromeClick     image.Point
+	chromeControlHover  chromeWindowControl
+}
+
+type chromeWindowControl uint8
+
+const (
+	chromeWindowControlNone chromeWindowControl = iota
+	chromeWindowControlMinimize
+	chromeWindowControlMaximize
+	chromeWindowControlClose
+)
+
+type chromeWindowControlButton struct {
+	control chromeWindowControl
+	bounds  image.Rectangle
 }
 
 type displayStartResult struct {
@@ -2161,13 +2176,53 @@ func (v *displayViewer) drawAppChrome(backingWidth, backingHeight int) {
 		v.drawRect(backingWidth, backingHeight, scale, float32(statusBounds.Min.X)+8, float32(statusBounds.Max.Y)-4,
 			float32(statusBounds.Dx()-16)*fraction, 2, uiPrimary)
 	}
+	controls := chromeWindowControlButtons(width, platformWindowControlsAvailable())
+	for _, button := range controls {
+		if v.chromeControlHover == button.control {
+			background := uiSurfaceHover
+			if button.control == chromeWindowControlClose {
+				background = uiError
+			}
+			v.drawRect(backingWidth, backingHeight, scale,
+				float32(button.bounds.Min.X), float32(button.bounds.Min.Y),
+				float32(button.bounds.Dx()), float32(button.bounds.Dy()), background)
+		}
+		centerX := float32(button.bounds.Min.X+button.bounds.Max.X) / 2
+		centerY := float32(button.bounds.Min.Y+button.bounds.Max.Y) / 2
+		switch button.control {
+		case chromeWindowControlMinimize:
+			v.drawRect(backingWidth, backingHeight, scale, centerX-5, centerY+3, 10, 1, uiText)
+		case chromeWindowControlMaximize:
+			v.drawOutline(backingWidth, backingHeight, scale,
+				image.Rect(int(centerX)-5, int(centerY)-4, int(centerX)+5, int(centerY)+4), uiText)
+		}
+	}
 	// Draw title-bar text after all chrome shapes so it remains on top.
 	v.text.BeginDraw()
 	v.drawCenteredTextBold(productName(), image.Rect(0, 0, int(width), int(appChromeHeight)), 13, uiText)
 	v.drawCenteredTextBold(fitStartupText(label, float32(statusBounds.Dx()-24), 13), statusBounds, 13, statusColor)
+	for _, button := range controls {
+		if button.control == chromeWindowControlClose {
+			v.drawCenteredTextBold("×", button.bounds, 16, uiText)
+		}
+	}
 	v.text.EndDraw()
 	if v.cvmfsExpanded {
 		v.drawCVMFSDetails(backingWidth, backingHeight, scale, width)
+	}
+}
+
+func chromeWindowControlButtons(width float32, available bool) []chromeWindowControlButton {
+	if !available {
+		return nil
+	}
+	const buttonWidth = 46
+	right := int(width)
+	left := max(0, right-3*buttonWidth)
+	return []chromeWindowControlButton{
+		{control: chromeWindowControlMinimize, bounds: image.Rect(left, 0, left+buttonWidth, int(appChromeHeight))},
+		{control: chromeWindowControlMaximize, bounds: image.Rect(left+buttonWidth, 0, left+2*buttonWidth, int(appChromeHeight))},
+		{control: chromeWindowControlClose, bounds: image.Rect(left+2*buttonWidth, 0, right, int(appChromeHeight))},
 	}
 }
 
@@ -2616,6 +2671,9 @@ func (v *displayViewer) handleInput() error {
 }
 
 func (v *displayViewer) handleChromeInput(event window.InputEvent) bool {
+	if event.Type == window.InputEventMouseMove {
+		v.chromeControlHover = chromeWindowControlNone
+	}
 	if !v.chromeEnabled {
 		return false
 	}
@@ -2632,6 +2690,16 @@ func (v *displayViewer) handleChromeInput(event window.InputEvent) bool {
 		return false
 	}
 	if point.Y >= 0 && float32(point.Y) < appChromeHeight {
+		for _, button := range chromeWindowControlButtons(width, platformWindowControlsAvailable()) {
+			if !point.In(button.bounds) {
+				continue
+			}
+			v.chromeControlHover = button.control
+			if event.Type == window.InputEventMouseDown && event.Button == window.ButtonLeft {
+				activatePlatformWindowControl(button.control)
+			}
+			return true
+		}
 		if event.Type == window.InputEventMouseDown && event.Button == window.ButtonLeft {
 			if point.In(statusBounds) {
 				v.cvmfsExpanded = !v.cvmfsExpanded

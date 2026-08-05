@@ -4,6 +4,10 @@ package desktopapp
 
 import "github.com/ebitengine/purego/objc"
 
+func platformWindowControlsAvailable() bool { return false }
+
+func activatePlatformWindowControl(chromeWindowControl) bool { return false }
+
 func toggleActiveWindowMaximized() bool {
 	application := objc.ID(objc.GetClass("NSApplication")).Send(objc.RegisterName("sharedApplication"))
 	if application == 0 {
