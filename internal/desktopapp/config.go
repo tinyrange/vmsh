@@ -9,30 +9,32 @@ import (
 // desktop applications. Runtime, setup, display, input, update, and lifecycle
 // behavior lives in this package so fixes are shared by every branded app.
 type Config struct {
-	ProductName          string
-	Subtitle             string
-	Kind                 string
-	Theme                Theme
-	DefaultVMName        string
-	DefaultImage         string
-	DefaultStorage       string
-	GuestStorageMount    string
-	DefaultUser          string
-	DefaultMemoryMB      uint64
-	DefaultCPUs          int
-	DefaultEphemeralHome bool
-	AMD64Emulation       bool
-	BrandPNG             []byte
-	ConfigDirName        string
-	DataDirName          string
-	ImageNamespace       string
-	CacheImageDir        string
-	DesktopReadiness     string
-	SSHHost              string
-	SSHUser              string
-	SSHHome              string
-	ReleaseAssetPrefix   string
-	CVMFSHostMount       *CVMFSHostMountConfig
+	ProductName                        string
+	Subtitle                           string
+	Kind                               string
+	Theme                              Theme
+	DefaultVMName                      string
+	DefaultImage                       string
+	DefaultStorage                     string
+	GuestStorageMount                  string
+	DefaultUser                        string
+	DefaultMemoryMB                    uint64
+	DefaultCPUs                        int
+	DefaultEphemeralHome               bool
+	AMD64Emulation                     bool
+	BrandPNG                           []byte
+	ConfigDirName                      string
+	DataDirName                        string
+	ImageNamespace                     string
+	CacheImageDir                      string
+	DesktopReadiness                   string
+	SSHHost                            string
+	SSHUser                            string
+	SSHHome                            string
+	ReleaseAssetPrefix                 string
+	ExperimentalCompressedOCI          bool
+	ExperimentalBackgroundImageUpdates bool
+	CVMFSHostMount                     *CVMFSHostMountConfig
 }
 
 type CVMFSHostMountConfig struct {

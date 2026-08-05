@@ -232,8 +232,17 @@ func Run(config Config, args []string) (retErr error) {
 	if !*vnc {
 		displayContext, cancelDisplay := context.WithCancel(lifetimeContext)
 		monitorDone := make(chan error, 1)
+		var preflightMu sync.Mutex
+		var latestPreflight startupPreflight
+		var imageStage backgroundImageStage
 		preflight := func(ctx context.Context) (startupPreflight, error) {
-			return runConfiguredAppPreflight(ctx, api, fs.Arg(0), activeCacheDir, appConfig.CVMFSHostMount)
+			result, err := runConfiguredAppPreflight(ctx, api, fs.Arg(0), activeCacheDir, appConfig.CVMFSHostMount)
+			if err == nil {
+				preflightMu.Lock()
+				latestPreflight = result
+				preflightMu.Unlock()
+			}
+			return result, err
 		}
 		start := func(ctx context.Context, options startupOptions, publish func(startupProgress)) (started displayStarted, retErr error) {
 			options = normalizeResourceOptions(options)
@@ -260,6 +269,9 @@ func Run(config Config, args []string) (retErr error) {
 					return displayStarted{}, fmt.Errorf("selected install location did not pass startup checks")
 				}
 				options.CVMFSAutoMirror = selectedPreflight.CVMFSMirror
+				preflightMu.Lock()
+				latestPreflight = selectedPreflight
+				preflightMu.Unlock()
 			}
 			stopped := make(chan struct{})
 			var stopOnce sync.Once
@@ -340,12 +352,25 @@ func Run(config Config, args []string) (retErr error) {
 			}
 
 			var measuredDownloadRate float64
-			imageName, err := prepareAppImage(ctx, api, fs.Arg(0), options.RefreshImage || *refreshImage, func(progress startupProgress) {
-				if progress.Rate > 0 {
-					measuredDownloadRate = progress.Rate
+			imageName := ""
+			if options.RefreshImage && appConfig.ExperimentalBackgroundImageUpdates {
+				publish(desktopStartupProgress("Finishing the image update"))
+				stagedName, staged, stageErr := imageStage.take(ctx)
+				if staged && stageErr == nil {
+					imageName = pulledImageName(fs.Arg(0), runtime.GOARCH)
+					if err := api.ActivateStagedImageContext(ctx, imageName, stagedName); err != nil {
+						imageName = ""
+					}
 				}
-				publish(progress)
-			})
+			}
+			if imageName == "" {
+				imageName, err = prepareAppImage(ctx, api, fs.Arg(0), options.RefreshImage || *refreshImage, func(progress startupProgress) {
+					if progress.Rate > 0 {
+						measuredDownloadRate = progress.Rate
+					}
+					publish(progress)
+				})
+			}
 			if err != nil {
 				return displayStarted{}, fmt.Errorf("prepare image %q: %w", fs.Arg(0), err)
 			}
@@ -418,6 +443,23 @@ func Run(config Config, args []string) (retErr error) {
 				return displayStarted{}, err
 			}
 			publish(desktopStartupProgress("Waiting for a complete desktop frame"))
+			if appConfig.ExperimentalBackgroundImageUpdates && isRegistryImageReference(fs.Arg(0)) {
+				preflightMu.Lock()
+				hasUpdate := latestPreflight.hasUpdate()
+				preflightMu.Unlock()
+				if hasUpdate {
+					stageAPI := api
+					stageName := pulledImageName(fs.Arg(0), runtime.GOARCH) + "-staged"
+					imageStage.start(stageName, func() error {
+						return stageAPI.PullImageStreamContext(lifetimeContext, stageName, client.PullImageRequest{
+							Source:         fs.Arg(0),
+							Architecture:   runtime.GOARCH,
+							Refresh:        true,
+							KeepCompressed: appConfig.ExperimentalCompressedOCI,
+						}, nil)
+					})
+				}
+			}
 			go func() {
 				err := monitorDisplayVM(ctx, api, *name)
 				if ctx.Err() != nil {
@@ -616,9 +658,10 @@ func prepareAppImage(ctx context.Context, api *client.Client, source string, ref
 
 	localName := pulledImageName(source, runtime.GOARCH)
 	err := api.PullImageStreamContext(ctx, localName, client.PullImageRequest{
-		Source:       source,
-		Architecture: runtime.GOARCH,
-		Refresh:      refresh,
+		Source:         source,
+		Architecture:   runtime.GOARCH,
+		Refresh:        refresh,
+		KeepCompressed: appConfig.ExperimentalCompressedOCI,
 	}, func(event client.ProgressEvent) error {
 		if publish != nil {
 			publish(pullStartupProgress(event))
