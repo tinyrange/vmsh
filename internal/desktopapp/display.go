@@ -2189,26 +2189,44 @@ func (v *displayViewer) drawAppChrome(backingWidth, backingHeight int) {
 		}
 		centerX := float32(button.bounds.Min.X+button.bounds.Max.X) / 2
 		centerY := float32(button.bounds.Min.Y+button.bounds.Max.Y) / 2
-		switch button.control {
-		case chromeWindowControlMinimize:
-			v.drawRect(backingWidth, backingHeight, scale, centerX-5, centerY+3, 10, 1, uiText)
-		case chromeWindowControlMaximize:
-			v.drawOutline(backingWidth, backingHeight, scale,
-				image.Rect(int(centerX)-5, int(centerY)-4, int(centerX)+5, int(centerY)+4), uiText)
-		}
+		v.drawChromeWindowControlGlyph(backingWidth, backingHeight, scale, button.control, centerX, centerY, uiText)
 	}
 	// Draw title-bar text after all chrome shapes so it remains on top.
 	v.text.BeginDraw()
 	v.drawCenteredTextBold(productName(), image.Rect(0, 0, int(width), int(appChromeHeight)), 13, uiText)
 	v.drawCenteredTextBold(fitStartupText(label, float32(statusBounds.Dx()-24), 13), statusBounds, 13, statusColor)
-	for _, button := range controls {
-		if button.control == chromeWindowControlClose {
-			v.drawCenteredTextBold("×", button.bounds, 16, uiText)
-		}
-	}
 	v.text.EndDraw()
 	if v.cvmfsExpanded {
 		v.drawCVMFSDetails(backingWidth, backingHeight, scale, width)
+	}
+}
+
+func (v *displayViewer) drawChromeWindowControlGlyph(
+	backingWidth, backingHeight int,
+	scale float32,
+	control chromeWindowControl,
+	centerX, centerY float32,
+	col color.RGBA,
+) {
+	const (
+		glyphSize = float32(10)
+		stroke    = float32(1)
+	)
+	left := centerX - glyphSize/2
+	top := centerY - glyphSize/2
+	switch control {
+	case chromeWindowControlMinimize:
+		v.drawRect(backingWidth, backingHeight, scale, left, top+glyphSize-stroke, glyphSize, stroke, col)
+	case chromeWindowControlMaximize:
+		v.drawRect(backingWidth, backingHeight, scale, left, top, glyphSize, stroke, col)
+		v.drawRect(backingWidth, backingHeight, scale, left, top+glyphSize-stroke, glyphSize, stroke, col)
+		v.drawRect(backingWidth, backingHeight, scale, left, top, stroke, glyphSize, col)
+		v.drawRect(backingWidth, backingHeight, scale, left+glyphSize-stroke, top, stroke, glyphSize, col)
+	case chromeWindowControlClose:
+		for offset := float32(0); offset < glyphSize; offset++ {
+			v.drawRect(backingWidth, backingHeight, scale, left+offset, top+offset, stroke, stroke, col)
+			v.drawRect(backingWidth, backingHeight, scale, left+offset, top+glyphSize-stroke-offset, stroke, stroke, col)
+		}
 	}
 }
 
