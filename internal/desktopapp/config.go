@@ -34,6 +34,16 @@ type Config struct {
 	ReleaseAssetPrefix                 string
 	ExperimentalCompressedOCI          bool
 	ExperimentalBackgroundImageUpdates bool
+	CVMFSHostMount                     *CVMFSHostMountConfig
+}
+
+type CVMFSHostMountConfig struct {
+	Mount           string
+	Mirror          string
+	Mirrors         []string
+	Repo            string
+	Path            string
+	CacheLimitBytes int64
 }
 
 var appConfig Config

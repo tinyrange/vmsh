@@ -28,6 +28,7 @@ const (
 	startupControlSharedFolder
 	startupControlMemory
 	startupControlCPUs
+	startupControlCVMFSMirror
 	startupControlSkip
 	startupControlPrimary
 )
@@ -37,6 +38,7 @@ type startupControlLayout struct {
 	brand          image.Rectangle
 	state          image.Rectangle
 	status         [4]image.Rectangle
+	cvmfsStatus    image.Rectangle
 	sshCheckbox    image.Rectangle
 	systemCheckbox image.Rectangle
 	advanced       image.Rectangle
@@ -45,6 +47,7 @@ type startupControlLayout struct {
 	advancedPanel  image.Rectangle
 	memorySlider   image.Rectangle
 	cpuSlider      image.Rectangle
+	cvmfsMirror    image.Rectangle
 	actionDivider  image.Rectangle
 	skip           image.Rectangle
 	button         image.Rectangle
@@ -55,6 +58,10 @@ func settingsControlLayout(width, height float32) startupControlLayout {
 }
 
 func settingsControlLayoutForState(width, height float32, advancedExpanded bool) startupControlLayout {
+	return settingsControlLayoutForOptions(width, height, advancedExpanded, false)
+}
+
+func settingsControlLayoutForOptions(width, height float32, advancedExpanded, cvmfs bool) startupControlLayout {
 	margin := float32(uiOuterMargin)
 	if width < 800 {
 		margin = uiCompactMargin
@@ -88,6 +95,12 @@ func settingsControlLayoutForState(width, height float32, advancedExpanded bool)
 	optionTop := statusTop
 	if !compactExpanded {
 		optionTop += 2*(uiStatusCardHeight+uiCardGap) + 2
+		if cvmfs {
+			layout.cvmfsStatus = image.Rect(
+				int(left), int(optionTop), int(right), int(optionTop+uiStatusCardHeight),
+			)
+			optionTop += uiStatusCardHeight + uiCardGap
+		}
 	}
 	optionWidth := (panelWidth - 2*uiCardGap) / 3
 	layout.sshCheckbox = image.Rect(
@@ -107,10 +120,18 @@ func settingsControlLayoutForState(width, height float32, advancedExpanded bool)
 			advancedHeight = 138
 			sliderTop = 62
 		}
+		resourceHeight := advancedHeight
+		if cvmfs {
+			advancedHeight += 66
+		}
 		layout.advancedPanel = image.Rect(int(left), int(sharedTop), int(right), int(sharedTop+advancedHeight))
 		midpoint := left + panelWidth/2
 		layout.memorySlider = image.Rect(int(left+22), int(sharedTop+sliderTop), int(midpoint-12), int(sharedTop+sliderTop+44))
 		layout.cpuSlider = image.Rect(int(midpoint+12), int(sharedTop+sliderTop), int(right-22), int(sharedTop+sliderTop+44))
+		if cvmfs {
+			mirrorTop := sharedTop + resourceHeight - 2
+			layout.cvmfsMirror = image.Rect(int(left+22), int(mirrorTop), int(right-22), int(mirrorTop+48))
+		}
 		sharedTop += advancedHeight + 10
 	}
 	layout.sharedFolder = image.Rect(int(left), int(sharedTop), int(right), int(sharedTop+uiOptionCardHeight))
@@ -159,6 +180,8 @@ func advancedControlAt(point image.Point, layout startupControlLayout) startupCo
 		return startupControlMemory
 	case point.In(layout.cpuSlider):
 		return startupControlCPUs
+	case point.In(layout.cvmfsMirror):
+		return startupControlCVMFSMirror
 	default:
 		return startupControlNone
 	}
@@ -199,9 +222,16 @@ func calculateStartupScreenLayout(width, height float32) startupScreenLayout {
 }
 
 func startupControlOrder(showSkip, advancedExpanded bool) []startupControl {
+	return startupControlOrderForOptions(showSkip, advancedExpanded, false)
+}
+
+func startupControlOrderForOptions(showSkip, advancedExpanded, cvmfs bool) []startupControl {
 	controls := []startupControl{startupControlSSH, startupControlSystem, startupControlAdvanced, startupControlSharedFolder}
 	if advancedExpanded {
 		controls = []startupControl{startupControlSSH, startupControlSystem, startupControlAdvanced, startupControlMemory, startupControlCPUs, startupControlSharedFolder}
+		if cvmfs {
+			controls = []startupControl{startupControlSSH, startupControlSystem, startupControlAdvanced, startupControlMemory, startupControlCPUs, startupControlCVMFSMirror, startupControlSharedFolder}
+		}
 	}
 	if showSkip {
 		controls = append(controls, startupControlSkip)
@@ -210,7 +240,11 @@ func startupControlOrder(showSkip, advancedExpanded bool) []startupControl {
 }
 
 func nextStartupControl(current startupControl, reverse, showSkip, advancedExpanded bool) startupControl {
-	controls := startupControlOrder(showSkip, advancedExpanded)
+	return nextStartupControlForOptions(current, reverse, showSkip, advancedExpanded, false)
+}
+
+func nextStartupControlForOptions(current startupControl, reverse, showSkip, advancedExpanded, cvmfs bool) startupControl {
+	controls := startupControlOrderForOptions(showSkip, advancedExpanded, cvmfs)
 	if len(controls) == 0 {
 		return startupControlNone
 	}

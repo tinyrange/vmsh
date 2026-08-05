@@ -225,6 +225,9 @@ func Run(config Config, args []string) (retErr error) {
 		Dmesg:            *dmesg,
 		TimeoutSeconds:   bootTimeout.Seconds(),
 	}
+	if appConfig.CVMFSHostMount != nil {
+		request.Env = append(request.Env, "CVMFS_DISABLE=true", "NEURODESKTOP_CVMFS_STARTUP_MODE=external")
+	}
 
 	if !*vnc {
 		displayContext, cancelDisplay := context.WithCancel(lifetimeContext)
@@ -233,7 +236,7 @@ func Run(config Config, args []string) (retErr error) {
 		var latestPreflight startupPreflight
 		var imageStage backgroundImageStage
 		preflight := func(ctx context.Context) (startupPreflight, error) {
-			result, err := runAppPreflight(ctx, api, fs.Arg(0), activeCacheDir)
+			result, err := runConfiguredAppPreflight(ctx, api, fs.Arg(0), activeCacheDir, appConfig.CVMFSHostMount)
 			if err == nil {
 				preflightMu.Lock()
 				latestPreflight = result
@@ -258,13 +261,14 @@ func Run(config Config, args []string) (retErr error) {
 				}
 				api = backend.api
 				activeCacheDir = desiredCacheDir
-				selectedPreflight, err := runAppPreflight(ctx, api, fs.Arg(0), activeCacheDir)
+				selectedPreflight, err := runConfiguredAppPreflight(ctx, api, fs.Arg(0), activeCacheDir, appConfig.CVMFSHostMount)
 				if err != nil {
 					return displayStarted{}, err
 				}
-				if !selectedPreflight.canStart() {
+				if !selectedPreflight.canPrepareImage() {
 					return displayStarted{}, fmt.Errorf("selected install location did not pass startup checks")
 				}
+				options.CVMFSAutoMirror = selectedPreflight.CVMFSMirror
 				preflightMu.Lock()
 				latestPreflight = selectedPreflight
 				preflightMu.Unlock()
@@ -293,6 +297,7 @@ func Run(config Config, args []string) (retErr error) {
 			settings.SharedFolder = selectedShare.Source
 			settings.MemoryMB = options.MemoryMB
 			settings.CPUs = options.CPUs
+			settings.CVMFSMirror = options.CVMFSMirror
 			if options.SystemInstall {
 				settings.InstallMode = appInstallSystem
 			} else {
@@ -376,6 +381,27 @@ func Run(config Config, args []string) (retErr error) {
 				}
 			}
 			startRequest.Image = imageName
+			if config := appConfig.CVMFSHostMount; config != nil {
+				selectedMirror := strings.TrimSpace(options.CVMFSMirror)
+				if selectedMirror == "" {
+					selectedMirror = strings.TrimSpace(options.CVMFSAutoMirror)
+				}
+				if selectedMirror == "" {
+					publish(startupProgress{Phase: startupBoot, Title: "Connecting CVMFS", Detail: "Detecting the nearest mirror"})
+					probe, probeErr := probeConfiguredCVMFS(ctx, api, config)
+					if probeErr != nil {
+						return displayStarted{}, fmt.Errorf("connect CVMFS before VM start: %w", probeErr)
+					}
+					selectedMirror = strings.TrimSpace(probe.SelectedMirror)
+				}
+				if selectedMirror == "" {
+					return displayStarted{}, fmt.Errorf("connect CVMFS before VM start: no mirror is available")
+				}
+				publish(startupProgress{Phase: startupBoot, Title: "Connecting CVMFS", Detail: mirrorDisplayName(selectedMirror)})
+				if err := api.SelectCVMFSMirrorContext(ctx, client.CVMFSMirrorSelectionRequest{Repo: config.Repo, Mirror: selectedMirror}); err != nil {
+					return displayStarted{}, fmt.Errorf("connect CVMFS before VM start: %w", err)
+				}
+			}
 			state, err := api.CreateInstanceStreamWithIDContext(ctx, *name, startRequest, func(event client.BootEvent) error {
 				if *dmesg && event.Kind == "serial" && event.Data != "" {
 					_, _ = io.WriteString(os.Stderr, event.Data)
@@ -446,6 +472,12 @@ func Run(config Config, args []string) (retErr error) {
 			}()
 			return displayStarted{Session: session, Stopped: stopped}, nil
 		}
+		var cvmfsStatus cvmfsStatusSource
+		if appConfig.CVMFSHostMount != nil {
+			cvmfsStatus = func(ctx context.Context) (client.CVMFSStatusResponse, error) {
+				return api.CVMFSStatusContext(ctx)
+			}
+		}
 		windowErr := openDisplayWindow(
 			displayContext,
 			productName(),
@@ -460,9 +492,13 @@ func Run(config Config, args []string) (retErr error) {
 				CPUs:          resourceOptions.CPUs,
 				MaxMemoryMB:   resourceOptions.MaxMemoryMB,
 				MaxCPUs:       resourceOptions.MaxCPUs,
+				CVMFSRepo:     cvmfsConfigRepo(appConfig.CVMFSHostMount),
+				CVMFSMirrors:  cvmfsConfigMirrors(appConfig.CVMFSHostMount),
+				CVMFSMirror:   configuredCVMFSMirror(settings.CVMFSMirror, appConfig.CVMFSHostMount),
 			},
 			preflight,
 			start,
+			cvmfsStatus,
 		)
 		cancelDisplay()
 		if windowErr != nil {
@@ -476,6 +512,20 @@ func Run(config Config, args []string) (retErr error) {
 		default:
 		}
 		return nil
+	}
+
+	if config := appConfig.CVMFSHostMount; config != nil {
+		probe, err := probeConfiguredCVMFS(lifetimeContext, api, config)
+		if err != nil {
+			return fmt.Errorf("check CVMFS mirrors: %w", err)
+		}
+		selected := configuredCVMFSMirror(settings.CVMFSMirror, config)
+		if selected == "" {
+			selected = probe.SelectedMirror
+		}
+		if err := api.SelectCVMFSMirrorContext(lifetimeContext, client.CVMFSMirrorSelectionRequest{Repo: config.Repo, Mirror: selected}); err != nil {
+			return fmt.Errorf("select CVMFS mirror: %w", err)
+		}
 	}
 
 	var lastBootMessage string
@@ -720,6 +770,85 @@ func persistentHomeMount(vmName, homeName string, ephemeral bool) ([]client.Pers
 		homeName = strings.TrimSpace(vmName)
 	}
 	return []client.PersistentMount{{Name: homeName}}, homeName, nil
+}
+
+func runConfiguredAppPreflight(ctx context.Context, api *client.Client, source, cacheDir string, cvmfs *CVMFSHostMountConfig) (startupPreflight, error) {
+	result, err := runAppPreflight(ctx, api, source, cacheDir)
+	if err != nil || cvmfs == nil {
+		return result, err
+	}
+	result.CVMFSRequired = true
+	probe, probeErr := probeConfiguredCVMFS(ctx, api, cvmfs)
+	if probeErr != nil {
+		result.CVMFSDetail = probeErr.Error()
+		return result, nil
+	}
+	result.CVMFSMirror = probe.SelectedMirror
+	result.CVMFSOK = strings.TrimSpace(probe.SelectedMirror) != ""
+	measured := 0
+	var selectedRate float64
+	for _, candidate := range probe.Results {
+		if candidate.RootCatalogBytes > 0 {
+			measured++
+		}
+		if candidate.Mirror == probe.SelectedMirror {
+			selectedRate = candidate.RootCatalogBytesPerSec
+		}
+	}
+	result.CVMFSDetail = fmt.Sprintf("Measured %d root-catalog mirror", measured)
+	if measured != 1 {
+		result.CVMFSDetail += "s"
+	}
+	if selectedRate > 0 {
+		result.CVMFSDetail += " · " + formatBytes(int64(selectedRate)) + "/s"
+	}
+	return result, nil
+}
+
+func probeConfiguredCVMFS(ctx context.Context, api *client.Client, cvmfs *CVMFSHostMountConfig) (client.CVMFSMirrorProbeResponse, error) {
+	if cvmfs == nil {
+		return client.CVMFSMirrorProbeResponse{}, fmt.Errorf("CVMFS host mount is not configured")
+	}
+	probeContext, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	return api.ProbeCVMFSMirrorsContext(probeContext, client.CVMFSMirrorProbeRequest{Repo: cvmfs.Repo})
+}
+
+func cvmfsConfigRepo(config *CVMFSHostMountConfig) string {
+	if config == nil {
+		return ""
+	}
+	return config.Repo
+}
+
+func cvmfsConfigMirrors(config *CVMFSHostMountConfig) []string {
+	if config == nil {
+		return nil
+	}
+	seen := make(map[string]bool, len(config.Mirrors)+1)
+	out := make([]string, 0, len(config.Mirrors)+1)
+	for _, candidate := range append([]string{config.Mirror}, config.Mirrors...) {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" || seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		out = append(out, candidate)
+	}
+	return out
+}
+
+func configuredCVMFSMirror(saved string, config *CVMFSHostMountConfig) string {
+	saved = strings.TrimSpace(saved)
+	if saved == "" || config == nil {
+		return ""
+	}
+	for _, mirror := range cvmfsConfigMirrors(config) {
+		if strings.TrimSpace(mirror) == saved {
+			return saved
+		}
+	}
+	return ""
 }
 
 func createStorageShare(value string) (client.ShareMount, error) {

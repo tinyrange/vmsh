@@ -22,24 +22,31 @@ func startEmbeddedBackend(cacheDir, name string, displayReady chan<- display.Ses
 	ready := make(chan client.ServerHello, 1)
 	done := make(chan error, 1)
 	serverArgs := []string{"-addr", "127.0.0.1:0", "-cache-dir", cacheDir}
+	serverOptions := ccvmd.ServerOptions{
+		Kind:          appConfig.Kind,
+		StartupWriter: io.Discard,
+		OnStartup: func(hello client.ServerHello) error {
+			ready <- hello
+			return nil
+		},
+		OnDisplay: func(id string, session display.Session) {
+			if id != name {
+				return
+			}
+			select {
+			case displayReady <- session:
+			default:
+			}
+		},
+	}
+	if config := appConfig.CVMFSHostMount; config != nil {
+		serverOptions.CVMFSMounts = []ccvmd.CVMFSHostMount{{
+			Mount: config.Mount, Mirror: config.Mirror, Mirrors: append([]string(nil), config.Mirrors...),
+			Repo: config.Repo, Path: config.Path, CacheLimitBytes: config.CacheLimitBytes,
+		}}
+	}
 	go func() {
-		_, err := ccvmd.RunServer(serverArgs, ccvmd.ServerOptions{
-			Kind:          appConfig.Kind,
-			StartupWriter: io.Discard,
-			OnStartup: func(hello client.ServerHello) error {
-				ready <- hello
-				return nil
-			},
-			OnDisplay: func(id string, session display.Session) {
-				if id != name {
-					return
-				}
-				select {
-				case displayReady <- session:
-				default:
-				}
-			},
-		})
+		_, err := ccvmd.RunServer(serverArgs, serverOptions)
 		done <- err
 	}()
 

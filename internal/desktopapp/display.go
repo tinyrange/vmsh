@@ -22,11 +22,13 @@ import (
 	"golang.org/x/image/font/gofont/gomono"
 	"golang.org/x/image/font/gofont/gomonobold"
 	"golang.org/x/image/font/gofont/goregular"
+	"j5.nz/cc/client"
 	"j5.nz/cc/display"
 )
 
 const (
-	glBGRA = 0x80e1
+	glBGRA          = 0x80e1
+	appChromeHeight = float32(28)
 
 	displayVertexShader = `#version 150
 in vec2 position;
@@ -173,6 +175,31 @@ type displayViewer struct {
 	updateHover         int
 	updateHoverActive   bool
 	updateConsumedKeys  map[window.Key]bool
+	chromeEnabled       bool
+	chromeInsets        window.TitleBarInsets
+	cvmfsStatus         client.CVMFSStatusResponse
+	cvmfsActivity       cvmfsActivityPresentation
+	cvmfsStatusEvents   chan client.CVMFSStatusResponse
+	cvmfsExpanded       bool
+	cvmfsMirrorMenuOpen bool
+	cvmfsMirrorOffset   int
+	lastChromeClickAt   time.Time
+	lastChromeClick     image.Point
+	chromeControlHover  chromeWindowControl
+}
+
+type chromeWindowControl uint8
+
+const (
+	chromeWindowControlNone chromeWindowControl = iota
+	chromeWindowControlMinimize
+	chromeWindowControlMaximize
+	chromeWindowControlClose
+)
+
+type chromeWindowControlButton struct {
+	control chromeWindowControl
+	bounds  image.Rectangle
 }
 
 type displayStartResult struct {
@@ -185,6 +212,42 @@ type displayPreflightResult struct {
 	err       error
 }
 
+type cvmfsStatusSource func(context.Context) (client.CVMFSStatusResponse, error)
+
+const cvmfsActivityHold = 750 * time.Millisecond
+
+// cvmfsActivityPresentation smooths the short gaps between demand-driven
+// object fetches. It does not alter the daemon's active-transfer state; it only
+// keeps the most recently observed activity visible long enough for a person to
+// read it.
+type cvmfsActivityPresentation struct {
+	lastActive client.CVMFSStatusResponse
+	activeAt   time.Time
+}
+
+func (p *cvmfsActivityPresentation) observe(status client.CVMFSStatusResponse, now time.Time) client.CVMFSStatusResponse {
+	if status.State == "error" {
+		p.lastActive = client.CVMFSStatusResponse{}
+		p.activeAt = time.Time{}
+		return status
+	}
+	if len(status.ActiveTransfers) != 0 {
+		p.lastActive = status
+		p.activeAt = now
+		return status
+	}
+	if !p.activeAt.IsZero() && now.Sub(p.activeAt) < cvmfsActivityHold {
+		presented := p.lastActive
+		if status.SelectedMirror != "" {
+			presented.SelectedMirror = status.SelectedMirror
+		}
+		return presented
+	}
+	p.lastActive = client.CVMFSStatusResponse{}
+	p.activeAt = time.Time{}
+	return status
+}
+
 func openDisplayWindow(
 	ctx context.Context,
 	title string,
@@ -192,6 +255,7 @@ func openDisplayWindow(
 	settings startupOptions,
 	preflight displayPreflight,
 	start displayStart,
+	cvmfsStatus cvmfsStatusSource,
 ) error {
 	win, err := window.New(title, width, height, true)
 	if err != nil {
@@ -212,6 +276,14 @@ func openDisplayWindow(
 		updateConsumedKeys: make(map[window.Key]bool),
 		parentContext:      ctx,
 		start:              start,
+		chromeEnabled:      cvmfsStatus != nil,
+		cvmfsStatusEvents:  make(chan client.CVMFSStatusResponse, 1),
+	}
+	if viewer.chromeEnabled {
+		if chrome, ok := win.(window.IntegratedTitleBarSupport); ok && chrome.SetIntegratedTitleBar(true) {
+			viewer.chromeInsets = chrome.IntegratedTitleBarInsets()
+		}
+		go pollCVMFSStatus(ctx, cvmfsStatus, viewer.cvmfsStatusEvents)
 	}
 	viewer.setStartupProgress(initialStartupProgress())
 	if err := viewer.init(); err != nil {
@@ -223,6 +295,36 @@ func openDisplayWindow(
 	return viewer.loop(ctx)
 }
 
+func pollCVMFSStatus(ctx context.Context, source cvmfsStatusSource, updates chan client.CVMFSStatusResponse) {
+	// CVMFS object fetches are commonly shorter than 200 ms. Poll often enough
+	// to observe them, then let cvmfsActivityPresentation bridge the tiny gaps
+	// between demand-driven reads.
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		status, err := source(ctx)
+		if err == nil {
+			select {
+			case updates <- status:
+			default:
+				select {
+				case <-updates:
+				default:
+				}
+				select {
+				case updates <- status:
+				default:
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 func (v *displayViewer) beginPreflight(ctx context.Context, preflight displayPreflight) {
 	go func() {
 		result, err := preflight(ctx)
@@ -231,12 +333,12 @@ func (v *displayViewer) beginPreflight(ctx context.Context, preflight displayPre
 }
 
 func (v *displayViewer) beginStart(refreshImage bool) {
-	if v.starting || !v.preflightReady || !v.preflight.canStart() {
+	if v.starting || !v.preflightReady || !v.preflight.canPrepareImage() {
 		return
 	}
 	v.settings.RefreshImage = refreshImage
 	backingWidth, backingHeight := v.window.BackingSize()
-	displaySize := guestDisplaySize(backingWidth, backingHeight, v.window.Scale())
+	displaySize := v.guestDisplaySize(backingWidth, backingHeight)
 	v.settings.DisplayWidth = displaySize.X
 	v.settings.DisplayHeight = displaySize.Y
 	ctx, cancel := context.WithCancel(v.parentContext)
@@ -524,8 +626,11 @@ func (v *displayViewer) loop(ctx context.Context) error {
 					continue
 				}
 				v.preflight = result.preflight
+				v.settings.CVMFSAutoMirror = result.preflight.CVMFSMirror
 				v.preflightReady = true
 				v.showSettings = true
+			case status := <-v.cvmfsStatusEvents:
+				v.cvmfsStatus = v.cvmfsActivity.observe(status, time.Now())
 			case <-v.imageRestartReady:
 				v.starting = false
 				v.startCancel = nil
@@ -581,16 +686,30 @@ func (v *displayViewer) loop(ctx context.Context) error {
 			v.gl.Disable(gl.Blend)
 			v.gl.ClearColor(0, 0, 0, 1)
 			v.gl.Clear(gl.ColorBufferBit)
-			v.gl.UseProgram(v.program)
-			v.gl.ActiveTexture(gl.Texture0)
-			v.gl.BindTexture(gl.Texture2D, v.texture)
-			v.gl.BindVertexArray(v.vertexArray)
-			v.gl.DrawArrays(gl.Triangles, 0, 6)
+			if v.chromeEnabled {
+				scale := normalizedDisplayScale(v.window.Scale())
+				logicalWidth := float32(backingWidth) / scale
+				logicalHeight := float32(backingHeight) / scale
+				v.drawTexture(v.texture, backingWidth, backingHeight, scale, 0, appChromeHeight, logicalWidth, logicalHeight-appChromeHeight)
+			} else {
+				v.gl.UseProgram(v.program)
+				v.gl.ActiveTexture(gl.Texture0)
+				v.gl.BindTexture(gl.Texture2D, v.texture)
+				v.gl.BindVertexArray(v.vertexArray)
+				v.gl.DrawArrays(gl.Triangles, 0, 6)
+			}
+			// The framebuffer's fourth byte is padding, but the UI overlays use
+			// real alpha (notably the font atlas). Restore blending as soon as the
+			// opaque framebuffer has been drawn.
+			v.gl.Enable(gl.Blend)
 			v.drawUpdateNotifications(backingWidth, backingHeight, time.Now())
 		} else if v.showSettings {
 			v.drawSettings(backingWidth, backingHeight)
 		} else {
 			v.drawStartup(backingWidth, backingHeight, time.Now())
+		}
+		if v.chromeEnabled {
+			v.drawAppChrome(backingWidth, backingHeight)
 		}
 		v.window.Swap()
 		time.Sleep(time.Second / 120)
@@ -601,6 +720,9 @@ func (v *displayViewer) loop(ctx context.Context) error {
 func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 	scale := normalizedDisplayScale(v.window.Scale())
 	for _, event := range events {
+		if v.handleChromeInput(event) {
+			continue
+		}
 		if (!v.showSettings && v.startup.Failed) || (v.showSettings && v.settingsFailureDetail() != "") {
 			switch event.Type {
 			case window.InputEventScroll:
@@ -627,6 +749,10 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 			}
 		}
 		if event.Type == window.InputEventKeyDown && event.Key == window.KeyEscape && !event.Repeat {
+			if v.cvmfsMirrorMenuOpen {
+				v.cvmfsMirrorMenuOpen = false
+				continue
+			}
 			if v.showSettings && v.showAdvanced {
 				v.showAdvanced = false
 				v.startupFocus = startupControlAdvanced
@@ -667,7 +793,8 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 			continue
 		}
 		backingWidth, backingHeight := v.window.BackingSize()
-		layout := settingsControlLayoutForState(float32(backingWidth)/scale, float32(backingHeight)/scale, v.showAdvanced)
+		logicalHeight := float32(backingHeight) / scale
+		layout := v.settingsLayout(float32(backingWidth)/scale, logicalHeight)
 		point := image.Pt(int(event.MouseX/scale), int(event.MouseY/scale))
 		switch event.Type {
 		case window.InputEventKeyDown:
@@ -676,11 +803,13 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 			}
 			switch event.Key {
 			case window.KeyTab:
-				v.startupFocus = nextStartupControl(
+				v.cvmfsMirrorMenuOpen = false
+				v.startupFocus = nextStartupControlForOptions(
 					v.startupFocus,
 					event.Mods&window.ModShift != 0,
 					v.preflight.hasUpdate(),
 					v.showAdvanced,
+					v.hasCVMFSMirrors(),
 				)
 				v.startupFocusVisible = true
 			case window.KeyLeft:
@@ -700,7 +829,22 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 					v.beginSettingsStart(v.preflight.hasUpdate())
 				}
 			}
+		case window.InputEventScroll:
+			if v.cvmfsMirrorMenuOpen {
+				v.scrollCVMFSMirrorMenu(event.ScrollY)
+			}
 		case window.InputEventMouseMove, window.InputEventMouseDown:
+			if event.Type == window.InputEventMouseDown && v.cvmfsMirrorMenuOpen {
+				if choice, ok := v.cvmfsMirrorChoiceAt(point, layout, logicalHeight); ok {
+					v.settings.CVMFSMirror = choice
+					v.cvmfsMirrorMenuOpen = false
+					v.startupFocus = startupControlCVMFSMirror
+					continue
+				}
+				if !point.In(layout.cvmfsMirror) {
+					v.cvmfsMirrorMenuOpen = false
+				}
+			}
 			control := advancedControlAt(point, layout)
 			if control == startupControlNone {
 				control = startupControlAt(point, layout, v.preflight.hasUpdate())
@@ -727,6 +871,10 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 				v.startupFocus = control
 				v.resourceDrag = control
 				v.setResourceFromPointer(control, point.X, layout)
+			case startupControlCVMFSMirror:
+				v.startupFocus = control
+				v.cvmfsMirrorMenuOpen = !v.cvmfsMirrorMenuOpen
+				v.ensureCVMFSMirrorVisible()
 			case startupControlSharedFolder:
 				v.startupFocus = startupControlSharedFolder
 				v.chooseSharedFolder()
@@ -751,6 +899,10 @@ func (v *displayViewer) activateStartupControl(control startupControl) {
 		v.settings.SystemInstall = !v.settings.SystemInstall
 	case startupControlAdvanced:
 		v.showAdvanced = !v.showAdvanced
+		v.cvmfsMirrorMenuOpen = false
+	case startupControlCVMFSMirror:
+		v.cvmfsMirrorMenuOpen = !v.cvmfsMirrorMenuOpen
+		v.ensureCVMFSMirrorVisible()
 	case startupControlSharedFolder:
 		v.chooseSharedFolder()
 	case startupControlSkip:
@@ -769,6 +921,8 @@ func (v *displayViewer) adjustResource(control startupControl, delta int) {
 		v.settings.MemoryMB = memoryForSliderStep(step+delta, v.settings.MaxMemoryMB)
 	case startupControlCPUs:
 		v.settings.CPUs = min(v.settings.MaxCPUs, max(1, v.settings.CPUs+delta))
+	case startupControlCVMFSMirror:
+		v.cycleCVMFSMirror(delta)
 	}
 }
 
@@ -853,7 +1007,7 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 	v.gl.UseProgram(v.program)
 	v.drawBackground(backingWidth, backingHeight)
 
-	layout := settingsControlLayoutForState(width, height, v.showAdvanced)
+	layout := v.settingsLayout(width, height)
 	panel := layout.panel
 	left := float32(panel.Min.X)
 	contentTop := float32(panel.Min.Y)
@@ -904,13 +1058,19 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 			stateColor = uiAccentSoft
 			stateBackground = uiSurfaceHover
 		}
-		if !v.preflight.canStart() {
+		if !v.preflight.canPrepareImage() {
 			title = "Can't start yet"
-			detail = "Review the failed requirement before starting " + productName() + "."
+			detail = "Review the failed host requirement before preparing " + productName() + "."
 			state = "ACTION NEEDED"
 			stateColor = uiWarning
 			stateBackground = uiWarningSurface
 			titleColor = uiWarning
+		} else if !preflightCanStartWithMirror(v.preflight, v.settings.CVMFSMirror) {
+			title = "Ready to prepare"
+			detail = "The desktop image will be prepared before CVMFS connects and the virtual machine starts."
+			state = "SETUP READY"
+			stateColor = uiWarning
+			stateBackground = uiWarningSurface
 		}
 	}
 
@@ -951,6 +1111,13 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 			"Virtual machine manager",
 			preflightReleaseDetail(v.preflightReady, v.preflight),
 		)
+		if !layout.cvmfsStatus.Empty() {
+			v.drawPreflightCard(backingWidth, backingHeight, scale, layout.cvmfsStatus,
+				cvmfsPreflightStatus(v.preflightReady, v.preflight),
+				"CVMFS mirror",
+				cvmfsPreflightDetail(v.preflightReady, v.preflight),
+			)
+		}
 	}
 
 	v.drawSettingsOption(
@@ -976,7 +1143,7 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 	button := layout.button
 	buttonColor := uiDisabled
 	buttonText := uiDisabled
-	if v.preflightReady && v.preflight.canStart() && !v.starting {
+	if v.preflightReady && v.preflight.canPrepareImage() && !v.starting {
 		buttonColor = uiPrimary
 		buttonText = uiWhite
 		if v.startupHover == startupControlPrimary {
@@ -1026,6 +1193,9 @@ func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
 	v.drawText(fitStartupText("Space  select   ·   Tab  move   ·   Enter  start", shortcutWidth, 15),
 		left, float32(button.Min.Y+33), 15, uiAccentSoft)
 	v.text.EndDraw()
+	if v.cvmfsMirrorMenuOpen {
+		v.drawCVMFSMirrorMenu(backingWidth, backingHeight, scale, layout, height)
+	}
 }
 
 func (v *displayViewer) drawAdvancedOption(backingWidth, backingHeight int, scale float32, bounds image.Rectangle) {
@@ -1041,7 +1211,15 @@ func (v *displayViewer) drawAdvancedOption(backingWidth, backingHeight int, scal
 	}
 	v.text.BeginDraw()
 	v.drawTextBold("Advanced", float32(bounds.Min.X+14), float32(bounds.Min.Y+24), 16, uiText)
-	v.drawText(fitStartupText(fmt.Sprintf("%s · %d vCPU", formatMemoryAmount(v.settings.MemoryMB), v.settings.CPUs), float32(bounds.Dx()-48), 14),
+	summary := fmt.Sprintf("%s · %d vCPU", formatMemoryAmount(v.settings.MemoryMB), v.settings.CPUs)
+	if v.hasCVMFSMirrors() {
+		mode := "CVMFS auto"
+		if strings.TrimSpace(v.settings.CVMFSMirror) != "" {
+			mode = "CVMFS override"
+		}
+		summary += " · " + mode
+	}
+	v.drawText(fitStartupText(summary, float32(bounds.Dx()-48), 14),
 		float32(bounds.Min.X+14), float32(bounds.Min.Y+47), 14, uiAccentSoft)
 	indicator := "+"
 	if v.showAdvanced {
@@ -1075,6 +1253,190 @@ func (v *displayViewer) drawAdvancedSettings(backingWidth, backingHeight int, sc
 	v.drawResourceSlider(backingWidth, backingHeight, scale, layout.cpuSlider,
 		sliderPosition(v.settings.CPUs, 1, v.settings.MaxCPUs),
 		v.startupFocusVisible && v.startupFocus == startupControlCPUs)
+	if !layout.cvmfsMirror.Empty() {
+		fill := uiSurfaceRaised
+		border := uiBorderStrong
+		if v.startupHover == startupControlCVMFSMirror {
+			fill = uiSurfaceHover
+		}
+		v.drawPanel(backingWidth, backingHeight, scale, layout.cvmfsMirror, 8, border, fill)
+		if v.startupFocusVisible && v.startupFocus == startupControlCVMFSMirror {
+			v.drawOutline(backingWidth, backingHeight, scale, layout.cvmfsMirror, uiAccent)
+		}
+		v.text.BeginDraw()
+		v.drawTextBold("CVMFS mirror", float32(layout.cvmfsMirror.Min.X+12), float32(layout.cvmfsMirror.Min.Y+18), 14, uiText)
+		label := fitStartupText(v.cvmfsMirrorSelectionLabel(), float32(layout.cvmfsMirror.Dx()-48), 13)
+		v.drawText(label, float32(layout.cvmfsMirror.Min.X+12), float32(layout.cvmfsMirror.Min.Y+39), 13, uiAccentSoft)
+		v.drawTextBold("v", float32(layout.cvmfsMirror.Max.X-25), float32(layout.cvmfsMirror.Min.Y+29), 17, uiAccent)
+		v.text.EndDraw()
+	}
+}
+
+const cvmfsMirrorMenuVisibleRows = 7
+
+func (v *displayViewer) hasCVMFSMirrors() bool { return len(v.settings.CVMFSMirrors) != 0 }
+
+func (v *displayViewer) chromeContentTop() float32 {
+	if v.chromeEnabled {
+		return appChromeHeight
+	}
+	return 0
+}
+
+func (v *displayViewer) settingsLayout(width, height float32) startupControlLayout {
+	top := v.chromeContentTop()
+	layout := settingsControlLayoutForOptions(width, max(float32(1), height-top), v.showAdvanced, v.hasCVMFSMirrors())
+	if top == 0 {
+		return layout
+	}
+	offset := image.Pt(0, int(top))
+	layout.panel = layout.panel.Add(offset)
+	layout.brand = layout.brand.Add(offset)
+	layout.state = layout.state.Add(offset)
+	for index := range layout.status {
+		layout.status[index] = layout.status[index].Add(offset)
+	}
+	layout.cvmfsStatus = layout.cvmfsStatus.Add(offset)
+	layout.sshCheckbox = layout.sshCheckbox.Add(offset)
+	layout.systemCheckbox = layout.systemCheckbox.Add(offset)
+	layout.advanced = layout.advanced.Add(offset)
+	layout.sharedFolder = layout.sharedFolder.Add(offset)
+	layout.sharedBrowse = layout.sharedBrowse.Add(offset)
+	layout.advancedPanel = layout.advancedPanel.Add(offset)
+	layout.memorySlider = layout.memorySlider.Add(offset)
+	layout.cpuSlider = layout.cpuSlider.Add(offset)
+	layout.cvmfsMirror = layout.cvmfsMirror.Add(offset)
+	layout.actionDivider = layout.actionDivider.Add(offset)
+	layout.skip = layout.skip.Add(offset)
+	layout.button = layout.button.Add(offset)
+	return layout
+}
+
+func (v *displayViewer) cvmfsMirrorChoices() []string {
+	if !v.hasCVMFSMirrors() {
+		return nil
+	}
+	return append([]string{""}, v.settings.CVMFSMirrors...)
+}
+
+func (v *displayViewer) cvmfsMirrorSelectionLabel() string {
+	if mirror := strings.TrimSpace(v.settings.CVMFSMirror); mirror != "" {
+		return mirrorDisplayName(mirror)
+	}
+	if mirror := strings.TrimSpace(v.settings.CVMFSAutoMirror); mirror != "" {
+		return "Automatic · " + mirrorDisplayName(mirror)
+	}
+	if detail := strings.TrimSpace(v.preflight.CVMFSDetail); detail != "" {
+		return "Automatic · " + detail
+	}
+	return "Automatic · measuring root catalogs"
+}
+
+func mirrorDisplayName(mirror string) string {
+	mirror = strings.TrimSpace(strings.TrimRight(mirror, "/"))
+	mirror = strings.TrimPrefix(mirror, "https://")
+	mirror = strings.TrimPrefix(mirror, "http://")
+	mirror = strings.TrimSuffix(mirror, "/cvmfs")
+	return mirror
+}
+
+func (v *displayViewer) selectedCVMFSMirrorIndex() int {
+	selected := strings.TrimSpace(v.settings.CVMFSMirror)
+	for index, choice := range v.cvmfsMirrorChoices() {
+		if choice == selected {
+			return index
+		}
+	}
+	return 0
+}
+
+func (v *displayViewer) cycleCVMFSMirror(delta int) {
+	choices := v.cvmfsMirrorChoices()
+	if len(choices) == 0 || delta == 0 {
+		return
+	}
+	index := (v.selectedCVMFSMirrorIndex() + delta) % len(choices)
+	if index < 0 {
+		index += len(choices)
+	}
+	v.settings.CVMFSMirror = choices[index]
+	v.ensureCVMFSMirrorVisible()
+}
+
+func (v *displayViewer) ensureCVMFSMirrorVisible() {
+	choices := v.cvmfsMirrorChoices()
+	visible := min(cvmfsMirrorMenuVisibleRows, len(choices))
+	selected := v.selectedCVMFSMirrorIndex()
+	if selected < v.cvmfsMirrorOffset {
+		v.cvmfsMirrorOffset = selected
+	} else if selected >= v.cvmfsMirrorOffset+visible {
+		v.cvmfsMirrorOffset = selected - visible + 1
+	}
+	v.cvmfsMirrorOffset = min(max(0, len(choices)-visible), max(0, v.cvmfsMirrorOffset))
+}
+
+func (v *displayViewer) scrollCVMFSMirrorMenu(delta float32) {
+	if delta > 0 {
+		v.cvmfsMirrorOffset--
+	} else if delta < 0 {
+		v.cvmfsMirrorOffset++
+	}
+	choices := v.cvmfsMirrorChoices()
+	visible := min(cvmfsMirrorMenuVisibleRows, len(choices))
+	v.cvmfsMirrorOffset = min(max(0, len(choices)-visible), max(0, v.cvmfsMirrorOffset))
+}
+
+func cvmfsMirrorMenuLayout(field image.Rectangle, viewportHeight, choiceCount, offset int) (image.Rectangle, []image.Rectangle) {
+	visible := min(cvmfsMirrorMenuVisibleRows, max(0, choiceCount-offset))
+	if field.Empty() || visible == 0 {
+		return image.Rectangle{}, nil
+	}
+	const rowHeight = 30
+	height := visible * rowHeight
+	top := field.Max.Y + 4
+	if top+height > viewportHeight-12 {
+		top = field.Min.Y - 4 - height
+	}
+	bounds := image.Rect(field.Min.X, top, field.Max.X, top+height)
+	rows := make([]image.Rectangle, visible)
+	for index := range rows {
+		rows[index] = image.Rect(bounds.Min.X, bounds.Min.Y+index*rowHeight, bounds.Max.X, bounds.Min.Y+(index+1)*rowHeight)
+	}
+	return bounds, rows
+}
+
+func (v *displayViewer) cvmfsMirrorChoiceAt(point image.Point, layout startupControlLayout, viewportHeight float32) (string, bool) {
+	choices := v.cvmfsMirrorChoices()
+	_, rows := cvmfsMirrorMenuLayout(layout.cvmfsMirror, int(viewportHeight), len(choices), v.cvmfsMirrorOffset)
+	for index, row := range rows {
+		if point.In(row) {
+			return choices[v.cvmfsMirrorOffset+index], true
+		}
+	}
+	return "", false
+}
+
+func (v *displayViewer) drawCVMFSMirrorMenu(backingWidth, backingHeight int, scale float32, layout startupControlLayout, viewportHeight float32) {
+	choices := v.cvmfsMirrorChoices()
+	bounds, rows := cvmfsMirrorMenuLayout(layout.cvmfsMirror, int(viewportHeight), len(choices), v.cvmfsMirrorOffset)
+	if bounds.Empty() {
+		return
+	}
+	v.drawPanel(backingWidth, backingHeight, scale, bounds, 8, uiBorderStrong, uiCanvas)
+	selected := v.selectedCVMFSMirrorIndex()
+	for index, row := range rows {
+		choiceIndex := v.cvmfsMirrorOffset + index
+		if choiceIndex == selected {
+			v.drawRect(backingWidth, backingHeight, scale, float32(row.Min.X+2), float32(row.Min.Y+1), float32(row.Dx()-4), float32(row.Dy()-2), uiSurfaceHover)
+		}
+		label := mirrorDisplayName(choices[choiceIndex])
+		if choiceIndex == 0 {
+			label = "Automatic (fastest root catalog)"
+		}
+		v.text.BeginDraw()
+		v.drawText(fitStartupText(label, float32(row.Dx()-24), 13), float32(row.Min.X+12), float32(row.Min.Y+20), 13, uiText)
+		v.text.EndDraw()
+	}
 }
 
 func (v *displayViewer) drawResourceSlider(backingWidth, backingHeight int, scale float32, bounds image.Rectangle, position float32, focused bool) {
@@ -1331,6 +1693,29 @@ func preflightReleaseDetail(ready bool, preflight startupPreflight) string {
 	return detail
 }
 
+func cvmfsPreflightStatus(ready bool, preflight startupPreflight) string {
+	if !preflight.CVMFSRequired {
+		return "SKIP"
+	}
+	return preflightStatus(ready, preflight.CVMFSOK)
+}
+
+func cvmfsPreflightDetail(ready bool, preflight startupPreflight) string {
+	if !ready {
+		return "Detecting the nearest mirror"
+	}
+	if mirror := mirrorDisplayName(preflight.CVMFSMirror); mirror != "" {
+		if detail := strings.TrimSpace(preflight.CVMFSDetail); detail != "" {
+			return mirror + " · " + detail
+		}
+		return mirror
+	}
+	if detail := strings.TrimSpace(preflight.CVMFSDetail); detail != "" {
+		return detail
+	}
+	return "No reachable mirror detected"
+}
+
 func (v *displayViewer) drawStartup(backingWidth, backingHeight int, now time.Time) {
 	v.gl.Enable(gl.Blend)
 	scale := normalizedDisplayScale(v.window.Scale())
@@ -1339,7 +1724,15 @@ func (v *displayViewer) drawStartup(backingWidth, backingHeight int, now time.Ti
 	v.gl.UseProgram(v.program)
 	v.drawBackground(backingWidth, backingHeight)
 
-	layout := calculateStartupScreenLayout(width, height)
+	chromeTop := v.chromeContentTop()
+	layout := calculateStartupScreenLayout(width, max(float32(1), height-chromeTop))
+	layout.panel = layout.panel.Add(image.Pt(0, int(chromeTop)))
+	layout.brand = layout.brand.Add(image.Pt(0, int(chromeTop)))
+	layout.state = layout.state.Add(image.Pt(0, int(chromeTop)))
+	layout.bar = layout.bar.Add(image.Pt(0, int(chromeTop)))
+	for index := range layout.steps {
+		layout.steps[index] = layout.steps[index].Add(image.Pt(0, int(chromeTop)))
+	}
 	panel := layout.panel
 	panelWidth := float32(panel.Dx())
 	left := float32(panel.Min.X)
@@ -1739,6 +2132,189 @@ func (v *displayViewer) drawTexture(texture uint32, backingWidth, backingHeight 
 	v.gl.Viewport(0, 0, int32(backingWidth), int32(backingHeight))
 }
 
+func cvmfsChromeStatusBounds(width float32, insets window.TitleBarInsets) image.Rectangle {
+	right := max(1, int(width-max(float32(12), insets.Right)))
+	left := min(right-1, max(int(insets.Left)+150, right-300))
+	left = max(0, left)
+	return image.Rect(left, 4, right, int(appChromeHeight)-4)
+}
+
+func cvmfsChromeDetailBounds(width float32, insets window.TitleBarInsets, transfers int) image.Rectangle {
+	status := cvmfsChromeStatusBounds(width, insets)
+	panelWidth := min(540, max(320, int(width)-24))
+	right := status.Max.X
+	left := max(12, right-panelWidth)
+	height := 54 + min(6, max(1, transfers))*52
+	return image.Rect(left, int(appChromeHeight)+6, right, int(appChromeHeight)+6+height)
+}
+
+func (v *displayViewer) drawAppChrome(backingWidth, backingHeight int) {
+	scale := normalizedDisplayScale(v.window.Scale())
+	width := float32(backingWidth) / scale
+	v.drawRect(backingWidth, backingHeight, scale, 0, 0, width, appChromeHeight, uiCanvas)
+	v.drawRect(backingWidth, backingHeight, scale, 0, appChromeHeight-1, width, 1, uiBorder)
+
+	statusBounds := cvmfsChromeStatusBounds(width, v.chromeInsets)
+	v.text.SetViewport(int32(width), int32(float32(backingHeight)/scale))
+	v.text.SetScale(scale)
+
+	statusColor := uiAccent
+	statusBackground := uiSurfaceRaised
+	label := cvmfsChromeLabel(v.cvmfsStatus, time.Now())
+	switch v.cvmfsStatus.State {
+	case "error":
+		statusColor = uiError
+		statusBackground = uiErrorSurface
+	}
+	v.drawRoundedRect(backingWidth, backingHeight, scale, statusBounds, statusBounds.Dy()/2, statusBackground)
+	if v.cvmfsStatus.State == "downloading" {
+		fraction := float32(v.cvmfsStatus.Progress)
+		if fraction <= 0 {
+			fraction = 0.08
+		}
+		fraction = min(float32(1), max(float32(0.02), fraction))
+		v.drawRect(backingWidth, backingHeight, scale, float32(statusBounds.Min.X)+8, float32(statusBounds.Max.Y)-4,
+			float32(statusBounds.Dx()-16)*fraction, 2, uiPrimary)
+	}
+	controls := chromeWindowControlButtons(width, platformWindowControlsAvailable())
+	for _, button := range controls {
+		if v.chromeControlHover == button.control {
+			background := uiSurfaceHover
+			if button.control == chromeWindowControlClose {
+				background = uiError
+			}
+			v.drawRect(backingWidth, backingHeight, scale,
+				float32(button.bounds.Min.X), float32(button.bounds.Min.Y),
+				float32(button.bounds.Dx()), float32(button.bounds.Dy()), background)
+		}
+		centerX := float32(button.bounds.Min.X+button.bounds.Max.X) / 2
+		centerY := float32(button.bounds.Min.Y+button.bounds.Max.Y) / 2
+		v.drawChromeWindowControlGlyph(backingWidth, backingHeight, scale, button.control, centerX, centerY, uiText)
+	}
+	// Draw title-bar text after all chrome shapes so it remains on top.
+	v.text.BeginDraw()
+	v.drawCenteredTextBold(productName(), image.Rect(0, 0, int(width), int(appChromeHeight)), 13, uiText)
+	v.drawCenteredTextBold(fitStartupText(label, float32(statusBounds.Dx()-24), 13), statusBounds, 13, statusColor)
+	v.text.EndDraw()
+	if v.cvmfsExpanded {
+		v.drawCVMFSDetails(backingWidth, backingHeight, scale, width)
+	}
+}
+
+func (v *displayViewer) drawChromeWindowControlGlyph(
+	backingWidth, backingHeight int,
+	scale float32,
+	control chromeWindowControl,
+	centerX, centerY float32,
+	col color.RGBA,
+) {
+	const (
+		glyphSize = float32(10)
+		stroke    = float32(1)
+	)
+	left := centerX - glyphSize/2
+	top := centerY - glyphSize/2
+	switch control {
+	case chromeWindowControlMinimize:
+		v.drawRect(backingWidth, backingHeight, scale, left, top+glyphSize-stroke, glyphSize, stroke, col)
+	case chromeWindowControlMaximize:
+		v.drawRect(backingWidth, backingHeight, scale, left, top, glyphSize, stroke, col)
+		v.drawRect(backingWidth, backingHeight, scale, left, top+glyphSize-stroke, glyphSize, stroke, col)
+		v.drawRect(backingWidth, backingHeight, scale, left, top, stroke, glyphSize, col)
+		v.drawRect(backingWidth, backingHeight, scale, left+glyphSize-stroke, top, stroke, glyphSize, col)
+	case chromeWindowControlClose:
+		for offset := float32(0); offset < glyphSize; offset++ {
+			v.drawRect(backingWidth, backingHeight, scale, left+offset, top+offset, stroke, stroke, col)
+			v.drawRect(backingWidth, backingHeight, scale, left+offset, top+glyphSize-stroke-offset, stroke, stroke, col)
+		}
+	}
+}
+
+func chromeWindowControlButtons(width float32, available bool) []chromeWindowControlButton {
+	if !available {
+		return nil
+	}
+	const buttonWidth = 46
+	right := int(width)
+	left := max(0, right-3*buttonWidth)
+	return []chromeWindowControlButton{
+		{control: chromeWindowControlMinimize, bounds: image.Rect(left, 0, left+buttonWidth, int(appChromeHeight))},
+		{control: chromeWindowControlMaximize, bounds: image.Rect(left+buttonWidth, 0, left+2*buttonWidth, int(appChromeHeight))},
+		{control: chromeWindowControlClose, bounds: image.Rect(left+2*buttonWidth, 0, right, int(appChromeHeight))},
+	}
+}
+
+func cvmfsChromeLabel(status client.CVMFSStatusResponse, now time.Time) string {
+	if status.State == "error" {
+		return "CVMFS needs attention"
+	}
+	count := len(status.ActiveTransfers)
+	if count == 0 {
+		return "CVMFS ready"
+	}
+	label := fmt.Sprintf("CVMFS · %d download", count)
+	if count != 1 {
+		label += "s"
+	}
+	if rate := cvmfsDownloadRate(status.ActiveTransfers, now); rate > 0 {
+		label += " · " + formatBytes(int64(rate)) + "/s"
+	}
+	return label
+}
+
+func cvmfsDownloadRate(transfers []client.CVMFSTransferState, now time.Time) float64 {
+	var rate float64
+	for _, transfer := range transfers {
+		started, err := time.Parse(time.RFC3339Nano, transfer.StartedAt)
+		if err != nil || transfer.Bytes <= 0 {
+			continue
+		}
+		elapsed := now.Sub(started).Seconds()
+		if elapsed > 0 {
+			rate += float64(transfer.Bytes) / elapsed
+		}
+	}
+	return rate
+}
+
+func (v *displayViewer) drawCVMFSDetails(backingWidth, backingHeight int, scale, width float32) {
+	bounds := cvmfsChromeDetailBounds(width, v.chromeInsets, len(v.cvmfsStatus.ActiveTransfers))
+	v.drawPanel(backingWidth, backingHeight, scale, bounds, 10, uiBorderStrong, uiCanvas)
+	v.text.BeginDraw()
+	v.drawTextBold("CVMFS transfers", float32(bounds.Min.X+16), float32(bounds.Min.Y+24), 15, uiText)
+	summary := "No active downloads"
+	if len(v.cvmfsStatus.ActiveTransfers) != 0 {
+		summary = fmt.Sprintf("%s of %s", formatBytes(v.cvmfsStatus.Bytes), formatBytes(v.cvmfsStatus.TotalBytes))
+	}
+	v.drawText(summary, float32(bounds.Min.X+16), float32(bounds.Min.Y+44), 13, uiTextSecondary)
+	v.text.EndDraw()
+	transfers := v.cvmfsStatus.ActiveTransfers
+	if len(transfers) > 6 {
+		transfers = transfers[:6]
+	}
+	for index, transfer := range transfers {
+		y := float32(bounds.Min.Y + 64 + index*52)
+		labelWidth := float32(bounds.Dx() - 32)
+		v.text.BeginDraw()
+		v.drawText(fitStartupText(transfer.Path, labelWidth, 13), float32(bounds.Min.X+16), y, 13, uiText)
+		amount := formatBytes(transfer.Bytes)
+		if transfer.TotalBytes > 0 {
+			amount += " / " + formatBytes(transfer.TotalBytes)
+		}
+		amountWidth := float32(v.text.GetAdvance(v.font, 12, amount))
+		v.drawText(amount, float32(bounds.Max.X-16)-amountWidth, y+17, 12, uiTextSecondary)
+		v.text.EndDraw()
+		barWidth := float32(bounds.Dx() - 32)
+		v.drawRect(backingWidth, backingHeight, scale, float32(bounds.Min.X+16), y+24, barWidth, 4, uiSurfaceRaised)
+		fraction := float32(transfer.Progress)
+		if fraction <= 0 {
+			fraction = 0.04
+		}
+		v.drawRect(backingWidth, backingHeight, scale, float32(bounds.Min.X+16), y+24,
+			barWidth*min(float32(1), fraction), 4, uiPrimary)
+	}
+}
+
 func startupEyebrow(progress startupProgress) string {
 	if progress.Failed {
 		return "STARTUP INTERRUPTED"
@@ -1975,7 +2551,7 @@ func (v *displayViewer) handleResize() error {
 		v.windowMinimized = false
 		v.generation = 0
 	}
-	size := guestDisplaySize(backingWidth, backingHeight, v.window.Scale())
+	size := v.guestDisplaySize(backingWidth, backingHeight)
 	if size == v.lastResize {
 		v.pendingResize = image.Point{}
 		return nil
@@ -2010,6 +2586,18 @@ func guestDisplaySize(backingWidth, backingHeight int, scale float32) image.Poin
 	return image.Pt(width, height)
 }
 
+func (v *displayViewer) guestDisplaySize(backingWidth, backingHeight int) image.Point {
+	return guestDisplaySizeWithChrome(backingWidth, backingHeight, v.window.Scale(), v.chromeEnabled)
+}
+
+func guestDisplaySizeWithChrome(backingWidth, backingHeight int, scale float32, chrome bool) image.Point {
+	size := guestDisplaySize(backingWidth, backingHeight, scale)
+	if chrome {
+		size.Y = max(1, size.Y-int(appChromeHeight))
+	}
+	return size
+}
+
 func (v *displayViewer) updateGuestCursor() error {
 	if v.guestCursor == nil {
 		return nil
@@ -2030,6 +2618,9 @@ func normalizedDisplayScale(scale float32) float32 {
 
 func (v *displayViewer) handleInput() error {
 	for _, event := range v.window.DrainInputEvents() {
+		if v.handleChromeInput(event) {
+			continue
+		}
 		if event.Type == window.InputEventMouseMove {
 			v.updateUpdateNotificationHover(event.MouseX, event.MouseY, time.Now())
 		}
@@ -2095,6 +2686,72 @@ func (v *displayViewer) handleInput() error {
 		v.keysDown[key] = false
 	}
 	return nil
+}
+
+func (v *displayViewer) handleChromeInput(event window.InputEvent) bool {
+	if event.Type == window.InputEventMouseMove {
+		v.chromeControlHover = chromeWindowControlNone
+	}
+	if !v.chromeEnabled {
+		return false
+	}
+	scale := normalizedDisplayScale(v.window.Scale())
+	backingWidth, _ := v.window.BackingSize()
+	width := float32(backingWidth) / scale
+	point := image.Pt(int(event.MouseX/scale), int(event.MouseY/scale))
+	statusBounds := cvmfsChromeStatusBounds(width, v.chromeInsets)
+	if event.Type == window.InputEventKeyDown && event.Key == window.KeyEscape && v.cvmfsExpanded {
+		v.cvmfsExpanded = false
+		return true
+	}
+	if event.Type != window.InputEventMouseDown && event.Type != window.InputEventMouseUp && event.Type != window.InputEventMouseMove {
+		return false
+	}
+	if point.Y >= 0 && float32(point.Y) < appChromeHeight {
+		for _, button := range chromeWindowControlButtons(width, platformWindowControlsAvailable()) {
+			if !point.In(button.bounds) {
+				continue
+			}
+			v.chromeControlHover = button.control
+			if event.Type == window.InputEventMouseDown && event.Button == window.ButtonLeft {
+				_ = activatePlatformWindowControl(button.control)
+			}
+			return true
+		}
+		if event.Type == window.InputEventMouseDown && event.Button == window.ButtonLeft {
+			if point.In(statusBounds) {
+				v.cvmfsExpanded = !v.cvmfsExpanded
+			} else if v.isTitleBarDoubleClick(point, time.Now()) {
+				toggleActiveWindowMaximized()
+			} else if chrome, ok := v.window.(window.IntegratedTitleBarSupport); ok {
+				chrome.BeginWindowDrag()
+			}
+		}
+		return true
+	}
+	if v.cvmfsExpanded && point.In(cvmfsChromeDetailBounds(width, v.chromeInsets, len(v.cvmfsStatus.ActiveTransfers))) {
+		return true
+	}
+	return false
+}
+
+func (v *displayViewer) isTitleBarDoubleClick(point image.Point, now time.Time) bool {
+	const (
+		maximumDelay    = 500 * time.Millisecond
+		maximumDistance = 5
+	)
+	deltaX := point.X - v.lastChromeClick.X
+	deltaY := point.Y - v.lastChromeClick.Y
+	doubleClick := !v.lastChromeClickAt.IsZero() &&
+		now.Sub(v.lastChromeClickAt) >= 0 && now.Sub(v.lastChromeClickAt) <= maximumDelay &&
+		deltaX*deltaX+deltaY*deltaY <= maximumDistance*maximumDistance
+	if doubleClick {
+		v.lastChromeClickAt = time.Time{}
+		return true
+	}
+	v.lastChromeClickAt = now
+	v.lastChromeClick = point
+	return false
 }
 
 func keyboardTransitions(event window.InputEvent, wasDown, platformDown bool) []bool {
@@ -2211,8 +2868,13 @@ func (v *displayViewer) sendPointer(x, y float32, buttons uint8) error {
 	if backingWidth <= 0 || backingHeight <= 0 || guestWidth <= 0 || guestHeight <= 0 {
 		return nil
 	}
+	guestTop := float32(0)
+	if v.chromeEnabled {
+		guestTop = appChromeHeight * normalizedDisplayScale(v.window.Scale())
+	}
+	guestBackingHeight := max(float32(1), float32(backingHeight)-guestTop)
 	guestX := uint32(min(guestWidth-1, max(0, int(x*float32(guestWidth)/float32(backingWidth)))))
-	guestY := uint32(min(guestHeight-1, max(0, int(y*float32(guestHeight)/float32(backingHeight)))))
+	guestY := uint32(min(guestHeight-1, max(0, int((y-guestTop)*float32(guestHeight)/guestBackingHeight))))
 	if err := v.session.Pointer(guestX, guestY, buttons, v.sentButtons); err != nil {
 		return fmt.Errorf("send pointer input: %w", err)
 	}

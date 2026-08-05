@@ -4,9 +4,10 @@ go 1.25.5
 
 require (
 	github.com/creack/pty v1.1.24
+	github.com/ebitengine/purego v0.10.0
 	github.com/getkin/kin-openapi v0.140.0
 	github.com/modelcontextprotocol/go-sdk v1.6.1
-	github.com/tinyrange/gowin v0.0.0-20260803070720-862309a6acaa
+	github.com/tinyrange/gowin v0.0.0-20260805075655-1dabf26dc3f9
 	golang.org/x/crypto v0.50.0
 	golang.org/x/image v0.39.0
 	golang.org/x/net v0.53.0
@@ -17,7 +18,6 @@ require (
 
 require (
 	github.com/containerd/stargz-snapshotter/estargz v0.18.2 // indirect
-	github.com/ebitengine/purego v0.10.0 // indirect
 	github.com/go-openapi/jsonpointer v0.22.5 // indirect
 	github.com/go-openapi/swag/jsonname v0.25.5 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect

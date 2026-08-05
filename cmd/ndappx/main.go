@@ -10,6 +10,29 @@ import (
 )
 
 const defaultNeurodesktopImage = "ghcr.io/tinyrange/neurodesktop-glass:20260727"
+const defaultCVMFSCacheLimit = int64(5 << 30)
+
+var defaultCVMFSMirrors = []string{
+	"http://cvmfs-geoproximity.neurodesk.org",
+	"http://cvmfs.neurodesk.org",
+	"http://cvmfs-brisbane.neurodesk.org",
+	"http://cvmfs-melbourne.neurodesk.org",
+	"http://cvmfs-sydney.neurodesk.org",
+	"http://cvmfs-perth.neurodesk.org",
+	"http://cvmfs-jetstream.neurodesk.org",
+	"http://cvmfs-frankfurt.neurodesk.org",
+	"http://cvmfs01.nikhef.nl:8000",
+	"http://cvmfs-s1bnl.opensciencegrid.org:8000",
+	"http://cvmfs-s1goc.opensciencegrid.org:8000",
+	"http://cvmfs-stratum-one.ihep.ac.cn",
+	"http://sampacs01.if.usp.br:8000",
+	"http://s1brisbane-cvmfs.openhtc.io",
+	"http://s1melbourne-cvmfs.openhtc.io",
+	"http://s1nikhef-cvmfs.openhtc.io",
+	"http://s1osggoc-cvmfs.openhtc.io:8080",
+	"http://s1bnl-cvmfs.openhtc.io",
+	"http://s1sampa-cvmfs.openhtc.io:8080",
+}
 
 const neurodeskDesktopReadiness = `
 attempt=0
@@ -59,6 +82,11 @@ func main() {
 		ReleaseAssetPrefix:                 "NeurodeskAppX",
 		ExperimentalCompressedOCI:          true,
 		ExperimentalBackgroundImageUpdates: true,
+		CVMFSHostMount: &desktopapp.CVMFSHostMountConfig{
+			Mount: "/cvmfs/neurodesk.ardc.edu.au", Mirror: defaultCVMFSMirrors[0],
+			Mirrors: defaultCVMFSMirrors, Repo: "neurodesk.ardc.edu.au", Path: "/",
+			CacheLimitBytes: defaultCVMFSCacheLimit,
+		},
 	}, platformArguments(os.Args[1:]))
 	if err == nil || errors.Is(err, flag.ErrHelp) {
 		return

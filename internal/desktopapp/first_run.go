@@ -44,20 +44,25 @@ type appSettings struct {
 	SharedFolder     string  `json:"shared_folder,omitempty"`
 	MemoryMB         uint64  `json:"memory_mb,omitempty"`
 	CPUs             int     `json:"cpus,omitempty"`
+	CVMFSMirror      string  `json:"cvmfs_mirror,omitempty"`
 }
 
 type startupOptions struct {
-	SSHEnabled    bool
-	SystemInstall bool
-	RefreshImage  bool
-	DownloadRate  float64
-	SharedFolder  string
-	DisplayWidth  int
-	DisplayHeight int
-	MemoryMB      uint64
-	CPUs          int
-	MaxMemoryMB   uint64
-	MaxCPUs       int
+	SSHEnabled      bool
+	SystemInstall   bool
+	RefreshImage    bool
+	DownloadRate    float64
+	SharedFolder    string
+	DisplayWidth    int
+	DisplayHeight   int
+	MemoryMB        uint64
+	CPUs            int
+	MaxMemoryMB     uint64
+	MaxCPUs         int
+	CVMFSRepo       string
+	CVMFSMirrors    []string
+	CVMFSMirror     string
+	CVMFSAutoMirror string
 }
 
 const minimumGuestMemoryMB = uint64(1024)
@@ -127,10 +132,22 @@ type startupPreflight struct {
 	ReleaseUpdate        *releaseUpdate
 	ReleaseChecked       bool
 	ReleaseCheckDetail   string
+	CVMFSRequired        bool
+	CVMFSOK              bool
+	CVMFSMirror          string
+	CVMFSDetail          string
 }
 
 func (p startupPreflight) canStart() bool {
+	return p.VirtualizationOK && p.DiskOK && (!p.CVMFSRequired || p.CVMFSOK)
+}
+
+func (p startupPreflight) canPrepareImage() bool {
 	return p.VirtualizationOK && p.DiskOK
+}
+
+func preflightCanStartWithMirror(p startupPreflight, mirrorOverride string) bool {
+	return p.VirtualizationOK && p.DiskOK && (!p.CVMFSRequired || p.CVMFSOK || strings.TrimSpace(mirrorOverride) != "")
 }
 
 func (p startupPreflight) hasUpdate() bool {
