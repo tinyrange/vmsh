@@ -329,6 +329,18 @@ func Run(config Config, args []string) (retErr error) {
 				networkCopy.PortForwards = append([]client.PortForward(nil), request.Network.PortForwards...)
 				startRequest.Network = &networkCopy
 			}
+			var webApp *desktopWebAppTrigger
+			if appConfig.DesktopWebApp != nil && startRequest.Network != nil {
+				webApp, err = prepareDesktopWebApp(startRequest.Network, *appConfig.DesktopWebApp)
+				if err != nil {
+					return displayStarted{}, err
+				}
+				defer func() {
+					if retErr != nil || ctx.Err() != nil {
+						webApp.Close()
+					}
+				}()
+			}
 			if options.SSHEnabled {
 				sshPort, err = reserveSSHPort()
 				if err != nil {
@@ -418,6 +430,16 @@ func Run(config Config, args []string) (retErr error) {
 			}
 			if state.Display == nil {
 				return displayStarted{}, fmt.Errorf("VM started without a graphical display")
+			}
+			if webApp != nil {
+				if err := webApp.configureGuest(ctx, api, *name); err != nil {
+					return displayStarted{}, err
+				}
+				go func() {
+					if err := webApp.monitor(ctx, openLoopbackWebApp); err != nil && ctx.Err() == nil {
+						fmt.Fprintf(os.Stderr, "%s: %v\n", productName(), err)
+					}
+				}()
 			}
 			go func() {
 				<-ctx.Done()
@@ -538,6 +560,14 @@ func Run(config Config, args []string) (retErr error) {
 		return fmt.Errorf("prepare image %q: %w", fs.Arg(0), err)
 	}
 	request.Image = imageName
+	var webApp *desktopWebAppTrigger
+	if appConfig.DesktopWebApp != nil && request.Network != nil {
+		webApp, err = prepareDesktopWebApp(request.Network, *appConfig.DesktopWebApp)
+		if err != nil {
+			return err
+		}
+		defer webApp.Close()
+	}
 	state, err := api.CreateInstanceStreamWithIDContext(lifetimeContext, *name, request, func(event client.BootEvent) error {
 		if *dmesg && event.Kind == "serial" && event.Data != "" {
 			_, _ = io.WriteString(os.Stderr, event.Data)
@@ -558,6 +588,16 @@ func Run(config Config, args []string) (retErr error) {
 	}
 	if state.Display == nil {
 		return fmt.Errorf("VM started without a graphical display")
+	}
+	if webApp != nil {
+		if err := webApp.configureGuest(lifetimeContext, api, *name); err != nil {
+			return err
+		}
+		go func() {
+			if err := webApp.monitor(lifetimeContext, openLoopbackWebApp); err != nil && lifetimeContext.Err() == nil {
+				fmt.Fprintf(os.Stderr, "%s: %v\n", productName(), err)
+			}
+		}()
 	}
 	if state.Display.VNCAddress == "" {
 		return fmt.Errorf("VM started without a VNC endpoint")

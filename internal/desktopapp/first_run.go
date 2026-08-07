@@ -391,14 +391,18 @@ func runtimeArch() string {
 }
 
 func reserveSSHPort() (int, error) {
+	return reserveLoopbackPort("SSH")
+}
+
+func reserveLoopbackPort(purpose string) (int, error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return 0, fmt.Errorf("reserve %s SSH port: %w", productName(), err)
+		return 0, fmt.Errorf("reserve %s %s port: %w", productName(), purpose, err)
 	}
 	defer listener.Close()
 	port := listener.Addr().(*net.TCPAddr).Port
 	if port <= 0 {
-		return 0, fmt.Errorf("reserve %s SSH port: invalid port %d", productName(), port)
+		return 0, fmt.Errorf("reserve %s %s port: invalid port %d", productName(), purpose, port)
 	}
 	return port, nil
 }
