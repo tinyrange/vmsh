@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -u
+
+service_name=neurodeskappx-jupyter.service
+status_url=http://127.0.0.1:8888/api/status
+log_file="$HOME/.local/state/NeurodeskAppX/jupyter.log"
+
+printf '\033[2J\033[H'
+printf 'NeurodeskAppX JupyterLab\n\n'
+
+if curl --silent --show-error --fail --max-time 2 "$status_url" >/dev/null 2>&1; then
+    printf 'JupyterLab is already ready.\n'
+    sleep 1
+    exit 0
+fi
+
+printf 'Starting JupyterLab...\n\n'
+touch "$log_file"
+tail -n 0 -F "$log_file" &
+tail_pid=$!
+cleanup() {
+    kill "$tail_pid" >/dev/null 2>&1 || true
+    wait "$tail_pid" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+if ! sudo -n /usr/bin/systemctl start "$service_name"; then
+    cleanup
+    trap - EXIT INT TERM
+    printf '\nJupyterLab could not be started.\n'
+    /usr/bin/systemctl status --no-pager "$service_name" || true
+    printf '\nPress Enter to close this window.\n'
+    read -r _
+    exit 1
+fi
+
+while ! curl --silent --show-error --fail --max-time 2 "$status_url" >/dev/null 2>&1; do
+    state=$(/usr/bin/systemctl show "$service_name" --property=ActiveState --value 2>/dev/null || true)
+    if [ "$state" = failed ] || [ "$state" = inactive ]; then
+        cleanup
+        trap - EXIT INT TERM
+        printf '\nJupyterLab stopped before it became ready.\n'
+        /usr/bin/systemctl status --no-pager "$service_name" || true
+        printf '\nPress Enter to close this window.\n'
+        read -r _
+        exit 1
+    fi
+    sleep 0.5
+done
+
+cleanup
+trap - EXIT INT TERM
+printf '\nJupyterLab is ready. Opening it in your host web browser...\n'
+sleep 1

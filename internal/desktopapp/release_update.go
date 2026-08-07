@@ -221,6 +221,13 @@ func openReleaseDownload(value string) error {
 	if err := requireHTTPSURL(value); err != nil {
 		return err
 	}
+	if err := openExternalURL(value); err != nil {
+		return fmt.Errorf("open %s download: %w", productName(), err)
+	}
+	return nil
+}
+
+func openExternalURL(value string) error {
 	var command *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":
@@ -231,7 +238,7 @@ func openReleaseDownload(value string) error {
 		command = exec.Command("xdg-open", value)
 	}
 	if err := command.Start(); err != nil {
-		return fmt.Errorf("open %s download: %w", productName(), err)
+		return err
 	}
 	go func() {
 		_ = command.Wait()

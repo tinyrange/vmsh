@@ -329,6 +329,19 @@ func Run(config Config, args []string) (retErr error) {
 				networkCopy.PortForwards = append([]client.PortForward(nil), request.Network.PortForwards...)
 				startRequest.Network = &networkCopy
 			}
+			webAppHostPort := 0
+			if appConfig.DesktopWebApp != nil && startRequest.Network != nil {
+				webAppHostPort, err = reserveLoopbackPort("web app")
+				if err != nil {
+					return displayStarted{}, err
+				}
+				startRequest.Network.PortForwards = append(startRequest.Network.PortForwards, client.PortForward{
+					Protocol:  "tcp",
+					HostAddr:  "127.0.0.1",
+					HostPort:  webAppHostPort,
+					GuestPort: appConfig.DesktopWebApp.GuestPort,
+				})
+			}
 			if options.SSHEnabled {
 				sshPort, err = reserveSSHPort()
 				if err != nil {
@@ -442,6 +455,13 @@ func Run(config Config, args []string) (retErr error) {
 			if err := waitForDesktop(ctx, api, *name); err != nil {
 				return displayStarted{}, err
 			}
+			if webAppHostPort != 0 {
+				go func() {
+					if err := monitorDesktopWebApp(ctx, webAppHostPort, *appConfig.DesktopWebApp); err != nil && ctx.Err() == nil {
+						fmt.Fprintf(os.Stderr, "%s: %v\n", productName(), err)
+					}
+				}()
+			}
 			publish(desktopStartupProgress("Waiting for a complete desktop frame"))
 			if appConfig.ExperimentalBackgroundImageUpdates && isRegistryImageReference(fs.Arg(0)) {
 				preflightMu.Lock()
@@ -538,6 +558,19 @@ func Run(config Config, args []string) (retErr error) {
 		return fmt.Errorf("prepare image %q: %w", fs.Arg(0), err)
 	}
 	request.Image = imageName
+	webAppHostPort := 0
+	if appConfig.DesktopWebApp != nil && request.Network != nil {
+		webAppHostPort, err = reserveLoopbackPort("web app")
+		if err != nil {
+			return err
+		}
+		request.Network.PortForwards = append(request.Network.PortForwards, client.PortForward{
+			Protocol:  "tcp",
+			HostAddr:  "127.0.0.1",
+			HostPort:  webAppHostPort,
+			GuestPort: appConfig.DesktopWebApp.GuestPort,
+		})
+	}
 	state, err := api.CreateInstanceStreamWithIDContext(lifetimeContext, *name, request, func(event client.BootEvent) error {
 		if *dmesg && event.Kind == "serial" && event.Data != "" {
 			_, _ = io.WriteString(os.Stderr, event.Data)
@@ -561,6 +594,13 @@ func Run(config Config, args []string) (retErr error) {
 	}
 	if state.Display.VNCAddress == "" {
 		return fmt.Errorf("VM started without a VNC endpoint")
+	}
+	if webAppHostPort != 0 {
+		go func() {
+			if err := monitorDesktopWebApp(lifetimeContext, webAppHostPort, *appConfig.DesktopWebApp); err != nil && lifetimeContext.Err() == nil {
+				fmt.Fprintf(os.Stderr, "%s: %v\n", productName(), err)
+			}
+		}()
 	}
 	fmt.Printf("VNC listening on %s\n", state.Display.VNCAddress)
 	fmt.Printf("VNC password: %s\n", *vncPassword)

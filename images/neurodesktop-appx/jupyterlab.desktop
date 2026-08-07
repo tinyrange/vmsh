@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=JupyterLab
+Comment=Start JupyterLab and open it in your host web browser
+Exec=/usr/local/bin/neurodeskappx-start-jupyter
+Icon=/opt/neurodesk_brain_logo.svg
+Terminal=true
+Categories=Development;Science;
+StartupNotify=true

@@ -127,6 +127,8 @@ jobs:
             exit 1
           fi
           context="$(dirname "$dockerfile")"
+          cp -a ../vmsh/images/neurodesktop-appx "$context/neurodeskappx"
+          cat ../vmsh/images/neurodesktop-appx/Dockerfile.fragment >> "$dockerfile"
           echo "dockerfile=neurocontainers/$dockerfile" >> "$GITHUB_OUTPUT"
           echo "context=neurocontainers/$context" >> "$GITHUB_OUTPUT"
 

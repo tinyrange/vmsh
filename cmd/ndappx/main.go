@@ -9,7 +9,7 @@ import (
 	"github.com/tinyrange/vmsh/internal/desktopapp"
 )
 
-const defaultNeurodesktopImage = "ghcr.io/tinyrange/neurodesktop-glass:latest-estargz"
+const defaultNeurodesktopImage = "ghcr.io/tinyrange/neurodesktop-glass:20260807-jupyter-estargz"
 const defaultCVMFSCacheLimit = int64(5 << 30)
 
 var defaultCVMFSMirrors = []string{
@@ -57,25 +57,30 @@ exit 1
 
 func main() {
 	err := desktopapp.Run(desktopapp.Config{
-		ProductName:                        "NeurodeskAppX",
-		Subtitle:                           "Reproducible neuroimaging",
-		Kind:                               "ndappx",
-		Theme:                              desktopapp.ThemeNeurodesk,
-		DefaultVMName:                      "ndappx",
-		DefaultImage:                       defaultNeurodesktopImage,
-		DefaultStorage:                     "~/neurodesktop-storage",
-		GuestStorageMount:                  "/vmsh-neurodesktop-storage",
-		DefaultUser:                        "jovyan",
-		DefaultMemoryMB:                    8192,
-		DefaultCPUs:                        platformDefaultCPUs(),
-		DefaultEphemeralHome:               platformDefaultEphemeralHome(),
-		AMD64Emulation:                     true,
-		BrandPNG:                           neurodeskIconPNG,
-		ConfigDirName:                      "NeurodeskAppX",
-		DataDirName:                        "NeurodeskAppX-data",
-		ImageNamespace:                     "ndappx",
-		CacheImageDir:                      "ndappx",
-		DesktopReadiness:                   neurodeskDesktopReadiness,
+		ProductName:          "NeurodeskAppX",
+		Subtitle:             "Reproducible neuroimaging",
+		Kind:                 "ndappx",
+		Theme:                desktopapp.ThemeNeurodesk,
+		DefaultVMName:        "ndappx",
+		DefaultImage:         defaultNeurodesktopImage,
+		DefaultStorage:       "~/neurodesktop-storage",
+		GuestStorageMount:    "/vmsh-neurodesktop-storage",
+		DefaultUser:          "jovyan",
+		DefaultMemoryMB:      8192,
+		DefaultCPUs:          platformDefaultCPUs(),
+		DefaultEphemeralHome: platformDefaultEphemeralHome(),
+		AMD64Emulation:       true,
+		BrandPNG:             neurodeskIconPNG,
+		ConfigDirName:        "NeurodeskAppX",
+		DataDirName:          "NeurodeskAppX-data",
+		ImageNamespace:       "ndappx",
+		CacheImageDir:        "ndappx",
+		DesktopReadiness:     neurodeskDesktopReadiness,
+		DesktopWebApp: &desktopapp.DesktopWebAppConfig{
+			GuestPort:  8888,
+			StatusPath: "/api/status",
+			URLPath:    "/lab",
+		},
 		SSHHost:                            "neurodesk",
 		SSHUser:                            "jovyan",
 		SSHHome:                            "/home/jovyan",
