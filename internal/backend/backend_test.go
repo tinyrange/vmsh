@@ -1457,6 +1457,11 @@ func TestStartDaemonLeaseReportsFeedAndReleaseFailures(t *testing.T) {
 	if !errors.As(feedErr, &leaseErr) || leaseErr.Operation != "feed failed" {
 		t.Fatalf("feed error = %v", feedErr)
 	}
+	select {
+	case err := <-reported:
+		t.Fatalf("repeated degradation report = %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
 	stop()
 	select {
 	case err := <-reported:
@@ -1468,15 +1473,77 @@ func TestStartDaemonLeaseReportsFeedAndReleaseFailures(t *testing.T) {
 	}
 }
 
-type failingWatchdogAPI struct{}
+func TestStartDaemonLeaseRecreatesExpiredLease(t *testing.T) {
+	t.Setenv("VMSH_DAEMON_WATCHDOG_TIMEOUT", "30ms")
+	api := &recoveringWatchdogAPI{recovered: make(chan struct{})}
+	reported := make(chan error, 1)
+	stop, err := StartDaemonLease(api, func(err error) { reported <- err })
+	if err != nil {
+		t.Fatalf("start lease: %v", err)
+	}
+	select {
+	case <-api.recovered:
+	case <-time.After(time.Second):
+		t.Fatal("replacement lease was not fed")
+	}
+	stop()
+	select {
+	case err := <-reported:
+		t.Fatalf("recovered lease reported degradation: %v", err)
+	default:
+	}
+	api.mu.Lock()
+	released := append([]string(nil), api.released...)
+	api.mu.Unlock()
+	if len(released) != 1 || released[0] != "lease-2" {
+		t.Fatalf("released leases = %q, want replacement lease", released)
+	}
+}
 
-func (*failingWatchdogAPI) CreateWatchdogLease(req client.WatchdogLeaseRequest) (client.WatchdogLeaseResponse, error) {
-	return client.WatchdogLeaseResponse{LeaseID: "lease", TimeoutSeconds: req.TimeoutSeconds}, nil
+type failingWatchdogAPI struct {
+	createCalls atomic.Int32
+}
+
+func (a *failingWatchdogAPI) CreateWatchdogLease(req client.WatchdogLeaseRequest) (client.WatchdogLeaseResponse, error) {
+	if a.createCalls.Add(1) == 1 {
+		return client.WatchdogLeaseResponse{LeaseID: "lease", TimeoutSeconds: req.TimeoutSeconds}, nil
+	}
+	return client.WatchdogLeaseResponse{}, fmt.Errorf("create unavailable")
 }
 
 func (*failingWatchdogAPI) FeedWatchdogLease(string) error { return fmt.Errorf("feed unavailable") }
 func (*failingWatchdogAPI) ReleaseWatchdogLease(string) error {
 	return fmt.Errorf("release unavailable")
+}
+
+type recoveringWatchdogAPI struct {
+	mu        sync.Mutex
+	created   int
+	released  []string
+	recovered chan struct{}
+	once      sync.Once
+}
+
+func (a *recoveringWatchdogAPI) CreateWatchdogLease(req client.WatchdogLeaseRequest) (client.WatchdogLeaseResponse, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.created++
+	return client.WatchdogLeaseResponse{LeaseID: fmt.Sprintf("lease-%d", a.created), TimeoutSeconds: req.TimeoutSeconds}, nil
+}
+
+func (a *recoveringWatchdogAPI) FeedWatchdogLease(id string) error {
+	if id == "lease-1" {
+		return fmt.Errorf("watchdog lease is not active")
+	}
+	a.once.Do(func() { close(a.recovered) })
+	return nil
+}
+
+func (a *recoveringWatchdogAPI) ReleaseWatchdogLease(id string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.released = append(a.released, id)
+	return nil
 }
 
 type recordingWatchdogAPI struct {
