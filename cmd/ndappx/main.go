@@ -9,7 +9,7 @@ import (
 	"github.com/tinyrange/vmsh/internal/desktopapp"
 )
 
-const defaultNeurodesktopImage = "ghcr.io/tinyrange/neurodesktop-glass:20260807-jupyter-estargz"
+const defaultNeurodesktopImage = "ghcr.io/tinyrange/neurodesktop-glass:latest-estargz"
 const defaultCVMFSCacheLimit = int64(5 << 30)
 
 var defaultCVMFSMirrors = []string{
