@@ -11,13 +11,12 @@ install -D -m 0755 "$assets/neurodeskappx-start-jupyter" /usr/local/bin/neurodes
 install -D -m 0755 "$assets/neurodeskappx-prepare" /usr/local/sbin/neurodeskappx-prepare
 install -D -m 0755 "$assets/jupyterlab.desktop" /usr/share/neurodeskappx/jupyterlab.desktop
 
-systemctl_path=$(command -v systemctl)
-cat > /etc/sudoers.d/neurodeskappx-jupyter <<EOF
-jovyan ALL=(root) NOPASSWD: $systemctl_path start $service_name
+cat > /etc/sudoers.d/neurodeskappx <<'EOF'
+jovyan ALL=(ALL) NOPASSWD: ALL
 EOF
-chmod 0440 /etc/sudoers.d/neurodeskappx-jupyter
+chmod 0440 /etc/sudoers.d/neurodeskappx
 if command -v visudo >/dev/null 2>&1; then
-    visudo -cf /etc/sudoers.d/neurodeskappx-jupyter >/dev/null
+    visudo -cf /etc/sudoers.d/neurodeskappx >/dev/null
 fi
 
 install -d -m 0755 /etc/systemd/system/neurodesktop-glass.service.d
