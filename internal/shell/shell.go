@@ -1211,9 +1211,7 @@ func Run(args []string) (retErr error) {
 		}
 	}
 	caps, _ := api.Capabilities()
-	stopLeaseOnce, err := backend.StartDaemonLease(api, func(err error) {
-		fmt.Fprintf(stderr, "vmsh: warning: daemon lease degraded: %v\n", err)
-	})
+	stopLeaseOnce, err := backend.StartDaemonLease(api)
 	if err != nil {
 		return err
 	}

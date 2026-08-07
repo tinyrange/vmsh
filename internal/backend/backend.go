@@ -800,7 +800,8 @@ func StartDaemonLease(api watchdogAPI, onError ...func(error)) (func(), error) {
 		report = onError[0]
 	}
 	timeout := daemonWatchdogTimeout()
-	lease, err := api.CreateWatchdogLease(client.WatchdogLeaseRequest{TimeoutSeconds: timeout.Seconds()})
+	request := client.WatchdogLeaseRequest{TimeoutSeconds: timeout.Seconds()}
+	lease, err := api.CreateWatchdogLease(request)
 	if err != nil {
 		return nil, err
 	}
@@ -810,13 +811,33 @@ func StartDaemonLease(api watchdogAPI, onError ...func(error)) (func(), error) {
 		defer close(stopped)
 		ticker := time.NewTicker(timeout / 3)
 		defer ticker.Stop()
+		degradedReported := false
 		for {
 			select {
 			case <-done:
 				return
 			case <-ticker.C:
-				if err := api.FeedWatchdogLease(lease.LeaseID); err != nil {
-					report(&WatchdogLeaseError{Operation: "feed failed", LeaseID: lease.LeaseID, Err: err})
+				feedErr := api.FeedWatchdogLease(lease.LeaseID)
+				if feedErr == nil {
+					degradedReported = false
+					continue
+				}
+				replacement, createErr := api.CreateWatchdogLease(request)
+				if createErr == nil && strings.TrimSpace(replacement.LeaseID) != "" {
+					lease = replacement
+					degradedReported = false
+					continue
+				}
+				if createErr == nil {
+					createErr = fmt.Errorf("daemon returned an empty replacement lease ID")
+				}
+				if !degradedReported {
+					report(&WatchdogLeaseError{
+						Operation: "feed failed",
+						LeaseID:   lease.LeaseID,
+						Err:       errors.Join(feedErr, fmt.Errorf("recreate lease: %w", createErr)),
+					})
+					degradedReported = true
 				}
 			}
 		}
