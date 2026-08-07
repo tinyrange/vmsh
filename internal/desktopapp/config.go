@@ -41,9 +41,8 @@ type Config struct {
 // DesktopWebAppConfig describes a guest web application which is started by
 // the user from the guest desktop and opened by the host once it is ready.
 type DesktopWebAppConfig struct {
-	GuestPort  int
-	StatusPath string
-	URLPath    string
+	GuestPort int
+	URLPath   string
 }
 
 type CVMFSHostMountConfig struct {
@@ -117,14 +116,11 @@ func normalizeConfig(config Config) (Config, error) {
 		if config.DesktopWebApp.GuestPort <= 0 || config.DesktopWebApp.GuestPort > 65535 {
 			return Config{}, fmt.Errorf("desktop web app guest port must be between 1 and 65535")
 		}
-		if config.DesktopWebApp.StatusPath == "" {
-			config.DesktopWebApp.StatusPath = "/api/status"
-		}
 		if config.DesktopWebApp.URLPath == "" {
 			config.DesktopWebApp.URLPath = "/"
 		}
-		if !strings.HasPrefix(config.DesktopWebApp.StatusPath, "/") || !strings.HasPrefix(config.DesktopWebApp.URLPath, "/") {
-			return Config{}, fmt.Errorf("desktop web app paths must begin with /")
+		if !strings.HasPrefix(config.DesktopWebApp.URLPath, "/") {
+			return Config{}, fmt.Errorf("desktop web app URL path must begin with /")
 		}
 	}
 	return config, nil

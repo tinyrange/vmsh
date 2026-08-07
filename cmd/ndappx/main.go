@@ -77,9 +77,8 @@ func main() {
 		CacheImageDir:        "ndappx",
 		DesktopReadiness:     neurodeskDesktopReadiness,
 		DesktopWebApp: &desktopapp.DesktopWebAppConfig{
-			GuestPort:  8888,
-			StatusPath: "/api/status",
-			URLPath:    "/lab",
+			GuestPort: 8888,
+			URLPath:   "/lab",
 		},
 		SSHHost:                            "neurodesk",
 		SSHUser:                            "jovyan",
