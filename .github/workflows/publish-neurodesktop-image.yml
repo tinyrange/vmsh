@@ -118,7 +118,6 @@ jobs:
           set -euo pipefail
           python -m builder stage neurodesktop-lite \
             --architecture "$ARCHITECTURE" \
-            --variant glass \
             --recreate \
             --download
           dockerfile="$(find build -mindepth 2 -maxdepth 2 -type f -path '*/neurodesktop-lite*/*' -iname '*.dockerfile' -print -quit)"
