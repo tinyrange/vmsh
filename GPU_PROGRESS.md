@@ -201,13 +201,14 @@ durable cc commit.
 
 - Path: `gowin`
 - Branch: `vmsh-gpu-shared-context`
-- HEAD: `5ccdc253a266abde5954f93f1d7e6150ce4801d4`
+- HEAD: `3f02e7d42a2d3443dd6a4dde89e76110534eee1d`
 - Tracking branch: `origin/vmsh-gpu-shared-context`
 - Working tree: clean
 
 Relevant Gowin commits are:
 
 ```text
+3f02e7d Skip shared-context test without accelerated OpenGL
 5ccdc25 Expose native OpenGL share groups
 c1ff06a Add Darwin shared OpenGL contexts
 ```
