@@ -3,6 +3,7 @@ Description=vmsh VirGL Khronos conformance fixture
 DefaultDependencies=no
 After=ccx3-stage2.service systemd-udev-trigger.service
 Wants=ccx3-stage2.service systemd-udev-trigger.service
+ConditionPathExists=!/shared/.vmsh-gpu-cts-manual
 
 [Service]
 Type=simple

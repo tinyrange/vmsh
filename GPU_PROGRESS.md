@@ -1,6 +1,6 @@
 # GPU acceleration progress and handoff
 
-Last updated: 2026-08-09 (Australia/Brisbane)
+Last updated: 2026-08-10 (Australia/Brisbane)
 
 This document is the operational and engineering handoff for the first-party
 virtio-gpu/VirGL acceleration work in vmsh. It is intended for a system that
@@ -50,6 +50,70 @@ The next active milestone is an honest modern API ladder:
 4. desktop GL 4.1, which is the ceiling of the Darwin NSOpenGL backend;
 5. a future Vulkan-over-Metal renderer for APIs beyond that frozen ceiling.
 
+### OpenGL 4.1 continuation (2026-08-10)
+
+The checkout now truthfully exposes OpenGL 4.1 / GLSL 4.10 and completes the
+entire exported `KHR-GL41.*` case set on the intended Mesa 26.1.6 guest runtime.
+The renderer work is published in cc commit `6b01aff`; the vmsh publication
+commit records the matching submodule pointer, fixture, and evidence.
+
+Authoritative result:
+
+```text
+VK-GL-CTS:       opengl-cts-4.6.8.1 (067e8832315e79817ede1c4863804e440f5d1c80)
+Guest Mesa:      26.1.6 from /opt/mesa
+Renderer:        virgl (vmsh Darwin VirGL)
+OpenGL / GLSL:   4.1 core / 4.10
+Exported cases:  11,884
+Observed cases:  11,884
+Pass:            10,245
+NotSupported:    1,639
+Fail:            0
+Missing / extra: 0 / 0
+Complete QPAs:   379 / 379
+```
+
+`NotSupported` is the CTS verdict for cases gated by optional extensions or
+invalid target/format combinations; no required/applicable case failed. This
+is a complete clean implementation result, not a claim of formal Khronos
+product certification.
+
+Artifacts are under:
+
+```text
+build/gpu-cts/shared-mesa26-gl41-88/gpu-cts/mesa26/manifest.json
+build/gpu-cts/shared-mesa26-gl41-88/gpu-cts/mesa26/summary.json
+build/gpu-cts/shared-mesa26-gl41-88/gpu-cts/mesa26/cases.txt
+build/gpu-cts/shared-mesa26-gl41-88/gpu-cts/mesa26/shards/
+```
+
+Two runner constraints are part of the result. A monolithic CTS process grows
+past both 6 GiB and 8 GiB after approximately 8,300 completed cases. Mesa 26
+also accumulates enough packed-pixel shader variants in one process to wedge
+Apple's native GL command queue. The checked-in `run-gl41-cts.sh` therefore
+uses fresh processes for top-level groups, finer texture-swizzle shards, and
+per-format packed-pixel shards. It verifies exact case-set equality and that
+every QPA ends with `#endSession`.
+
+The final renderer fixes include:
+
+- hybrid TGSI constants: ordinary uniforms below 1,024 registers and native
+  `std140 uvec4` blocks for larger declarations, preserving both normal draws
+  and the FP64 maximum-uniform cases;
+- tessellation-control/evaluation handles in program-cache invalidation;
+- bounded stale OpenGL-error draining around checked RGB9_E5 readback and
+  conversion paths, with red-only shared-exponent and pending-error behavior
+  regressions;
+- all earlier texture swizzle, multisample typed-view, UNORM24 conversion,
+  indirect draw, shader subroutine, FP64, tessellation, and transform-feedback
+  fixes retained.
+
+The manual runner originally inherited the distro Mesa 25.0.7 because the
+`/opt/mesa` environment lived only in the systemd unit. Both fixture runners
+now set `LD_LIBRARY_PATH=/opt/mesa/lib` and
+`LIBGL_DRIVERS_PATH=/opt/mesa/lib/dri` themselves. The authoritative result
+above was rerun from a clean VM after `glxinfo` confirmed Mesa 26.1.6.
+
 Do not raise a capset field merely to make Mesa report a newer version. A
 capability is advertised only after the decoder, host execution, resource
 transfer, shader translation, and behavior tests all support it.
@@ -60,38 +124,36 @@ transfer, shader translation, and behavior tests all support it.
 
 - Working directory: `/Users/joshua/dev/projects/vmsh`
 - Branch: `agent/virtio-gpu-darwin`
-- Last application-workload commit: `549c007f3a3e6b0e34be9fd05124ec30c4ebc178`
+- Last application-workload commit: `3f45b92` (`Add Firefox WebGL GPU fixture`)
 - Remote branch: `origin/agent/virtio-gpu-darwin`
 - Draft PR: [tinyrange/vmsh#244](https://github.com/tinyrange/vmsh/pull/244)
 - PR title: `Add Darwin guest GPU acceleration`
 - PR base: `main`
 
-This report is published in the next GPU conformance commit after `549c007`.
-After that commit is pushed, the root branch and remote branch should agree and
-the working tree should be clean. The publication commit contains:
+The OpenGL 4.1 publication commit contains:
 
 ```text
 GPU_PLAN.html
 GPU_PROGRESS.md
-cc -> 219c723
+cc -> 6b01aff
 images/gpu-cts/
 ```
 
-The pushed GPU history at the root is:
+The GPU history at the root includes:
 
 ```text
-(current) Advance GPU conformance work
-549c007 Add Firefox WebGL GPU fixture
-bf0a13e Run OpenArena through native GPU acceleration
-5a6fc8c Run full glmark2 through native Glass
-7c02010 Add Darwin guest GPU acceleration
+(current) Publish OpenGL 4.1 conformance support
+3f45b92 Add Firefox WebGL GPU fixture
+81c3568 Run OpenArena through native GPU acceleration
+98e93ea Run full glmark2 through native Glass
+040b42b Add Darwin guest GPU acceleration
 ```
 
 ### cc submodule
 
 - Path: `cc`
 - Branch: `vmsh-virtio-gpu-3d`
-- HEAD: `219c723` (`Advance Darwin VirGL conformance support`)
+- HEAD: `6b01aff` (`Complete Darwin VirGL OpenGL 4.1 support`)
 - Tracking branch: `origin/vmsh-virtio-gpu-3d`
 - The branch and its remote are synchronized at that commit.
 - Working tree: clean at publication time.
@@ -99,48 +161,53 @@ bf0a13e Run OpenArena through native GPU acceleration
 Committed GPU history at the cc boundary is:
 
 ```text
-219c723 Advance Darwin VirGL conformance support
-f62caea Run Firefox WebGL through Darwin VirGL
-ac116cb Run OpenArena through Darwin VirGL
-f47e443 Complete glmark2 and native scanout
-d3ed559 Add Darwin VirGL renderer
+6b01aff Complete Darwin VirGL OpenGL 4.1 support
+1d2b156 Advance Darwin VirGL conformance support
+a8c37a2 Run Firefox WebGL through Darwin VirGL
+0e5176b Run OpenArena through Darwin VirGL
+158f5f3 Complete glmark2 and native scanout
+51b77df Add Darwin VirGL renderer
 ```
 
-The modern conformance commit changes:
+The OpenGL 4.1 conformance commit changes:
 
 ```text
 M cmd/virgl-replay/main.go
 M internal/virgl/capset.go
 M internal/virgl/capset_test.go
+A internal/virgl/formats.go
+A internal/virgl/formats_darwin_test.go
+M internal/virgl/capture.go
 M internal/virgl/framebuffer_darwin_test.go
 M internal/virgl/gl_darwin.go
 M internal/virgl/host_darwin.go
+A internal/virgl/query_darwin_test.go
 M internal/virgl/renderer.go
 M internal/virgl/renderer_test.go
 M internal/virgl/replay_darwin.go
+A internal/virgl/streamout_darwin_test.go
 M internal/virgl/tgsi.go
 M internal/virgl/tgsi_darwin_test.go
 M internal/virgl/tgsi_test.go
-M internal/virtio/gpu.go
 ```
 
-Commit `219c723` contains approximately 3,435 insertions and 763 deletions. It
-was pushed before the root submodule pointer was updated, so the root commit
-references a durable cc commit.
+Commit `6b01aff` contains 10,738 insertions and 1,083 deletions. It was pushed
+before the root submodule pointer was updated, so the root commit references a
+durable cc commit.
 
 ### Gowin submodule
 
 - Path: `gowin`
 - Branch: `vmsh-gpu-shared-context`
-- HEAD: `25d29bd2a831417328ea1abfdce1c50799851390`
+- HEAD: `5ccdc253a266abde5954f93f1d7e6150ce4801d4`
 - Tracking branch: `origin/vmsh-gpu-shared-context`
 - Working tree: clean
 
 Relevant Gowin commits are:
 
 ```text
-25d29bd Expose native OpenGL share groups
-b8857c7 Add Darwin shared OpenGL contexts
+5ccdc25 Expose native OpenGL share groups
+c1ff06a Add Darwin shared OpenGL contexts
 ```
 
 ## Product intent and constraints
@@ -309,7 +376,7 @@ kmscube, glmark2, OpenArena, Firefox WebGL, and the completed ES2 baseline.
 - Zero routine CPU readbacks on the native path.
 - One lazy readback when the first explicit CPU snapshot is requested.
 
-## Modern renderer work in cc commit 219c723
+## Modern renderer work through cc commit 6b01aff
 
 This commit extends the application-proven implementation substantially. Treat
 the items in this section as the first coherent modern-GL/conformance batch.
@@ -386,10 +453,10 @@ returns an explicit error for a multi-layer framebuffer surface.
 - `TestUniformBufferSuppliesFragmentConstants` renders a pixel from an actual
   `CONST[1]` source rather than merely checking command parsing.
 
-This is a compatibility implementation using native uniform arrays, not yet a
-native GL uniform-buffer-object binding path. It is behaviorally useful for the
-current TGSI protocol but should be revisited when CTS coverage demands native
-UBO reflection, binding, size, or update semantics.
+The published GL 4.1 continuation supersedes the original compatibility-only
+path. TGSI blocks below 1,024 registers use native uniform arrays; larger
+declarations use real `std140 uvec4` uniform-buffer bindings so ordinary draws
+remain stable while maximum-uniform FP64 cases fit Apple's limits.
 
 ### Shader program lifetime
 
@@ -406,26 +473,15 @@ solution.
 
 ### Current honest capset
 
-The relevant committed capset values are:
-
-| Capability | Advertised value | Important qualification |
-| --- | ---: | --- |
-| GLSL level | 150 | Does not by itself make Mesa expose GL 3.x |
-| Max 2D texture size | 4096 | Measured/implemented bound |
-| Max texture-array layers | 256 | 2D array path implemented |
-| Max render targets | 4 | MRT clear behavior tested |
-| Max uniform blocks | 12 | TGSI constant-block compatibility path |
-| Max streamout buffers | 0 | Transform feedback is not implemented |
-| Max samples | 1 | Multisampling is not implemented |
-| Max TBO size | 0 | Texture buffer objects are not implemented |
-| Max viewports | 1 | Multi-viewport is not implemented |
-| Texture gather components | 0 | Gather is not implemented |
-| Dual-source render targets | 0 | Not implemented |
-| Host feature fallback version | 0 | Intentionally disabled |
-
-The capset advertises only a small set of color, depth/stencil, and vertex
-formats. This is currently the principal reason modern Mesa remains at OpenGL
-2.0/GLES 2.0 despite arrays, MRT, instancing, and uniform buffers being present.
+Commit `1d2b156` was the last low-capability boundary. Commit `6b01aff` now
+advertises the complete set needed for Mesa 26.1.6 to create real
+OpenGL 4.1 core contexts. Geometry/tessellation shaders, multisampling,
+streamout/query semantics, sampler and texture-buffer behavior, indirect draw,
+FP64, multiple viewports, texture gather, and the required format families are
+implemented behind those fields and covered by behavior tests plus the exact
+CTS result. Optional GL 4.2+ or extension-only fields remain disabled. Host
+feature fallback/version overrides remain zero; the 4.1 identity is earned by
+capabilities, not forced.
 
 ## Application evidence
 
@@ -581,82 +637,56 @@ clusters prevent progress on GLES3/desktop GL feature implementation.
 
 ### Current Mesa 26 probe baseline
 
-Artifacts:
+The current live identity and complete GL 4.1 result supersede the earlier
+GL 2.1 probe snapshots:
 
 ```text
-build/gpu-cts/shared-mesa26-modern2/gpu-cts/
+renderer: virgl (vmsh Darwin VirGL)
+OpenGL:   4.1 (Core Profile) Mesa 26.1.6
+GLSL:     4.10
+GLES:     3.0 Mesa 26.1.6
 ```
 
-Identity:
-
-```text
-renderer: virgl
-OpenGL:   2.0 Mesa 26.1.6
-GLSL:     1.20
-```
-
-The GLES3 and GLES3.1 probes currently fail with:
-
-```text
-FATAL ERROR: Matching EGL config not found
-```
-
-The GL30, GL31, GL32, GL33, GL40, and GL41 probes currently fail context
-creation with:
-
-```text
-FATAL ERROR: Got EGL_BAD_MATCH: eglCreateContext()
-```
-
-That is an honest API-ceiling result, not a harness failure. Earlier
-`CTS-Configs` desktop probes were misleading because they could pass without a
-relevant WGL configuration. The runner now executes real `KHR-GL30.info.*`
-through `KHR-GL41.info.*` cases through EGL, so passing requires creation of the
-requested context.
-
-The modern result tree has only 12 of 45 ES2 groups and must not be used as the
-primary ES2 baseline. It exists mainly as the current Mesa 26 context-probe
-record.
+See the authoritative artifact paths and counts in the executive status. The
+older `shared-mesa26-streamout-01` and `shared-mesa26-formats2-01` trees remain
+useful only as historical capability-ladder evidence.
 
 ### Current image archive
 
 Local archive:
 
 ```text
-build/gpu-cts/vmsh-gpu-cts-mesa26-modern.docker.tar
+build/gpu-cts/vmsh-gpu-cts-mesa26-gl41.docker.tar
 ```
 
-Size is approximately 226 MiB. SHA-256:
+SHA-256:
 
 ```text
-98985f3304cc11a2273a700df3f1f55bf1520d62a460b180c234d20246283f66
+77811a7525759ccd724921007a92eb13891196b88666be30269165f0890615ad
 ```
 
-A matching archive was built natively on `astra-pi5` at:
-
-```text
-/home/joshua/vmsh-gpu-cts-mesa26-modern.docker.tar
-```
-
-Verify the checksum before replacing the local archive.
+The archive was built natively on `astra-pi5` and pulled into the repository.
+It contains Mesa 26.1.6, the pinned CTS revision above, and
+`cts-gl41-harness.patch` with SHA-256
+`6328a57739263c06cc9e05386f0a847ec477c1f3933ee9d0b209c461f96d5a1c`.
+The patch guards a CTS deinitializer's use of a GL 4.2 entry point in a GL 4.1
+context; it does not waive cases or change expected results.
 
 ## Fresh verification performed for this handoff
 
-The following passed on 2026-08-09 with a repository-local Go build cache:
+The following passed on 2026-08-10 after the final Mesa 26 conformance run:
 
 ```sh
 cd /Users/joshua/dev/projects/vmsh/cc
-mkdir -p ../build/go-cache
-GOCACHE="$PWD/../build/go-cache" \
-  go test ./internal/virgl ./internal/virtio -count=1
+go test ./... -count=1
+go vet ./...
 git diff --check
 
 cd /Users/joshua/dev/projects/vmsh
-mkdir -p build/go-cache
-GOCACHE="$PWD/build/go-cache" \
-  go test ./cmd/squadvm ./internal/... -count=1
+go test ./... -count=1
+go vet ./...
 git diff --check
-sh -n images/gpu-cts/run-gpu-cts.sh
+sh -n images/gpu-cts/run-gpu-cts.sh images/gpu-cts/run-gl41-cts.sh
 ```
 
 Observed package results included:
@@ -668,12 +698,11 @@ ok github.com/tinyrange/vmsh/cmd/squadvm
 ok github.com/tinyrange/vmsh/internal/...
 ```
 
-This was not a new live VM or full CTS run. The modern capset still reports GL
-2.0, so repeatedly rebooting the fixture after each isolated field change would
-not provide new information. Batch a coherent capability cluster, run behavior
-tests, and then reboot the Mesa 26 probe image.
+The full Mesa 26 GL 4.1 result was produced in repository-local VMs 88 and 89.
+VM 89 stopped cleanly after the final recovery shards. The user's production
+`ccvm` using `/Users/joshua/Library/Caches/ccx3` was not touched.
 
-## Important behavior tests in cc commit 219c723
+## Important behavior tests through cc commit 6b01aff
 
 New or substantially relevant behavior tests include:
 
@@ -716,109 +745,36 @@ would catch and assert the actual outcome.
 
 ## Known gaps and risks
 
-### Format coverage is the next primary blocker
+### Conformance runner process bounds
 
-Host texture allocation currently maps nearly every non-depth texture to
-RGBA8, with only narrow BGRA transfer distinctions. The capset therefore
-advertises only a small safe format set. Do not broadly add format bits until
-allocation, upload, readback, framebuffer use, sampling, and relevant vertex
-conversion are correct for each format.
+The renderer completes every GL 4.1 case, but upstream CTS process lifetime is
+not bounded enough for a monolithic run on this fixture. Use the checked-in
+sharded runner. Do not raise guest memory again and call an eventual OOM a
+renderer failure. Exact expected/observed case equality and complete per-shard
+QPAs are the authoritative contract.
 
-Mesa 26 moved its format definitions. Use upstream files from the exact Mesa
-release as the enumeration source:
+### Packed-pixel native queue pressure
 
-```text
-src/util/format/u_formats.h
-src/util/format/u_format.yaml
-```
+Mesa 26's monolithic `packed_pixels` group accumulates enough shader variants
+to wedge Apple's GL command queue. The exact stalled case passes in a fresh
+process, and all 4,732 packed-pixel cases pass when split by format family.
+Keep that subdivision unless a future native-driver or renderer lifetime fix
+is proven by a complete monolithic run.
 
-Do not rely on recalled numeric `PIPE_FORMAT` values or an old Mesa header.
+### Optional extension results remain honest
 
-The first useful format cluster should cover the GLES3 gates, including at
-least the required subset of:
+The 1,639 `NotSupported` results are dominated by optional extensions such as
+fragment shading rate, clip control, texture barrier, and invalid
+target/format combinations. Do not expose those extensions merely to reduce
+the count. Add them only with the same end-to-end implementation and behavior
+evidence used for the GL 4.1 core.
 
-- R8 and RG8;
-- sRGB8 / sRGB8-alpha behavior;
-- R/RG/RGBA half-float and float formats;
-- signed normalized R/RG formats;
-- packed 2_10_10_10 formats;
-- depth32f where the Darwin host supports it;
-- matching external format, component type, byte width, aspect, and swizzle.
+### Program and native-driver lifetime still matter
 
-A table-driven mapping should describe, for each supported pipe format:
-
-```text
-native internal format
-transfer external format
-transfer data type
-bytes per pixel/block
-color/depth/stencil aspects
-channel order and swizzle
-renderability
-sampler support
-vertex support where applicable
-```
-
-Add real pixel/vertex behavior tests before setting the corresponding capset
-mask bits. Xorg/Mesa logs previously showed `GL_R8` and 2_10_10 formats falling
-back, which is direct evidence that this cluster matters.
-
-### Transform feedback / streamout is absent
-
-`max_streamout_buffers` remains zero. Mesa's GLES3 version computation requires
-transform feedback.
-
-The protocol work is expected to include:
-
-- VirGL streamout-target objects;
-- `SET_STREAMOUT_TARGETS` command handling;
-- resource offset/size validation and lifetime;
-- parsing the shader stream-output metadata rather than rejecting nonzero
-  stream-output declarations;
-- calling native transform-feedback varying setup before program link;
-- buffer-range binding;
-- begin/end transform feedback around supported draws;
-- behavior tests that read back captured vertices.
-
-Confirm all payload layouts against the matching VirGL/Mesa protocol source
-before implementation. Do not infer offsets from an application trace alone.
-
-### Queries are absent
-
-Modern Mesa also needs query objects and result semantics. Implement bounded
-query creation/destruction, begin/end, result retrieval, wait/no-wait behavior,
-and guest-buffer result writes. Start with the exact query types required by
-the GLES3/GL3.0 version gate and add behavior-level tests.
-
-### Later GL features are intentionally absent
-
-The following are later rungs, not reasons to overstate the current capset:
-
-- geometry shaders and layered rendering;
-- multisampling and sample resolves;
-- full sampler-object and GLSL 3.30 behavior;
-- texture buffer objects;
-- tessellation shaders;
-- indirect draw;
-- cube-map arrays;
-- sample shading;
-- FP64;
-- multiple viewports and texture gather.
-
-### Program-memory behavior needs a long-run check
-
-The 128-entry LRU bounds program objects, but the official monolithic ES2
-runner has not yet completed cleanly under the new policy. Once a coherent
-modern feature batch is committed, run a long memory observation and record:
-
-- host resident memory over time;
-- guest memory and OOM state;
-- number of cached host programs;
-- whether all official QPAs end in `#endSession`;
-- whether macOS terminates any development process.
-
-Do not reintroduce compile-context rotation or unconditional `glFinish` as a
-substitute for understanding ownership.
+The 128-entry host-program LRU bounds renderer-owned programs. The sharded CTS
+run also bounds CTS and native-driver variant lifetime. Preserve both layers;
+do not reintroduce unconditional `glFinish`, fake capability overrides, or a
+larger VM as substitutes for explicit ownership and completion boundaries.
 
 ### Darwin OpenGL has a hard ceiling
 
@@ -829,72 +785,49 @@ Do not encode fake GL 4.2+ capabilities into the current backend.
 
 ## Prioritized continuation plan
 
-### Shift 0: preserve and reproduce the current state
+### Shift 0: preserve the conformance boundary
 
-1. Read this report and `GPU_PLAN.html` M6A.
-2. Confirm all three branch/commit identities listed above.
-3. Confirm the working tree is clean before editing.
-4. Run the fresh verification commands.
-5. Do not rebase or update submodules until commit `219c723` and its root
-   pointer are confirmed on their remotes.
-6. Check free disk space and active processes before building or starting a VM.
+1. Preserve the Mesa 26 manifest, summary, case list, QPAs, image checksum, and
+   CTS patch checksum listed above.
+2. Run both modules' full Go tests and vet before publication.
+3. Confirm the root and cc branches remain synchronized with their remotes and
+   the published submodule pointer resolves to `6b01aff`.
+4. Keep all development caches and VM storage repository-local and leave the
+   production/global `ccvm` untouched.
 
-### Shift 1: implement a truthful modern format table
+### Shift 1: publish intentionally
 
-1. Obtain `u_formats.h` and `u_format.yaml` from Mesa 26.1.6.
-2. Map the exact GLES3-required formats to Darwin OpenGL storage and transfer
-   tuples.
-3. Refactor texture allocation, transfer-to-host, transfer-from-host,
-   framebuffer attachment, readback, and vertex interpretation to use the same
-   checked format descriptor.
-4. Add behavior tests for every newly advertised format family.
-5. Add only the proven format mask bits.
-6. Run cc tests and replay representative OpenArena/Firefox captures to catch
-   regressions without booting a VM.
+1. Review the large cc renderer diff as one coherent GL 4.1 capability change.
+2. Commit and push the cc submodule before updating the root pointer.
+3. Include the CTS harness/runner and this report in the root publication.
+4. Do not publish, commit, or open/update a PR unless the user requests it.
 
-### Shift 2: implement transform feedback
+### Shift 2: keep the result reproducible
 
-1. Verify protocol object and command layouts from upstream source.
-2. Implement bounded streamout objects and resource lifetime.
-3. Parse shader stream-output metadata.
-4. Bind native transform-feedback varyings and buffers.
-5. Execute and read back a minimal captured vertex stream.
-6. Add the first nonzero streamout cap only after the pixel/buffer behavior
-   test passes.
+1. Rebuild future ARM64 images on `astra-pi5` with provenance disabled.
+2. Verify `/opt/mesa` identity in `glxinfo` before starting long tests.
+3. Use `run-gl41-cts`; do not return to a monolithic process.
+4. Require exact expected/observed case equality, zero failures, and complete
+   QPA sessions before replacing this baseline.
 
-### Shift 3: implement required query semantics
+### Shift 3: recheck applications
 
-1. Identify the smallest GLES3/GL3.0 query set from current Mesa's version and
-   extension computation.
-2. Implement lifecycle and result transfer with strict validation.
-3. Add behavior tests for result values and wait modes.
-4. Advertise only the supported query subset.
+Replay the representative OpenArena and Firefox captures, then run an
+interactive context transition followed by repeated guest commands to protect
+the session-oriented vmsh workflow, daemon reuse, and native presentation path.
 
-### Shift 4: rerun the modern context ladder
+### Shift 4: optional extensions only when valuable
 
-After formats, transform feedback, and queries form a coherent cluster:
+Treat every optional extension as a new end-to-end capability. Implement it
+only for a real application need, add behavior evidence, and rerun the affected
+CTS slice plus the full exact suite before changing the capset.
 
-1. rebuild the cc/SquadVM development binaries;
-2. start the existing Mesa 26 image with a unique development name and
-   repo-local cache/storage;
-3. inspect `manifest.json` first;
-4. inspect GLES3, GLES3.1, and GL30-GL41 probe QPAs/logs;
-5. if a new context is exposed, begin that API's small info/capability slices;
-6. only then launch the relevant long CTS corpus;
-7. preserve every structured result and exact renderer identity.
+### Shift 5 and beyond: move past Darwin's frozen OpenGL
 
-If Mesa still reports GL2/GLES2, inspect Mesa's version computation and Xorg
-logs for the next missing implemented capability. Never force an override just
-to begin the suite.
-
-### Shift 5 and beyond: climb one API rung at a time
-
-- Earn GLES3 and GL3.0/3.1 with passing feature slices.
-- Add GL3.2/3.3 geometry, multisample, sampler, and GLSL behavior.
-- Add GL4.0 tessellation, indirect draw, cube arrays, sample shading, and FP64.
-- Complete the remaining GL4.1 slices.
-- Run selected Piglit coverage alongside Khronos CTS.
-- Keep the full existing application corpus green at every rung.
+Further core desktop API progress belongs in a Vulkan-over-Metal backend, with
+newer OpenGL layered over that renderer if needed. Keep the NSOpenGL backend at
+its truthful 4.1 ceiling and preserve this conformance corpus as its regression
+boundary.
 
 ## Build and run procedures
 
@@ -934,7 +867,7 @@ sees the expected single-platform descriptor:
 docker buildx build \
   --platform linux/arm64 \
   --provenance=false \
-  --output type=docker,dest=/home/joshua/vmsh-gpu-cts-mesa26-modern.docker.tar \
+  --output type=docker,dest=/home/joshua/vmsh-gpu-cts-mesa26-gl41.docker.tar \
   images/gpu-cts
 ```
 
@@ -952,15 +885,20 @@ than colliding with an existing session:
 cd /Users/joshua/dev/projects/vmsh
 
 build/gpu-cts/run/squadvm \
-  -name gpu-cts-mesa26-dev-01 \
+  -name gpu-cts-mesa26-gl41-next \
   -cache-dir "$PWD/build/gpu-cts/cache" \
   -storage "$PWD/build/gpu-cts/shared-mesa26-next" \
-  -memory-mb 6144 \
-  "docker-archive:$PWD/build/gpu-cts/vmsh-gpu-cts-mesa26-modern.docker.tar"
+  -memory-mb 8192 \
+  "docker-archive:$PWD/build/gpu-cts/vmsh-gpu-cts-mesa26-gl41.docker.tar"
 ```
 
-Use at least 6144 MiB. A 4 GiB official runner was killed by the guest OOM path
-before it could produce complete QPAs.
+For a manual GL 4.1 run, create `.vmsh-gpu-cts-manual` in the shared storage
+before boot, then run `/usr/local/bin/run-gl41-cts`. The runner sets the
+`/opt/mesa` library/driver environment itself. Verify the manifest reports Mesa
+26.1.6; a manual shell without those paths silently selects distro Mesa 25.
+
+Use 8192 MiB for comparison with the authoritative run, but retain sharding.
+A monolithic process was OOM-killed at both 6 GiB and 8 GiB.
 
 For a resumable run, reuse the same storage directory with the same intended
 fixture. For a clean comparison, use a new explicitly named storage directory.
@@ -993,16 +931,15 @@ terminal, and production sessions are expected to be present.
 
 ## Artifact and disk policy
 
-Disk space is tight and can change while other terminals run. At report time
-the host had approximately 6.2 GiB free. Check `df -h .` before image import,
-compilation, or a long capture.
+Disk space is tight and can change while other terminals run. Check `df -h .`
+before image import, compilation, or a long capture.
 
 Preserve these artifacts:
 
 ```text
-build/gpu-cts/vmsh-gpu-cts-mesa26-modern.docker.tar
+build/gpu-cts/vmsh-gpu-cts-mesa26-gl41.docker.tar
+build/gpu-cts/shared-mesa26-gl41-88/gpu-cts/mesa26/
 build/gpu-cts/shared-mesa25/gpu-cts/
-build/gpu-cts/shared-mesa26-modern2/gpu-cts/
 build/gpu-cts/texture-full.cap
 build/gpu-cts/texture-pot.cap
 build/gpu-cts/fbo-full.cap
@@ -1018,8 +955,8 @@ The largest current repo-local items include approximately:
 | `build/gpu-cts/texture-full.cap` | 273 MiB | Keep until a smaller equivalent replay exists |
 | Mesa 26 image archive | 226 MiB | Keep and checksum |
 | `build/gpu-cts/run` | 217 MiB | Rebuildable binaries |
-| Mesa 25 result tree | 134 MiB | Authoritative evidence; keep |
-| Mesa 26 modern probe tree | 28 MiB | Current API-ceiling evidence; keep |
+| Mesa 26 GL 4.1 result tree | varies | Current authoritative evidence; keep |
+| Mesa 25 result tree | 134 MiB | Historical ES2 evidence; keep |
 
 Safe cleanup candidates, after confirming no development build uses them, are:
 
@@ -1064,19 +1001,18 @@ Never force-push without explicit authorization.
 
 ## Completion criteria for the current milestone
 
-M6A is complete only when all of the following are true:
+The OpenGL 4.1 conformance milestone is complete in the working tree:
 
-- Mesa 26 creates GLES3 and requested GL3.x/GL4.x contexts without a version
-  override;
-- the GLES3, GL30, GL31, GL32, GL33, GL40, and GL41 CTS profiles pass their
-  required slices;
-- selected Piglit coverage passes;
-- the existing kmscube, glmark2, OpenArena, and Firefox workloads remain
-  correct and performant;
-- the official GLES2 must-pass artifacts complete without unsupported-command
-  suppression, environment-gated tests, or a fake capset;
-- long-run host program and VM memory are bounded;
-- native shared-texture scanout remains the normal presentation path.
+- Mesa 26.1.6 creates a real GL 4.1 core context without a version override;
+- every exported `KHR-GL41.*` case has one complete structured result;
+- every applicable case passes, with zero failures and zero missing/extra
+  cases;
+- all QPAs end cleanly and the runner bounds CTS/native-driver lifetime;
+- renderer behavior tests, full Go tests, vet, script syntax, and diff checks
+  pass.
+
+Publication and broader application/Piglit regression runs are follow-on work,
+not evidence gaps in the completed GL 4.1 case corpus.
 
 The end goal is not a high version string. It is a first-party, debuggable,
 truthful guest graphics stack that runs real applications correctly and can be
@@ -1087,14 +1023,13 @@ advanced deliberately toward modern APIs.
 ```text
 [ ] Read AGENTS.md and this report completely.
 [ ] Confirm vmsh, cc, and Gowin branches and commits.
-[ ] Confirm the published working tree is clean before making new changes.
+[ ] Confirm the published GL 4.1 boundary and cc pointer before new edits.
 [ ] Check disk space and exact active VM/process command lines.
-[ ] Run the fresh targeted test commands with repo-local caches.
-[ ] Inspect Mesa 26.1.6 u_formats.h and u_format.yaml.
-[ ] Implement and behavior-test the first truthful GLES3 format cluster.
-[ ] Keep streamout/query caps at zero until their command paths exist.
+[ ] Run go test ./... and go vet ./... in both root and cc.
+[ ] Verify the authoritative Mesa 26 manifest, summary, and exact case counts.
+[ ] Use run-gl41-cts; never substitute a monolithic CTS process.
+[ ] Confirm glxinfo selects /opt/mesa 26.1.6 before accepting a new run.
 [ ] Replay existing captures before spending a VM boot on visual regression.
-[ ] Reboot the Mesa 26 probe fixture only after a coherent capability batch.
 [ ] Preserve manifests, QPAs, summaries, checksums, and exact renderer identity.
 [ ] Commit cc before updating the root submodule pointer when publication is requested.
 ```

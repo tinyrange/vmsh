@@ -27,6 +27,9 @@ RUN git clone --depth 1 --branch "${VK_GL_CTS_TAG}" \
         https://github.com/KhronosGroup/VK-GL-CTS.git /src/vk-gl-cts \
     && git -C /src/vk-gl-cts rev-parse HEAD > /src/vk-gl-cts.commit
 
+COPY cts-gl41-harness.patch /tmp/cts-gl41-harness.patch
+RUN git -C /src/vk-gl-cts apply /tmp/cts-gl41-harness.patch
+
 RUN python3 /src/vk-gl-cts/external/fetch_sources.py
 
 RUN cmake -S /src/vk-gl-cts -B /build/vk-gl-cts -G Ninja \
@@ -148,12 +151,14 @@ COPY --from=vk-gl-cts-builder /build/vk-gl-cts/modules/gles3/ /opt/vk-gl-cts/gle
 COPY --from=vk-gl-cts-builder /build/vk-gl-cts/modules/gles31/ /opt/vk-gl-cts/gles31/
 COPY --from=vk-gl-cts-builder /src/vk-gl-cts.commit /opt/vk-gl-cts/commit
 COPY --from=mesa-builder /opt/mesa/ /opt/mesa/
+COPY cts-gl41-harness.patch /opt/vk-gl-cts/cts-gl41-harness.patch
 COPY xorg.conf /etc/X11/xorg.conf
 COPY run-gpu-cts.sh /usr/local/bin/run-gpu-cts
+COPY run-gl41-cts.sh /usr/local/bin/run-gl41-cts
 COPY vmsh-gpu-cts.service /etc/systemd/system/vmsh-gpu-cts.service
 
 RUN printf '%s\n' "${VK_GL_CTS_TAG}" > /opt/vk-gl-cts/tag \
-    && chmod 0755 /usr/local/bin/run-gpu-cts \
+    && chmod 0755 /usr/local/bin/run-gpu-cts /usr/local/bin/run-gl41-cts \
     && systemctl enable vmsh-gpu-cts.service \
     && ln -sfn /etc/systemd/system/multi-user.target /etc/systemd/system/default.target
 

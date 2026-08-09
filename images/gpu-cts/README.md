@@ -14,6 +14,29 @@ API; those cases run against a real implementation rather than being excluded.
 The CTS builder remains separate so changing the guest driver does not also
 change the pinned test binaries.
 
+The pinned CTS release is built with `cts-gl41-harness.patch`. The patch only
+guards test-harness use of APIs newer than the requested context: it does not
+waive cases, change expected rendering results, or override the reported GL
+version. Its SHA-256 is recorded in `manifest.json` and the patch itself is
+stored in the image beside the CTS revision.
+
+For an isolated manually driven suite, create `.vmsh-gpu-cts-manual` at the
+root of the VM's shared storage before boot. The systemd unit then remains
+inactive, allowing one authoritative Xorg/CTS process to start without first
+creating and killing the automatic runner's GL context. Normal fixture boots
+remain unchanged when the sentinel is absent.
+
+With that sentinel present, `/usr/local/bin/run-gl41-cts` runs the complete
+exported `KHR-GL41.*` case set into `/shared/gpu-cts/gl41` by default. It uses a
+fresh CTS process for each top-level group, finer shards for
+`texture_swizzle`, and per-format shards for `packed_pixels`. The upstream
+process otherwise retains enough memory to exceed an 8 GiB guest, while Mesa
+26's packed-pixel variant accumulation can wedge Apple's native GL queue. The
+runner is resumable at completed shards and writes `summary.json`, exact
+expected/observed case lists, and missing/extra lists; success requires
+complete QPA sessions, zero failures, and exact case-set equality. An alternate
+result directory may be supplied as its sole argument.
+
 The service first captures `glxinfo` and a machine-readable manifest, runs
 quick GLES2, GLES3, GLES3.1, and real desktop context probes from GL 3.0
 through GL 4.1, and then executes the complete
@@ -55,10 +78,10 @@ build/gpu-cts/run/squadvm \
     -name gpu-cts-development \
     -cache-dir "$PWD/build/gpu-cts/cache" \
     -storage "$PWD/build/gpu-cts/shared" \
-    -memory-mb 6144 \
+    -memory-mb 8192 \
     "docker-archive:$PWD/build/gpu-cts/vmsh-gpu-cts.docker.tar"
 ```
 
-The official runner needs more than the normal 4 GiB SquadVM default. Use at
-least 6144 MiB; an interrupted 4 GiB run was killed by the guest OOM path before
-it could write complete QPAs.
+Use 8192 MiB for comparison with the GL 4.1 baseline, but do not substitute
+memory for sharding: monolithic runs were OOM-killed with both 6 GiB and 8 GiB
+guests.

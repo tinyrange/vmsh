@@ -4,6 +4,8 @@ set -eu
 display=:0
 results=/shared/gpu-cts
 modules=/opt/vk-gl-cts/modules
+export LD_LIBRARY_PATH=/opt/mesa/lib
+export LIBGL_DRIVERS_PATH=/opt/mesa/lib/dri
 gles2=/opt/vk-gl-cts/gles2
 gles3=/opt/vk-gl-cts/gles3
 gles31=/opt/vk-gl-cts/gles31
@@ -72,11 +74,14 @@ if ! grep -Eq '^OpenGL renderer string: .*virgl' "$results/glxinfo.log"; then
     cat "$results/glxinfo.log" >&2
     exit 1
 fi
+glxinfo > "$results/glxinfo-full.log" 2>&1 || true
+eglinfo > "$results/eglinfo.log" 2>&1 || true
 
 touch /run/user/1000/squadvm-desktop-ready
 
 tag=$(cat /opt/vk-gl-cts/tag)
 commit=$(cat /opt/vk-gl-cts/commit)
+cts_patch_sha256=$(sha256sum /opt/vk-gl-cts/cts-gl41-harness.patch | awk '{print $1}')
 renderer=$(sed -n 's/^OpenGL renderer string: //p' "$results/glxinfo.log")
 version=$(sed -n 's/^OpenGL version string: //p' "$results/glxinfo.log")
 sl_version=$(sed -n 's/^OpenGL shading language version string: //p' "$results/glxinfo.log")
@@ -84,10 +89,11 @@ jq -n \
     --arg suite "VK-GL-CTS" \
     --arg tag "$tag" \
     --arg commit "$commit" \
+    --arg cts_patch_sha256 "$cts_patch_sha256" \
     --arg renderer "$renderer" \
     --arg version "$version" \
     --arg shading_language "$sl_version" \
-    '{suite:$suite,tag:$tag,commit:$commit,renderer:$renderer,version:$version,shading_language:$shading_language,mesa_gles1_enabled:true}' \
+    '{suite:$suite,tag:$tag,commit:$commit,cts_patch_sha256:$cts_patch_sha256,renderer:$renderer,version:$version,shading_language:$shading_language,mesa_gles1_enabled:true}' \
     > "$results/manifest.json.new"
 mv "$results/manifest.json.new" "$results/manifest.json"
 
@@ -96,6 +102,7 @@ mv "$results/manifest.json.new" "$results/manifest.json"
 # guest-visible API ceiling.
 "$modules/glcts" \
     --deqp-gl-context-type=egl \
+    --deqp-terminate-on-device-lost=disable \
     --deqp-case='CTS-Configs.es2' \
     --deqp-log-filename="$results/es2-info.qpa" \
     --deqp-surface-width=256 \
@@ -104,6 +111,7 @@ mv "$results/manifest.json.new" "$results/manifest.json"
 for gl_version in 30 31 32 33 40 41; do
     "$modules/glcts" \
         --deqp-gl-context-type=egl \
+        --deqp-terminate-on-device-lost=disable \
         --deqp-case="KHR-GL${gl_version}.info.*" \
         --deqp-log-filename="$results/gl${gl_version}-probes/info.qpa" \
         --deqp-surface-width=256 \
