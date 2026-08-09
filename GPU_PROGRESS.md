@@ -135,7 +135,7 @@ The OpenGL 4.1 publication commit contains:
 ```text
 GPU_PLAN.html
 GPU_PROGRESS.md
-cc -> 6b01aff
+cc -> 479d72d
 images/gpu-cts/
 ```
 
@@ -153,7 +153,7 @@ The GPU history at the root includes:
 
 - Path: `cc`
 - Branch: `vmsh-virtio-gpu-3d`
-- HEAD: `6b01aff` (`Complete Darwin VirGL OpenGL 4.1 support`)
+- HEAD: `479d72d` (`Add non-Darwin VirGL replay stubs`)
 - Tracking branch: `origin/vmsh-virtio-gpu-3d`
 - The branch and its remote are synchronized at that commit.
 - Working tree: clean at publication time.
@@ -161,6 +161,7 @@ The GPU history at the root includes:
 Committed GPU history at the cc boundary is:
 
 ```text
+479d72d Add non-Darwin VirGL replay stubs
 6b01aff Complete Darwin VirGL OpenGL 4.1 support
 1d2b156 Advance Darwin VirGL conformance support
 a8c37a2 Run Firefox WebGL through Darwin VirGL
@@ -791,7 +792,7 @@ Do not encode fake GL 4.2+ capabilities into the current backend.
    CTS patch checksum listed above.
 2. Run both modules' full Go tests and vet before publication.
 3. Confirm the root and cc branches remain synchronized with their remotes and
-   the published submodule pointer resolves to `6b01aff`.
+   the published submodule pointer resolves to `479d72d`.
 4. Keep all development caches and VM storage repository-local and leave the
    production/global `ccvm` untouched.
 
