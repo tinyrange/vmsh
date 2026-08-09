@@ -2203,8 +2203,10 @@ type DisplayState struct {
             <li>The live ARM64 SquadVM corpus is <code>images/gpu-glmark2</code>: it runs glmark2's complete 33-scene built-in suite, including build, texture, shading, bump, effects, desktop, buffer updates, complex models, conditionals, functions, and loops.</li>
             <li>The representative application workload is <code>images/gpu-openarena</code>: stock OpenArena 0.8.8 runs as an ordinary GLX/OpenGL 2.0 application against Mesa VirGL. Its deterministic 1,200-message bot-match slice covers renderer and map initialization, GLSL compilation, model and texture loading, animated gameplay, and repeated dynamic-buffer updates.</li>
             <li>The browser workload is <code>images/gpu-firefox</code>: Firefox ESR runs four local WebGL scenes covering indexed depth-tested geometry, render-to-texture with a post-processing pass, dynamic additive point sprites, and a procedural fragment shader. Structured telemetry and guest <code>gl.readPixels</code> captures prove that every scene rendered through VirGL rather than merely reaching the host window.</li>
+            <li>The conformance workload is <code>images/gpu-cts</code>: it pins Khronos VK-GL-CTS <code>opengl-cts-4.6.8.1</code>, captures the exact guest renderer and API ceiling, runs dEQP-GLES2 in restart-safe groups with atomic structured progress, preserves QPA artifacts, and finishes with the official <code>cts-runner --type=es2</code> configuration.</li>
             <li>The fixture builds on <code>astra-pi5</code>, boots under systemd, selects the host-preferred DRM mode, requires an XRGB/depth visual, identifies the guest renderer as <code>virgl</code>, and loops without an environment-variable gate.</li>
-            <li>Next add resize and reattach cycles, WebGL 2 coverage, and a second representative native application trace with a materially different renderer profile.</li>
+            <li>The Darwin desktop-GL ladder uses the GL30 through GL41 CTS profiles plus Piglit. GL 4.0 is an intermediate rung; the completion target for the current NSOpenGL renderer is the host's honest OpenGL 4.1 core / GLSL 4.10 ceiling. Raising a version is the result of passing its feature slices; it is never used to discover missing decoder operations by crashing ordinary applications.</li>
+            <li>Next add Piglit’s desktop GL profile, resize and reattach cycles, WebGL 2 coverage, and a second representative native application trace with a materially different renderer profile.</li>
             <li>Add Neurodesk visualization traces when the renderer moves from the host-sharing experiment into the neuroimaging product slice.</li>
             <li>Replay traces against the first-party renderer in CI using software host GL where necessary.</li>
             <li>Optionally replay the same traces through virglrenderer during development and compare output; do not require it for normal builds.</li>
@@ -2355,6 +2357,49 @@ type DisplayState struct {
               explicitly requests it.
             </p>
             <div class="gate">Current evidence: a renderer behavior test proves that a native flush performs zero readbacks and that the first CPU snapshot performs exactly one lazy readback; Gowin's cross-context fence test verifies shared texture ownership; and the native 1440×900 guest corpus runs through the shared-texture path at roughly 2,000–4,400 frames/second in early scenes versus roughly 500–1,000 through VNC readback. Repeated resize and attach soak remains ongoing hardening.</div>
+          </article>
+
+          <article class="milestone">
+            <div class="milestone-id">M6A</div>
+            <h3>Conformance baseline and desktop OpenGL 4.1 ladder <span class="status now">In progress</span></h3>
+            <p>
+              The renderer now publishes both legacy VirGL and extensible
+              VirGL2 capsets. The VirGL2 profile carries bounded, implemented
+              host limits while leaving modern feature fallbacks disabled, so
+              adding the new ABI does not manufacture a higher guest version.
+              The ARM64 conformance image now builds Mesa 26.1.6 as one
+              cohesive EGL, GL, GLES, GBM, and VirGL userspace, pins Khronos
+              VK-GL-CTS 4.6.8.1, and records the current OpenGL 2.0 and GLES
+              2.0 ceiling. It runs capability probes for GLES 3.0, GLES 3.1,
+              GL 4.0, and GL 4.1 before the long resumable suites; probe
+              enumeration is a harness-integrity signal, never an API claim.
+              The first GL 3-era implementation slice
+              is also in place: per-attribute instance divisors, instanced
+              indexed and non-indexed draws, and TGSI
+              <code>INSTANCEID</code>/<code>VERTEXID</code> system values. The
+              conformance baseline has already driven concrete GLES2 fixes for
+              complete front/back stencil state, clear-mask restoration,
+              programmable point size, blend dithering, scaled and normalized
+              byte vertex formats, integer TGSI operations, and projected,
+              biased, and explicit-LOD 2D texture sampling.
+            </p>
+            <p>
+              Advancement follows the modern API ladder while the remaining
+              GLES2 regressions continue as a parallel baseline. First earn
+              GLES 3.0 and desktop GL 3.0/3.1 with integer formats, texture
+              arrays, multiple render targets, queries, uniform buffers,
+              instancing, and transform feedback; earn GL
+              3.2/3.3 with geometry shaders, multisampling, sampler objects, and
+              the remaining GLSL 3.30 behavior; then add the GL 4.0 shader,
+              tessellation, indirect-draw, cube-array, sample-shading, and
+              FP64 slices before completing the remaining GL 4.1 feature and
+              conformance slices supported by Darwin's frozen OpenGL 4.1 core
+              profile. A future Vulkan-over-Metal backend is the path beyond
+              that ceiling for modern Steam/Proton workloads and newer OpenGL
+              implemented over Vulkan; it is not simulated by overstating the
+              NSOpenGL capset.
+            </p>
+            <div class="gate">Current evidence: VirGL2 honestly leaves Mesa at OpenGL 2.0/GLES 2.0 and completes the existing four-scene Firefox WebGL corpus at roughly 60 fps with distinct non-black guest readbacks. The latest 45-group GLES2 run records 17,699 passes, 18 failures, 303 unsupported cases, 14 compatibility warnings, and 2 quality warnings; all six clipping failures are fixed, leaving two guest-compiler scoping cases and sixteen projected-mipmap seam cases. The first modern renderer slice now supports and advertises four color targets, with a native behavior test proving that one VirGL framebuffer clear updates both attached textures. The official monolithic ES2 runner also exposed a host-program lifetime problem, now bounded by a tested 128-entry LRU; its long-run memory behavior remains diagnostic work and does not block the GLES3 feature ladder. Exit gate: Mesa 26 creates the requested contexts without an override; GLES3, GL30, GL31, GL32, GL33, GL40, and GL41 CTS profiles plus selected Piglit coverage pass; and the official GLES2 must-pass artifacts complete without unsupported-command suppression or a test gate.</div>
           </article>
 
           <article class="milestone">

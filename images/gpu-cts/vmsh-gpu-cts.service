@@ -1,0 +1,19 @@
+[Unit]
+Description=vmsh VirGL Khronos conformance fixture
+DefaultDependencies=no
+After=ccx3-stage2.service systemd-udev-trigger.service
+Wants=ccx3-stage2.service systemd-udev-trigger.service
+
+[Service]
+Type=simple
+Environment=LD_LIBRARY_PATH=/opt/mesa/lib
+Environment=LIBGL_DRIVERS_PATH=/opt/mesa/lib/dri
+ExecStart=/usr/local/bin/run-gpu-cts
+Restart=on-failure
+RestartSec=1s
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
