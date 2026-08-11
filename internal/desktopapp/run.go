@@ -104,6 +104,7 @@ func Run(config Config, args []string) (retErr error) {
 	if err != nil {
 		return err
 	}
+	mapPersistentHomeOwner(persistentMounts, appConfig.PersistentHomeOwner)
 	width, height, err := parseDisplaySize(*displaySize)
 	if err != nil {
 		return err
@@ -810,6 +811,15 @@ func persistentHomeMount(vmName, homeName string, ephemeral bool) ([]client.Pers
 		homeName = strings.TrimSpace(vmName)
 	}
 	return []client.PersistentMount{{Name: homeName}}, homeName, nil
+}
+
+func mapPersistentHomeOwner(mounts []client.PersistentMount, owner *GuestOwner) {
+	if len(mounts) == 0 || owner == nil {
+		return
+	}
+	mounts[0].MapOwner = true
+	mounts[0].OwnerUID = owner.UID
+	mounts[0].OwnerGID = owner.GID
 }
 
 func runConfiguredAppPreflight(ctx context.Context, api *client.Client, source, cacheDir string, cvmfs *CVMFSHostMountConfig) (startupPreflight, error) {

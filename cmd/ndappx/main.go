@@ -69,6 +69,7 @@ func main() {
 		DefaultMemoryMB:      8192,
 		DefaultCPUs:          platformDefaultCPUs(),
 		DefaultEphemeralHome: platformDefaultEphemeralHome(),
+		PersistentHomeOwner:  &desktopapp.GuestOwner{UID: 1000, GID: 100},
 		AMD64Emulation:       true,
 		BrandPNG:             neurodeskIconPNG,
 		ConfigDirName:        "NeurodeskAppX",
