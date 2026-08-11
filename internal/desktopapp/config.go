@@ -21,6 +21,7 @@ type Config struct {
 	DefaultMemoryMB                    uint64
 	DefaultCPUs                        int
 	DefaultEphemeralHome               bool
+	PersistentHomeOwner                *GuestOwner
 	AMD64Emulation                     bool
 	BrandPNG                           []byte
 	ConfigDirName                      string
@@ -36,6 +37,14 @@ type Config struct {
 	ExperimentalBackgroundImageUpdates bool
 	CVMFSHostMount                     *CVMFSHostMountConfig
 	DesktopWebApp                      *DesktopWebAppConfig
+}
+
+// GuestOwner maps a shared or persistent tree to one guest account. This is
+// useful for desktop homes, where host-backed entries must remain writable by
+// the session user even when an early-boot root process creates them.
+type GuestOwner struct {
+	UID uint32
+	GID uint32
 }
 
 // DesktopWebAppConfig describes a guest web application which is started by

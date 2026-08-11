@@ -18,6 +18,11 @@ import (
 
 const desktopWebAppReadyEnvironment = "VMSH_DESKTOP_WEBAPP_READY_URL"
 
+// Guest init may spend up to 30 seconds waiting for systemd before it runs a
+// systemctl command. Leave enough time for that readiness gate and the command
+// itself; a shorter exec deadline aborts an otherwise healthy VM during boot.
+const desktopWebAppGuestConfigurationTimeout = 45 * time.Second
+
 // desktopWebAppTrigger is a guest-to-host readiness callback. The random URL
 // is installed in systemd's manager environment after boot, and the guest
 // desktop launcher POSTs to it only after its web app is ready.
@@ -116,7 +121,7 @@ func (t *desktopWebAppTrigger) configureGuest(ctx context.Context, api *client.C
 	result, err := api.RunInContext(ctx, name, client.RunRequest{
 		Command:        []string{"/usr/bin/systemctl", "set-environment", assignment},
 		User:           "root",
-		TimeoutSeconds: 10,
+		TimeoutSeconds: desktopWebAppGuestConfigurationTimeout.Seconds(),
 	})
 	if err != nil {
 		return fmt.Errorf("configure desktop web app callback: %w", err)

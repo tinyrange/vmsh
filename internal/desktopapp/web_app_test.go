@@ -2,13 +2,39 @@ package desktopapp
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
 
 	"j5.nz/cc/client"
 )
+
+func TestDesktopWebAppGuestConfigurationOutlivesSystemdReadiness(t *testing.T) {
+	var request client.RunRequest
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, incoming *http.Request) {
+		if err := json.NewDecoder(incoming.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(response).Encode(client.ExecResponse{})
+	}))
+	defer server.Close()
+
+	trigger, err := newDesktopWebAppTrigger("http://127.0.0.1:8888/lab")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer trigger.Close()
+	if err := trigger.configureGuest(t.Context(), client.NewClient(server.URL, nil), "ndappx"); err != nil {
+		t.Fatal(err)
+	}
+	if request.TimeoutSeconds <= 30 {
+		t.Fatalf("guest configuration timeout = %.1fs; systemd readiness alone may take 30s", request.TimeoutSeconds)
+	}
+}
 
 func TestPrepareDesktopWebAppMakesForwardAndCallbackReachable(t *testing.T) {
 	network := &client.NetworkConfig{Enabled: true, AllowInternet: true}

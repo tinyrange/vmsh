@@ -108,6 +108,17 @@ func TestSquadVMCanUseNamedOrEphemeralHome(t *testing.T) {
 	}
 }
 
+func TestPersistentDesktopHomeMapsEntriesToSessionUser(t *testing.T) {
+	mounts, _, err := persistentHomeMount("ndappx", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapPersistentHomeOwner(mounts, &GuestOwner{UID: 1000, GID: 100})
+	if len(mounts) != 1 || !mounts[0].MapOwner || mounts[0].OwnerUID != 1000 || mounts[0].OwnerGID != 100 {
+		t.Fatalf("persistent home owner mapping = %+v", mounts)
+	}
+}
+
 func TestSquadVMStorageShareIsWritableBySquadUser(t *testing.T) {
 	source := filepath.Join(t.TempDir(), "squadvm-shared")
 	share, err := createStorageShare(source)
