@@ -1,64 +1,36 @@
-# vmsh v0.8.0
+# vmsh v0.8.1
 
 ## Highlights
 
-- Made NeurodeskAppX container launches substantially faster by serving CVMFS
-  from the host, selecting a responsive mirror before boot, and reusing indexed
-  catalogs. The first tested `niimath` launch fell from about 15 seconds to
-  about 1.2 seconds.
-- Added registry-compatible compressed image storage, range-based delta
-  downloads, and background image staging for NeurodeskAppX.
-- Fixed persistent-home stalls and recovery failures affecting VS Code Remote
-  SSH and other metadata-heavy SquadVM workloads.
-
-## Desktop applications
-
-- Added an expandable Advanced section with persistent memory and vCPU controls
-  bounded by the host's available resources.
-- Improved integrated window chrome, title placement, maximize and restore
-  behavior, and per-monitor DPI sizing on Windows while retaining native macOS
-  window controls.
-- Defaulted Windows desktop VMs to four vCPUs and kept selected resource values
-  across launches.
-- Corrected image disk-space estimates and showed concurrent transfer progress
-  without hiding active downloads between short demand-read gaps.
+- Fixed NeurodeskAppX startup on Linux when a persistent home contains entries
+  created by an early-boot root process.
+- Added an on-demand JupyterLab launcher to NeurodeskAppX, with the browser
+  opening only after the guest reports that JupyterLab is ready.
+- Recovered daemon watchdog leases automatically after host sleep, preventing
+  repeated warnings from corrupting an interactive vmsh prompt.
 
 ## NeurodeskAppX
 
-- Moved `neurodesk.ardc.edu.au` CVMFS access to a long-lived host service and
-  disabled the redundant guest CVMFS daemon.
-- Benchmarked configured mirrors before boot, automatically preferred healthy
-  fast mirrors, and added a persistent manual mirror selector.
-- Added visible CVMFS transfer counts, rates, and expandable logical-path
-  progress while bounding the shared host cache to 5 GiB.
-- Stored OCI layers in compressed form and reused unchanged compressed byte
-  ranges when enhanced eStargz images change.
-- Staged image updates in the background, validated them completely, and
-  activated them atomically on the next requested refresh.
-- Kept the enhanced format compatible with ordinary OCI registries and retained
-  conventional image tags for clients that do not use the optimized path.
-
-## SquadVM
-
-- Made file durability selective so one `fsync` no longer synchronizes every
-  dirty persistent-home inode or blocks unrelated SSH and filesystem traffic.
-- Added separate file, directory, and whole-filesystem durability, advisory
-  range locks, concurrent virtio-fs request handling, and improved persistent
-  home caching.
-- Recovered cleanly from interrupted persistent-home attachments, discarded
-  unreachable orphaned metadata trees, and stopped replaying completed recovery
-  warnings on later starts.
-- Verified a fresh VS Code Remote SSH server download, 3,601-file unpack,
-  integrity check, server startup, and extension-host connection.
+- Mapped persistent-home entries to the Neurodesktop session account so
+  `/home/jovyan` remains writable as UID 1000/GID 100, including when existing
+  entries were originally owned by root.
+- Kept guest callback configuration alive beyond the systemd readiness window,
+  avoiding false startup failures while a healthy Linux VM is still booting.
+- Forwarded JupyterLab through a random loopback-only host port and replaced
+  host-side readiness polling with a tokenized guest-to-host callback.
+- Reopened the existing JupyterLab session on later desktop-icon clicks without
+  starting another server.
+- Updated the Glass-only Neurodesktop image from the upstream Neurocontainers
+  recipe, retained passwordless sudo, and published conventional OCI and
+  enhanced eStargz variants for AMD64 and ARM64.
 
 ## Reliability
 
-- Parallelized outstanding persistent-file synchronization during clean
-  shutdown and avoided re-syncing already durable home data.
-- Preserved incomplete or unreferenced persistent data in recovery quarantine
-  while keeping successful recovery informational rather than fatal.
-- Kept the conventional and enhanced image publishing paths side by side so
-  existing OCI consumers remain backwards compatible.
+- Recreated expired daemon watchdog leases after sleep and continued feeding
+  the replacement lease without emitting a warning when recovery succeeded.
+- Reported an unrecoverable watchdog episode at most once and stopped background
+  lease diagnostics from writing asynchronously into the interactive editor.
+- Released the current replacement lease when the shell exits.
 
 ## Release artifacts
 
