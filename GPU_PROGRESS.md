@@ -1,6 +1,6 @@
 # GPU acceleration progress and handoff
 
-Last updated: 2026-08-10 (Australia/Brisbane)
+Last updated: 2026-08-12 (Australia/Brisbane)
 
 This document is the operational and engineering handoff for the first-party
 virtio-gpu/VirGL acceleration work in vmsh. It is intended for a system that
@@ -49,6 +49,100 @@ The next active milestone is an honest modern API ladder:
 3. desktop GL 4.0;
 4. desktop GL 4.1, which is the ceiling of the Darwin NSOpenGL backend;
 5. a future Vulkan-over-Metal renderer for APIs beyond that frozen ceiling.
+
+### Neurodesk application sweep (2026-08-12)
+
+The experimental NeurodeskAppX integration was exercised unattended against
+the ARM64 Neurodesktop Glass image and the live CVMFS application catalogue.
+The VM used 16 GiB RAM and 8 vCPUs. Every run recorded the transient service
+state, process tree, X11 window list, application output, and an automation API
+framebuffer capture. The captures came from the guest display session; no host
+desktop automation was used.
+
+The following CVMFS applications started, mapped windows, and produced clean
+captures while the container environment selected `virpipe`:
+
+- MRView 3.0.8, which explicitly reported `virgl (vmsh Darwin VirGL)`, OpenGL
+  4.1 Core, and Mesa 25.0.7;
+- ITK-SNAP 4.4.0, FreeView 8.2.0, AFNI 26.0.07 and `SUMA_glxdino`;
+- Anatomist 6.0.16, QuPath 0.7.0, and DSI Studio 2024.06.12;
+- TrackVis reached its license dialog.
+
+Slicer 5.10.0 remained alive and initialized its Welcome module, but did not
+map a window during the 75-second automated interval. The FSLeyes 6.0.7.22 and
+Blender 5.0.1 crashes are amd64-emulation/allocator failures, not renderer
+regressions. Both fail under `virpipe` and `llvmpipe`, and both fail before an
+OpenGL context is created. QEMU 11.0.1 maps allocator arenas in the AArch64
+host's `0x0000ffff...` range; the emulated x86_64 program then dereferences the
+same low address with `0xffffffff...` sign extension. For example, Blender maps
+`0x0000ffff68a00000` and faults at `0xffffffff68a0a440`, while the FSLeyes
+dependency chain maps `0x0000ffff23c00000` and faults at
+`0xffffffff23c16500`.
+
+FSLeyes itself is not the crashing native component. FSLeyes 1.18.0 imports
+pandas 2.3.3, pandas imports PyArrow 23.0.1, and PyArrow's bundled
+Arrow-prefixed jemalloc crashes during initialization. `import pandas` and
+`import pyarrow` are minimal reproducers; NumPy, wxPython, PyOpenGL, FSLeyes GL
+modules, and a live wx GL context all succeed. Blender is linked with its own
+malloc replacement and even `blender --version` crashes during allocator
+initialization, before its dynamic loader finishes X11 initializers. A native
+arm64 application build, an amd64 build without jemalloc, or corrected QEMU
+guest address-space handling is required; VirGL changes cannot fix either
+failure.
+
+BrainSuite's tested GUI entrypoint was missing `libmwlaunchermain.so`. The
+binary declares it as a required dependency and its RPATH names the expected
+bundled directories, but the library and MATLAB Runtime tree are both absent.
+This packaging defect is tracked as NeuroContainers issue 3020.
+
+A second catalogue pass covered additional GUI families. BIDSvue
+0.1.20260704 mapped a clean Electron/Chromium window, although Chromium logged
+permission failures while trying to open `/dev/dri/card0`; the usable window is
+therefore not yet evidence that Chromium's own compositor selected virgl.
+BrainVISA 6.0.38 completed toolbox and workflow-controller initialization, but
+its window was hidden by a zero-byte persistent
+`~/.config/openbox/lxde-rc.xml`; restoring `/etc/xdg/openbox/LXDE/rc.xml`
+removed that unrelated desktop-state error.
+
+Voreen 5.3.0 started with Mesa 25.2.8 and explicitly reported
+`virgl (vmsh Darwin VirGL)`, then failed to compile its render-target viewer
+shader. The generated first line is `#version 130 core`; GLSL 1.30 does not
+accept a profile suffix, so Mesa reports `illegal text following version
+number`. This is an application/container shader-generation defect exposed by
+the modern renderer, not a VM crash. MINC Register 1.9.18 reproduces the old
+vtest disconnect below and aborts with SIGABRT. MIPView 0.1.4 reached a mapped
+Qt 6 window, but the same persistent Openbox dialog initially obscured it.
+VesselVio 1.1.2 loaded VTK 9 and then exited silently before mapping a window.
+MIPAV 11.3.3 loaded its Java runtime and began extracting the Linux OpenGL
+Java3D native library, while ilastik 1.4.0 remained in cold CVMFS page reads;
+both need warm-cache follow-up before assigning a graphics verdict.
+
+A repeatable compatibility gap exists in the container-side vtest path. The
+following applications abort with `lost connection to rendering server on 8
+read -1 22` under `virpipe`, but start successfully with `llvmpipe`:
+
+- Connectome Workbench 2.1.0 (Mesa 22.3.6);
+- MRIcroGL and Surfice (Mesa 21.0.3);
+- MITK Diffusion (Mesa 21.2.6);
+- SlicerSALT (Mesa 20.2.6).
+
+Removing the Mesa GL/GLSL version overrides does not change those failures.
+Conversely, tested containers with Mesa 23.2.1, 25.0.7, and 25.2.8 connect to
+the same Ubuntu `virgl_test_server` 1.0.0 bridge. The current evidence therefore
+locates this gap at old-Mesa vtest compatibility, before commands reach the
+vmsh virtio-gpu/VirGL decoder. Software rendering is a valid per-application
+fallback, but it must not be presented as accelerated rendering.
+
+The sweep also found a boot-order integration bug: Ubuntu's
+`systemd-binfmt.service` can replace the early guest-init `qemu-x86_64`
+registration. NeurodeskAppX now waits for that service and then restores the
+registration before launching CVMFS amd64 applications. A separate image fix
+is staged in NeuroContainers PR 3019 to keep `/home/jovyan/.local` owned by the
+desktop user when Glass prepares a fresh persistent home.
+
+Evidence is under `build/ndappx-gpu/logs/newimg-*.txt` and
+`build/ndappx-gpu/captures/newimg-*-presentation/`. These are local runtime
+artifacts and are intentionally not committed.
 
 ### OpenGL 4.1 continuation (2026-08-10)
 

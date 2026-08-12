@@ -19,6 +19,27 @@ also writes one actual WebGL canvas readback to
 launcher separately refuses to continue
 unless `glxinfo -B` identifies the Xorg renderer as VirGL.
 
+The same image also contains a pinned copy of the official Khronos WebGL
+conformance suite. Before boot, write either `webgl1` or `webgl2` to
+`/shared/.vmsh-webgl-cts` to select it instead of the demo. The suite starts
+automatically and posts its complete text report to one of:
+
+- `/shared/firefox-webgl-cts-webgl1.txt`;
+- `/shared/firefox-webgl-cts-webgl2.txt`.
+
+The matching `.status` file contains `running` or `complete`. Run WebGL 1 and
+WebGL 2 in separate fresh VM sessions so browser and driver state cannot leak
+between results. Failed page records include their individual assertion
+messages so renderer mismatches can be diagnosed without an interactive
+browser session. Without the sentinel, the original four-scene workload is
+unchanged.
+
+For failure isolation, `.vmsh-webgl-cts-include` and
+`.vmsh-webgl-cts-skip` may each contain one comma-separated list of suite URL
+regular expressions. If Firefox exits before posting a report, the status file
+records `browser-exited:<status>` and the Xorg desktop remains alive for
+inspection instead of closing the VM window.
+
 Other observable files in `/shared` are:
 
 - `firefox-webgl-glxinfo.log`: GLX vendor, renderer, and version selection;

@@ -74,6 +74,8 @@ sh -lc 'uname -m && whoami'
 - `gowin`: git submodule containing the native window, input, and OpenGL
   frontend used by SquadVM and NeurodeskAppX.
 - `docs`: focused development notes and test recipes.
+- [`docs/desktop-automation.md`](docs/desktop-automation.md): opt-in,
+  loopback-only framebuffer capture and guest input for the desktop apps.
 - `tools/build.go`: local build and run helper for `cc`, `ccvm`, the native
   desktop frontends, and `vmsh`. It uses the checked-out `cc` and `gowin`
   sources, signs the native payloads on macOS, and can launch the built `vmsh`.

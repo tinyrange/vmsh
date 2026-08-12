@@ -101,6 +101,8 @@ void main() {
 
 type displayViewer struct {
 	session             display.Session
+	automation          *desktopAutomation
+	automationAutostart bool
 	window              window.Window
 	guestCursor         guestCursorHost
 	gl                  gl.OpenGL
@@ -269,6 +271,8 @@ func openDisplayWindow(
 	start displayStart,
 	cvmfsStatus cvmfsStatusSource,
 	publishOpenGLShareGroup func(context, pixelFormat uintptr),
+	automation *desktopAutomation,
+	automationAutostart bool,
 ) error {
 	win, err := window.New(title, width, height, true)
 	if err != nil {
@@ -282,22 +286,24 @@ func openDisplayWindow(
 		}
 	}
 	viewer := &displayViewer{
-		window:             win,
-		guestCursor:        newGuestCursorHost(),
-		keysDown:           make(map[window.Key]bool),
-		startup:            initialStartupProgress(),
-		startupEvents:      make(chan startupProgress, 16),
-		startDone:          make(chan displayStartResult, 1),
-		cancelDone:         make(chan struct{}, 1),
-		preflightDone:      make(chan displayPreflightResult, 1),
-		imageRestartReady:  make(chan struct{}, 1),
-		settings:           settings,
-		showSettings:       true,
-		updateConsumedKeys: make(map[window.Key]bool),
-		parentContext:      ctx,
-		start:              start,
-		chromeEnabled:      cvmfsStatus != nil,
-		cvmfsStatusEvents:  make(chan client.CVMFSStatusResponse, 1),
+		window:              win,
+		automation:          automation,
+		automationAutostart: automationAutostart,
+		guestCursor:         newGuestCursorHost(),
+		keysDown:            make(map[window.Key]bool),
+		startup:             initialStartupProgress(),
+		startupEvents:       make(chan startupProgress, 16),
+		startDone:           make(chan displayStartResult, 1),
+		cancelDone:          make(chan struct{}, 1),
+		preflightDone:       make(chan displayPreflightResult, 1),
+		imageRestartReady:   make(chan struct{}, 1),
+		settings:            settings,
+		showSettings:        true,
+		updateConsumedKeys:  make(map[window.Key]bool),
+		parentContext:       ctx,
+		start:               start,
+		chromeEnabled:       cvmfsStatus != nil,
+		cvmfsStatusEvents:   make(chan client.CVMFSStatusResponse, 1),
 	}
 	if viewer.chromeEnabled {
 		if chrome, ok := win.(window.IntegratedTitleBarSupport); ok && chrome.SetIntegratedTitleBar(true) {
@@ -554,6 +560,9 @@ func (v *displayViewer) init() error {
 }
 
 func (v *displayViewer) close() {
+	if v.automation != nil {
+		v.automation.setSession(nil)
+	}
 	v.releaseNativeFrame()
 	if v.guestCursor != nil {
 		v.guestCursor.Close()
@@ -629,6 +638,9 @@ func (v *displayViewer) loop(ctx context.Context) error {
 					v.setStartupProgress(failedStartupProgress(fmt.Errorf("VM started without a native display session")))
 				} else {
 					v.session = result.started.Session
+					if v.automation != nil {
+						v.automation.setSession(v.session)
+					}
 					v.lastResize = image.Pt(v.settings.DisplayWidth, v.settings.DisplayHeight)
 					v.attemptStopped = result.started.Stopped
 					v.session.SetClipboard(v.hostClipboard)
@@ -653,6 +665,10 @@ func (v *displayViewer) loop(ctx context.Context) error {
 				v.settings.CVMFSAutoMirror = result.preflight.CVMFSMirror
 				v.preflightReady = true
 				v.showSettings = true
+				if v.automationAutostart {
+					v.automationAutostart = false
+					v.beginStart(false)
+				}
 			case status := <-v.cvmfsStatusEvents:
 				v.cvmfsStatus = v.cvmfsActivity.observe(status, time.Now())
 			case <-v.imageRestartReady:
@@ -754,6 +770,15 @@ func (v *displayViewer) loop(ctx context.Context) error {
 		if v.chromeEnabled {
 			v.drawAppChrome(backingWidth, backingHeight)
 		}
+		if capture, ok := v.automation.beginPresentationFrame(); ok && backingWidth > 0 && backingHeight > 0 {
+			pixels := make([]byte, backingWidth*backingHeight*4)
+			v.gl.ReadPixels(0, 0, int32(backingWidth), int32(backingHeight), gl.RGBA, gl.UnsignedByte, unsafe.Pointer(&pixels[0]))
+			generation := v.generation
+			if v.nativeFrame.Texture != 0 {
+				generation = v.nativeGeneration
+			}
+			v.automation.submitPresentationFrame(capture, backingWidth, backingHeight, generation, pixels)
+		}
 		v.window.Swap()
 		if v.desktopVisible && v.nativeFrame.Texture != 0 {
 			v.presentedGeneration = v.nativeGeneration
@@ -830,6 +855,9 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 					v.showSettings = true
 				}
 				v.releaseNativeFrame()
+				if v.automation != nil {
+					v.automation.setSession(nil)
+				}
 				v.session = nil
 				v.presentation = desktopPresentationGate{}
 				v.desktopVisible = false
@@ -851,12 +879,10 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 			switch event.Key {
 			case window.KeyTab:
 				v.cvmfsMirrorMenuOpen = false
-				v.startupFocus = nextStartupControlForOptions(
-					v.startupFocus,
-					event.Mods&window.ModShift != 0,
-					v.preflight.hasUpdate(),
-					v.showAdvanced,
-					v.hasCVMFSMirrors(),
+				v.startupFocus = nextStartupControlForFeatures(
+					v.startupFocus, event.Mods&window.ModShift != 0,
+					v.preflight.hasUpdate(), v.showAdvanced,
+					v.hasCVMFSMirrors(), v.settings.GPUAccelerationAvailable,
 				)
 				v.startupFocusVisible = true
 			case window.KeyLeft:
@@ -918,6 +944,9 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 				v.startupFocus = control
 				v.resourceDrag = control
 				v.setResourceFromPointer(control, point.X, layout)
+			case startupControlGPUAcceleration:
+				v.startupFocus = control
+				v.settings.GPUAcceleration = !v.settings.GPUAcceleration
 			case startupControlCVMFSMirror:
 				v.startupFocus = control
 				v.cvmfsMirrorMenuOpen = !v.cvmfsMirrorMenuOpen
@@ -947,6 +976,8 @@ func (v *displayViewer) activateStartupControl(control startupControl) {
 	case startupControlAdvanced:
 		v.showAdvanced = !v.showAdvanced
 		v.cvmfsMirrorMenuOpen = false
+	case startupControlGPUAcceleration:
+		v.settings.GPUAcceleration = !v.settings.GPUAcceleration
 	case startupControlCVMFSMirror:
 		v.cvmfsMirrorMenuOpen = !v.cvmfsMirrorMenuOpen
 		v.ensureCVMFSMirrorVisible()
@@ -1309,6 +1340,9 @@ func (v *displayViewer) drawAdvancedOption(backingWidth, backingHeight int, scal
 		}
 		summary += " · " + mode
 	}
+	if v.settings.GPUAcceleration {
+		summary += " · GPU experimental"
+	}
 	v.drawText(fitStartupText(summary, float32(bounds.Dx()-48), 14),
 		float32(bounds.Min.X+14), float32(bounds.Min.Y+47), 14, uiAccentSoft)
 	indicator := "+"
@@ -1343,6 +1377,15 @@ func (v *displayViewer) drawAdvancedSettings(backingWidth, backingHeight int, sc
 	v.drawResourceSlider(backingWidth, backingHeight, scale, layout.cpuSlider,
 		sliderPosition(v.settings.CPUs, 1, v.settings.MaxCPUs),
 		v.startupFocusVisible && v.startupFocus == startupControlCPUs)
+	if !layout.gpuCheckbox.Empty() {
+		v.drawSettingsOption(
+			backingWidth, backingHeight, scale, layout.gpuCheckbox,
+			"Experimental GPU acceleration", "OpenGL acceleration on Apple silicon",
+			v.settings.GPUAcceleration,
+			v.startupFocusVisible && v.startupFocus == startupControlGPUAcceleration,
+			v.startupHover == startupControlGPUAcceleration,
+		)
+	}
 	if !layout.cvmfsMirror.Empty() {
 		fill := uiSurfaceRaised
 		border := uiBorderStrong
@@ -1375,7 +1418,10 @@ func (v *displayViewer) chromeContentTop() float32 {
 
 func (v *displayViewer) settingsLayout(width, height float32) startupControlLayout {
 	top := v.chromeContentTop()
-	layout := settingsControlLayoutForOptions(width, max(float32(1), height-top), v.showAdvanced, v.hasCVMFSMirrors())
+	layout := settingsControlLayoutForFeatures(
+		width, max(float32(1), height-top), v.showAdvanced,
+		v.hasCVMFSMirrors(), v.settings.GPUAccelerationAvailable,
+	)
 	if top == 0 {
 		return layout
 	}
@@ -1395,6 +1441,7 @@ func (v *displayViewer) settingsLayout(width, height float32) startupControlLayo
 	layout.advancedPanel = layout.advancedPanel.Add(offset)
 	layout.memorySlider = layout.memorySlider.Add(offset)
 	layout.cpuSlider = layout.cpuSlider.Add(offset)
+	layout.gpuCheckbox = layout.gpuCheckbox.Add(offset)
 	layout.cvmfsMirror = layout.cvmfsMirror.Add(offset)
 	layout.actionDivider = layout.actionDivider.Add(offset)
 	layout.skip = layout.skip.Add(offset)
@@ -2990,7 +3037,11 @@ func (v *displayViewer) sendPointer(x, y float32, buttons uint8) error {
 	guestBackingHeight := max(float32(1), float32(backingHeight)-guestTop)
 	guestX := uint32(min(guestWidth-1, max(0, int(x*float32(guestWidth)/float32(backingWidth)))))
 	guestY := uint32(min(guestHeight-1, max(0, int((y-guestTop)*float32(guestHeight)/guestBackingHeight))))
-	if err := v.session.Pointer(guestX, guestY, buttons, v.sentButtons); err != nil {
+	if v.automation != nil {
+		if err := v.automation.pointer(guestX, guestY, buttons); err != nil {
+			return err
+		}
+	} else if err := v.session.Pointer(guestX, guestY, buttons, v.sentButtons); err != nil {
 		return fmt.Errorf("send pointer input: %w", err)
 	}
 	v.sentButtons = buttons

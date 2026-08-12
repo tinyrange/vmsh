@@ -44,25 +44,28 @@ type appSettings struct {
 	SharedFolder     string  `json:"shared_folder,omitempty"`
 	MemoryMB         uint64  `json:"memory_mb,omitempty"`
 	CPUs             int     `json:"cpus,omitempty"`
+	GPUAcceleration  bool    `json:"gpu_acceleration,omitempty"`
 	CVMFSMirror      string  `json:"cvmfs_mirror,omitempty"`
 }
 
 type startupOptions struct {
-	SSHEnabled      bool
-	SystemInstall   bool
-	RefreshImage    bool
-	DownloadRate    float64
-	SharedFolder    string
-	DisplayWidth    int
-	DisplayHeight   int
-	MemoryMB        uint64
-	CPUs            int
-	MaxMemoryMB     uint64
-	MaxCPUs         int
-	CVMFSRepo       string
-	CVMFSMirrors    []string
-	CVMFSMirror     string
-	CVMFSAutoMirror string
+	SSHEnabled               bool
+	SystemInstall            bool
+	RefreshImage             bool
+	DownloadRate             float64
+	SharedFolder             string
+	DisplayWidth             int
+	DisplayHeight            int
+	MemoryMB                 uint64
+	CPUs                     int
+	MaxMemoryMB              uint64
+	MaxCPUs                  int
+	GPUAcceleration          bool
+	GPUAccelerationAvailable bool
+	CVMFSRepo                string
+	CVMFSMirrors             []string
+	CVMFSMirror              string
+	CVMFSAutoMirror          string
 }
 
 const minimumGuestMemoryMB = uint64(1024)
@@ -79,6 +82,21 @@ func applyResourceOptions(request client.CreateInstanceRequest, options startupO
 	options = normalizeResourceOptions(options)
 	request.MemoryMB = options.MemoryMB
 	request.CPUs = options.CPUs
+	return request
+}
+
+func applyStartupOptions(request client.CreateInstanceRequest, options startupOptions) client.CreateInstanceRequest {
+	request = applyResourceOptions(request, options)
+	if request.Display == nil {
+		return request
+	}
+	display := *request.Display
+	display.Accelerated3D = options.GPUAccelerationAvailable && options.GPUAcceleration
+	if options.DisplayWidth > 0 && options.DisplayHeight > 0 {
+		display.Width = uint32(options.DisplayWidth)
+		display.Height = uint32(options.DisplayHeight)
+	}
+	request.Display = &display
 	return request
 }
 
