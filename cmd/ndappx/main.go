@@ -32,28 +32,6 @@ if [ -x /run/ccx3-qemu-x86_64 ] && [ ! -e /proc/sys/fs/binfmt_misc/qemu-x86_64 ]
         | sed 's/\\\\/\\/g' > /proc/sys/fs/binfmt_misc/register
 fi
 
-cat > /run/systemd/system/neurodesktop-virgl.service <<'EOF'
-[Unit]
-Description=VirGL bridge for Neurodesktop application containers
-After=ccx3-stage2.service
-ConditionPathExists=/dev/dri/renderD128
-
-[Service]
-Type=simple
-User=jovyan
-Group=users
-SupplementaryGroups=render
-ExecStartPre=/usr/bin/rm -f /tmp/.virgl_test /tmp/.neurodesktop-virgl
-ExecStartPre=/usr/bin/ln -s /tmp/.virgl_test /tmp/.neurodesktop-virgl
-ExecStart=/usr/bin/virgl_test_server --multi-clients --use-egl-surfaceless --rendernode /dev/dri/renderD128 --socket-path /tmp/.virgl_test
-Restart=on-failure
-RestartSec=1s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
 chgrp render /dev/dri/renderD128
 chmod g+rw /dev/dri/renderD128
 # The image's container-runtime wrapper owns the exact-version allowlist and
@@ -62,6 +40,16 @@ chmod g+rw /dev/dri/renderD128
 # nested container.
 systemctl stop neurodesktop-virgl.service 2>/dev/null || true
 rm -f /tmp/.virgl_test /tmp/.neurodesktop-virgl
+systemctl unset-environment \
+    LIBGL_DRI3_DISABLE \
+    SINGULARITYENV_LIBGL_DRI3_DISABLE \
+    SINGULARITYENV_LIBGL_ALWAYS_SOFTWARE \
+    SINGULARITYENV_GALLIUM_DRIVER \
+    SINGULARITYENV_VTEST_SOCKET_NAME \
+    APPTAINERENV_LIBGL_DRI3_DISABLE \
+    APPTAINERENV_LIBGL_ALWAYS_SOFTWARE \
+    APPTAINERENV_GALLIUM_DRIVER \
+    APPTAINERENV_VTEST_SOCKET_NAME
 systemctl set-environment NEURODESKTOP_GPU_ACCELERATION=1
 systemctl restart --no-block neurodesktop-glass.service
 `
