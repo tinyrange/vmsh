@@ -17,6 +17,11 @@ if ! command -v virgl_test_server >/dev/null 2>&1; then
     echo "the Neurodesktop image does not contain virgl-server; refresh the image before enabling GPU acceleration" >&2
     exit 1
 fi
+if [ ! -x /usr/local/libexec/neurodesktop-container-runtime ] \
+    || [ ! -r /etc/neurodesktop/gpu-containers.tsv ]; then
+    echo "the Neurodesktop image does not contain the GPU container manifest; refresh the image before enabling GPU acceleration" >&2
+    exit 1
+fi
 
 # systemd-binfmt may replace registrations made by the early guest init. The
 # ARM64 Neurodesktop image carries amd64 application containers, so restore the
@@ -38,8 +43,9 @@ Type=simple
 User=jovyan
 Group=users
 SupplementaryGroups=render
-ExecStartPre=/usr/bin/rm -f /tmp/.neurodesktop-virgl
-ExecStart=/usr/bin/virgl_test_server --use-egl-surfaceless --rendernode /dev/dri/renderD128 --socket-path /tmp/.neurodesktop-virgl
+ExecStartPre=/usr/bin/rm -f /tmp/.virgl_test /tmp/.neurodesktop-virgl
+ExecStartPre=/usr/bin/ln -s /tmp/.virgl_test /tmp/.neurodesktop-virgl
+ExecStart=/usr/bin/virgl_test_server --multi-clients --use-egl-surfaceless --rendernode /dev/dri/renderD128 --socket-path /tmp/.virgl_test
 Restart=on-failure
 RestartSec=1s
 
@@ -50,35 +56,13 @@ EOF
 systemctl daemon-reload
 chgrp render /dev/dri/renderD128
 chmod g+rw /dev/dri/renderD128
-systemctl restart neurodesktop-virgl.service
-
-attempt=0
-while [ "$attempt" -lt 100 ]; do
-    if [ -S /tmp/.neurodesktop-virgl ]; then
-        break
-    fi
-    if ! systemctl is-active --quiet neurodesktop-virgl.service; then
-        systemctl --no-pager --full status neurodesktop-virgl.service >&2 || true
-        exit 1
-    fi
-    attempt=$((attempt + 1))
-    sleep 0.05
-done
-if [ ! -S /tmp/.neurodesktop-virgl ]; then
-    echo "timed out waiting for the Neurodesktop VirGL bridge" >&2
-    exit 1
-fi
-
-systemctl set-environment \
-    LIBGL_DRI3_DISABLE=true \
-    SINGULARITYENV_LIBGL_DRI3_DISABLE=true \
-    SINGULARITYENV_LIBGL_ALWAYS_SOFTWARE=true \
-    SINGULARITYENV_GALLIUM_DRIVER=virpipe \
-    SINGULARITYENV_VTEST_SOCKET_NAME=/tmp/.neurodesktop-virgl \
-    APPTAINERENV_LIBGL_DRI3_DISABLE=true \
-    APPTAINERENV_LIBGL_ALWAYS_SOFTWARE=true \
-    APPTAINERENV_GALLIUM_DRIVER=virpipe \
-    APPTAINERENV_VTEST_SOCKET_NAME=/tmp/.neurodesktop-virgl
+# The image's container-runtime wrapper owns the exact-version allowlist and
+# starts this service only when an allowlisted container is launched. Keep the
+# desktop checkbox as the master switch without injecting VirGL into every
+# nested container.
+systemctl stop neurodesktop-virgl.service 2>/dev/null || true
+rm -f /tmp/.virgl_test /tmp/.neurodesktop-virgl
+systemctl set-environment NEURODESKTOP_GPU_ACCELERATION=1
 systemctl restart --no-block neurodesktop-glass.service
 `
 
