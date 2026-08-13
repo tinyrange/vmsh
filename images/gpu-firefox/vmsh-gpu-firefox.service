@@ -1,0 +1,17 @@
+[Unit]
+Description=vmsh accelerated Firefox WebGL demos
+DefaultDependencies=no
+After=ccx3-stage2.service systemd-udev-trigger.service
+Wants=ccx3-stage2.service systemd-udev-trigger.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/start-firefox-webgl
+Restart=on-failure
+RestartSec=1s
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

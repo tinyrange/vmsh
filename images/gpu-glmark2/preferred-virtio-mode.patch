@@ -1,0 +1,23 @@
+diff --git a/src/native-state-drm.cpp b/src/native-state-drm.cpp
+index 97431c2..ec85eec 100644
+--- a/src/native-state-drm.cpp
++++ b/src/native-state-drm.cpp
+@@ -600,11 +600,17 @@ NativeStateDRM::init()
+         return false;
+     }
+ 
+-    // Find the best resolution (we will always operate full-screen).
++    // Virtio DRM exposes standard fallback modes in addition to the host's
++    // preferred scanout. Use that preferred mode when present instead of
++    // selecting a synthetic mode that the host did not advertise.
+     unsigned int bestArea(0);
+     for (int m = 0; m < connector_->count_modes; m++) {
+         drmModeModeInfo* curMode = &connector_->modes[m];
+         unsigned int curArea = curMode->hdisplay * curMode->vdisplay;
++        if (curMode->type & DRM_MODE_TYPE_PREFERRED) {
++            mode_ = curMode;
++            break;
++        }
+         if (curArea > bestArea) {
+             mode_ = curMode;
+             bestArea = curArea;

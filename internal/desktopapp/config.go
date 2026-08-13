@@ -33,6 +33,8 @@ type Config struct {
 	SSHUser                            string
 	SSHHome                            string
 	ReleaseAssetPrefix                 string
+	ExperimentalGPUAcceleration        bool
+	ExperimentalGPUDesktopSetup        string
 	ExperimentalCompressedOCI          bool
 	ExperimentalBackgroundImageUpdates bool
 	CVMFSHostMount                     *CVMFSHostMountConfig

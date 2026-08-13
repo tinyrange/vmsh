@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -44,6 +45,10 @@ func Run(config Config, args []string) (retErr error) {
 	vnc := fs.Bool("vnc", false, "Use a VNC client instead of the native graphics window")
 	vncListen := fs.String("vnc-listen", "127.0.0.1:0", "VNC listen address (requires --vnc)")
 	vncPassword := fs.String("vnc-password", "", "VNC password (generated when omitted; requires --vnc)")
+	automationListen := fs.String("automation-listen", "", "Enable desktop automation on a loopback address")
+	automationTokenFile := fs.String("automation-token-file", "", "Bearer-token file for desktop automation")
+	automationCaptureDir := fs.String("automation-capture-dir", "", "Root directory for desktop frame captures")
+	automationAutostart := fs.Bool("automation-autostart", false, "Start with saved settings when desktop automation is enabled")
 	displaySize := fs.String("display", "1440x900", "Initial display size WIDTHxHEIGHT")
 	initSystem := fs.String("init", "systemd", "Guest init system")
 	memoryMB := fs.Uint64("memory-mb", appConfig.DefaultMemoryMB, "Guest memory in MiB")
@@ -90,6 +95,16 @@ func Run(config Config, args []string) (retErr error) {
 	if !*vnc && vncOptionSet {
 		return fmt.Errorf("--vnc-listen and --vnc-password require --vnc")
 	}
+	automationConfig, err := loadDesktopAutomationConfig(*automationListen, *automationTokenFile, *automationCaptureDir)
+	if err != nil {
+		return err
+	}
+	if *vnc && automationConfig != nil {
+		return fmt.Errorf("desktop automation requires the native graphics window")
+	}
+	if *automationAutostart && automationConfig == nil {
+		return fmt.Errorf("--automation-autostart requires desktop automation to be enabled")
+	}
 	if len(*vncPassword) > 8 {
 		return fmt.Errorf("VNC passwords are limited to 8 bytes")
 	}
@@ -109,9 +124,32 @@ func Run(config Config, args []string) (retErr error) {
 	if err != nil {
 		return err
 	}
-	settings, settingsDir, err := loadAppSettings()
-	if err != nil {
-		return err
+	var (
+		settings       appSettings
+		settingsDir    string
+		systemInstall  bool
+		activeCacheDir string
+	)
+	if strings.TrimSpace(*cacheDir) != "" {
+		activeCacheDir, err = resolveAppCacheDir(*cacheDir, false)
+		if err != nil {
+			return err
+		}
+		settingsDir = filepath.Join(activeCacheDir, "frontend")
+		settings, err = loadAppSettingsFromDir(settingsDir)
+		if err != nil {
+			return err
+		}
+	} else {
+		settings, settingsDir, err = loadAppSettings()
+		if err != nil {
+			return err
+		}
+		systemInstall = settings.systemInstall()
+		activeCacheDir, err = resolveAppCacheDir("", systemInstall)
+		if err != nil {
+			return err
+		}
 	}
 	storageValue := *storage
 	if !storageOptionSet && strings.TrimSpace(settings.SharedFolder) != "" {
@@ -140,12 +178,20 @@ func Run(config Config, args []string) (retErr error) {
 		MaxMemoryMB: maximumMemoryMB,
 		MaxCPUs:     runtime.NumCPU(),
 	})
+	gpuAccelerationAvailable := appConfig.ExperimentalGPUAcceleration && platformExperimentalGPUAccelerationAvailable()
 
 	displayReady := make(chan ccdisplay.Session, 1)
-	systemInstall := settings.systemInstall()
-	activeCacheDir, err := resolveAppCacheDir(*cacheDir, systemInstall)
-	if err != nil {
-		return err
+	var openGLShareContext atomic.Uintptr
+	var openGLSharePixelFormat atomic.Uintptr
+	openGLShareGroup := func() (context, pixelFormat uintptr) {
+		return openGLShareContext.Load(), openGLSharePixelFormat.Load()
+	}
+	publishOpenGLShareGroup := func(context, pixelFormat uintptr) {
+		if !platformNativeGPUScanoutAvailable() {
+			return
+		}
+		openGLShareContext.Store(context)
+		openGLSharePixelFormat.Store(pixelFormat)
 	}
 	if strings.TrimSpace(*cacheDir) == "" && !systemInstall {
 		regularCacheDir, regularErr := resolveAppCacheDir("", true)
@@ -156,7 +202,7 @@ func Run(config Config, args []string) (retErr error) {
 			systemInstall = true
 		}
 	}
-	backend, err := startEmbeddedBackend(activeCacheDir, *name, displayReady)
+	backend, err := startEmbeddedBackend(activeCacheDir, *name, displayReady, openGLShareGroup)
 	if err != nil && strings.TrimSpace(*cacheDir) == "" && !systemInstall {
 		// A portable directory may be unavailable beside an installed app.
 		// Keep the first-run UI reachable by falling back to the user cache and
@@ -164,7 +210,7 @@ func Run(config Config, args []string) (retErr error) {
 		systemInstall = true
 		activeCacheDir, err = resolveAppCacheDir("", true)
 		if err == nil {
-			backend, err = startEmbeddedBackend(activeCacheDir, *name, displayReady)
+			backend, err = startEmbeddedBackend(activeCacheDir, *name, displayReady, openGLShareGroup)
 		}
 	}
 	if err != nil {
@@ -189,7 +235,19 @@ func Run(config Config, args []string) (retErr error) {
 			retErr = errors.Join(retErr, err)
 		}
 	}()
-
+	automation, err := startDesktopAutomation(lifetimeContext, automationConfig, os.Stderr)
+	if err != nil {
+		return err
+	}
+	if automation != nil {
+		defer func() {
+			shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := automation.close(shutdownContext); err != nil {
+				retErr = errors.Join(retErr, err)
+			}
+		}()
+	}
 	var networkConfig *client.NetworkConfig
 	if *network {
 		networkConfig = &client.NetworkConfig{
@@ -256,7 +314,7 @@ func Run(config Config, args []string) (retErr error) {
 				if err := backend.stop(); err != nil {
 					return displayStarted{}, err
 				}
-				backend, err = startEmbeddedBackend(desiredCacheDir, *name, displayReady)
+				backend, err = startEmbeddedBackend(desiredCacheDir, *name, displayReady, openGLShareGroup)
 				if err != nil {
 					return displayStarted{}, err
 				}
@@ -298,6 +356,7 @@ func Run(config Config, args []string) (retErr error) {
 			settings.SharedFolder = selectedShare.Source
 			settings.MemoryMB = options.MemoryMB
 			settings.CPUs = options.CPUs
+			settings.GPUAcceleration = options.GPUAccelerationAvailable && options.GPUAcceleration
 			settings.CVMFSMirror = options.CVMFSMirror
 			if options.SystemInstall {
 				settings.InstallMode = appInstallSystem
@@ -314,17 +373,11 @@ func Run(config Config, args []string) (retErr error) {
 			var sshPort int
 			var sshPublicKey []byte
 			var sshIdentity string
-			startRequest := applyResourceOptions(request, options)
+			startRequest := applyStartupOptions(request, options)
 			startRequest.Shares = []client.ShareMount{selectedShare}
 			// The native startup view owns the window until the graphical session
 			// is ready, so keep the VM serial stream enabled and show it there.
 			startRequest.Dmesg = true
-			if options.DisplayWidth > 0 && options.DisplayHeight > 0 {
-				displayCopy := *request.Display
-				displayCopy.Width = uint32(options.DisplayWidth)
-				displayCopy.Height = uint32(options.DisplayHeight)
-				startRequest.Display = &displayCopy
-			}
 			if request.Network != nil {
 				networkCopy := *request.Network
 				networkCopy.PortForwards = append([]client.PortForward(nil), request.Network.PortForwards...)
@@ -432,6 +485,13 @@ func Run(config Config, args []string) (retErr error) {
 			if state.Display == nil {
 				return displayStarted{}, fmt.Errorf("VM started without a graphical display")
 			}
+			accelerated := startRequest.Display != nil && startRequest.Display.Accelerated3D
+			if accelerated && strings.TrimSpace(appConfig.ExperimentalGPUDesktopSetup) != "" {
+				publish(desktopStartupProgress("Configuring application graphics"))
+				if err := runGuestRootScript(ctx, api, *name, appConfig.ExperimentalGPUDesktopSetup); err != nil {
+					return displayStarted{}, fmt.Errorf("configure accelerated %s desktop: %w", productName(), err)
+				}
+			}
 			if webApp != nil {
 				if err := webApp.configureGuest(ctx, api, *name); err != nil {
 					return displayStarted{}, err
@@ -462,7 +522,7 @@ func Run(config Config, args []string) (retErr error) {
 				return displayStarted{}, ctx.Err()
 			}
 			publish(desktopStartupProgress("Waiting for the " + productName() + " session"))
-			if err := waitForDesktop(ctx, api, *name); err != nil {
+			if err := waitForDisplayReady(ctx, api, *name, session, accelerated); err != nil {
 				return displayStarted{}, err
 			}
 			publish(desktopStartupProgress("Waiting for a complete desktop frame"))
@@ -507,21 +567,26 @@ func Run(config Config, args []string) (retErr error) {
 			width,
 			height,
 			startupOptions{
-				SSHEnabled:    settings.SSHEnabled,
-				SystemInstall: systemInstall,
-				DownloadRate:  settings.DownloadRate,
-				SharedFolder:  settings.SharedFolder,
-				MemoryMB:      resourceOptions.MemoryMB,
-				CPUs:          resourceOptions.CPUs,
-				MaxMemoryMB:   resourceOptions.MaxMemoryMB,
-				MaxCPUs:       resourceOptions.MaxCPUs,
-				CVMFSRepo:     cvmfsConfigRepo(appConfig.CVMFSHostMount),
-				CVMFSMirrors:  cvmfsConfigMirrors(appConfig.CVMFSHostMount),
-				CVMFSMirror:   configuredCVMFSMirror(settings.CVMFSMirror, appConfig.CVMFSHostMount),
+				SSHEnabled:               settings.SSHEnabled,
+				SystemInstall:            systemInstall,
+				DownloadRate:             settings.DownloadRate,
+				SharedFolder:             settings.SharedFolder,
+				MemoryMB:                 resourceOptions.MemoryMB,
+				CPUs:                     resourceOptions.CPUs,
+				MaxMemoryMB:              resourceOptions.MaxMemoryMB,
+				MaxCPUs:                  resourceOptions.MaxCPUs,
+				GPUAcceleration:          settings.GPUAcceleration && gpuAccelerationAvailable,
+				GPUAccelerationAvailable: gpuAccelerationAvailable,
+				CVMFSRepo:                cvmfsConfigRepo(appConfig.CVMFSHostMount),
+				CVMFSMirrors:             cvmfsConfigMirrors(appConfig.CVMFSHostMount),
+				CVMFSMirror:              configuredCVMFSMirror(settings.CVMFSMirror, appConfig.CVMFSHostMount),
 			},
 			preflight,
 			start,
 			cvmfsStatus,
+			publishOpenGLShareGroup,
+			automation,
+			*automationAutostart,
 		)
 		cancelDisplay()
 		if windowErr != nil {
@@ -652,6 +717,26 @@ func Run(config Config, args []string) (retErr error) {
 			}
 		}
 	}
+}
+
+func runGuestRootScript(ctx context.Context, api *client.Client, name, script string) error {
+	exitCode := -1
+	err := api.RunStreamInContext(ctx, name, client.RunRequest{
+		Command: []string{"/bin/sh", "-eu", "-c", script},
+		User:    "root",
+	}, func(event client.ExecEvent) error {
+		if event.Kind == "exit" {
+			exitCode = event.ExitCode
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if exitCode != 0 {
+		return fmt.Errorf("guest setup exited with status %d", exitCode)
+	}
+	return nil
 }
 
 func monitorDisplayVM(ctx context.Context, api *client.Client, name string) error {
@@ -785,6 +870,51 @@ exit 1
 		return fmt.Errorf("%s session did not become ready", productName())
 	}
 	return nil
+}
+
+func waitForDisplayReady(ctx context.Context, api *client.Client, name string, session ccdisplay.Session, accelerated bool) error {
+	if !accelerated {
+		return waitForDesktop(ctx, api, name)
+	}
+	native, ok := session.(ccdisplay.OpenGLFrameSession)
+	if !ok {
+		return waitForDesktop(ctx, api, name)
+	}
+	readyContext, cancelReady := context.WithCancel(ctx)
+	defer cancelReady()
+	var desktopReady <-chan error
+
+	var generation uint64
+	for {
+		frame, available, err := native.AcquireOpenGLFrame(generation)
+		if err != nil {
+			return fmt.Errorf("wait for accelerated %s frame: %w", productName(), err)
+		}
+		if available {
+			generation = frame.Generation
+			valid := frame.Width > 0 && frame.Height > 0 && frame.Texture != 0
+			frame.Release(0)
+			if valid {
+				return nil
+			}
+		}
+		if desktopReady == nil && api != nil {
+			result := make(chan error, 1)
+			desktopReady = result
+			go func() {
+				result <- waitForDesktop(readyContext, api, name)
+			}()
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-desktopReady:
+			return err
+		case <-session.Changed():
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 func generateVNCPassword() (string, error) {

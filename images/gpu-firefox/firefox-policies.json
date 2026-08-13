@@ -1,0 +1,25 @@
+{
+  "policies": {
+    "DisableAppUpdate": true,
+    "DisableFirefoxAccounts": true,
+    "DisableFirefoxStudies": true,
+    "DisablePocket": true,
+    "DisableTelemetry": true,
+    "DontCheckDefaultBrowser": true,
+    "NoDefaultBookmarks": true,
+    "OverrideFirstRunPage": "",
+    "OverridePostUpdatePage": "",
+    "Preferences": {
+      "browser.aboutConfig.showWarning": false,
+      "browser.shell.checkDefaultBrowser": false,
+      "browser.startup.homepage_override.mstone": "ignore",
+      "browser.tabs.warnOnClose": false,
+      "datareporting.policy.dataSubmissionEnabled": false,
+      "extensions.pocket.enabled": false,
+      "gfx.webrender.all": true,
+      "layers.acceleration.force-enabled": true,
+      "webgl.disabled": false,
+      "webgl.force-enabled": true
+    }
+  }
+}

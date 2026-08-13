@@ -12,6 +12,48 @@ import (
 const defaultNeurodesktopImage = "ghcr.io/tinyrange/neurodesktop-glass:latest-estargz"
 const defaultCVMFSCacheLimit = int64(5 << 30)
 
+const neurodeskGPUDesktopSetup = `
+if ! command -v virgl_test_server >/dev/null 2>&1; then
+    echo "the Neurodesktop image does not contain virgl-server; refresh the image before enabling GPU acceleration" >&2
+    exit 1
+fi
+if [ ! -x /usr/local/libexec/neurodesktop-container-runtime ] \
+    || [ ! -r /etc/neurodesktop/gpu-containers.tsv ]; then
+    echo "the Neurodesktop image does not contain the GPU container manifest; refresh the image before enabling GPU acceleration" >&2
+    exit 1
+fi
+
+# systemd-binfmt may replace registrations made by the early guest init. The
+# ARM64 Neurodesktop image carries amd64 application containers, so restore the
+# emulator after systemd has settled if its registration was removed.
+systemctl start systemd-binfmt.service 2>/dev/null || true
+if [ -x /run/ccx3-qemu-x86_64 ] && [ ! -e /proc/sys/fs/binfmt_misc/qemu-x86_64 ]; then
+    printf '%s' ':qemu-x86_64:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/run/ccx3-qemu-x86_64:F' \
+        | sed 's/\\\\/\\/g' > /proc/sys/fs/binfmt_misc/register
+fi
+
+chgrp render /dev/dri/renderD128
+chmod g+rw /dev/dri/renderD128
+# The image's container-runtime wrapper owns the exact-version allowlist and
+# starts this service only when an allowlisted container is launched. Keep the
+# desktop checkbox as the master switch without injecting VirGL into every
+# nested container.
+systemctl stop neurodesktop-virgl.service 2>/dev/null || true
+rm -f /tmp/.virgl_test /tmp/.neurodesktop-virgl
+systemctl unset-environment \
+    LIBGL_DRI3_DISABLE \
+    SINGULARITYENV_LIBGL_DRI3_DISABLE \
+    SINGULARITYENV_LIBGL_ALWAYS_SOFTWARE \
+    SINGULARITYENV_GALLIUM_DRIVER \
+    SINGULARITYENV_VTEST_SOCKET_NAME \
+    APPTAINERENV_LIBGL_DRI3_DISABLE \
+    APPTAINERENV_LIBGL_ALWAYS_SOFTWARE \
+    APPTAINERENV_GALLIUM_DRIVER \
+    APPTAINERENV_VTEST_SOCKET_NAME
+systemctl set-environment NEURODESKTOP_GPU_ACCELERATION=1
+systemctl restart --no-block neurodesktop-glass.service
+`
+
 var defaultCVMFSMirrors = []string{
 	"http://cvmfs-geoproximity.neurodesk.org",
 	"http://cvmfs.neurodesk.org",
@@ -85,6 +127,8 @@ func main() {
 		SSHUser:                            "jovyan",
 		SSHHome:                            "/home/jovyan",
 		ReleaseAssetPrefix:                 "NeurodeskAppX",
+		ExperimentalGPUAcceleration:        true,
+		ExperimentalGPUDesktopSetup:        neurodeskGPUDesktopSetup,
 		ExperimentalCompressedOCI:          true,
 		ExperimentalBackgroundImageUpdates: true,
 		CVMFSHostMount: &desktopapp.CVMFSHostMountConfig{

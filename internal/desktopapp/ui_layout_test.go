@@ -239,6 +239,10 @@ func TestStartupKeyboardTraversalIncludesOnlyVisibleActions(t *testing.T) {
 	if control != startupControlCPUs {
 		t.Fatalf("expanded traversal reached %v after memory, want CPU slider", control)
 	}
+	control = nextStartupControlForFeatures(startupControlCPUs, false, false, true, false, true)
+	if control != startupControlGPUAcceleration {
+		t.Fatalf("GPU-enabled traversal reached %v after CPUs, want GPU option", control)
+	}
 }
 
 func TestAdvancedCVMFSMirrorControlFitsBeforeSharedFolder(t *testing.T) {
@@ -388,6 +392,48 @@ func TestAdvancedResourceControlsCoverHostRange(t *testing.T) {
 	if viewer.settings.MemoryMB != options.MaxMemoryMB || viewer.settings.CPUs != options.MaxCPUs {
 		t.Fatalf("right endpoints = %d MiB/%d CPUs, want %d MiB/%d CPUs",
 			viewer.settings.MemoryMB, viewer.settings.CPUs, options.MaxMemoryMB, options.MaxCPUs)
+	}
+}
+
+func TestExperimentalGPUControlAppliesOnlyWhenAvailable(t *testing.T) {
+	base := client.CreateInstanceRequest{Display: &client.DisplayConfig{Width: 1440, Height: 900}}
+	disabled := applyStartupOptions(base, startupOptions{
+		MemoryMB: 4096, CPUs: 4, MaxMemoryMB: 8192, MaxCPUs: 8,
+		GPUAcceleration: true,
+	})
+	if disabled.Display.Accelerated3D {
+		t.Fatal("unavailable GPU option enabled accelerated display")
+	}
+	enabled := applyStartupOptions(base, startupOptions{
+		MemoryMB: 4096, CPUs: 4, MaxMemoryMB: 8192, MaxCPUs: 8,
+		GPUAcceleration: true, GPUAccelerationAvailable: true,
+		DisplayWidth: 1512, DisplayHeight: 982,
+	})
+	if !enabled.Display.Accelerated3D {
+		t.Fatal("available selected GPU option did not enable accelerated display")
+	}
+	if enabled.Display.Width != 1512 || enabled.Display.Height != 982 {
+		t.Fatalf("accelerated display size = %dx%d, want 1512x982", enabled.Display.Width, enabled.Display.Height)
+	}
+	if base.Display.Accelerated3D {
+		t.Fatal("applying startup options mutated the reusable base request")
+	}
+}
+
+func TestExperimentalGPUControlFitsCompactAdvancedLayout(t *testing.T) {
+	layout := settingsControlLayoutForFeatures(760, 640, true, false, true)
+	viewport := image.Rect(0, 0, 760, 640)
+	if layout.gpuCheckbox.Empty() || !layout.gpuCheckbox.In(layout.advancedPanel) {
+		t.Fatalf("GPU control %v is outside advanced panel %v", layout.gpuCheckbox, layout.advancedPanel)
+	}
+	if !layout.panel.In(viewport) {
+		t.Fatalf("GPU settings panel %v is outside viewport %v", layout.panel, viewport)
+	}
+	if layout.gpuCheckbox.Overlaps(layout.sharedFolder) {
+		t.Fatal("GPU control overlaps shared folder")
+	}
+	if got := advancedControlAt(layout.gpuCheckbox.Min.Add(image.Pt(2, 2)), layout); got != startupControlGPUAcceleration {
+		t.Fatalf("GPU checkbox resolves to %v", got)
 	}
 }
 

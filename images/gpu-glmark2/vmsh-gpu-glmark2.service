@@ -1,0 +1,13 @@
+[Unit]
+Description=vmsh virtio-gpu glmark2 compatibility corpus
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/start-glmark2
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

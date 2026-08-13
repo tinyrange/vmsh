@@ -40,10 +40,15 @@ void main() {
 }`
 	displayFragmentShader = `#version 150
 uniform sampler2D framebuffer;
+uniform bool flipY;
 in vec2 uv;
 out vec4 color;
 void main() {
-	color = texture(framebuffer, uv);
+	vec2 samplePosition = uv;
+	if (flipY) {
+		samplePosition.y = 1.0 - samplePosition.y;
+	}
+	color = texture(framebuffer, samplePosition);
 }`
 	roundedRectFragmentShader = `#version 150
 uniform vec4 shapeColor;
@@ -96,15 +101,19 @@ void main() {
 
 type displayViewer struct {
 	session             display.Session
+	automation          *desktopAutomation
+	automationAutostart bool
 	window              window.Window
 	guestCursor         guestCursorHost
 	gl                  gl.OpenGL
+	synchronization     gl.Synchronization
 	text                *gowintext.Stash
 	font                int
 	fontBold            int
 	fontMono            int
 	fontMonoBold        int
 	program             uint32
+	flipY               int32
 	roundedRectProgram  uint32
 	roundedRectColor    int32
 	roundedRectGeometry int32
@@ -121,6 +130,10 @@ type displayViewer struct {
 	textureWidth        int
 	textureHeight       int
 	generation          uint64
+	nativeGeneration    uint64
+	presentedGeneration uint64
+	nativeFrame         display.OpenGLFrame
+	nativeConsumerFence gl.Sync
 	buttons             uint8
 	sentButtons         uint8
 	scrollX120Remainder float64
@@ -132,6 +145,7 @@ type displayViewer struct {
 	lastResize          image.Point
 	pendingResize       image.Point
 	resizeChangedAt     time.Time
+	resizeInitialized   bool
 	windowMinimized     bool
 	startup             startupProgress
 	startupChecklist    []startupChecklistItem
@@ -256,28 +270,40 @@ func openDisplayWindow(
 	preflight displayPreflight,
 	start displayStart,
 	cvmfsStatus cvmfsStatusSource,
+	publishOpenGLShareGroup func(context, pixelFormat uintptr),
+	automation *desktopAutomation,
+	automationAutostart bool,
 ) error {
 	win, err := window.New(title, width, height, true)
 	if err != nil {
 		return fmt.Errorf("open graphics window: %w", err)
 	}
+	if publishOpenGLShareGroup != nil {
+		if provider, ok := win.(window.OpenGLShareGroupProvider); ok {
+			context, pixelFormat := provider.OpenGLShareGroup()
+			publishOpenGLShareGroup(context, pixelFormat)
+			defer publishOpenGLShareGroup(0, 0)
+		}
+	}
 	viewer := &displayViewer{
-		window:             win,
-		guestCursor:        newGuestCursorHost(),
-		keysDown:           make(map[window.Key]bool),
-		startup:            initialStartupProgress(),
-		startupEvents:      make(chan startupProgress, 16),
-		startDone:          make(chan displayStartResult, 1),
-		cancelDone:         make(chan struct{}, 1),
-		preflightDone:      make(chan displayPreflightResult, 1),
-		imageRestartReady:  make(chan struct{}, 1),
-		settings:           settings,
-		showSettings:       true,
-		updateConsumedKeys: make(map[window.Key]bool),
-		parentContext:      ctx,
-		start:              start,
-		chromeEnabled:      cvmfsStatus != nil,
-		cvmfsStatusEvents:  make(chan client.CVMFSStatusResponse, 1),
+		window:              win,
+		automation:          automation,
+		automationAutostart: automationAutostart,
+		guestCursor:         newGuestCursorHost(),
+		keysDown:            make(map[window.Key]bool),
+		startup:             initialStartupProgress(),
+		startupEvents:       make(chan startupProgress, 16),
+		startDone:           make(chan displayStartResult, 1),
+		cancelDone:          make(chan struct{}, 1),
+		preflightDone:       make(chan displayPreflightResult, 1),
+		imageRestartReady:   make(chan struct{}, 1),
+		settings:            settings,
+		showSettings:        true,
+		updateConsumedKeys:  make(map[window.Key]bool),
+		parentContext:       ctx,
+		start:               start,
+		chromeEnabled:       cvmfsStatus != nil,
+		cvmfsStatusEvents:   make(chan client.CVMFSStatusResponse, 1),
 	}
 	if viewer.chromeEnabled {
 		if chrome, ok := win.(window.IntegratedTitleBarSupport); ok && chrome.SetIntegratedTitleBar(true) {
@@ -437,6 +463,7 @@ func (v *displayViewer) init() error {
 	if err != nil {
 		return fmt.Errorf("initialize graphics: %w", err)
 	}
+	v.synchronization, _ = v.gl.(gl.Synchronization)
 	// The low-level display path does not pass through gowin/graphics, which
 	// normally establishes alpha blending for Fontstash glyph textures.
 	v.gl.Enable(gl.Blend)
@@ -505,6 +532,8 @@ func (v *displayViewer) init() error {
 	v.gl.PixelStorei(gl.UnpackAlignment, 1)
 	v.gl.UseProgram(v.program)
 	v.gl.Uniform1i(v.gl.GetUniformLocation(v.program, "framebuffer"), 0)
+	v.flipY = v.gl.GetUniformLocation(v.program, "flipY")
+	v.gl.Uniform1i(v.flipY, 0)
 	if err := v.loadBrandTexture(); err != nil {
 		return err
 	}
@@ -531,6 +560,10 @@ func (v *displayViewer) init() error {
 }
 
 func (v *displayViewer) close() {
+	if v.automation != nil {
+		v.automation.setSession(nil)
+	}
+	v.releaseNativeFrame()
 	if v.guestCursor != nil {
 		v.guestCursor.Close()
 	}
@@ -605,6 +638,9 @@ func (v *displayViewer) loop(ctx context.Context) error {
 					v.setStartupProgress(failedStartupProgress(fmt.Errorf("VM started without a native display session")))
 				} else {
 					v.session = result.started.Session
+					if v.automation != nil {
+						v.automation.setSession(v.session)
+					}
 					v.lastResize = image.Pt(v.settings.DisplayWidth, v.settings.DisplayHeight)
 					v.attemptStopped = result.started.Stopped
 					v.session.SetClipboard(v.hostClipboard)
@@ -629,6 +665,10 @@ func (v *displayViewer) loop(ctx context.Context) error {
 				v.settings.CVMFSAutoMirror = result.preflight.CVMFSMirror
 				v.preflightReady = true
 				v.showSettings = true
+				if v.automationAutostart {
+					v.automationAutostart = false
+					v.beginStart(false)
+				}
 			case status := <-v.cvmfsStatusEvents:
 				v.cvmfsStatus = v.cvmfsActivity.observe(status, time.Now())
 			case <-v.imageRestartReady:
@@ -666,7 +706,11 @@ func (v *displayViewer) loop(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			v.presentation.observe(update, time.Now())
+			if v.nativeFrame.Texture != 0 {
+				v.presentation.observeOpenGLFrame(v.nativeFrame, time.Now())
+			} else {
+				v.presentation.observe(update, time.Now())
+			}
 			if v.presentation.ready(time.Now()) {
 				v.desktopVisible = true
 			}
@@ -677,6 +721,14 @@ func (v *displayViewer) loop(ctx context.Context) error {
 		if err := v.updateGuestCursor(); err != nil {
 			return err
 		}
+		if v.desktopVisible && v.nativeFrame.Texture != 0 &&
+			v.presentedGeneration == v.nativeGeneration {
+			// A native guest frame is already resident in the window's front
+			// buffer. Re-presenting it forces AppKit to synchronize a second
+			// shared OpenGL context without producing a new visible result.
+			time.Sleep(time.Second / 120)
+			continue
+		}
 		backingWidth, backingHeight := v.window.BackingSize()
 		v.gl.Viewport(0, 0, int32(backingWidth), int32(backingHeight))
 		if v.desktopVisible && v.textureWidth > 0 && v.textureHeight > 0 {
@@ -686,18 +738,25 @@ func (v *displayViewer) loop(ctx context.Context) error {
 			v.gl.Disable(gl.Blend)
 			v.gl.ClearColor(0, 0, 0, 1)
 			v.gl.Clear(gl.ColorBufferBit)
+			texture := v.texture
+			if v.nativeFrame.Texture != 0 {
+				texture = v.nativeFrame.Texture
+			}
 			if v.chromeEnabled {
 				scale := normalizedDisplayScale(v.window.Scale())
 				logicalWidth := float32(backingWidth) / scale
 				logicalHeight := float32(backingHeight) / scale
-				v.drawTexture(v.texture, backingWidth, backingHeight, scale, 0, appChromeHeight, logicalWidth, logicalHeight-appChromeHeight)
+				v.drawTextureFlipped(texture, backingWidth, backingHeight, scale, 0, appChromeHeight, logicalWidth, logicalHeight-appChromeHeight, v.nativeFrame.Texture != 0)
 			} else {
 				v.gl.UseProgram(v.program)
 				v.gl.ActiveTexture(gl.Texture0)
-				v.gl.BindTexture(gl.Texture2D, v.texture)
+				v.gl.BindTexture(gl.Texture2D, texture)
+				v.gl.Uniform1i(v.flipY, boolInt32(v.nativeFrame.Texture != 0))
 				v.gl.BindVertexArray(v.vertexArray)
 				v.gl.DrawArrays(gl.Triangles, 0, 6)
+				v.gl.Uniform1i(v.flipY, 0)
 			}
+			v.markNativeFrameConsumed()
 			// The framebuffer's fourth byte is padding, but the UI overlays use
 			// real alpha (notably the font atlas). Restore blending as soon as the
 			// opaque framebuffer has been drawn.
@@ -711,7 +770,19 @@ func (v *displayViewer) loop(ctx context.Context) error {
 		if v.chromeEnabled {
 			v.drawAppChrome(backingWidth, backingHeight)
 		}
+		if capture, ok := v.automation.beginPresentationFrame(); ok && backingWidth > 0 && backingHeight > 0 {
+			pixels := make([]byte, backingWidth*backingHeight*4)
+			v.gl.ReadPixels(0, 0, int32(backingWidth), int32(backingHeight), gl.RGBA, gl.UnsignedByte, unsafe.Pointer(&pixels[0]))
+			generation := v.generation
+			if v.nativeFrame.Texture != 0 {
+				generation = v.nativeGeneration
+			}
+			v.automation.submitPresentationFrame(capture, backingWidth, backingHeight, generation, pixels)
+		}
 		v.window.Swap()
+		if v.desktopVisible && v.nativeFrame.Texture != 0 {
+			v.presentedGeneration = v.nativeGeneration
+		}
 		time.Sleep(time.Second / 120)
 	}
 	return v.startErr
@@ -783,6 +854,10 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 				} else {
 					v.showSettings = true
 				}
+				v.releaseNativeFrame()
+				if v.automation != nil {
+					v.automation.setSession(nil)
+				}
 				v.session = nil
 				v.presentation = desktopPresentationGate{}
 				v.desktopVisible = false
@@ -804,12 +879,10 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 			switch event.Key {
 			case window.KeyTab:
 				v.cvmfsMirrorMenuOpen = false
-				v.startupFocus = nextStartupControlForOptions(
-					v.startupFocus,
-					event.Mods&window.ModShift != 0,
-					v.preflight.hasUpdate(),
-					v.showAdvanced,
-					v.hasCVMFSMirrors(),
+				v.startupFocus = nextStartupControlForFeatures(
+					v.startupFocus, event.Mods&window.ModShift != 0,
+					v.preflight.hasUpdate(), v.showAdvanced,
+					v.hasCVMFSMirrors(), v.settings.GPUAccelerationAvailable,
 				)
 				v.startupFocusVisible = true
 			case window.KeyLeft:
@@ -871,6 +944,9 @@ func (v *displayViewer) handleStartupInput(events []window.InputEvent) {
 				v.startupFocus = control
 				v.resourceDrag = control
 				v.setResourceFromPointer(control, point.X, layout)
+			case startupControlGPUAcceleration:
+				v.startupFocus = control
+				v.settings.GPUAcceleration = !v.settings.GPUAcceleration
 			case startupControlCVMFSMirror:
 				v.startupFocus = control
 				v.cvmfsMirrorMenuOpen = !v.cvmfsMirrorMenuOpen
@@ -900,6 +976,8 @@ func (v *displayViewer) activateStartupControl(control startupControl) {
 	case startupControlAdvanced:
 		v.showAdvanced = !v.showAdvanced
 		v.cvmfsMirrorMenuOpen = false
+	case startupControlGPUAcceleration:
+		v.settings.GPUAcceleration = !v.settings.GPUAcceleration
 	case startupControlCVMFSMirror:
 		v.cvmfsMirrorMenuOpen = !v.cvmfsMirrorMenuOpen
 		v.ensureCVMFSMirrorVisible()
@@ -979,6 +1057,29 @@ func (v *displayViewer) chooseSharedFolder() {
 }
 
 func (v *displayViewer) updateTexture() (display.FramebufferUpdate, error) {
+	if provider, ok := v.session.(display.OpenGLFrameSession); ok && v.synchronization != nil {
+		frame, available, err := provider.AcquireOpenGLFrame(v.nativeGeneration)
+		if err != nil {
+			return display.FramebufferUpdate{}, err
+		}
+		if available {
+			v.releaseNativeFrame()
+			v.synchronization.WaitSync(gl.Sync(frame.ProducerFence), 0, gl.TimeoutIgnored)
+			v.nativeFrame = frame
+			v.textureWidth, v.textureHeight = frame.Width, frame.Height
+			v.nativeGeneration = frame.Generation
+			return display.FramebufferUpdate{
+				Width: frame.Width, Height: frame.Height, Generation: frame.Generation,
+				Rect: image.Rect(0, 0, frame.Width, frame.Height),
+			}, nil
+		}
+		if v.nativeFrame.Texture != 0 {
+			return display.FramebufferUpdate{
+				Width: v.nativeFrame.Width, Height: v.nativeFrame.Height,
+				Generation: v.nativeFrame.Generation,
+			}, nil
+		}
+	}
 	width, height := v.session.Size()
 	update := v.session.Snapshot(image.Rect(0, 0, width, height), v.generation, v.generation != 0)
 	if update.Generation == v.generation && update.Rect.Empty() {
@@ -997,6 +1098,26 @@ func (v *displayViewer) updateTexture() (display.FramebufferUpdate, error) {
 	}
 	v.generation = update.Generation
 	return update, nil
+}
+
+func (v *displayViewer) markNativeFrameConsumed() {
+	if v.nativeFrame.Texture == 0 || v.synchronization == nil {
+		return
+	}
+	if v.nativeConsumerFence != 0 {
+		v.synchronization.DeleteSync(v.nativeConsumerFence)
+	}
+	v.nativeConsumerFence = v.synchronization.FenceSync(gl.SyncGPUCommandsComplete, 0)
+	v.synchronization.Flush()
+}
+
+func (v *displayViewer) releaseNativeFrame() {
+	if v.nativeFrame.Texture == 0 {
+		return
+	}
+	v.nativeFrame.Release(uintptr(v.nativeConsumerFence))
+	v.nativeFrame = display.OpenGLFrame{}
+	v.nativeConsumerFence = 0
 }
 
 func (v *displayViewer) drawSettings(backingWidth, backingHeight int) {
@@ -1219,6 +1340,9 @@ func (v *displayViewer) drawAdvancedOption(backingWidth, backingHeight int, scal
 		}
 		summary += " · " + mode
 	}
+	if v.settings.GPUAcceleration {
+		summary += " · GPU experimental"
+	}
 	v.drawText(fitStartupText(summary, float32(bounds.Dx()-48), 14),
 		float32(bounds.Min.X+14), float32(bounds.Min.Y+47), 14, uiAccentSoft)
 	indicator := "+"
@@ -1253,6 +1377,15 @@ func (v *displayViewer) drawAdvancedSettings(backingWidth, backingHeight int, sc
 	v.drawResourceSlider(backingWidth, backingHeight, scale, layout.cpuSlider,
 		sliderPosition(v.settings.CPUs, 1, v.settings.MaxCPUs),
 		v.startupFocusVisible && v.startupFocus == startupControlCPUs)
+	if !layout.gpuCheckbox.Empty() {
+		v.drawSettingsOption(
+			backingWidth, backingHeight, scale, layout.gpuCheckbox,
+			"Experimental GPU acceleration", "OpenGL acceleration on Apple silicon",
+			v.settings.GPUAcceleration,
+			v.startupFocusVisible && v.startupFocus == startupControlGPUAcceleration,
+			v.startupHover == startupControlGPUAcceleration,
+		)
+	}
 	if !layout.cvmfsMirror.Empty() {
 		fill := uiSurfaceRaised
 		border := uiBorderStrong
@@ -1285,7 +1418,10 @@ func (v *displayViewer) chromeContentTop() float32 {
 
 func (v *displayViewer) settingsLayout(width, height float32) startupControlLayout {
 	top := v.chromeContentTop()
-	layout := settingsControlLayoutForOptions(width, max(float32(1), height-top), v.showAdvanced, v.hasCVMFSMirrors())
+	layout := settingsControlLayoutForFeatures(
+		width, max(float32(1), height-top), v.showAdvanced,
+		v.hasCVMFSMirrors(), v.settings.GPUAccelerationAvailable,
+	)
 	if top == 0 {
 		return layout
 	}
@@ -1305,6 +1441,7 @@ func (v *displayViewer) settingsLayout(width, height float32) startupControlLayo
 	layout.advancedPanel = layout.advancedPanel.Add(offset)
 	layout.memorySlider = layout.memorySlider.Add(offset)
 	layout.cpuSlider = layout.cpuSlider.Add(offset)
+	layout.gpuCheckbox = layout.gpuCheckbox.Add(offset)
 	layout.cvmfsMirror = layout.cvmfsMirror.Add(offset)
 	layout.actionDivider = layout.actionDivider.Add(offset)
 	layout.skip = layout.skip.Add(offset)
@@ -2116,6 +2253,10 @@ func (v *displayViewer) loadBrandTexture() error {
 }
 
 func (v *displayViewer) drawTexture(texture uint32, backingWidth, backingHeight int, scale, x, y, width, height float32) {
+	v.drawTextureFlipped(texture, backingWidth, backingHeight, scale, x, y, width, height, false)
+}
+
+func (v *displayViewer) drawTextureFlipped(texture uint32, backingWidth, backingHeight int, scale, x, y, width, height float32, flipY bool) {
 	if texture == 0 || width <= 0 || height <= 0 {
 		return
 	}
@@ -2125,11 +2266,20 @@ func (v *displayViewer) drawTexture(texture uint32, backingWidth, backingHeight 
 	pixelHeight := int32(math.Ceil(float64(height * scale)))
 	v.gl.Viewport(left, bottom, pixelWidth, pixelHeight)
 	v.gl.UseProgram(v.program)
+	v.gl.Uniform1i(v.flipY, boolInt32(flipY))
 	v.gl.ActiveTexture(gl.Texture0)
 	v.gl.BindTexture(gl.Texture2D, texture)
 	v.gl.BindVertexArray(v.vertexArray)
 	v.gl.DrawArrays(gl.Triangles, 0, 6)
+	v.gl.Uniform1i(v.flipY, 0)
 	v.gl.Viewport(0, 0, int32(backingWidth), int32(backingHeight))
+}
+
+func boolInt32(value bool) int32 {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func cvmfsChromeStatusBounds(width float32, insets window.TitleBarInsets) image.Rectangle {
@@ -2552,6 +2702,18 @@ func (v *displayViewer) handleResize() error {
 		v.generation = 0
 	}
 	size := v.guestDisplaySize(backingWidth, backingHeight)
+	if !v.resizeInitialized {
+		// Cocoa may constrain the requested content rectangle to the visible
+		// screen before the first frame. Treat that platform-adjusted size as
+		// the presentation baseline, not a user resize. Otherwise a direct-DRM
+		// guest can allocate its initial framebuffer and immediately receive a
+		// different hotplug mode before its first page flip, leaving the CRTC
+		// permanently rejected with EINVAL.
+		v.lastResize = size
+		v.pendingResize = image.Point{}
+		v.resizeInitialized = true
+		return nil
+	}
 	if size == v.lastResize {
 		v.pendingResize = image.Point{}
 		return nil
@@ -2875,7 +3037,11 @@ func (v *displayViewer) sendPointer(x, y float32, buttons uint8) error {
 	guestBackingHeight := max(float32(1), float32(backingHeight)-guestTop)
 	guestX := uint32(min(guestWidth-1, max(0, int(x*float32(guestWidth)/float32(backingWidth)))))
 	guestY := uint32(min(guestHeight-1, max(0, int((y-guestTop)*float32(guestHeight)/guestBackingHeight))))
-	if err := v.session.Pointer(guestX, guestY, buttons, v.sentButtons); err != nil {
+	if v.automation != nil {
+		if err := v.automation.pointer(guestX, guestY, buttons); err != nil {
+			return err
+		}
+	} else if err := v.session.Pointer(guestX, guestY, buttons, v.sentButtons); err != nil {
 		return fmt.Errorf("send pointer input: %w", err)
 	}
 	v.sentButtons = buttons

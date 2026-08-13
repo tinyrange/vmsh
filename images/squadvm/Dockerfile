@@ -164,15 +164,16 @@ RUN curl --fail --location --silent --show-error \
     && gtk-update-icon-cache --force /usr/share/icons/hicolor \
     && update-desktop-database /usr/share/applications \
     && rm -f /tmp/cyber-squad-logo.svg \
-    && chmod 0755 \
-        /usr/local/bin/glass-clipboard \
+	&& chmod 0755 \
+		/usr/local/bin/glass-clipboard \
         /usr/local/bin/glass-resize \
         /usr/local/bin/squadvm-burpsuite \
         /usr/local/bin/binwalk \
-        /usr/local/bin/pwninit \
-        /usr/local/sbin/squadvm-sshd-prepare \
-        /usr/local/sbin/squadvm-session \
-    && if [ "${TARGETARCH}" = "arm64" ]; then \
+		/usr/local/bin/pwninit \
+		/usr/local/sbin/squadvm-sshd-prepare \
+		/usr/local/sbin/squadvm-session \
+	&& find /usr/lib -path '*/dri/virtio_gpu_dri.so' -print -quit | grep -q . \
+	&& if [ "${TARGETARCH}" = "arm64" ]; then \
         install -m 0755 /tmp/qemu-gdb /usr/local/bin/qemu-gdb; \
     fi \
     && rm -f /tmp/qemu-gdb \

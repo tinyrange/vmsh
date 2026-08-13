@@ -28,6 +28,7 @@ const (
 	startupControlSharedFolder
 	startupControlMemory
 	startupControlCPUs
+	startupControlGPUAcceleration
 	startupControlCVMFSMirror
 	startupControlSkip
 	startupControlPrimary
@@ -47,6 +48,7 @@ type startupControlLayout struct {
 	advancedPanel  image.Rectangle
 	memorySlider   image.Rectangle
 	cpuSlider      image.Rectangle
+	gpuCheckbox    image.Rectangle
 	cvmfsMirror    image.Rectangle
 	actionDivider  image.Rectangle
 	skip           image.Rectangle
@@ -54,14 +56,18 @@ type startupControlLayout struct {
 }
 
 func settingsControlLayout(width, height float32) startupControlLayout {
-	return settingsControlLayoutForState(width, height, false)
+	return settingsControlLayoutForFeatures(width, height, false, false, false)
 }
 
 func settingsControlLayoutForState(width, height float32, advancedExpanded bool) startupControlLayout {
-	return settingsControlLayoutForOptions(width, height, advancedExpanded, false)
+	return settingsControlLayoutForFeatures(width, height, advancedExpanded, false, false)
 }
 
 func settingsControlLayoutForOptions(width, height float32, advancedExpanded, cvmfs bool) startupControlLayout {
+	return settingsControlLayoutForFeatures(width, height, advancedExpanded, cvmfs, false)
+}
+
+func settingsControlLayoutForFeatures(width, height float32, advancedExpanded, cvmfs, gpu bool) startupControlLayout {
 	margin := float32(uiOuterMargin)
 	if width < 800 {
 		margin = uiCompactMargin
@@ -121,6 +127,12 @@ func settingsControlLayoutForOptions(width, height float32, advancedExpanded, cv
 			sliderTop = 62
 		}
 		resourceHeight := advancedHeight
+		nextAdvancedTop := sharedTop + resourceHeight - 2
+		if gpu {
+			layout.gpuCheckbox = image.Rect(int(left+22), int(nextAdvancedTop), int(right-22), int(nextAdvancedTop+54))
+			advancedHeight += 66
+			nextAdvancedTop += 66
+		}
 		if cvmfs {
 			advancedHeight += 66
 		}
@@ -129,7 +141,7 @@ func settingsControlLayoutForOptions(width, height float32, advancedExpanded, cv
 		layout.memorySlider = image.Rect(int(left+22), int(sharedTop+sliderTop), int(midpoint-12), int(sharedTop+sliderTop+44))
 		layout.cpuSlider = image.Rect(int(midpoint+12), int(sharedTop+sliderTop), int(right-22), int(sharedTop+sliderTop+44))
 		if cvmfs {
-			mirrorTop := sharedTop + resourceHeight - 2
+			mirrorTop := nextAdvancedTop
 			layout.cvmfsMirror = image.Rect(int(left+22), int(mirrorTop), int(right-22), int(mirrorTop+48))
 		}
 		sharedTop += advancedHeight + 10
@@ -180,6 +192,8 @@ func advancedControlAt(point image.Point, layout startupControlLayout) startupCo
 		return startupControlMemory
 	case point.In(layout.cpuSlider):
 		return startupControlCPUs
+	case point.In(layout.gpuCheckbox):
+		return startupControlGPUAcceleration
 	case point.In(layout.cvmfsMirror):
 		return startupControlCVMFSMirror
 	default:
@@ -226,11 +240,22 @@ func startupControlOrder(showSkip, advancedExpanded bool) []startupControl {
 }
 
 func startupControlOrderForOptions(showSkip, advancedExpanded, cvmfs bool) []startupControl {
+	return startupControlOrderForFeatures(showSkip, advancedExpanded, cvmfs, false)
+}
+
+func startupControlOrderForFeatures(showSkip, advancedExpanded, cvmfs, gpu bool) []startupControl {
 	controls := []startupControl{startupControlSSH, startupControlSystem, startupControlAdvanced, startupControlSharedFolder}
 	if advancedExpanded {
 		controls = []startupControl{startupControlSSH, startupControlSystem, startupControlAdvanced, startupControlMemory, startupControlCPUs, startupControlSharedFolder}
+		if gpu {
+			controls = []startupControl{startupControlSSH, startupControlSystem, startupControlAdvanced, startupControlMemory, startupControlCPUs, startupControlGPUAcceleration, startupControlSharedFolder}
+		}
 		if cvmfs {
-			controls = []startupControl{startupControlSSH, startupControlSystem, startupControlAdvanced, startupControlMemory, startupControlCPUs, startupControlCVMFSMirror, startupControlSharedFolder}
+			controls = []startupControl{startupControlSSH, startupControlSystem, startupControlAdvanced, startupControlMemory, startupControlCPUs}
+			if gpu {
+				controls = append(controls, startupControlGPUAcceleration)
+			}
+			controls = append(controls, startupControlCVMFSMirror, startupControlSharedFolder)
 		}
 	}
 	if showSkip {
@@ -244,7 +269,11 @@ func nextStartupControl(current startupControl, reverse, showSkip, advancedExpan
 }
 
 func nextStartupControlForOptions(current startupControl, reverse, showSkip, advancedExpanded, cvmfs bool) startupControl {
-	controls := startupControlOrderForOptions(showSkip, advancedExpanded, cvmfs)
+	return nextStartupControlForFeatures(current, reverse, showSkip, advancedExpanded, cvmfs, false)
+}
+
+func nextStartupControlForFeatures(current startupControl, reverse, showSkip, advancedExpanded, cvmfs, gpu bool) startupControl {
+	controls := startupControlOrderForFeatures(showSkip, advancedExpanded, cvmfs, gpu)
 	if len(controls) == 0 {
 		return startupControlNone
 	}

@@ -1,0 +1,2816 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>vmsh First-Party GPU Acceleration Plan</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18201f;
+      --muted: #5b6663;
+      --faint: #7e8986;
+      --paper: #fbfcfa;
+      --surface: #ffffff;
+      --surface-2: #f1f5f2;
+      --surface-3: #e6eeea;
+      --line: #d3dcd7;
+      --line-strong: #aebdb5;
+      --green: #08695b;
+      --green-dark: #064b42;
+      --green-soft: #dff2eb;
+      --blue: #2f5f86;
+      --blue-soft: #e5eff7;
+      --amber: #98620a;
+      --amber-soft: #fff2d8;
+      --red: #a23c33;
+      --red-soft: #fbe8e5;
+      --violet: #65518e;
+      --violet-soft: #eee9f8;
+      --code-bg: #15211e;
+      --code-ink: #e8f2ee;
+      --shadow: 0 16px 42px rgba(31, 48, 42, 0.08);
+      --radius: 14px;
+      --content: 1180px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 8% 0%, rgba(8, 105, 91, 0.08), transparent 29rem),
+        linear-gradient(180deg, #f7faf7 0, var(--paper) 28rem);
+      color: var(--ink);
+      font: 16px/1.62 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    a {
+      color: var(--green);
+      text-decoration-color: rgba(8, 105, 91, 0.35);
+      text-underline-offset: 0.16em;
+    }
+
+    a:hover {
+      color: var(--green-dark);
+      text-decoration-color: currentColor;
+    }
+
+    code, pre, .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    code {
+      border-radius: 5px;
+      background: var(--surface-2);
+      padding: 0.12rem 0.3rem;
+      font-size: 0.91em;
+    }
+
+    pre {
+      margin: 16px 0 0;
+      border: 1px solid #253530;
+      border-radius: 12px;
+      background: var(--code-bg);
+      color: var(--code-ink);
+      overflow-x: auto;
+      padding: 18px 20px;
+      font-size: 0.88rem;
+      line-height: 1.56;
+      tab-size: 2;
+    }
+
+    pre code {
+      background: transparent;
+      color: inherit;
+      padding: 0;
+    }
+
+    .page {
+      width: min(var(--content), calc(100% - 36px));
+      margin: 0 auto;
+      padding: 38px 0 88px;
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background:
+        linear-gradient(135deg, rgba(255, 255, 255, 0.98), rgba(239, 247, 242, 0.95)),
+        var(--surface);
+      box-shadow: var(--shadow);
+      padding: clamp(28px, 5vw, 64px);
+    }
+
+    .hero::after {
+      position: absolute;
+      right: -7rem;
+      bottom: -9rem;
+      width: 24rem;
+      height: 24rem;
+      border: 1px solid rgba(8, 105, 91, 0.18);
+      border-radius: 50%;
+      box-shadow:
+        0 0 0 3rem rgba(8, 105, 91, 0.035),
+        0 0 0 7rem rgba(8, 105, 91, 0.025);
+      content: "";
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      margin: 0 0 13px;
+      color: var(--green);
+      font-size: 0.76rem;
+      font-weight: 760;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3, h4 {
+      margin: 0;
+      line-height: 1.2;
+      letter-spacing: -0.018em;
+    }
+
+    h1 {
+      max-width: 850px;
+      font-size: clamp(2.2rem, 5.2vw, 4.35rem);
+      font-weight: 760;
+    }
+
+    h2 {
+      font-size: clamp(1.55rem, 2.8vw, 2.15rem);
+    }
+
+    h3 {
+      font-size: 1.15rem;
+    }
+
+    h4 {
+      font-size: 0.98rem;
+    }
+
+    p {
+      margin: 12px 0 0;
+    }
+
+    .lede {
+      position: relative;
+      z-index: 1;
+      max-width: 820px;
+      margin-top: 20px;
+      color: var(--muted);
+      font-size: clamp(1.02rem, 1.9vw, 1.22rem);
+    }
+
+    .chips {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 28px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 30px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.82);
+      color: var(--muted);
+      padding: 4px 11px;
+      font-size: 0.78rem;
+      font-weight: 650;
+    }
+
+    .chip::before {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--green);
+      content: "";
+    }
+
+    .layout {
+      display: grid;
+      align-items: start;
+      gap: 28px;
+      grid-template-columns: 236px minmax(0, 1fr);
+      margin-top: 34px;
+    }
+
+    .toc {
+      position: sticky;
+      top: 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: 0 10px 28px rgba(31, 48, 42, 0.05);
+      padding: 17px;
+      backdrop-filter: blur(12px);
+    }
+
+    .toc-title {
+      margin: 0 0 9px;
+      color: var(--faint);
+      font-size: 0.71rem;
+      font-weight: 760;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .toc ol {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .toc li + li {
+      margin-top: 2px;
+    }
+
+    .toc a {
+      display: block;
+      border-radius: 7px;
+      color: var(--muted);
+      padding: 5px 7px;
+      text-decoration: none;
+      font-size: 0.82rem;
+      line-height: 1.25;
+    }
+
+    .toc a:hover {
+      background: var(--green-soft);
+      color: var(--green-dark);
+    }
+
+    main {
+      min-width: 0;
+    }
+
+    .section {
+      scroll-margin-top: 24px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: 0 8px 26px rgba(31, 48, 42, 0.045);
+      padding: clamp(22px, 4vw, 38px);
+    }
+
+    .section + .section {
+      margin-top: 22px;
+    }
+
+    .section-number {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--green);
+      font-size: 0.72rem;
+      font-weight: 780;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .section-intro {
+      max-width: 780px;
+      color: var(--muted);
+      font-size: 1.02rem;
+    }
+
+    .callout {
+      margin-top: 20px;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--green);
+      border-radius: 9px;
+      background: var(--surface-2);
+      padding: 15px 18px;
+    }
+
+    .callout.warning {
+      border-left-color: var(--amber);
+      background: var(--amber-soft);
+    }
+
+    .callout.danger {
+      border-left-color: var(--red);
+      background: var(--red-soft);
+    }
+
+    .callout strong {
+      color: var(--ink);
+    }
+
+    .grid {
+      display: grid;
+      gap: 14px;
+      margin-top: 18px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .grid.three {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .card {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: linear-gradient(180deg, #fff, #fbfcfb);
+      padding: 17px;
+    }
+
+    .card p {
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .card .label {
+      display: inline-block;
+      margin-bottom: 10px;
+      border-radius: 999px;
+      background: var(--green-soft);
+      color: var(--green-dark);
+      padding: 3px 8px;
+      font-size: 0.68rem;
+      font-weight: 760;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .card .label.blue {
+      background: var(--blue-soft);
+      color: var(--blue);
+    }
+
+    .card .label.violet {
+      background: var(--violet-soft);
+      color: var(--violet);
+    }
+
+    .card .label.amber {
+      background: var(--amber-soft);
+      color: var(--amber);
+    }
+
+    ul, ol {
+      margin: 13px 0 0;
+      padding-left: 1.35rem;
+    }
+
+    li {
+      margin: 6px 0;
+    }
+
+    li::marker {
+      color: var(--green);
+    }
+
+    .tight li {
+      margin: 3px 0;
+    }
+
+    .table-wrap {
+      margin-top: 18px;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--surface);
+      font-size: 0.9rem;
+    }
+
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 11px 13px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: var(--surface-2);
+      color: var(--green-dark);
+      font-size: 0.74rem;
+      letter-spacing: 0.055em;
+      text-transform: uppercase;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    tbody tr:hover {
+      background: #fbfdfb;
+    }
+
+    .status {
+      display: inline-block;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface-2);
+      color: var(--muted);
+      padding: 2px 8px;
+      white-space: nowrap;
+      font-size: 0.74rem;
+      font-weight: 700;
+    }
+
+    .status.now {
+      border-color: #afd3c5;
+      background: var(--green-soft);
+      color: var(--green-dark);
+    }
+
+    .status.later {
+      border-color: #d9c492;
+      background: var(--amber-soft);
+      color: var(--amber);
+    }
+
+    .status.no {
+      border-color: #e0b7b1;
+      background: var(--red-soft);
+      color: var(--red);
+    }
+
+    .architecture {
+      display: grid;
+      gap: 10px;
+      margin-top: 24px;
+    }
+
+    .arch-row {
+      display: grid;
+      align-items: stretch;
+      gap: 10px;
+      grid-template-columns: 1fr 48px 1fr 48px 1fr;
+    }
+
+    .arch-node {
+      display: flex;
+      min-height: 104px;
+      flex-direction: column;
+      justify-content: center;
+      border: 1px solid var(--line-strong);
+      border-radius: 12px;
+      background: var(--surface);
+      padding: 14px;
+      text-align: center;
+    }
+
+    .arch-node strong {
+      display: block;
+      font-size: 0.95rem;
+    }
+
+    .arch-node span {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 0.78rem;
+      line-height: 1.35;
+    }
+
+    .arch-node.guest {
+      border-color: #b8cadb;
+      background: var(--blue-soft);
+    }
+
+    .arch-node.cc {
+      border-color: #b6d4c8;
+      background: var(--green-soft);
+    }
+
+    .arch-node.vmsh {
+      border-color: #c9bde0;
+      background: var(--violet-soft);
+    }
+
+    .arch-node.gowin {
+      border-color: #e1c995;
+      background: var(--amber-soft);
+    }
+
+    .arrow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--green);
+      font-size: 1.4rem;
+      font-weight: 780;
+    }
+
+    .arch-caption {
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 0.85rem;
+      text-align: center;
+    }
+
+    .ownership {
+      display: grid;
+      gap: 0;
+      margin-top: 20px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+    }
+
+    .ownership-row {
+      display: grid;
+      grid-template-columns: 155px minmax(0, 1fr);
+    }
+
+    .ownership-row + .ownership-row {
+      border-top: 1px solid var(--line);
+    }
+
+    .owner {
+      display: flex;
+      align-items: center;
+      background: var(--surface-2);
+      color: var(--green-dark);
+      padding: 13px 15px;
+      font-weight: 740;
+    }
+
+    .responsibility {
+      padding: 13px 15px;
+    }
+
+    .flow-list {
+      margin-top: 20px;
+      padding: 0;
+      list-style: none;
+      counter-reset: flow;
+    }
+
+    .flow-list li {
+      position: relative;
+      min-height: 52px;
+      margin: 0;
+      padding: 0 0 18px 52px;
+      counter-increment: flow;
+    }
+
+    .flow-list li::before {
+      position: absolute;
+      top: 0;
+      left: 0;
+      display: grid;
+      width: 34px;
+      height: 34px;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--green);
+      color: white;
+      content: counter(flow);
+      font-size: 0.78rem;
+      font-weight: 780;
+    }
+
+    .flow-list li::after {
+      position: absolute;
+      top: 34px;
+      bottom: 0;
+      left: 16px;
+      width: 2px;
+      background: var(--line);
+      content: "";
+    }
+
+    .flow-list li:last-child::after {
+      display: none;
+    }
+
+    .flow-list strong {
+      display: block;
+      line-height: 1.35;
+    }
+
+    .flow-list span {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .milestone {
+      position: relative;
+      margin-top: 18px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--surface);
+      padding: 19px 20px 19px 70px;
+    }
+
+    .milestone-id {
+      position: absolute;
+      top: 18px;
+      left: 18px;
+      display: grid;
+      width: 37px;
+      height: 37px;
+      place-items: center;
+      border-radius: 10px;
+      background: var(--green);
+      color: white;
+      font-size: 0.78rem;
+      font-weight: 800;
+    }
+
+    .milestone p {
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .gate {
+      margin-top: 10px;
+      color: var(--green-dark);
+      font-size: 0.88rem;
+      font-weight: 670;
+    }
+
+    .decision-list {
+      margin-top: 18px;
+      padding: 0;
+      list-style: none;
+    }
+
+    .decision-list li {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: 118px minmax(0, 1fr);
+      margin: 0;
+      border-top: 1px solid var(--line);
+      padding: 11px 0;
+    }
+
+    .decision-list li:last-child {
+      border-bottom: 1px solid var(--line);
+    }
+
+    .decision-list strong {
+      color: var(--green-dark);
+      font-size: 0.84rem;
+    }
+
+    .decision-list span {
+      color: var(--muted);
+    }
+
+    .checks {
+      padding-left: 0;
+      list-style: none;
+    }
+
+    .checks li {
+      position: relative;
+      padding-left: 29px;
+    }
+
+    .checks li::before {
+      position: absolute;
+      top: 0.08rem;
+      left: 0;
+      color: var(--green);
+      content: "\2713";
+      font-weight: 800;
+    }
+
+    .footnote {
+      color: var(--faint);
+      font-size: 0.78rem;
+    }
+
+    footer {
+      margin-top: 24px;
+      border-top: 1px solid var(--line);
+      color: var(--faint);
+      padding: 20px 4px 0;
+      font-size: 0.82rem;
+    }
+
+    @media (max-width: 920px) {
+      .layout {
+        display: block;
+      }
+
+      .toc {
+        position: static;
+        margin-bottom: 22px;
+      }
+
+      .toc ol {
+        display: grid;
+        gap: 3px 12px;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .grid.three {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 680px) {
+      .page {
+        width: min(100% - 20px, var(--content));
+        padding-top: 10px;
+      }
+
+      .hero {
+        border-radius: 16px;
+        padding: 27px 22px;
+      }
+
+      .hero::after {
+        display: none;
+      }
+
+      .toc ol, .grid, .grid.three {
+        grid-template-columns: 1fr;
+      }
+
+      .section {
+        padding: 22px 18px;
+      }
+
+      .arch-row {
+        grid-template-columns: 1fr;
+      }
+
+      .arrow {
+        min-height: 26px;
+        transform: rotate(90deg);
+      }
+
+      .ownership-row {
+        grid-template-columns: 1fr;
+      }
+
+      .owner {
+        padding-bottom: 6px;
+      }
+
+      .responsibility {
+        background: var(--surface-2);
+        padding-top: 4px;
+      }
+
+      .milestone {
+        padding: 66px 17px 18px;
+      }
+
+      .decision-list li {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media print {
+      body {
+        background: white;
+        font-size: 10.5pt;
+      }
+
+      .page {
+        width: 100%;
+        padding: 0;
+      }
+
+      .hero, .section {
+        break-inside: avoid;
+        box-shadow: none;
+      }
+
+      .layout {
+        display: block;
+      }
+
+      .toc {
+        display: none;
+      }
+
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+
+      pre {
+        white-space: pre-wrap;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <p class="eyebrow">Architecture and delivery plan</p>
+      <h1>First-party 3D acceleration for vmsh</h1>
+      <p class="lede">
+        Start on a Darwin/ARM64 host, add standard VirGL acceleration to cc,
+        render it through a first-party Go implementation, and present shared
+        GPU textures through native Glass and a vendored Gowin platform layer.
+        The host-sharing experiment starts in SquadVM. The product goals are
+        accelerated neuroimaging applications in Neurodesk and Steam/Proton
+        gaming in SquadVM or a dedicated gaming frontend.
+      </p>
+      <div class="chips" aria-label="Plan attributes">
+        <span class="chip">Standard Mesa guest</span>
+        <span class="chip">First-party host renderer</span>
+        <span class="chip">Gowin submodule</span>
+        <span class="chip">2D fallback preserved</span>
+        <span class="chip">Darwin/ARM64 first</span>
+      </div>
+    </header>
+
+    <div class="layout">
+      <nav class="toc" aria-label="Document contents">
+        <p class="toc-title">Contents</p>
+        <ol>
+          <li><a href="#decision">Decision</a></li>
+          <li><a href="#goals">Goals and non-goals</a></li>
+          <li><a href="#baseline">Current baseline</a></li>
+          <li><a href="#architecture">Target architecture</a></li>
+          <li><a href="#ownership">Repository ownership</a></li>
+          <li><a href="#gowin">Gowin submodule</a></li>
+          <li><a href="#contexts">GL context model</a></li>
+          <li><a href="#virtio">virtio-gpu work</a></li>
+          <li><a href="#renderer">VirGL renderer</a></li>
+          <li><a href="#shaders">Shader translation</a></li>
+          <li><a href="#resources">Resources and memory</a></li>
+          <li><a href="#fences">Queues and fences</a></li>
+          <li><a href="#scanout">Scanout and presentation</a></li>
+          <li><a href="#api">Configuration and API</a></li>
+            <li><a href="#products">Product ladder</a></li>
+            <li><a href="#platforms">Platform plan</a></li>
+          <li><a href="#security">Security model</a></li>
+          <li><a href="#observability">Diagnostics</a></li>
+          <li><a href="#testing">Testing strategy</a></li>
+          <li><a href="#milestones">Milestones</a></li>
+          <li><a href="#performance">Performance gates</a></li>
+          <li><a href="#risks">Risk register</a></li>
+            <li><a href="#steam">Steam path</a></li>
+            <li><a href="#done">Definition of done</a></li>
+          <li><a href="#references">References</a></li>
+        </ol>
+      </nav>
+
+      <main>
+        <section class="section" id="decision">
+          <span class="section-number">01 · Decision</span>
+          <h2>Own the host graphics stack</h2>
+          <p class="section-intro">
+            vmsh will implement and ship its own VirGL command processor and
+            OpenGL renderer. The guest continues to use the standard Linux
+            virtio-gpu DRM driver and Mesa VirGL driver; the first-party
+            boundary begins at the host side of the virtio device.
+          </p>
+
+          <div class="callout">
+            <strong>Committed direction:</strong> virglrenderer and rutabaga are
+            not runtime dependencies. They may be used in development as
+            behavioral oracles, command-stream references, and differential
+            test targets.
+          </div>
+
+          <ul class="decision-list">
+            <li>
+              <strong>Guest ABI</strong>
+              <span>Standard virtio-gpu plus the existing VirGL capset and command stream.</span>
+            </li>
+            <li>
+              <strong>Host renderer</strong>
+              <span>A new Go implementation owned by vmsh, initially scoped to an honest, deliberately small capset.</span>
+            </li>
+            <li>
+              <strong>Presentation</strong>
+              <span>Shared OpenGL resources produced on a renderer thread and sampled by native Glass on its window thread.</span>
+            </li>
+            <li>
+              <strong>First host</strong>
+              <span>Darwin/ARM64 with HVF, an ARM64 Linux guest, NSOpenGL shared contexts, and native Glass.</span>
+            </li>
+            <li>
+              <strong>Product ladder</strong>
+              <span>Accelerate Neurodesk first; preserve a backend-neutral route toward Vulkan, Metal, and translated x86 Steam games.</span>
+            </li>
+            <li>
+              <strong>Fallback</strong>
+              <span>The existing CPU framebuffer and <code>display.Session.Snapshot</code> path remains a supported mode.</span>
+            </li>
+          </ul>
+        </section>
+
+        <section class="section" id="goals">
+          <span class="section-number">02 · Scope</span>
+          <h2>Goals and non-goals</h2>
+
+          <div class="grid">
+            <article class="card">
+              <span class="label">Goal</span>
+              <h3>Useful Neurodesk acceleration</h3>
+              <p>
+                Neurodesk's Xorg desktop, compositing, visualization tools, and
+                ordinary OpenGL applications render through the Apple GPU
+                rather than llvmpipe.
+              </p>
+            </article>
+            <article class="card">
+              <span class="label">Goal</span>
+              <h3>Darwin-first, portable core</h3>
+              <p>
+                Prove the stack over Hypervisor.framework first while keeping
+                the virtio device and VirGL renderer portable to KVM and WHP.
+              </p>
+            </article>
+            <article class="card">
+              <span class="label">Goal</span>
+              <h3>Native Glass integration</h3>
+              <p>
+                The renderer and visible Gowin window share GPU resources with
+                explicit synchronization and no window-thread violations.
+              </p>
+            </article>
+            <article class="card">
+              <span class="label">Goal</span>
+              <h3>Truthful compatibility</h3>
+              <p>
+                Guest capabilities are generated from implemented behavior
+                intersected with host support. Unsupported features are never
+                advertised optimistically.
+              </p>
+            </article>
+            <article class="card">
+              <span class="label violet">North star</span>
+              <h3>Steam-class gaming</h3>
+              <p>
+                Preserve a path for translated x86-64 Steam and Proton
+                workloads, guest Vulkan, a Metal-capable host renderer, game
+                input, audio, and low-latency presentation.
+              </p>
+            </article>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Out of scope for the first release</th>
+                  <th>Reason</th>
+                  <th>Revisit condition</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Venus and guest Vulkan</td>
+                  <td>Required for the Steam north star, but it needs blob resources, host-visible memory, context initialization, and a Metal-capable Vulkan renderer.</td>
+                  <td>Neurodesk VirGL is stable on Darwin/ARM64 and the backend-neutral renderer contract is proven.</td>
+                </tr>
+                <tr>
+                  <td>GPU or PCI passthrough</td>
+                  <td>Breaks portability and introduces platform-specific privilege and device ownership.</td>
+                  <td>Only as an independent expert feature.</td>
+                </tr>
+                <tr>
+                  <td>Video encode/decode commands</td>
+                  <td>Large additional API and security surface unrelated to desktop 3D.</td>
+                  <td>A concrete product workload requires it.</td>
+                </tr>
+                <tr>
+                  <td>3D VM snapshots</td>
+                  <td>Host GL object state is not currently serializable and display snapshots are already restricted.</td>
+                  <td>A renderer-neutral state format exists.</td>
+                </tr>
+                <tr>
+                  <td>Full OpenGL feature parity</td>
+                  <td>The first release must advertise only the subset proven by conformance tests.</td>
+                  <td>Expanded incrementally from real workloads.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="section" id="baseline">
+          <span class="section-number">03 · Baseline</span>
+          <h2>What exists today</h2>
+          <p class="section-intro">
+            cc already has the correct device position and most lifecycle
+            connections. The missing layer is the host interpretation of 3D
+            resources and command buffers.
+          </p>
+
+          <div class="grid three">
+            <article class="card">
+              <span class="label blue">Guest</span>
+              <h3>DRM-ready image</h3>
+              <p>
+                The guest kernel enables <code>CONFIG_DRM_VIRTIO_GPU</code>.
+                Neurodesk and SquadVM publish ARM64 images. SquadVM uses Xorg's
+                <code>modesetting</code> driver; the same standard Mesa VirGL
+                path can accelerate both images once a host capset is exposed.
+              </p>
+            </article>
+            <article class="card">
+              <span class="label">cc</span>
+              <h3>Portable 2D virtio GPU</h3>
+              <p>
+                One MMIO device already serves KVM, HVF, and WHP. It implements
+                scanout, 2D resources, backing attachment, transfers, flush,
+                cursor, input, resize, and interrupts.
+              </p>
+            </article>
+            <article class="card">
+              <span class="label violet">Glass</span>
+              <h3>CPU scanout upload</h3>
+              <p>
+                Native frontends poll framebuffer snapshots and upload dirty
+                XRGB8888 regions with <code>gl.TexSubImage2D</code> before
+                drawing a fullscreen textured quad.
+              </p>
+            </article>
+          </div>
+
+          <div class="callout">
+            <strong>Cross-architecture baseline:</strong> the ARM64 SquadVM
+            image already installs <code>qemu-x86_64</code>, registers it
+            through <code>binfmt_misc</code>, and carries essential AMD64
+            runtime libraries. That proves the packaging shape, but Steam-class
+            performance requires a JIT-oriented translator with graphics API
+            forwarding rather than treating qemu-user as the final CPU path.
+          </div>
+
+          <pre><code>guest resource
+    │ TRANSFER_TO_HOST_2D + RESOURCE_FLUSH
+    ▼
+cc/internal/virtio.Framebuffer (CPU XRGB8888)
+    │ Snapshot(rect, generation, incremental)
+    ▼
+display.Session
+    │ dirty byte slice
+    ▼
+native Glass → gl.TexSubImage2D → visible Gowin window</code></pre>
+
+          <p class="footnote">
+            Relevant code:
+            <a href="cc/internal/virtio/gpu.go">cc/internal/virtio/gpu.go</a>,
+            <a href="cc/internal/virtio/display.go">cc/internal/virtio/display.go</a>,
+            <a href="cc/display/display.go">cc/display/display.go</a>, and
+            <a href="cmd/squadvm/display.go">cmd/squadvm/display.go</a>.
+          </p>
+        </section>
+
+        <section class="section" id="architecture">
+          <span class="section-number">04 · Architecture</span>
+          <h2>Target data path</h2>
+          <p class="section-intro">
+            Keep the standard guest driver and the portable cc device. Insert a
+            first-party renderer behind a narrow interface, then give Glass an
+            optional native-frame path alongside its existing CPU snapshots.
+          </p>
+
+          <div class="architecture" role="img" aria-label="Guest application flows through Mesa, cc, the vmsh VirGL renderer, Gowin, and native Glass">
+            <div class="arch-row">
+              <div class="arch-node guest">
+                <strong>Guest applications</strong>
+                <span>OpenGL, Xorg glamor, compositor</span>
+              </div>
+              <div class="arrow" aria-hidden="true">→</div>
+              <div class="arch-node guest">
+                <strong>Mesa VirGL</strong>
+                <span>Gallium state and TGSI command stream</span>
+              </div>
+              <div class="arrow" aria-hidden="true">→</div>
+              <div class="arch-node guest">
+                <strong>virtio-gpu DRM</strong>
+                <span>resources, contexts, submissions, fences</span>
+              </div>
+            </div>
+            <div class="arch-row">
+              <div class="arch-node cc">
+                <strong>cc virtio-gpu</strong>
+                <span>transport, guest memory, resource ledger, used rings, IRQs</span>
+              </div>
+              <div class="arrow" aria-hidden="true">→</div>
+              <div class="arch-node vmsh">
+                <strong>vmsh VirGL renderer</strong>
+                <span>validation, Gallium state, TGSI lowering, host GL calls</span>
+              </div>
+              <div class="arrow" aria-hidden="true">→</div>
+              <div class="arch-node gowin">
+                <strong>Gowin share group</strong>
+                <span>offscreen renderer context, sync, visible window context</span>
+              </div>
+            </div>
+          </div>
+          <p class="arch-caption">
+            The two rows are connected by the virtqueue. The renderer never
+            invokes GL on a vCPU or window event thread.
+          </p>
+
+          <div class="callout">
+            <strong>Boundary rule:</strong> cc understands virtio-gpu and
+            resource accounting, but treats submitted VirGL words as an opaque
+            renderer payload. vmsh understands VirGL. Gowin understands native
+            windowing and host graphics contexts, but not VM protocols.
+          </div>
+        </section>
+
+        <section class="section" id="ownership">
+          <span class="section-number">05 · Ownership</span>
+          <h2>Repository and package boundaries</h2>
+          <p class="section-intro">
+            Owning the stack does not require collapsing the layers. Each
+            repository should own the protocol closest to its existing purpose.
+          </p>
+
+          <div class="ownership">
+            <div class="ownership-row">
+              <div class="owner">cc/</div>
+              <div class="responsibility">
+                Guest-facing virtio-gpu device, standard commands and responses,
+                guest-memory transfers, resource/context IDs, descriptor
+                lifetime, fences, IRQ delivery, and CPU framebuffer fallback.
+              </div>
+            </div>
+            <div class="ownership-row">
+              <div class="owner">vmsh/</div>
+              <div class="responsibility">
+                First-party VirGL decoder and renderer, TGSI compiler,
+                acceleration policy, native Glass integration, diagnostics,
+                compatibility corpus, and end-to-end behavior tests.
+              </div>
+            </div>
+            <div class="ownership-row">
+              <div class="owner">gowin/</div>
+              <div class="responsibility">
+                Platform graphics bindings, starting with OpenGL share groups,
+                offscreen contexts, current-context execution, synchronization,
+                and visible window presentation. A later Metal surface/device
+                API follows the same ownership boundary.
+              </div>
+            </div>
+            <div class="ownership-row">
+              <div class="owner">guest image</div>
+              <div class="responsibility">
+                Standard Linux virtio-gpu kernel driver, Mesa VirGL driver,
+                Xorg modesetting configuration, and diagnostic applications.
+              </div>
+            </div>
+          </div>
+
+          <h3 style="margin-top: 24px;">Proposed package shape</h3>
+          <pre><code>cc/
+  display/
+    renderer.go             public renderer contract, no GL types
+  internal/virtio/
+    gpu.go                  existing device
+    gpu_3d.go               3D command transport and validation
+    gpu_fence.go            pending descriptor retirement
+
+vmsh/
+  internal/gpu/
+    renderer.go             factory and renderer worker
+    virgl/
+      protocol.go           command headers and object layouts
+      decoder.go            bounded word-stream decoder
+      context.go            guest context and sub-context state
+      resources.go          renderer-side resource objects
+      state.go              Gallium-to-GL state shadow
+      formats.go            VirGL ↔ host GL format table
+      tgsi/                 lexer, parser, checked IR, GLSL lowering
+      trace/                capture and replay format
+  internal/glass/
+    native_frame.go         optional shared-texture presentation
+
+gowin/
+  gl/
+    gl.go                   generated/maintained GL surface
+    sync.go                 fence and wait operations
+  window/
+    context.go              Context and ShareGroup interfaces
+    context_{linux,darwin,windows}.go</code></pre>
+
+          <div class="callout warning">
+            <strong>Visibility constraint:</strong> vmsh cannot implement an
+            interface hidden under <code>cc/internal</code>. The renderer
+            contract must be a small public package in cc, while all concrete
+            implementations remain outside cc.
+          </div>
+        </section>
+
+        <section class="section" id="gowin">
+          <span class="section-number">06 · Dependency ownership</span>
+          <h2>Vendor Gowin as a sibling submodule</h2>
+          <p class="section-intro">
+            Gowin should follow the same source ownership model as cc: a
+            reviewed commit pinned in the vmsh tree and selected by a local Go
+            module replacement.
+          </p>
+
+          <div class="callout">
+            <strong>Bootstrap policy:</strong> add <code>gowin/</code> first at
+            the commit represented by the currently consumed module version
+            (<code>8be60804d51a</code>). This makes vendoring behavior-neutral.
+            Update to a newer Gowin commit in a separate reviewed change.
+          </div>
+
+          <pre><code>git submodule add -b main https://github.com/tinyrange/gowin.git gowin
+git -C gowin checkout &lt;full commit for 8be60804d51a&gt;
+
+# go.mod
+replace github.com/tinyrange/gowin =&gt; ./gowin</code></pre>
+
+          <h3 style="margin-top: 24px;">Required repository changes</h3>
+          <ol>
+            <li>
+              Add a <code>gowin</code> entry to <code>.gitmodules</code> with
+              <code>branch = main</code>, matching the cc convention.
+            </li>
+            <li>
+              Add the local <code>replace</code> directive while retaining a
+              meaningful required module version for tooling and provenance.
+            </li>
+            <li>
+              Update README repository layout and requirements to name both
+              required submodules.
+            </li>
+            <li>
+              Add <code>gowin/go.sum</code> to dependency cache keys where it
+              materially improves CI caching.
+            </li>
+            <li>
+              Confirm all checkout jobs use
+              <code>submodules: recursive</code>. Release and test workflows
+              already do; publishing and Pages jobs should be evaluated based
+              on whether they compile native frontends.
+            </li>
+            <li>
+              Make <code>tools/build.go</code> fail early with a useful
+              diagnostic when either submodule is absent.
+            </li>
+          </ol>
+
+          <h3 style="margin-top: 24px;">Update discipline</h3>
+          <div class="grid">
+            <article class="card">
+              <span class="label">Update</span>
+              <h3>Advance intentionally</h3>
+              <p>
+                Update the Gowin pointer in its own commit, record notable API
+                or platform changes, and run native build and window smoke tests
+                before mixing renderer work into the same change.
+              </p>
+            </article>
+            <article class="card">
+              <span class="label amber">Rollback</span>
+              <h3>Move one pointer</h3>
+              <p>
+                A broken platform update is recoverable by returning the
+                submodule pointer to the last tested commit. Do not copy patched
+                module-cache files into vmsh.
+              </p>
+            </article>
+          </div>
+        </section>
+
+        <section class="section" id="contexts">
+          <span class="section-number">07 · Host execution</span>
+          <h2>GL context and thread model</h2>
+          <p class="section-intro">
+            Context ownership is a correctness contract, not an optimization.
+            Gowin must make the legal calling thread explicit and must support a
+            renderer context that shares objects with the visible window.
+          </p>
+
+          <pre><code>UI goroutine                         Renderer goroutine
+runtime.LockOSThread()               runtime.LockOSThread()
+        │                                    │
+visible Gowin context                offscreen shared context
+        │                                    │
+poll events / compose UI             decode / validate / issue GL
+        │                                    │
+wait on render fence  ◀────────────── glFlush + published NativeFrame
+        │
+sample shared texture / Swap</code></pre>
+
+          <h3 style="margin-top: 24px;">Gowin interfaces</h3>
+          <pre><code>type ShareGroup interface {
+    NewOffscreenContext(ContextOptions) (Context, error)
+    NewWindow(WindowOptions) (Window, error)
+    Close() error
+}
+
+type Context interface {
+    Run(func(gl.OpenGL) error) error
+    Capabilities() Capabilities
+    Close() error
+}
+
+type Window interface {
+    Context() Context
+    Poll() (Event, error)
+    Swap() error
+    Close() error
+}</code></pre>
+
+          <ul>
+            <li>Every <code>Context.Run</code> executes on its permanently locked OS thread.</li>
+            <li>The renderer receives no raw native window handle and cannot pump UI events.</li>
+            <li>The UI receives an opaque native-frame token rather than mutable renderer state.</li>
+            <li>Window destruction does not destroy the share group until the renderer has stopped.</li>
+            <li>Context loss transitions the display to a structured failed or 2D-fallback state.</li>
+          </ul>
+
+          <div class="callout danger">
+            <strong>Forbidden:</strong> executing host GL from
+            <code>GPU.Write</code>, a vCPU exit, a virtqueue notification
+            goroutine, or an arbitrary display polling goroutine.
+          </div>
+        </section>
+
+        <section class="section" id="virtio">
+          <span class="section-number">08 · Guest device</span>
+          <h2>cc virtio-gpu extensions</h2>
+          <p class="section-intro">
+            The existing 2D device remains the base. 3D is a negotiated feature
+            that adds capsets, contexts, 3D resources, command submission, and
+            asynchronous completion.
+          </p>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Area</th>
+                  <th>Addition</th>
+                  <th>Contract to protect</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Features</td>
+                  <td><code>VIRTIO_GPU_F_VIRGL</code> and nonzero <code>num_capsets</code></td>
+                  <td>Advertise only when a renderer was successfully created.</td>
+                </tr>
+                <tr>
+                  <td>Capsets</td>
+                  <td><code>GET_CAPSET_INFO</code>, <code>GET_CAPSET</code></td>
+                  <td>Bounds, version selection, exact response sizes.</td>
+                </tr>
+                <tr>
+                  <td>Contexts</td>
+                  <td>Create/destroy and attach/detach resource</td>
+                  <td>No cross-context or use-after-destroy handles.</td>
+                </tr>
+                <tr>
+                  <td>Resources</td>
+                  <td><code>RESOURCE_CREATE_3D</code> and 3D transfer commands</td>
+                  <td>Checked dimensions, levels, layers, strides, and backing ranges.</td>
+                </tr>
+                <tr>
+                  <td>Execution</td>
+                  <td><code>SUBMIT_3D</code></td>
+                  <td>Bounded command size; renderer executes outside the device lock.</td>
+                </tr>
+                <tr>
+                  <td>Completion</td>
+                  <td>Fence ID, context ring, pending descriptor retirement</td>
+                  <td>Used ring and IRQ occur only after the requested fence completes.</td>
+                </tr>
+                <tr>
+                  <td>Errors</td>
+                  <td>Structured invalid context/resource/parameter responses</td>
+                  <td>Bad guest input never becomes a daemon crash.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3 style="margin-top: 24px;">Public renderer contract</h3>
+          <pre><code>type RendererFactory interface {
+    NewRenderer(RendererConfig) (Renderer, error)
+}
+
+type Renderer interface {
+    Capsets() ([]Capset, error)
+    CreateContext(ContextID, ContextInfo) error
+    DestroyContext(ContextID) error
+    CreateResource3D(ResourceID, Resource3D) error
+    DestroyResource(ResourceID) error
+    AttachBacking(ResourceID, []BackingEntry) error
+    DetachBacking(ResourceID) error
+    AttachResource(ContextID, ResourceID) error
+    DetachResource(ContextID, ResourceID) error
+    TransferToHost(Transfer3D) error
+    TransferFromHost(Transfer3D) error
+    Submit(ContextID, []uint32, Fence) error
+    SetScanout(ScanoutID, ResourceID, Rectangle) error
+    Close() error
+}</code></pre>
+
+          <p>
+            Callbacks or a completion channel carry fence retirement back to
+            cc. The interface must not mention OpenGL texture IDs, GL contexts,
+            Gowin windows, or platform handles.
+          </p>
+        </section>
+
+        <section class="section" id="renderer">
+          <span class="section-number">09 · First-party renderer</span>
+          <h2>VirGL command processor</h2>
+          <p class="section-intro">
+            A submitted buffer is a sequence of 32-bit words. Each command has
+            an 8-bit command, 8-bit object type, and 16-bit payload length. The
+            parser must completely validate framing before dispatch.
+          </p>
+
+          <ol class="flow-list">
+            <li>
+              <strong>Frame</strong>
+              <span>Read the command header, reject zero progress, overflow, truncation, excess size, and unknown mandatory encodings.</span>
+            </li>
+            <li>
+              <strong>Decode</strong>
+              <span>Convert words into typed, immutable command values using checked field widths and enumerations.</span>
+            </li>
+            <li>
+              <strong>Validate</strong>
+              <span>Resolve context-local handles, resource types, formats, levels, ranges, and required state without calling GL.</span>
+            </li>
+            <li>
+              <strong>Plan</strong>
+              <span>Translate the command into renderer operations and update a shadow copy of Gallium state.</span>
+            </li>
+            <li>
+              <strong>Execute</strong>
+              <span>Issue host GL operations on the renderer context thread and record an explicit fence when requested.</span>
+            </li>
+          </ol>
+
+          <h3>Initial command surface</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Class</th>
+                  <th>First implementation</th>
+                  <th>Deferred until required</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Objects</td>
+                  <td>Blend, rasterizer, depth/stencil/alpha, shader, vertex elements, sampler view/state, surface</td>
+                  <td>Queries, streamout, MSAA surface</td>
+                </tr>
+                <tr>
+                  <td>Framebuffer</td>
+                  <td>Viewport, framebuffer attachments, scissor, clear, blend color, stencil reference</td>
+                  <td>Conditional render and advanced multisample state</td>
+                </tr>
+                <tr>
+                  <td>Input</td>
+                  <td>Vertex buffers, index buffer, constant buffers</td>
+                  <td>Indirect multi-draw and atomic buffers</td>
+                </tr>
+                <tr>
+                  <td>Textures</td>
+                  <td>Sampler states/views, inline write, copy region, basic blit</td>
+                  <td>Shader images and uncommon compressed formats</td>
+                </tr>
+                <tr>
+                  <td>Execution</td>
+                  <td>Clear and direct <code>DRAW_VBO</code></td>
+                  <td>Compute launch, tessellation, geometry, streamout</td>
+                </tr>
+                <tr>
+                  <td>Contexts</td>
+                  <td>Main context; add sub-contexts when the captured Mesa baseline proves they are required</td>
+                  <td>Cross-context sharing beyond the guest ABI contract</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warning">
+            <strong>This table is a hypothesis, not the capset.</strong> Before
+            freezing the first supported subset, capture command streams from
+            the exact Mesa baseline used by SquadVM. If Mesa requires a command
+            during initialization, it belongs in the earliest viable slice even
+            if the test scene appears not to use it.
+          </div>
+
+          <h3 style="margin-top: 24px;">Capability rule</h3>
+          <pre><code>advertised capability
+    = implemented and behavior-tested
+    ∩ available in the current host GL context
+    ∩ allowed by the selected compatibility profile</code></pre>
+
+          <p>
+            Host extension discovery alone never enables a guest feature. A
+            feature bit becomes visible only after the corresponding command,
+            state interaction, shader lowering, and negative validation paths
+            are implemented.
+          </p>
+        </section>
+
+        <section class="section" id="shaders">
+          <span class="section-number">10 · Compiler</span>
+          <h2>TGSI to host GLSL</h2>
+          <p class="section-intro">
+            Shader translation is the deepest independent subsystem. Treat it
+            as a checked compiler pipeline rather than string substitution.
+          </p>
+
+          <pre><code>TGSI text from guest
+    ↓ bounded lexer
+tokens + source locations
+    ↓ parser
+typed TGSI syntax tree
+    ↓ verifier
+register files, declarations, control flow, sampler types, limits
+    ↓ lowering
+small renderer IR + stage interface
+    ↓ GLSL emitter
+#version 330 core source
+    ↓ host compiler + link
+cached GL program or structured diagnostic</code></pre>
+
+          <div class="grid">
+            <article class="card">
+              <span class="label">Compiler contract</span>
+              <h3>Never trust declarations</h3>
+              <p>
+                Validate register indexes, masks, source counts, immediates,
+                nesting depth, control-flow targets, stage legality, and sampler
+                compatibility before emitting GLSL.
+              </p>
+            </article>
+            <article class="card">
+              <span class="label blue">Host contract</span>
+              <h3>One conservative baseline</h3>
+              <p>
+                Request OpenGL 3.3 core or better on all platforms. Begin with
+                GLSL 330 and explicitly lower guest behavior that differs from
+                the host profile.
+              </p>
+            </article>
+            <article class="card">
+              <span class="label violet">Program cache</span>
+              <h3>Key the full interaction</h3>
+              <p>
+                Cache by shader content plus renderer state that changes emitted
+                interfaces or patching. Never assume a shader handle uniquely
+                identifies a host program.
+              </p>
+            </article>
+            <article class="card">
+              <span class="label amber">Diagnostics</span>
+              <h3>Preserve both sides</h3>
+              <p>
+                Debug traces should correlate TGSI, generated GLSL, host compile
+                logs, context ID, and submission sequence without logging guest
+                data by default.
+              </p>
+            </article>
+          </div>
+
+          <h3 style="margin-top: 24px;">First compiler scope</h3>
+          <ul>
+            <li>Vertex and fragment stages only.</li>
+            <li>Declarations, immediates, inputs, outputs, constants, temporaries, and system values used by the baseline.</li>
+            <li>Arithmetic, comparison, conversion, texture sampling, derivatives, and structured control flow required by desktop shaders.</li>
+            <li>Interpolation and linkage validation between stages.</li>
+            <li>Coordinate, depth, point-size, clip, and front-face conventions covered by rendered-pixel tests.</li>
+          </ul>
+
+          <p>
+            Geometry, tessellation, and compute stages remain disabled in the
+            capset until their compiler and state paths are complete.
+          </p>
+        </section>
+
+        <section class="section" id="resources">
+          <span class="section-number">11 · Data model</span>
+          <h2>Resources, formats, and guest memory</h2>
+
+          <div class="grid">
+            <article class="card">
+              <span class="label">cc ledger</span>
+              <h3>Guest-visible identity</h3>
+              <p>
+                Resource ID, creation parameters, backing entries, attached
+                contexts, scanout references, outstanding transfers, and
+                destruction state.
+              </p>
+            </article>
+            <article class="card">
+              <span class="label violet">Renderer object</span>
+              <h3>Host-visible identity</h3>
+              <p>
+                GL target/name, storage allocation, format mapping, dimensions,
+                mip levels, layers, synchronization state, and memory charge.
+              </p>
+            </article>
+          </div>
+
+          <h3 style="margin-top: 24px;">Phase-one memory policy</h3>
+          <ol>
+            <li>
+              cc validates every guest backing entry using checked
+              <code>address + length</code> arithmetic.
+            </li>
+            <li>
+              Transfers copy guest bytes into renderer-owned native or Go byte
+              storage during the call; the renderer does not retain a pointer
+              into movable Go memory.
+            </li>
+            <li>
+              The renderer uploads or reads data on its GL thread using bounded
+              staging buffers.
+            </li>
+            <li>
+              Transfer-from-host copies completed bytes back through cc's
+              <code>GuestMemory</code> interface.
+            </li>
+          </ol>
+
+          <p>
+            Later, stable mapped guest ranges may eliminate copies, but only
+            after KVM, HVF, and WHP expose a common pinned-region contract with
+            explicit lifetime and teardown.
+          </p>
+
+          <h3 style="margin-top: 24px;">Format table requirements</h3>
+          <ul>
+            <li>Single authoritative mapping for VirGL format, GL internal format, upload format, type, component class, block dimensions, and bytes per block.</li>
+            <li>Creation rejects formats absent from both the implementation profile and host capabilities.</li>
+            <li>Transfer validation uses block geometry rather than assuming four bytes per pixel.</li>
+            <li>Depth/stencil, integer, normalized, sRGB, and renderability properties are distinct flags.</li>
+            <li>Scanout begins with XRGB8888/BGRA-compatible color resources; other formats require an explicit conversion path.</li>
+          </ul>
+
+          <div class="callout danger">
+            <strong>No retained guest pointers:</strong> a C-free implementation
+            still has pointer-lifetime risks if a renderer goroutine keeps a
+            slice that aliases hypervisor mappings during VM teardown. Ownership
+            and cancellation must be explicit.
+          </div>
+        </section>
+
+        <section class="section" id="fences">
+          <span class="section-number">12 · Concurrency</span>
+          <h2>Virtqueues, submissions, and fences</h2>
+          <p class="section-intro">
+            Current queue processing is synchronous under the GPU mutex. 3D
+            completion must become asynchronous without losing virtio ordering
+            or allowing a guest reset to race late renderer callbacks.
+          </p>
+
+          <ol class="flow-list">
+            <li>
+              <strong>Consume descriptor</strong>
+              <span>Copy the request and command buffer into bounded device-owned memory.</span>
+            </li>
+            <li>
+              <strong>Validate envelope</strong>
+              <span>Check virtio header, context, resource references, output descriptor capacity, and fence metadata.</span>
+            </li>
+            <li>
+              <strong>Submit work</strong>
+              <span>Enqueue an immutable renderer job and release the GPU lock immediately.</span>
+            </li>
+            <li>
+              <strong>Execute and fence</strong>
+              <span>The renderer thread processes commands in context order and creates a host GL synchronization point.</span>
+            </li>
+            <li>
+              <strong>Retire</strong>
+              <span>Completion reacquires device state, verifies the generation, writes the response, advances the used ring, and raises the IRQ.</span>
+            </li>
+          </ol>
+
+          <h3>Required invariants</h3>
+          <ul class="checks">
+            <li>Each accepted descriptor is retired exactly once.</li>
+            <li>A fenced descriptor is not visible in the used ring before renderer completion.</li>
+            <li>Fence fields are echoed according to the negotiated virtio contract.</li>
+            <li>Completions from a pre-reset renderer generation are discarded safely.</li>
+            <li>Destroy waits for or cancels queued jobs before releasing resource state.</li>
+            <li>No GL call occurs while holding the device mutex.</li>
+            <li>Queue backpressure is bounded and produces a deterministic device error rather than memory growth.</li>
+          </ul>
+
+          <p>
+            Start with one serialized renderer queue per VM. Parallel contexts
+            are an optimization only after ordering and teardown behavior are
+            proven.
+          </p>
+        </section>
+
+        <section class="section" id="scanout">
+          <span class="section-number">13 · Presentation</span>
+          <h2>Scanout and native Glass</h2>
+          <p class="section-intro">
+            Deliver acceleration in two presentation stages. The first validates
+            rendering without changing the public display session. The second
+            removes the readback and upload.
+          </p>
+
+          <div class="grid">
+            <article class="card">
+              <span class="label blue">Stage A</span>
+              <h3>CPU-compatible scanout</h3>
+              <p>
+                On flush, read the rendered resource into the existing
+                XRGB8888 framebuffer. Glass continues polling snapshots and
+                uploading dirty rectangles. This is slower but preserves VNC,
+                screenshots, and the entire current display contract.
+              </p>
+            </article>
+            <article class="card">
+              <span class="label">Stage B</span>
+              <h3>Shared native frame</h3>
+              <p>
+                Publish an opaque frame containing a shared texture reference,
+                size, generation, damage, and synchronization token. Glass waits,
+                samples it in its context, swaps, then releases the frame.
+              </p>
+            </article>
+          </div>
+
+          <pre><code>type NativeFrameSession interface {
+    AcquireFrame(context.Context, uint64) (NativeFrame, error)
+}
+
+type NativeFrame interface {
+    Size() (width, height uint32)
+    Generation() uint64
+    Damage() image.Rectangle
+    Present(Presenter) error
+    Release()
+}</code></pre>
+
+          <p>
+            The optional interface must not expose a raw GL texture name through
+            ccvmd's JSON API. Texture identity is meaningful only inside a share
+            group and process. CPU snapshots remain authoritative for VNC,
+            headless clients, and fallback.
+          </p>
+
+          <h3 style="margin-top: 24px;">Synchronization protocol</h3>
+          <ol>
+            <li>Renderer finishes all writes to the scanout texture.</li>
+            <li>Renderer inserts a GL fence and flushes the producer context.</li>
+            <li>Renderer atomically publishes the frame generation and fence.</li>
+            <li>Glass waits on the fence in the consumer context before sampling.</li>
+            <li>Glass releases its reference after the swap no longer needs the frame.</li>
+            <li>Renderer reuses or destroys the texture only after all frame references are released.</li>
+          </ol>
+
+          <div class="callout warning">
+            <strong>Resize:</strong> preserve the current long-lived session
+            model. A resize is a state transition that creates a replacement
+            scanout, signals the guest, and retires the old shared frame after
+            both renderer and Glass references drain.
+          </div>
+        </section>
+
+        <section class="section" id="api">
+          <span class="section-number">14 · Product contract</span>
+          <h2>Configuration, capability, and fallback API</h2>
+
+          <pre><code>type DisplayAcceleration string
+
+const (
+    DisplayAccelerationAuto  DisplayAcceleration = "auto"
+    DisplayAccelerationOff   DisplayAcceleration = "off"
+    DisplayAccelerationVirGL DisplayAcceleration = "virgl"
+)
+
+type DisplayConfig struct {
+    Width        uint32
+    Height       uint32
+    Acceleration DisplayAcceleration
+    // existing VNC fields...
+}
+
+type DisplayState struct {
+    Width          uint32
+    Height         uint32
+    Acceleration   DisplayAcceleration
+    Renderer       string
+    FallbackReason string
+    // existing VNC fields...
+}</code></pre>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Request</th>
+                  <th>Renderer available</th>
+                  <th>Renderer unavailable or initialization fails</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>off</code></td>
+                  <td>Use the existing 2D device.</td>
+                  <td>Use the existing 2D device.</td>
+                </tr>
+                <tr>
+                  <td><code>auto</code></td>
+                  <td>Enable VirGL and report the selected renderer.</td>
+                  <td>Continue in 2D and report a structured fallback reason.</td>
+                </tr>
+                <tr>
+                  <td><code>virgl</code></td>
+                  <td>Enable VirGL.</td>
+                  <td>Fail display startup with a structured unsupported or initialization error.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>
+            Host capabilities should enumerate renderer modes separately from
+            generic display support. A host can support a 2D graphical display
+            without supporting VirGL.
+          </p>
+
+          <div class="callout">
+            <strong>Session behavior:</strong> acceleration is selected when the
+            VM-backed system context starts. It remains stable for that VM
+            lifetime; attaching or detaching a frontend must not silently
+            replace the guest-visible GPU feature set.
+          </div>
+        </section>
+
+        <section class="section" id="products">
+          <span class="section-number">15 · Product ladder</span>
+          <h2>Two workloads, one extensible device boundary</h2>
+          <p class="section-intro">
+            Neurodesk and Steam exercise different graphics generations. VirGL
+            is the shortest route to useful scientific visualization and a
+            reliable desktop; it is foundation work for gaming, not the entire
+            gaming stack.
+          </p>
+
+          <div class="architecture" role="img" aria-label="Neurodesk uses the VirGL and OpenGL path first, while Steam later uses CPU translation, Proton, Vulkan virtualization, and Metal">
+            <div class="arch-row">
+              <div class="arch-node guest">
+                <strong>Neurodesk ARM64</strong>
+                <span>native Linux tools, Xorg, OpenGL visualization</span>
+              </div>
+              <div class="arrow" aria-hidden="true">→</div>
+              <div class="arch-node vmsh">
+                <strong>First-party VirGL</strong>
+                <span>Gallium state and TGSI to host OpenGL</span>
+              </div>
+              <div class="arrow" aria-hidden="true">→</div>
+              <div class="arch-node gowin">
+                <strong>NSOpenGL + Glass</strong>
+                <span>shared texture presentation on Darwin/ARM64</span>
+              </div>
+            </div>
+            <div class="arch-row">
+              <div class="arch-node guest">
+                <strong>Steam / Proton x86-64</strong>
+                <span>CPU translation plus DXVK or vkd3d-proton</span>
+              </div>
+              <div class="arrow" aria-hidden="true">→</div>
+              <div class="arch-node vmsh">
+                <strong>Guest Vulkan path</strong>
+                <span>virtio resources and first-party command virtualization</span>
+              </div>
+              <div class="arrow" aria-hidden="true">→</div>
+              <div class="arch-node gowin">
+                <strong>Metal + Glass</strong>
+                <span>backend-neutral native frames and low-latency input</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid">
+            <article class="card">
+              <span class="label">Track A · First</span>
+              <h3>Neurodesk on Apple Silicon</h3>
+              <p>
+                ARM64 Linux guest over HVF, standard Mesa VirGL, first-party
+                TGSI renderer, NSOpenGL 4.1 host context, and shared-texture
+                native Glass presentation.
+              </p>
+            </article>
+            <article class="card">
+              <span class="label violet">Track B · North star</span>
+              <h3>Steam and Proton</h3>
+              <p>
+                A performant x86/x86-64 translator, forwarded graphics and
+                system libraries, Vulkan-capable virtio resources, a Metal host
+                backend, controller/audio integration, and frame pacing.
+              </p>
+            </article>
+          </div>
+
+          <div class="callout warning">
+            <strong>VirGL alone is not a modern Proton solution.</strong> DXVK
+            translates Direct3D 8–11 to Vulkan and vkd3d-proton implements
+            Direct3D 12 over Vulkan. The first release should therefore optimize
+            for Neurodesk without claiming Steam compatibility from OpenGL
+            acceleration alone.
+          </div>
+
+          <h3 style="margin-top: 24px;">Architecture decisions to make reusable now</h3>
+          <ul>
+            <li>The cc renderer interface negotiates context/capset types rather than assuming every future context is VirGL.</li>
+            <li>Guest blob and host-visible resource support can be added without replacing 2D or VirGL resource accounting.</li>
+            <li><code>NativeFrame</code> remains opaque: it may carry a shared GL texture today and a Metal texture or IOSurface later.</li>
+            <li>Glass input, audio, frame pacing, and presentation lifecycles remain independent from renderer command decoding.</li>
+            <li>CPU translation is a guest execution service, not code embedded in the GPU renderer.</li>
+          </ul>
+        </section>
+
+        <section class="section" id="platforms">
+          <span class="section-number">16 · Portability</span>
+          <h2>Host platform sequence</h2>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Platform</th>
+                  <th>Context sharing</th>
+                  <th>Initial baseline</th>
+                  <th>Important risk</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>macOS arm64</td>
+                  <td><code>NSOpenGLContext initWithFormat:shareContext:</code></td>
+                  <td><span class="status now">First</span> OpenGL 4.1 core</td>
+                  <td>OpenGL is deprecated and frozen; the VirGL profile must fit the 4.1 core ceiling while future gaming work targets Metal.</td>
+                </tr>
+                <tr>
+                  <td>Linux amd64/arm64</td>
+                  <td>GLX shared context using the same display and compatible framebuffer configuration</td>
+                  <td><span class="status later">Second</span> OpenGL 3.3 core</td>
+                  <td>Driver and X11 variation; CI needs a real GPU lane in addition to software GL.</td>
+                </tr>
+                <tr>
+                  <td>Windows amd64</td>
+                  <td><code>wglCreateContextAttribsARB</code> with a share context</td>
+                  <td><span class="status later">Third</span> OpenGL 3.3 core</td>
+                  <td>Pixel-format compatibility and wide driver variability.</td>
+                </tr>
+                <tr>
+                  <td>Windows arm64</td>
+                  <td>Same WGL abstraction where the native frontend is built</td>
+                  <td><span class="status no">Deferred</span></td>
+                  <td>Current release matrix does not build desktop frontends for this target.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3 style="margin-top: 24px;">Portability rules</h3>
+          <ul>
+            <li>Platform files create and bind contexts; the renderer contains no GLX, Objective-C, or WGL calls.</li>
+            <li>The common GL interface exposes required operations and typed constants uniformly.</li>
+            <li>Missing host operations reduce the advertised capset or reject acceleration; they never become silent no-ops.</li>
+            <li>Renderer correctness is tested against both core-profile semantics and known host-driver differences.</li>
+            <li>The Darwin implementation is the reference lifecycle implementation; Linux and Windows adapt the same contracts rather than redefining them.</li>
+          </ul>
+        </section>
+
+        <section class="section" id="security">
+          <span class="section-number">17 · Trust boundary</span>
+          <h2>Security and resource governance</h2>
+          <p class="section-intro">
+            The guest controls the VirGL byte stream. Treat the renderer as an
+            untrusted-input parser with access to a sensitive host driver API.
+          </p>
+
+          <div class="grid three">
+            <article class="card">
+              <span class="label amber">Validate</span>
+              <h3>Before GL</h3>
+              <p>
+                Lengths, multiplication, offsets, handles, formats, levels,
+                layers, masks, enum values, shader complexity, and object state
+                are checked without invoking the host driver.
+              </p>
+            </article>
+            <article class="card">
+              <span class="label amber">Budget</span>
+              <h3>Per VM</h3>
+              <p>
+                Charge resources, staging buffers, shader source, compiled
+                programs, contexts, queued words, outstanding fences, and trace
+                storage to explicit limits.
+              </p>
+            </article>
+            <article class="card">
+              <span class="label amber">Contain</span>
+              <h3>Fail one context</h3>
+              <p>
+                Invalid commands fail the offending guest context or device
+                operation. They do not panic the daemon, leak host state, or
+                poison unrelated VM sessions.
+              </p>
+            </article>
+          </div>
+
+          <h3 style="margin-top: 24px;">Initial limits</h3>
+          <p>
+            Exact defaults should be chosen from desktop traces, but every
+            dimension must exist before acceleration is enabled:
+          </p>
+          <ul>
+            <li>maximum command words per submission and queued across the VM;</li>
+            <li>maximum resources, contexts, sub-contexts, shaders, and object handles;</li>
+            <li>maximum texture dimension, layer count, mip levels, and samples;</li>
+            <li>maximum total estimated GPU bytes plus CPU staging bytes;</li>
+            <li>maximum TGSI source bytes, tokens, declarations, instructions, registers, and control-flow depth;</li>
+            <li>maximum in-flight fences and maximum retained completed frames;</li>
+            <li>bounded diagnostic capture disabled by default.</li>
+          </ul>
+
+          <h3 style="margin-top: 24px;">Hardening path</h3>
+          <ol>
+            <li>Pure Go parser and renderer in-process with strict budgets and fuzzing.</li>
+            <li>Renderer health watchdog and context-loss containment.</li>
+            <li>Optional per-VM renderer worker process if host driver isolation becomes necessary.</li>
+            <li>Platform sandboxing for the worker without changing the cc renderer contract.</li>
+          </ol>
+
+          <div class="callout danger">
+            <strong>Go memory safety is not the whole boundary.</strong> Valid
+            but adversarial shaders and GL state still reach native host
+            drivers. Parser safety, resource limits, and eventual process
+            isolation are separate requirements.
+          </div>
+        </section>
+
+        <section class="section" id="observability">
+          <span class="section-number">18 · Operability</span>
+          <h2>Diagnostics, tracing, and recovery</h2>
+
+          <div class="grid">
+            <article class="card">
+              <span class="label">State</span>
+              <h3>Structured renderer status</h3>
+              <p>
+                Renderer profile, host GL vendor/renderer/version, negotiated
+                capset, resource usage, last completed fence, queue depth,
+                context-loss state, and fallback reason.
+              </p>
+            </article>
+            <article class="card">
+              <span class="label violet">Trace</span>
+              <h3>Capture and replay</h3>
+              <p>
+                A versioned, bounded trace records decoded commands, resource
+                metadata, and selected payloads. The replay tool runs without a
+                VM to reproduce rendering and parser failures.
+              </p>
+            </article>
+          </div>
+
+          <h3 style="margin-top: 24px;">Diagnostic levels</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Level</th>
+                  <th>Default</th>
+                  <th>Contents</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Operational</td>
+                  <td>On</td>
+                  <td>Renderer selection, capset identity, initialization/fallback, context loss, fatal device errors.</td>
+                </tr>
+                <tr>
+                  <td>Metrics</td>
+                  <td>On, aggregated</td>
+                  <td>Submissions, words, upload/readback bytes, draw count, shader compiles, cache hits, fence latency.</td>
+                </tr>
+                <tr>
+                  <td>Command trace</td>
+                  <td>Off</td>
+                  <td>Typed command stream with bounded resource payload capture.</td>
+                </tr>
+                <tr>
+                  <td>Shader trace</td>
+                  <td>Off</td>
+                  <td>TGSI, checked IR, generated GLSL, and compile/link log.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>
+            Logs should identify VM, context, submission, and fence using stable
+            structured fields. User-facing prose is not a test contract.
+          </p>
+        </section>
+
+        <section class="section" id="testing">
+          <span class="section-number">19 · Verification</span>
+          <h2>Behavior-level testing strategy</h2>
+          <p class="section-intro">
+            Tests protect guest-visible behavior, isolation, and rendered
+            results. Avoid tests that merely freeze helper structure, exact
+            internal GL call sequences, fallback ordering, or UI wording.
+          </p>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Layer</th>
+                  <th>User bug it catches</th>
+                  <th>Test form</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>virtio protocol</td>
+                  <td>Guest hangs, wrong responses, early fences, lost interrupts</td>
+                  <td>Descriptor-chain tests with exact structured responses, used-ring state, and IRQ behavior.</td>
+                </tr>
+                <tr>
+                  <td>Decoder</td>
+                  <td>Malformed guest stream crashes or corrupts the daemon</td>
+                  <td>Table tests for protocol boundaries plus persistent fuzz targets for every command family.</td>
+                </tr>
+                <tr>
+                  <td>TGSI compiler</td>
+                  <td>Valid applications fail compilation or produce wrong pixels</td>
+                  <td>Checked IR tests, host compile tests, and rendered shader cases.</td>
+                </tr>
+                <tr>
+                  <td>Renderer state</td>
+                  <td>Textures, depth, blending, scissor, or indexing render incorrectly</td>
+                  <td>Small scenes with sampled-pixel assertions and tolerances where the API permits variation.</td>
+                </tr>
+                <tr>
+                  <td>Glass handoff</td>
+                  <td>Tearing, stale frames, resize corruption, context-thread crashes</td>
+                  <td>Frame generation, fence, release, resize, detach, and close behavior under repeated rendering.</td>
+                </tr>
+                <tr>
+                  <td>Guest integration</td>
+                  <td>Mesa falls back to software or the desktop fails to start</td>
+                  <td>Boot a VM, verify structured DRM/capset state, render a known scene, and inspect resulting pixels.</td>
+                </tr>
+                <tr>
+                  <td>Fallback</td>
+                  <td>Unsupported hosts lose graphical display entirely</td>
+                  <td>Force renderer initialization failure and prove <code>auto</code> still provides a functioning 2D desktop.</td>
+                </tr>
+                <tr>
+                  <td>Lifecycle</td>
+                  <td>Repeated VM use leaks or poisons the daemon</td>
+                  <td>Start, render, resize, stop, and restart VM-backed contexts repeatedly in one daemon session.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3 style="margin-top: 24px;">Compatibility corpus</h3>
+          <ul>
+            <li>The live ARM64 SquadVM corpus is <code>images/gpu-glmark2</code>: it runs glmark2's complete 33-scene built-in suite, including build, texture, shading, bump, effects, desktop, buffer updates, complex models, conditionals, functions, and loops.</li>
+            <li>The representative application workload is <code>images/gpu-openarena</code>: stock OpenArena 0.8.8 runs as an ordinary GLX/OpenGL 2.0 application against Mesa VirGL. Its deterministic 1,200-message bot-match slice covers renderer and map initialization, GLSL compilation, model and texture loading, animated gameplay, and repeated dynamic-buffer updates.</li>
+            <li>The browser workload is <code>images/gpu-firefox</code>: Firefox ESR runs four local WebGL scenes covering indexed depth-tested geometry, render-to-texture with a post-processing pass, dynamic additive point sprites, and a procedural fragment shader. Structured telemetry and guest <code>gl.readPixels</code> captures prove that every scene rendered through VirGL rather than merely reaching the host window.</li>
+            <li>The conformance workload is <code>images/gpu-cts</code>: it pins Khronos VK-GL-CTS <code>opengl-cts-4.6.8.1</code>, captures the exact guest renderer and API ceiling, runs dEQP-GLES2 in restart-safe groups with atomic structured progress, preserves QPA artifacts, and finishes with the official <code>cts-runner --type=es2</code> configuration.</li>
+            <li>The fixture builds on <code>astra-pi5</code>, boots under systemd, selects the host-preferred DRM mode, requires an XRGB/depth visual, identifies the guest renderer as <code>virgl</code>, and loops without an environment-variable gate.</li>
+            <li>The Darwin desktop-GL ladder uses the GL30 through GL41 CTS profiles plus Piglit. GL 4.0 is an intermediate rung; the completion target for the current NSOpenGL renderer is the host's honest OpenGL 4.1 core / GLSL 4.10 ceiling. Raising a version is the result of passing its feature slices; it is never used to discover missing decoder operations by crashing ordinary applications.</li>
+            <li>Next add Piglit’s desktop GL profile, resize and reattach cycles, WebGL 2 coverage, and a second representative native application trace with a materially different renderer profile.</li>
+            <li>Add Neurodesk visualization traces when the renderer moves from the host-sharing experiment into the neuroimaging product slice.</li>
+            <li>Replay traces against the first-party renderer in CI using software host GL where necessary.</li>
+            <li>Optionally replay the same traces through virglrenderer during development and compare output; do not require it for normal builds.</li>
+            <li>Add a new trace only when it represents an important user workflow or a real fixed bug.</li>
+          </ul>
+
+          <div class="callout">
+            <strong>End-to-end workflow:</strong> exercise acceleration within a
+            long-lived vmsh/Glass session—select or create the VM-backed system,
+            render repeatedly, resize or reattach, run ordinary commands, then
+            return to <code>@host</code>. A one-shot boot is not sufficient to
+            validate session lifecycle.
+          </div>
+        </section>
+
+        <section class="section" id="milestones">
+          <span class="section-number">20 · Delivery</span>
+          <h2>Implementation milestones</h2>
+          <p class="section-intro">
+            Milestones are gated by observable behavior rather than dates. Each
+            slice leaves the existing 2D path working.
+          </p>
+
+          <article class="milestone">
+            <div class="milestone-id">M0</div>
+            <h3>Own Gowin source <span class="status now">Implemented</span></h3>
+            <p>
+              Gowin is now a pinned sibling submodule, selected locally through
+              <code>go.mod</code>, covered by recursive checkout and dependency
+              caching, and checked by the repository build helper before a
+              build starts.
+            </p>
+            <div class="gate">Current evidence: vmsh, cc, ccvm, ndappx, and squadvm build and sign on Darwin/ARM64; the release matrix remains the clean-clone cross-platform gate.</div>
+          </article>
+
+          <article class="milestone">
+            <div class="milestone-id">M1</div>
+            <h3>Shared NSOpenGL contexts <span class="status now">Implemented</span></h3>
+            <p>
+              Gowin now creates a shared <code>NSOpenGLContext</code> on a
+              dedicated locked renderer thread and exposes serialized execution
+              plus explicit fence, wait, flush, and deletion operations. Its
+              Darwin integration test exercises the producer/presenter ownership
+              contract independently of guest graphics.
+            </p>
+            <div class="gate">Current evidence: the Gowin Darwin test performs 16 alternating fenced updates with exact FBO pixel readback before clean teardown. Guest OpenGL is not credited to this milestone; it must pass through the M2–M4 virtio-gpu and VirGL path. Resize soak remains ongoing hardening.</div>
+          </article>
+
+          <div class="callout">
+            <strong>Cube acceptance boundary:</strong> a host-side demo or a
+            guest script sending scene parameters is not an accelerated guest
+            application. Acceptance requires a regular Mesa OpenGL process in
+            the ARM64 guest, a negotiated virtio-gpu 3D device, VirGL command
+            submission and fence completion, host GPU execution, and the guest
+            scanout presented by Glass. The reproducible test guest lives in
+            <code>images/gpu-cube</code>, and all development runtime state stays
+            beneath the repository through explicit <code>-cache-dir</code> and
+            <code>-storage</code> options.
+          </div>
+
+          <article class="milestone">
+            <div class="milestone-id">M2</div>
+            <h3>Asynchronous cc 3D transport <span class="status now">Live, synchronous fences</span></h3>
+            <p>
+              Renderer injection, VirGL feature negotiation, capset queries,
+              contexts, 3D resources, scatter/gather transfers, opaque
+              submissions, fenced responses, and renderer scanout are
+              implemented and exercised through a fake renderer. Submission is
+              deliberately synchronous in this first slice; queued execution
+              and asynchronous fence retirement remain the hardening step.
+            </p>
+            <div class="gate">Current evidence: protocol tests cover capsets, context/resource lifecycle, backing transfer, opaque submit, fence identity, and renderer-to-framebuffer scanout without a host GL dependency.</div>
+          </article>
+
+          <article class="milestone">
+            <div class="milestone-id">M3</div>
+            <h3>Bounded VirGL decoder <span class="status now">Firefox WebGL profile live</span></h3>
+            <p>
+              Bounded framing, contexts, resource and object handle tables,
+              vertex/rasterizer/framebuffer/shader state, sampler views and
+              states, depth targets, indexing, multi-buffer vertices,
+              texture transfers, blits, validation, and explicit
+              unsupported-command errors are implemented. The TGSI compiler
+              now links unnamed varyings and translates the sampler, arithmetic,
+              integer, indirect-addressing, discard, and structured-control-flow
+              instructions exercised by the complete SquadVM glmark2 corpus and
+              OpenArena. Fragmented shader submissions are reassembled with
+              strict size and offset checks. Host resources remain alive while
+              referenced by surfaces, sampler views, or draw bindings, and
+              dynamic buffer uploads preserve their authoritative guest data.
+              Rasterizer point-size and sprite-coordinate state maps Gallium generic
+              inputs onto native point coordinates, and texture/buffer readback now
+              returns real host-rendered bytes across split virtio guest backing.
+            </p>
+            <div class="gate">Current evidence: malformed framing and unsupported TGSI are rejected; standard kmscube renders continuously; all 33 stock OpenGL ES glmark2 benchmarks complete; stock OpenArena loads 114 GLSL shaders, a full map, models, textures, HUD, and animated bot combat; and Firefox sustains four distinct WebGL workloads through Mesa VirGL without a rejected renderer operation.</div>
+          </article>
+
+          <article class="milestone">
+            <div class="milestone-id">M4</div>
+            <h3>First accelerated guest cube <span class="status now">Implemented</span></h3>
+            <p>
+              The initial TGSI vertex/fragment compiler translates Mesa's real
+              declarations, immediates, swizzles, write masks, arithmetic, dot,
+              reciprocal-square-root, and varying semantics to GLSL. Guest
+              buffers, constants, surfaces, framebuffer state, viewport,
+              clears, rasterizer culling, and triangle-strip draws execute on a
+              dedicated accelerated Darwin OpenGL context. The result is read
+              back through the existing CPU framebuffer for Glass and VNC.
+            </p>
+            <div class="gate">Current evidence: Debian ARM64 kmscube reports Mesa renderer “virgl”, remains active across continuous KMS page flips, sustains roughly 440 frames/second in the native run, and produces distinct, correctly culled 1440×900 framebuffer captures over time.</div>
+          </article>
+
+          <article class="milestone">
+            <div class="milestone-id">M5</div>
+            <h3>SquadVM application profile <span class="status now">Firefox WebGL implemented</span></h3>
+            <p>
+              The reproducible ARM64 <code>images/gpu-glmark2</code> guest
+              expands the cube into a regular application corpus covering the
+              complete built-in glmark2-es2-drm suite: VBO and client-vertex
+              upload paths, indexed draws, all core primitive modes used by the
+              suite, texture and mipmap sampling, varyings, 24-bit depth,
+              depth-only shadow passes, render-target blits, integer shader
+              operations, indirect constants, and repeated scene cycles.
+              Separate fixture launches also verify clean context teardown and
+              recreation. It runs as an ordinary systemd service and keeps all
+              host cache, storage, and capture artifacts beneath the repository.
+              The companion <code>images/gpu-openarena</code> fixture then runs
+              a stock desktop game through Xorg, GLX, OpenGL 2.0, and the same
+              owned VirGL decoder. Its build derives a deterministic benchmark
+              from OpenArena's installed data rather than vendoring game assets.
+              The <code>images/gpu-firefox</code> fixture adds a regular browser and
+              WebGL 1 application, runs entirely from a loopback origin, refuses a
+              non-VirGL Xorg renderer, and records structured browser telemetry plus
+              one guest-rendered PNG for every scene.
+            </p>
+            <div class="gate">Current evidence: the glmark2 guest reports Mesa/X.org, renderer “virgl”, OpenGL ES 2.0, and completes all 33 stock scenes. The OpenArena guest reports direct rendering, renderer “virgl”, OpenGL 2.0 and GLSL 1.20; its 1440×900 timedemo completes 1,201 rendered frames in 54.5 seconds (22.0 fps on the M4 Darwin/ARM64 development host, improved from the initial 15.1 fps baseline). Firefox ESR reports Mesa/X.org and WebGL 1.0, visits all four 1440×900 scenes at 60 fps in the final Darwin run, and produces distinct non-black guest readbacks for indexed cubes, framebuffer post-processing, dynamic point sprites, and a procedural shader.</div>
+          </article>
+
+          <article class="milestone">
+            <div class="milestone-id">M6</div>
+            <h3>Native shared-texture scanout <span class="status now">Implemented on Darwin</span></h3>
+            <p>
+              Gowin exposes the visible window's complete NSOpenGL share group.
+              cc publishes leased frames from a bounded three-texture pool with
+              producer and consumer fences, generation, damage, release, and
+              resize-safe teardown. Glass samples those textures directly.
+              CPU readback is deferred until a VNC or diagnostic snapshot
+              explicitly requests it.
+            </p>
+            <div class="gate">Current evidence: a renderer behavior test proves that a native flush performs zero readbacks and that the first CPU snapshot performs exactly one lazy readback; Gowin's cross-context fence test verifies shared texture ownership; and the native 1440×900 guest corpus runs through the shared-texture path at roughly 2,000–4,400 frames/second in early scenes versus roughly 500–1,000 through VNC readback. Repeated resize and attach soak remains ongoing hardening.</div>
+          </article>
+
+          <article class="milestone">
+            <div class="milestone-id">M6A</div>
+            <h3>Conformance baseline and desktop OpenGL 4.1 ladder <span class="status now">In progress</span></h3>
+            <p>
+              The renderer now publishes both legacy VirGL and extensible
+              VirGL2 capsets. The VirGL2 profile carries bounded, implemented
+              host limits while leaving modern feature fallbacks disabled, so
+              adding the new ABI does not manufacture a higher guest version.
+              The ARM64 conformance image now builds Mesa 26.1.6 as one
+              cohesive EGL, GL, GLES, GBM, and VirGL userspace, pins Khronos
+              VK-GL-CTS 4.6.8.1, and records the current OpenGL 2.0 and GLES
+              2.0 ceiling. It runs capability probes for GLES 3.0, GLES 3.1,
+              GL 4.0, and GL 4.1 before the long resumable suites; probe
+              enumeration is a harness-integrity signal, never an API claim.
+              The first GL 3-era implementation slice
+              is also in place: per-attribute instance divisors, instanced
+              indexed and non-indexed draws, and TGSI
+              <code>INSTANCEID</code>/<code>VERTEXID</code> system values. The
+              conformance baseline has already driven concrete GLES2 fixes for
+              complete front/back stencil state, clear-mask restoration,
+              programmable point size, blend dithering, scaled and normalized
+              byte vertex formats, integer TGSI operations, and projected,
+              biased, and explicit-LOD 2D texture sampling.
+            </p>
+            <p>
+              Advancement follows the modern API ladder while the remaining
+              GLES2 regressions continue as a parallel baseline. First earn
+              GLES 3.0 and desktop GL 3.0/3.1 with integer formats, texture
+              arrays, multiple render targets, queries, uniform buffers,
+              instancing, and transform feedback; earn GL
+              3.2/3.3 with geometry shaders, multisampling, sampler objects, and
+              the remaining GLSL 3.30 behavior; then add the GL 4.0 shader,
+              tessellation, indirect-draw, cube-array, sample-shading, and
+              FP64 slices before completing the remaining GL 4.1 feature and
+              conformance slices supported by Darwin's frozen OpenGL 4.1 core
+              profile. A future Vulkan-over-Metal backend is the path beyond
+              that ceiling for modern Steam/Proton workloads and newer OpenGL
+              implemented over Vulkan; it is not simulated by overstating the
+              NSOpenGL capset.
+            </p>
+            <div class="gate">Current evidence: VirGL2 honestly leaves Mesa at OpenGL 2.0/GLES 2.0 and completes the existing four-scene Firefox WebGL corpus at roughly 60 fps with distinct non-black guest readbacks. The latest 45-group GLES2 run records 17,699 passes, 18 failures, 303 unsupported cases, 14 compatibility warnings, and 2 quality warnings; all six clipping failures are fixed, leaving two guest-compiler scoping cases and sixteen projected-mipmap seam cases. The first modern renderer slice now supports and advertises four color targets, with a native behavior test proving that one VirGL framebuffer clear updates both attached textures. The official monolithic ES2 runner also exposed a host-program lifetime problem, now bounded by a tested 128-entry LRU; its long-run memory behavior remains diagnostic work and does not block the GLES3 feature ladder. Exit gate: Mesa 26 creates the requested contexts without an override; GLES3, GL30, GL31, GL32, GL33, GL40, and GL41 CTS profiles plus selected Piglit coverage pass; and the official GLES2 must-pass artifacts complete without unsupported-command suppression or a test gate.</div>
+          </article>
+
+          <article class="milestone">
+            <div class="milestone-id">M7</div>
+            <h3>Linux, Windows, and SquadVM portability</h3>
+            <p>
+              Implement GLX and WGL share groups, fill common GL binding gaps,
+              intersect capsets with each host, add SquadVM traces, and run the
+              same renderer corpus on all supported native desktop targets.
+            </p>
+            <div class="gate">Exit gate: the standard guest scene and desktop behavior pass on KVM, HVF, and WHP with 2D fallback verified independently.</div>
+          </article>
+
+          <article class="milestone">
+            <div class="milestone-id">M8</div>
+            <h3>Hardening and default-auto rollout</h3>
+            <p>
+              Tune budgets, complete long-running stress and fuzz campaigns,
+              validate context-loss recovery, establish performance telemetry,
+              and change NeurodeskAppX from opt-in VirGL to <code>auto</code>
+              on qualified Darwin/ARM64 hosts.
+            </p>
+            <div class="gate">Exit gate: acceleration can be enabled by default without weakening VM lifecycle reliability or unsupported-host behavior.</div>
+          </article>
+        </section>
+
+        <section class="section" id="performance">
+          <span class="section-number">21 · Performance</span>
+          <h2>Performance gates</h2>
+          <p class="section-intro">
+            Correctness gates delivery. Performance measurements decide when to
+            remove temporary copies and when acceleration should become the
+            default.
+          </p>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Measure</th>
+                  <th>Stage A expectation</th>
+                  <th>Stage B expectation</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Guest rendering</td>
+                  <td>Clearly faster than llvmpipe for a representative 3D scene despite scanout readback.</td>
+                  <td>Host GPU remains the dominant renderer with no scanout readback bottleneck.</td>
+                </tr>
+                <tr>
+                  <td>Frame handoff</td>
+                  <td>Measured GPU readback and texture-upload bytes are visible in diagnostics.</td>
+                  <td>Normal frames share a texture and perform only synchronization plus composition.</td>
+                </tr>
+                <tr>
+                  <td>Input latency</td>
+                  <td>Renderer work cannot block the window event loop or VM input device path.</td>
+                  <td>Fence waits are bounded and do not serialize unrelated UI composition.</td>
+                </tr>
+                <tr>
+                  <td>Daemon stability</td>
+                  <td colspan="2">Long-running render, resize, stop, and restart cycles show no unbounded resource or goroutine growth.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>
+            Avoid brittle timing assertions in ordinary unit tests. Maintain a
+            repeatable benchmark harness and compare distributions or profiles
+            during development and release qualification.
+          </p>
+        </section>
+
+        <section class="section" id="risks">
+          <span class="section-number">22 · Risk register</span>
+          <h2>Primary risks and responses</h2>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Risk</th>
+                  <th>Impact</th>
+                  <th>Response</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>VirGL compatibility surface is larger than the first trace suggests.</td>
+                  <td>Desktop initializes but ordinary applications fail.</td>
+                  <td>Honest capset, pinned Mesa baseline, trace corpus, feature-by-feature expansion, differential testing.</td>
+                </tr>
+                <tr>
+                  <td>TGSI translation dominates implementation effort.</td>
+                  <td>Long path from triangle to usable desktop.</td>
+                  <td>Separate compiler architecture, narrow stages/features, compiler-focused tests and diagnostics.</td>
+                </tr>
+                <tr>
+                  <td>Host GL differences create platform-only failures.</td>
+                  <td>Works on the Darwin reference host but not Linux or Windows, or depends on behavior outside macOS's frozen OpenGL 4.1 profile.</td>
+                  <td>Conservative GL 3.3 core contract, capability intersection, common rendering corpus, real-host lanes.</td>
+                </tr>
+                <tr>
+                  <td>The VirGL implementation becomes an OpenGL-shaped product boundary.</td>
+                  <td>A later Vulkan/Metal renderer requires invasive display and resource rewrites.</td>
+                  <td>Keep capset negotiation, cc resources, native frames, and presentation handles backend-neutral from the first change.</td>
+                </tr>
+                <tr>
+                  <td>qemu-user is mistaken for the final Steam CPU architecture.</td>
+                  <td>The Steam client may start experimentally while games remain unusably slow or incompatible.</td>
+                  <td>Measure CPU translation separately and require a JIT plus native graphics-library forwarding before gaming claims.</td>
+                </tr>
+                <tr>
+                  <td>Asynchronous completion races VM teardown.</td>
+                  <td>Use-after-free, double retirement, daemon crash.</td>
+                  <td>Renderer generations, explicit cancellation, single owner queue, lifecycle stress tests.</td>
+                </tr>
+                <tr>
+                  <td>Shared texture lifetime is coupled to the window.</td>
+                  <td>Detach or resize destroys resources still in use.</td>
+                  <td>Share-group ownership above the window, reference-counted native frames, ordered shutdown.</td>
+                </tr>
+                <tr>
+                  <td>Guest input reaches a fragile host driver.</td>
+                  <td>Denial of service or host compromise.</td>
+                  <td>Complete pre-GL validation, budgets, fuzzing, watchdogs, and a future worker-process boundary.</td>
+                </tr>
+                <tr>
+                  <td>Multiple accelerated VMs compete for a process-global renderer.</td>
+                  <td>Resource collisions or incorrect isolation.</td>
+                  <td>The first-party renderer is instance-scoped from the start; global caches are immutable or keyed by renderer identity.</td>
+                </tr>
+                <tr>
+                  <td>Submodule development becomes confusing.</td>
+                  <td>Detached-head work or unreviewed dependency drift.</td>
+                  <td>Document update flow, pin reviewed commits, keep Gowin pointer changes isolated, verify recursive clones.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="section" id="steam">
+          <span class="section-number">23 · North-star track</span>
+          <h2>Path from VirGL to Steam on Apple Silicon</h2>
+          <p class="section-intro">
+            Steam gaming on a Darwin/ARM64 host is a combined CPU, graphics,
+            media, and product problem. It should build on the same VM and Glass
+            lifecycle, but it needs a second graphics protocol beyond VirGL.
+          </p>
+
+          <div class="callout warning">
+            <strong>Two independent translations are required:</strong> most of
+            the Steam catalog and Proton runtime is x86/x86-64, while modern
+            Windows games reach Vulkan through DXVK or vkd3d-proton. CPU
+            translation and GPU virtualization must therefore be designed and
+            measured separately.
+          </div>
+
+          <div class="ownership">
+            <div class="ownership-row">
+              <div class="owner">CPU execution</div>
+              <div class="responsibility">
+                Replace the current qemu-user compatibility baseline with a
+                gaming-capable JIT and syscall/runtime strategy. Evaluate a
+                FEX-class design with x86 and x86-64 support, per-application
+                tuning, and native library forwarding.
+              </div>
+            </div>
+            <div class="ownership-row">
+              <div class="owner">Guest runtime</div>
+              <div class="responsibility">
+                Steam, Wine/Proton, an x86-64 root filesystem, 32-bit runtime
+                support where required, DXVK, vkd3d-proton, persistent game
+                storage, and reproducible per-title configuration.
+              </div>
+            </div>
+            <div class="ownership-row">
+              <div class="owner">GPU protocol</div>
+              <div class="responsibility">
+                Blob resources, host-visible mappings, context initialization,
+                Vulkan command serialization, synchronization, memory budgets,
+                and a first-party host implementation.
+              </div>
+            </div>
+            <div class="ownership-row">
+              <div class="owner">Apple GPU</div>
+              <div class="responsibility">
+                A Metal-capable backend. MoltenVK is a useful compatibility
+                reference and development oracle, but is not assumed to be a
+                shipped dependency under the first-party ownership decision.
+              </div>
+            </div>
+            <div class="ownership-row">
+              <div class="owner">Product shell</div>
+              <div class="responsibility">
+                Low-latency controller, keyboard, mouse, audio, frame pacing,
+                fullscreen/window transitions, overlays, persistent libraries,
+                and clean VM stop/restart behavior.
+              </div>
+            </div>
+          </div>
+
+          <h3 style="margin-top: 24px;">GPU protocol decision gate</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Candidate</th>
+                  <th>Advantage</th>
+                  <th>Darwin constraint</th>
+                  <th>Plan position</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Venus-compatible guest ABI</td>
+                  <td>Standard Mesa guest driver and an existing Vulkan serialization model.</td>
+                  <td>Current Venus host assumptions center on native Vulkan and external/host-visible memory behavior that cannot be copied blindly onto Metal.</td>
+                  <td>Preferred guest-facing starting point; feasibility spike required.</td>
+                </tr>
+                <tr>
+                  <td>First-party Vulkan-to-Metal backend</td>
+                  <td>Full control over resource lifetime, presentation, and Apple GPU integration.</td>
+                  <td>Very large Vulkan semantics, shader, synchronization, and compatibility surface.</td>
+                  <td>North-star ownership direction; scope only after measured prototype work.</td>
+                </tr>
+                <tr>
+                  <td>Vendored Vulkan portability implementation</td>
+                  <td>Fastest way to test whether the remaining VM and CPU stack can run games.</td>
+                  <td>Does not satisfy a strict first-party renderer goal and may expose portability-subset gaps needed by DXVK/vkd3d-proton.</td>
+                  <td>Allowed as a development oracle or temporary experiment, not an assumed product dependency.</td>
+                </tr>
+                <tr>
+                  <td>VirGL/OpenGL only</td>
+                  <td>Already delivered for Neurodesk and older native OpenGL software.</td>
+                  <td>Does not provide the Vulkan feature model expected by current Proton translation layers.</td>
+                  <td>Fallback and legacy path, not the gaming architecture.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3 style="margin-top: 24px;">Gaming-track gates</h3>
+          <ol class="flow-list">
+            <li>
+              <strong>G0 · Native ARM64 Vulkan experiment</strong>
+              <span>Render a Vulkan scene from an ARM64 Linux guest through candidate virtio resource and Metal-host paths, before adding x86 translation.</span>
+            </li>
+            <li>
+              <strong>G1 · Vulkan memory and synchronization contract</strong>
+              <span>Prove blob resources, host-visible mappings, queues, semaphores, fences, presentation, reset, and teardown over HVF.</span>
+            </li>
+            <li>
+              <strong>G2 · Translated x86-64 Vulkan</strong>
+              <span>Run a translated x86-64 Vulkan diagnostic and scene with native graphics API forwarding and measured CPU overhead.</span>
+            </li>
+            <li>
+              <strong>G3 · Steam and Proton runtime</strong>
+              <span>Start Steam reliably, maintain a persistent library, launch Proton, and preserve controller/audio/input behavior across sessions.</span>
+            </li>
+            <li>
+              <strong>G4 · Curated game vertical slice</strong>
+              <span>Run one explicitly selected DXVK title from installation through gameplay with correct pixels, input, audio, save data, and clean shutdown.</span>
+            </li>
+            <li>
+              <strong>G5 · Compatibility and latency program</strong>
+              <span>Expand title coverage, frame pacing, shader/pipeline caching, fullscreen behavior, controller support, and per-title diagnostics without claiming universal Steam compatibility.</span>
+            </li>
+          </ol>
+
+          <div class="callout">
+            <strong>Frontend decision can wait:</strong> begin inside SquadVM to
+            reuse its ARM64 image, x86 packaging, persistent home, Glass, and
+            release machinery. Split out a gaming-specific frontend only when
+            its library, controller, fullscreen, update, and lifecycle
+            requirements materially diverge from SquadVM.
+          </div>
+        </section>
+
+        <section class="section" id="done">
+          <span class="section-number">24 · Completion</span>
+          <h2>Definition of done for the VirGL foundation</h2>
+          <p class="section-intro">
+            The first program is complete when acceleration is a reliable
+            property of a long-lived Neurodesk session on Darwin/ARM64, not
+            merely when one demo draws. Steam then advances through the separate
+            gaming-track gates without reopening these foundations.
+          </p>
+
+          <ul class="checks">
+            <li>Gowin and cc are pinned sibling submodules and a clean recursive clone contains every source dependency needed to build native releases.</li>
+            <li>The shipped renderer is first-party Go code and normal builds do not link virglrenderer, rutabaga, or another external renderer.</li>
+            <li>A standard Linux virtio-gpu/Mesa guest negotiates the supported VirGL capset without a custom guest kernel or Mesa fork.</li>
+            <li>Known scenes correctly exercise buffers, indexing, textures, sampling, blending, depth, scissor, resource copies, and vertex/fragment shaders.</li>
+            <li>Neurodesk reaches a usable accelerated desktop on an ARM64 Linux guest over HVF and runs the selected visualization corpus.</li>
+            <li>Native Glass consumes shared textures with explicit producer/consumer synchronization and no normal full-frame readback.</li>
+            <li>CPU snapshots continue to support 2D fallback, screenshots, and VNC/headless consumers.</li>
+            <li>Malformed protocol and shader inputs are bounded, fuzzed, and produce device/context failures rather than process panics.</li>
+            <li>Start, render, resize, detach/attach where supported, stop, and restart work repeatedly in the same daemon session.</li>
+            <li>macOS HVF passes the complete reference corpus; Linux KVM and Windows WHP pass it before acceleration is enabled by default on those hosts.</li>
+            <li><code>auto</code> falls back cleanly while explicit <code>virgl</code> produces a structured failure when unavailable.</li>
+            <li>Renderer diagnostics expose negotiated capability, resource budgets, queue/fence progress, and context loss without depending on user-facing prose.</li>
+            <li>The renderer contract, resource ledger, and opaque native-frame handoff can add a Vulkan/Metal backend without exposing OpenGL identities through cc or the display API.</li>
+          </ul>
+
+          <div class="callout">
+            <strong>Success condition:</strong> a user launches NeurodeskAppX
+            on Apple Silicon, works in an accelerated scientific desktop over
+            time, resizes and restarts it safely, and gets the existing 2D
+            desktop if acceleration cannot initialize. The same architecture
+            then supports the Steam track rather than constraining it.
+          </div>
+        </section>
+
+        <section class="section" id="references">
+          <span class="section-number">25 · Sources</span>
+          <h2>Protocol and implementation references</h2>
+          <ul>
+            <li>
+              <a href="https://docs.oasis-open.org/virtio/virtio/v1.4/virtio-v1.4.html">
+                Virtual I/O Device (VIRTIO) Version 1.4
+              </a>
+              — normative virtio-gpu device, commands, features, and fence behavior.
+            </li>
+            <li>
+              <a href="https://docs.mesa3d.org/drivers/virgl.html">
+                Mesa VirGL driver documentation
+              </a>
+              — guest Gallium driver and host renderer relationship.
+            </li>
+            <li>
+              <a href="https://gitlab.freedesktop.org/virgl/virglrenderer/-/blob/main/src/virgl_protocol.h">
+                virgl_protocol.h
+              </a>
+              — command headers, object layouts, and field encodings used as the compatibility reference.
+            </li>
+            <li>
+              <a href="https://gitlab.freedesktop.org/virgl/virglrenderer/-/blob/main/src/vrend/vrend_decode.c">
+                vrend_decode.c
+              </a>
+              and
+              <a href="https://gitlab.freedesktop.org/virgl/virglrenderer/-/blob/main/src/vrend/vrend_shader.c">
+                vrend_shader.c
+              </a>
+              — development references and differential-oracle candidates, not shipped code.
+            </li>
+            <li>
+              <a href="https://qemu.readthedocs.io/en/v10.0.3/system/devices/virtio-gpu.html">
+                QEMU virtio-gpu documentation
+              </a>
+              — comparison of 2D, VirGL, rutabaga, and Venus device models.
+            </li>
+            <li>
+              <a href="https://docs.mesa3d.org/drivers/venus.html">
+                Mesa Venus documentation
+              </a>
+              — guest requirements for blob resources, host-visible memory,
+              context initialization, and current host Vulkan assumptions.
+            </li>
+            <li>
+              <a href="https://github.com/FEX-Emu/FEX">
+                FEX
+              </a>
+              — reference for JIT-based x86/x86-64 execution on ARM64 Linux,
+              Wine/Proton use, and native OpenGL/Vulkan library forwarding.
+            </li>
+            <li>
+              <a href="https://github.com/doitsujin/DXVK">
+                DXVK
+              </a>
+              and
+              <a href="https://github.com/HansKristian-Work/vkd3d-proton">
+                vkd3d-proton
+              </a>
+              — the Vulkan-based Direct3D translation paths that make guest
+              Vulkan central to the Steam target.
+            </li>
+            <li>
+              <a href="https://github.com/KhronosGroup/MoltenVK">
+                MoltenVK
+              </a>
+              — Vulkan-to-Metal compatibility reference and experimental
+              oracle for the Darwin gaming track.
+            </li>
+            <li>
+              Local implementation:
+              <a href="cc/internal/virtio/gpu.go">cc/internal/virtio/gpu.go</a>,
+              <a href="cc/internal/virtio/display.go">cc/internal/virtio/display.go</a>,
+              <a href="cc/client/protocol.go">cc/client/protocol.go</a>,
+              <a href="cmd/ndappx/display.go">cmd/ndappx/display.go</a>, and
+              <a href="cmd/squadvm/display.go">cmd/squadvm/display.go</a>.
+            </li>
+          </ul>
+
+          <p class="footnote">
+            External implementations are references, compatibility targets, or
+            explicitly temporary experiment candidates. The shipped renderer
+            decision remains independently structured around standard guest
+            ABIs and vmsh's lifecycle requirements.
+          </p>
+        </section>
+
+        <footer>
+          <strong>GPU_PLAN.html</strong> · Proposed first-party GPU architecture
+          for vmsh, cc, Gowin, and the native Glass frontends.
+        </footer>
+      </main>
+    </div>
+  </div>
+</body>
+</html>

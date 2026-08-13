@@ -45,6 +45,10 @@ persists the image home directory, and maps `~/squadvm-shared` on the host to
 `/shared` in the guest. Pass another OCI reference as the final argument to
 test a locally published image.
 
+For opt-in framebuffer capture and guest keyboard or pointer control without
+host OS automation, see the shared
+[desktop automation API](../../docs/desktop-automation.md).
+
 Import and start it with `cc`:
 
 ```sh
